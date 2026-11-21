@@ -3,17 +3,19 @@
 //! part until its last part publishes them all, and the projection reads a
 //! feed call makes.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::EngineError;
 use crate::Runtime;
-use crate::cache::{FeedState, KeptWrite, MountResources, ProjectionTransition};
+use crate::cache::{FeedState, KeptWrite, MountResources, ProjectionTransition, RecordKind};
 use crate::clock;
 use crate::effect_apply::EffectApplier;
 use crate::inspector;
 use crate::object_id::ObjectId;
 use crate::runtime::Result;
+use crate::view::FilePayload;
 use omnifs_api::events::InspectorOutcome;
 use omnifs_core::path::Path;
 use omnifs_wit::host::types as wit_types;
@@ -30,11 +32,14 @@ pub(crate) struct FeedObject {
 }
 
 /// A feed that answers for the path of an operation; `starts` marks an
-/// operation on one of its starting paths.
+/// operation on one of its starting paths, and `own` an own feed, which the
+/// operation asks for the facts of its own starting paths after the
+/// answering feed of an outer object.
 #[derive(Debug, Clone)]
 pub struct FeedClaim {
     pub(crate) object: FeedObject,
     pub(crate) starts: bool,
+    pub(crate) own: bool,
 }
 
 impl FeedClaim {
@@ -45,7 +50,26 @@ impl FeedClaim {
                 path: Path::parse(&claim.object.path).map_err(anyhow::Error::from)?,
             },
             starts: claim.starts,
+            own: claim.own,
         })
+    }
+}
+
+/// The operation on a starting path of a feed that starts an answer, by its
+/// path under the anchor of the claim: one without its fact in the
+/// projection, or one of an answer of the answering claim past its deadline.
+#[derive(Debug, Clone)]
+pub(crate) enum FeedStart {
+    Lacks(Path),
+    Due(Path),
+}
+
+impl FeedStart {
+    fn to_wit(&self) -> wit_types::FeedStart {
+        match self {
+            Self::Lacks(path) => wit_types::FeedStart::Lacks(path.as_str().to_string()),
+            Self::Due(path) => wit_types::FeedStart::Due(path.as_str().to_string()),
+        }
     }
 }
 
@@ -86,8 +110,8 @@ pub(crate) struct FeedChanges {
 }
 
 /// The feed operations in flight, by correlation id, with the anchor path of
-/// their object: `projection.listing` answers only for them and only under
-/// that path.
+/// their object: `projection.listing` and `projection.file` answer only for
+/// them and only under that path.
 #[derive(Default)]
 pub(crate) struct FeedOperations {
     paths: dashmap::DashMap<u64, Path>,
@@ -131,14 +155,13 @@ impl ProjectionReads {
         }
     }
 
-    /// The listing of `path` in the projection, for the feed operation `id`
-    /// and a path in the subtree of its object; none for a path without one.
-    pub(crate) fn listing(
+    /// `path`, for the feed operation `id` and a path in the subtree of its
+    /// object.
+    fn feed_path(
         &self,
         id: u64,
         path: &str,
-        form: wit_types::ListingForm,
-    ) -> std::result::Result<Option<wit_types::ListingFacts>, wit_types::ProviderError> {
+    ) -> std::result::Result<Path, wit_types::ProviderError> {
         let Some(object) = self.operations.paths.get(&id).map(|entry| entry.clone()) else {
             return Err(refusal(
                 wit_types::ErrorKind::Denied,
@@ -153,6 +176,49 @@ impl ProjectionReads {
                 format!("{path} is outside the feed of {object}"),
             ));
         }
+        Ok(path)
+    }
+
+    /// The bytes of the fed file at `path` in the projection, for the feed
+    /// operation `id` and a path in the subtree of its object; none for a
+    /// path without one.
+    pub(crate) fn file(
+        &self,
+        id: u64,
+        path: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, wit_types::ProviderError> {
+        let path = self.feed_path(id, path)?;
+        let internal = |error: crate::cache::ProjectionError| {
+            refusal(wit_types::ErrorKind::Internal, error.to_string())
+        };
+        if !self.resources.is_fed(&path).map_err(internal)? {
+            return Ok(None);
+        }
+        let Some(record) = self
+            .resources
+            .cache_get(&path, RecordKind::File, None)
+            .map_err(internal)?
+        else {
+            return Ok(None);
+        };
+        let file = FilePayload::deserialize(&record.payload).ok_or_else(|| {
+            refusal(
+                wit_types::ErrorKind::Internal,
+                format!("the file fact of {path} does not decode"),
+            )
+        })?;
+        Ok(Some(file.content))
+    }
+
+    /// The listing of `path` in the projection, for the feed operation `id`
+    /// and a path in the subtree of its object; none for a path without one.
+    pub(crate) fn listing(
+        &self,
+        id: u64,
+        path: &str,
+        form: wit_types::ListingForm,
+    ) -> std::result::Result<Option<wit_types::ListingFacts>, wit_types::ProviderError> {
+        let path = self.feed_path(id, path)?;
         let Some(listing) = self
             .resources
             .dirents_payload(&path)
@@ -197,7 +263,7 @@ impl Runtime {
     pub(crate) async fn feed(
         &self,
         object: &FeedObject,
-        start: Option<&Path>,
+        start: Option<&FeedStart>,
         seen: Option<&FeedState>,
     ) -> Result<bool> {
         let led = AtomicBool::new(false);
@@ -232,8 +298,9 @@ impl Runtime {
     /// comes; a part of a later answer is kept, and the last part publishes
     /// the kept parts with it. The answer continues from the token of the
     /// last kept part, else of the last published part, which a failure
-    /// keeps.
-    async fn run_feed_answer(&self, object: &FeedObject, start: Option<&Path>) -> Result<()> {
+    /// keeps. A restart publishes its token, drops the kept parts, and is
+    /// the error of the answer.
+    async fn run_feed_answer(&self, object: &FeedObject, start: Option<&FeedStart>) -> Result<()> {
         let state = self
             .resources
             .feed_state(object.id.as_bytes())
@@ -266,12 +333,15 @@ impl Runtime {
     }
 
     /// One call of the feed of `object` from `token`, in a `later` answer,
-    /// after the end of the first answer of the feed, with `kept` parts.
+    /// after the end of the first answer of the feed, with `kept` parts. The
+    /// `until` of a part is the time of the facts of the part, a part of a
+    /// later answer with `more` having none.
+    #[allow(clippy::too_many_lines)]
     async fn run_feed_call(
         &self,
         object: &FeedObject,
         token: Option<String>,
-        start: Option<&Path>,
+        start: Option<&FeedStart>,
         later: bool,
         kept: bool,
     ) -> Result<FeedStep> {
@@ -288,25 +358,42 @@ impl Runtime {
         let tokened = token.is_some();
         async {
             let operation = self.feed_operations.begin(id, object.path.clone());
-            let (wire_result, effects) = self
+            let (wire_result, effects, until) = self
                 .instance
                 .feed(
                     id,
                     object.path.as_str().to_string(),
                     token,
-                    start.map(|start| start.as_str().to_string()),
+                    start.map(FeedStart::to_wit),
                 )
                 .await?;
             drop(operation);
-            crate::op_validate::validate_feed(&wire_result, &effects, tokened, |tree| {
+            crate::op_validate::validate_feed(&wire_result, &effects, until, tokened, |tree| {
                 self.tree_ref(tree).is_some()
             })
             .map_err(EngineError::ProviderProtocol)?;
             super::lifecycle::inspect_result(&span, &wire_result);
             let pending_blobs = blob_guard.take();
             let answer = self.provider_result(wire_result)?;
+            // The facts of the part of this call, whose time is its `until`.
+            let deadlined = until
+                .map(|until| {
+                    effects
+                        .fs
+                        .iter()
+                        .map(|write| Ok((Path::parse(&write.path)?, until)))
+                        .collect::<std::result::Result<HashMap<_, _>, omnifs_core::path::ParseError>>()
+                })
+                .transpose()
+                .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?
+                .unwrap_or_default();
             let (answer, effects) = match answer {
                 wit_types::FeedAnswer::Part(part) if later && part.more => {
+                    if until.is_some() {
+                        return Err(EngineError::ProviderProtocol(
+                            "a part of a later feed answer with more parts has no until".into(),
+                        ));
+                    }
                     let token = part.token.clone();
                     self.keep_feed_part(
                         object,
@@ -336,14 +423,15 @@ impl Runtime {
                 answer => (answer, effects),
             };
             let step = match &answer {
-                wit_types::FeedAnswer::Part(part) => FeedStep::Part {
+                wit_types::FeedAnswer::Part(part) => Ok(FeedStep::Part {
                     more: part.more,
                     token: part.token.clone(),
-                },
-                wit_types::FeedAnswer::Unchanged => FeedStep::Unchanged,
+                }),
+                wit_types::FeedAnswer::Unchanged => Ok(FeedStep::Unchanged),
+                wit_types::FeedAnswer::Restart(restart) => Err(restart.error.clone()),
             };
             let (mut transition, changes) = EffectApplier::new(&self.resources)
-                .lower_feed(object, answer, &effects, clock::now_millis())
+                .lower_feed(object, answer, &effects, deadlined, clock::now_millis())
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             transition.blobs.extend(pending_blobs);
             self.publish_transition(transition, captured_epoch)?;
@@ -355,8 +443,16 @@ impl Runtime {
                 self.record_dir_changed(listing, fed);
             }
             self.record_view_invalidations(Vec::new(), changes.paths);
-            inspector::record_outcome(&span, InspectorOutcome::Ok);
-            Ok(step)
+            match step {
+                Ok(step) => {
+                    inspector::record_outcome(&span, InspectorOutcome::Ok);
+                    Ok(step)
+                },
+                Err(error) => {
+                    inspector::record_outcome(&span, inspector::outcome_for_provider_error(&error));
+                    self.provider_result(Err(error))
+                },
+            }
         }
         .instrument(span.clone())
         .await
@@ -377,6 +473,7 @@ impl Runtime {
                 object,
                 wit_types::FeedAnswer::Part(kept.part.clone()),
                 &kept.effects,
+                HashMap::new(),
                 clock::now_millis(),
             )
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;

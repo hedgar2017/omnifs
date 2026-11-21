@@ -825,27 +825,43 @@ fn file_object_anchor_reads_canonical() {
 // Feeds and fed faces
 // ---------------------------------------------------------------------------
 
+/// A part that writes the token and the starts of its call, until five
+/// seconds after the epoch; a restart from the token `t1`.
 #[allow(clippy::unused_async)]
 async fn demo_feed(cx: crate::feed::FeedCx<DemoKey, ()>) -> Result<crate::feed::Feed> {
     cx.file(
         format!("/items/{}/summary", cx.key().id),
-        format!("{:?} {:?}", cx.token(), cx.start()).into_bytes(),
+        format!("{:?} {:?} {:?}", cx.token(), cx.start(), cx.due()).into_bytes(),
     )?;
     cx.dir(
         format!("/items/{}/parts", cx.key().id),
         crate::browse::ListingWrite::Complete,
     )?;
-    Ok(crate::feed::Feed::part("t1").into())
+    if cx.token() == Some("t1") {
+        return Ok(crate::feed::Feed::restart(
+            "t0",
+            ProviderError::invalid_input("an expired cursor"),
+        ));
+    }
+    Ok(crate::feed::Feed::part("t1")
+        .until(std::time::UNIX_EPOCH + std::time::Duration::from_secs(5))
+        .into())
 }
 
 fn fed_router(starts: &'static [&'static str]) -> Result<CompiledRouter<()>> {
+    fed_router_of(starts, false)
+}
+
+fn fed_router_of(starts: &'static [&'static str], own: bool) -> Result<CompiledRouter<()>> {
     let mut router = Router::<()>::new();
     router.object::<DemoObj>("/items/{id}", |o| {
         o.dynamic();
         o.file("item.json").canonical::<Json>()?;
         o.file("summary").fed()?;
         o.dir("parts").fed()?;
-        o.feed(demo_feed).starts(starts.iter().copied())?;
+        let feed = o.feed(demo_feed);
+        let feed = if own { feed.own() } else { feed };
+        feed.starts(starts.iter().copied())?;
         Ok(())
     })?;
     router.compile()
@@ -881,6 +897,7 @@ fn fed_faces_answer_the_claims_of_their_feeds_without_a_request() {
     assert_eq!(claims[0].object.id.kind, "demo.obj");
     assert_eq!(claims[0].object.id.captures[0].value, "7");
     assert!(!claims[0].starts, "summary is not a starting path");
+    assert!(!claims[0].own, "the feed is not an own feed");
 
     let (list, _) = poll_ready(router.list_children(&cx, "/items/7/parts", None))
         .unwrap()
@@ -892,6 +909,13 @@ fn fed_faces_answer_the_claims_of_their_feeds_without_a_request() {
 
     let outcome = poll_ready(router.read_file(&cx, "/items/7/summary", "", None)).unwrap();
     assert!(matches!(outcome, crate::browse::ReadOutcome::Feed(_)));
+
+    // The claims of an own feed say so.
+    let router = fed_router_of(&["parts"], true).unwrap();
+    let (lookup, _) = poll_ready(router.lookup_child(&cx, "/items/7", "summary"))
+        .unwrap()
+        .into_result_and_effects();
+    assert!(claims_of(lookup)[0].own, "the feed is an own feed");
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -999,19 +1023,8 @@ fn a_feed_answers_for_the_fed_faces_beneath_the_paths_its_object_routes() {
     assert_eq!(error.kind(), ProviderErrorKind::NotFound);
 }
 
-#[test]
-fn the_feed_export_runs_the_feed_of_the_object_at_its_path() {
-    let router = fed_router(&["parts"]).unwrap();
-    let cx = Cx::new(1, Rc::new(RefCell::new(())));
-
-    let (answer, effects) =
-        poll_ready(router.feed(&cx, "/items/7", None, Some("/items/7/parts".to_string()))).unwrap();
-    let wit_types::FeedAnswer::Part(part) = answer else {
-        panic!("expected a part");
-    };
-    assert_eq!(part.token, "t1");
-    assert!(!part.more);
-    let effects = effects.into_wit();
+/// The bytes of the fed file `summary` of `effects`.
+fn summary_of(effects: &wit_types::Effects) -> &[u8] {
     let summary = effects
         .fs
         .iter()
@@ -1020,16 +1033,55 @@ fn the_feed_export_runs_the_feed_of_the_object_at_its_path() {
     let wit_types::FsKind::File(file) = &summary.kind else {
         panic!("summary is a file");
     };
-    assert!(
-        matches!(&file.bytes, wit_types::ByteSource::Inline(bytes) if bytes == b"None Some(\"parts\")")
-    );
+    let wit_types::ByteSource::Inline(bytes) = &file.bytes else {
+        panic!("summary has inline bytes");
+    };
+    bytes
+}
+
+#[test]
+fn the_feed_export_runs_the_feed_of_the_object_at_its_path() {
+    let router = fed_router(&["parts"]).unwrap();
+    let cx = Cx::new(1, Rc::new(RefCell::new(())));
+
+    let lacks = |path: &str| Some(wit_types::FeedStart::Lacks(path.to_string()));
+    let (answer, effects, until) =
+        poll_ready(router.feed(&cx, "/items/7", None, lacks("/items/7/parts"))).unwrap();
+    let wit_types::FeedAnswer::Part(part) = answer else {
+        panic!("expected a part");
+    };
+    assert_eq!(part.token, "t1");
+    assert!(!part.more);
+    assert_eq!(until, Some(5_000), "the facts of the part count until then");
+    let effects = effects.into_wit();
+    assert_eq!(summary_of(&effects), b"None Some(\"parts\") None");
     assert!(effects.fs.iter().any(|write| matches!(
         write.kind,
         wit_types::FsKind::Directory(wit_types::ListingWrite::Complete)
     )));
 
-    let error = poll_ready(router.feed(&cx, "/items/7", None, Some("/items/8/parts".to_string())))
-        .unwrap_err();
+    // An answer past the deadline of the feed names its starting path apart.
+    let due = Some(wit_types::FeedStart::Due("/items/7/parts".to_string()));
+    let (_, effects, _) = poll_ready(router.feed(&cx, "/items/7", None, due)).unwrap();
+    assert_eq!(
+        summary_of(&effects.into_wit()),
+        b"None None Some(\"parts\")"
+    );
+
+    // A restart carries its token and its error, without the writes of its
+    // call.
+    let (answer, effects, until) =
+        poll_ready(router.feed(&cx, "/items/7", Some("t1".to_string()), None)).unwrap();
+    let wit_types::FeedAnswer::Restart(restart) = answer else {
+        panic!("expected a restart");
+    };
+    assert_eq!(restart.token, "t0");
+    assert_eq!(restart.error.kind, wit_types::ErrorKind::InvalidInput);
+    assert!(effects.is_empty());
+    assert_eq!(until, None);
+
+    let error =
+        poll_ready(router.feed(&cx, "/items/7", None, lacks("/items/8/parts"))).unwrap_err();
     assert_eq!(error.kind(), ProviderErrorKind::InvalidInput);
     let error = poll_ready(router.feed(&cx, "/elsewhere", None, None)).unwrap_err();
     assert_eq!(error.kind(), ProviderErrorKind::NotFound);

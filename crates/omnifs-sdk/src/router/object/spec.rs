@@ -74,11 +74,12 @@ pub(in crate::router) struct ObjectDefinition<O: Object> {
     pub(super) feed: Option<FeedDeclaration<O::State>>,
 }
 
-/// An object's feed: its boxed method and its starting paths, relative to
-/// the object (`""` for the anchor itself).
+/// An object's feed: its boxed method, its starting paths, relative to the
+/// object (`""` for the anchor itself), and whether it is an own feed.
 pub(in crate::router) struct FeedDeclaration<S> {
     pub handler: std::rc::Rc<crate::feed::FeedHandlerFn<S>>,
     pub starts: Vec<&'static str>,
+    pub own: bool,
 }
 
 impl<S> Clone for FeedDeclaration<S> {
@@ -86,6 +87,7 @@ impl<S> Clone for FeedDeclaration<S> {
         Self {
             handler: self.handler.clone(),
             starts: self.starts.clone(),
+            own: self.own,
         }
     }
 }
@@ -280,6 +282,7 @@ impl<O: Object> ObjectBlock<O> {
         FeedFace {
             block: self,
             handler: crate::feed::feed_handler::<O, Fut>(method),
+            own: false,
         }
     }
 
@@ -445,9 +448,21 @@ impl<O: Object> ObjectBlock<O> {
 pub struct FeedFace<'a, O: Object> {
     block: &'a mut ObjectBlock<O>,
     handler: std::rc::Rc<crate::feed::FeedHandlerFn<O::State>>,
+    own: bool,
 }
 
 impl<'a, O: Object> FeedFace<'a, O> {
+    /// An own feed: it answers the facts of its own starting paths for an
+    /// upstream without an inventory of them. A lookup below its anchor
+    /// without its positive lookup starts it after the end of its first
+    /// answer too, and an operation asks it after the answering feed of an
+    /// outer object (see [`crate::feed`]).
+    #[must_use]
+    pub fn own(mut self) -> Self {
+        self.own = true;
+        self
+    }
+
     /// The starting paths of the feed, relative to the object (`""` for the
     /// anchor itself): an operation on one of them without its fact in the
     /// projection starts an answer of the feed. Each must name a fed face of
@@ -465,6 +480,7 @@ impl<'a, O: Object> FeedFace<'a, O> {
         self.block.feed = Some(FeedDeclaration {
             handler: self.handler,
             starts: starts.into_iter().collect(),
+            own: self.own,
         });
         Ok(self.block)
     }

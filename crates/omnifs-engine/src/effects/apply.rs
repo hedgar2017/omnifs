@@ -1,11 +1,11 @@
 //! Pure lowering from provider terminals to durable projection transitions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::cache::identity::GitId;
 use crate::cache::{
-    DirentsMutation, FactPayload, FeedPartWrite, FeedWrite, Freshness, GitWrite, Invalidation,
-    MountResources, ObjectMutation, ProjectionTransition, RecordWrite,
+    DirentsMutation, FactPayload, FeedAnswerWrite, FeedPartWrite, FeedWrite, Freshness, GitWrite,
+    Invalidation, MountResources, ObjectMutation, ProjectionTransition, RecordWrite,
 };
 use crate::clock::{DYNAMIC_TTL_MILLIS, freshness_expiry, page_deadline};
 use crate::object_id::ObjectId;
@@ -445,13 +445,16 @@ impl<'a> EffectApplier<'a> {
     }
 
     /// Lower one answer of the feed of `object`: the facts of a part are fed,
-    /// and the feed states it brought publish with them. Returns the outcome
-    /// and what the answer changes.
+    /// those at the paths of `until` counting as lacking for the start of an
+    /// answer after their time, and the feed states it brought publish with
+    /// them; a restart moves the token of the feed. Returns the outcome and
+    /// what the answer changes.
     pub(crate) fn lower_feed(
         &self,
         object: &FeedObject,
         answer: wit_types::FeedAnswer,
         effects: &wit_types::Effects,
+        until: HashMap<Path, u64>,
         now_millis: u64,
     ) -> anyhow::Result<(ProjectionTransition, FeedChanges)> {
         let mut transition = self.lower_writes(effects, now_millis, true)?;
@@ -479,32 +482,39 @@ impl<'a> EffectApplier<'a> {
         let deadline = now_millis.saturating_add(DYNAMIC_TTL_MILLIS);
         let mut feed = FeedWrite {
             object: object.id.as_bytes().to_vec(),
-            part: None,
+            answer: FeedAnswerWrite::Unchanged,
             inner: Vec::new(),
             anchors: Vec::new(),
             deadline,
+            until,
         };
-        if let wit_types::FeedAnswer::Part(part) = answer {
-            feed.inner = part
-                .inner
-                .iter()
-                .map(|state| {
-                    (
-                        ObjectId::from_wit(&state.id).as_bytes().to_vec(),
-                        state.token.clone(),
-                    )
-                })
-                .collect();
-            feed.anchors = part
-                .anchors
-                .iter()
-                .map(|anchor| Ok((Path::parse(&anchor.path)?, Path::parse(&anchor.anchor)?)))
-                .collect::<Result<_, omnifs_core::path::ParseError>>()
-                .map_err(anyhow::Error::from)?;
-            feed.part = Some(FeedPartWrite {
-                token: part.token,
-                more: part.more,
-            });
+        match answer {
+            wit_types::FeedAnswer::Unchanged => {},
+            wit_types::FeedAnswer::Part(part) => {
+                feed.inner = part
+                    .inner
+                    .iter()
+                    .map(|state| {
+                        (
+                            ObjectId::from_wit(&state.id).as_bytes().to_vec(),
+                            state.token.clone(),
+                        )
+                    })
+                    .collect();
+                feed.anchors = part
+                    .anchors
+                    .iter()
+                    .map(|anchor| Ok((Path::parse(&anchor.path)?, Path::parse(&anchor.anchor)?)))
+                    .collect::<Result<_, omnifs_core::path::ParseError>>()
+                    .map_err(anyhow::Error::from)?;
+                feed.answer = FeedAnswerWrite::Part(FeedPartWrite {
+                    token: part.token,
+                    more: part.more,
+                });
+            },
+            wit_types::FeedAnswer::Restart(restart) => {
+                feed.answer = FeedAnswerWrite::Restart(restart.token);
+            },
         }
         transition.feed = Some(feed);
         Ok((transition, changes))
@@ -683,6 +693,7 @@ fn listing_write_from_wit(write: wit_types::ListingWrite) -> ListingWrite {
         wit_types::ListingWrite::Partial => ListingWrite::Partial,
         wit_types::ListingWrite::Exhaustive => ListingWrite::Exhaustive,
         wit_types::ListingWrite::Complete => ListingWrite::Complete,
+        wit_types::ListingWrite::Join => ListingWrite::Join,
     }
 }
 

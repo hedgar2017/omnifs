@@ -6,31 +6,33 @@ use std::rc::Rc;
 use crate::browse::{Effects, FeedClaim};
 use crate::cx::Cx;
 use crate::error::{ProviderError, Result};
-use crate::feed::Feed;
+use crate::feed::{Feed, FeedStart};
 use crate::identity::LogicalId;
 use omnifs_core::path::Path;
 use omnifs_wit::provider::types as wit_types;
 
 use super::super::compiled::CompiledRouter;
-use super::super::object::ClaimSpec;
+use super::super::object::{ClaimSpec, ObjectFeed};
 use super::route_shape::Shape;
 
 impl<S> CompiledRouter<S> {
     /// Run one call of the feed of the object anchored at `path`, from
     /// `token`, for an answer that the operation at `start` started.
     ///
-    /// The feed answers [`Feed::unchanged`] or a part with the token after
-    /// it, whether more parts follow, and the tokens of the inner feeds it
-    /// brought; the facts of the part are the writes of its context. A path
-    /// without a feed is not found, so a provider without feeds answers every
-    /// call not-found.
+    /// The feed answers [`Feed::unchanged`], a part with the token after it,
+    /// whether more parts follow, the tokens of the inner feeds it brought,
+    /// and the time in milliseconds of the Unix epoch after which its facts
+    /// count as lacking for the start of an answer, or a restart with the
+    /// token the feed takes and the error of the answer; the facts of a part
+    /// are the writes of its context. A path without a feed is not found, so
+    /// a provider without feeds answers every call not-found.
     pub async fn feed(
         &self,
         cx: &Cx<S>,
         path: &str,
         token: Option<String>,
-        start: Option<String>,
-    ) -> Result<(wit_types::FeedAnswer, Effects)> {
+        start: Option<wit_types::FeedStart>,
+    ) -> Result<(wit_types::FeedAnswer, Effects, Option<u64>)> {
         let abs =
             Path::parse(path).map_err(|error| ProviderError::invalid_input(error.to_string()))?;
         let shape = self.shape();
@@ -43,21 +45,13 @@ impl<S> CompiledRouter<S> {
             .as_ref()
             .ok_or_else(|| ProviderError::not_found(format!("no feed at {path}")))?;
         let start = start
-            .map(|start| {
-                let start_abs = Path::parse(&start)
-                    .map_err(|error| ProviderError::invalid_input(error.to_string()))?;
-                feed.starts
-                    .iter()
-                    .find(|declared| {
-                        start_abs.has_prefix(&abs)
-                            && declared.pattern.match_path(&start_abs).is_ok()
-                    })
-                    .map(|declared| declared.declared)
-                    .ok_or_else(|| {
-                        ProviderError::invalid_input(format!(
-                            "{start} is not a starting path of the feed at {path}"
-                        ))
-                    })
+            .map(|start| match start {
+                wit_types::FeedStart::Lacks(start) => {
+                    declared_start(feed, &abs, &start).map(FeedStart::Lacks)
+                },
+                wit_types::FeedStart::Due(start) => {
+                    declared_start(feed, &abs, &start).map(FeedStart::Due)
+                },
             })
             .transpose()?;
 
@@ -76,10 +70,10 @@ impl<S> CompiledRouter<S> {
         .await
         .map_err(|error| error.with_context("feed", &abs))?;
         let effects = facts.take();
-        let answer = match answer {
-            Feed::Unchanged => wit_types::FeedAnswer::Unchanged,
+        match answer {
+            Feed::Unchanged => Ok((wit_types::FeedAnswer::Unchanged, effects, None)),
             Feed::Part(part) => {
-                let (token, more, inner) = part.into_parts();
+                let (token, more, inner, until) = part.into_parts();
                 let inner = inner
                     .into_iter()
                     .map(|state| wit_types::FeedState {
@@ -87,16 +81,55 @@ impl<S> CompiledRouter<S> {
                         token: state.token,
                     })
                     .collect();
-                wit_types::FeedAnswer::Part(wit_types::FeedPart {
-                    token,
-                    more,
-                    inner,
-                    anchors: shape.facet_anchors(&effects)?,
-                })
+                let until = until
+                    .map(|until| {
+                        let since = until
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(|error| ProviderError::internal(error.to_string()))?;
+                        u64::try_from(since.as_millis())
+                            .map_err(|error| ProviderError::internal(error.to_string()))
+                    })
+                    .transpose()?;
+                let anchors = shape.facet_anchors(&effects)?;
+                Ok((
+                    wit_types::FeedAnswer::Part(wit_types::FeedPart {
+                        token,
+                        more,
+                        inner,
+                        anchors,
+                    }),
+                    effects,
+                    until,
+                ))
             },
-        };
-        Ok((answer, effects))
+            Feed::Restart { token, error } => Ok((
+                wit_types::FeedAnswer::Restart(wit_types::FeedRestart {
+                    token,
+                    error: error.into(),
+                }),
+                Effects::new(),
+                None,
+            )),
+        }
     }
+}
+
+/// The declared starting path of `feed`, the feed of the object anchored at
+/// `anchor`, that names the path `start`.
+fn declared_start<S>(feed: &ObjectFeed<S>, anchor: &Path, start: &str) -> Result<&'static str> {
+    let start_abs =
+        Path::parse(start).map_err(|error| ProviderError::invalid_input(error.to_string()))?;
+    feed.starts
+        .iter()
+        .find(|declared| {
+            start_abs.has_prefix(anchor) && declared.pattern.match_path(&start_abs).is_ok()
+        })
+        .map(|declared| declared.declared)
+        .ok_or_else(|| {
+            ProviderError::invalid_input(format!(
+                "{start} is not a starting path of the feed at {anchor}"
+            ))
+        })
 }
 
 impl<S> Shape<'_, S> {
@@ -159,6 +192,7 @@ impl<S> Shape<'_, S> {
                 path: Path::parse(&path)
                     .map_err(|error| ProviderError::internal(error.to_string()))?,
                 starts: on_face && spec.starts,
+                own: feed.own,
             });
         }
         if claims.is_empty() {

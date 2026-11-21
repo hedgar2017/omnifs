@@ -94,17 +94,27 @@ where
     }
 
     /// `tokened` says whether the call carried a token, the only call
-    /// `unchanged` can answer.
+    /// `unchanged` and a restart can answer. Only a part has an `until`, and
+    /// a restart carries no effects.
     pub(crate) fn feed(
         result: &std::result::Result<wit_types::FeedAnswer, wit_types::ProviderError>,
+        effects: &wit_types::Effects,
+        until: Option<u64>,
         tokened: bool,
     ) -> std::result::Result<(), String> {
+        if until.is_some() && !matches!(result, Ok(wit_types::FeedAnswer::Part(_))) {
+            return Err("only a feed part has an until".to_string());
+        }
         let Ok(answer) = result else { return Ok(()) };
         match answer {
-            wit_types::FeedAnswer::Unchanged if !tokened => {
-                Err("feed answered unchanged to a call without a token".to_string())
+            wit_types::FeedAnswer::Unchanged | wit_types::FeedAnswer::Restart(_) if !tokened => {
+                Err("feed answered unchanged or restart to a call without a token".to_string())
             },
             wit_types::FeedAnswer::Unchanged => Ok(()),
+            wit_types::FeedAnswer::Restart(_) if !effects_empty(effects) => {
+                Err("a feed restart must not carry effects".to_string())
+            },
+            wit_types::FeedAnswer::Restart(restart) => Self::feed_token(&restart.token),
             wit_types::FeedAnswer::Part(part) => {
                 Self::feed_token(&part.token)?;
                 for state in &part.inner {
@@ -486,11 +496,13 @@ where
     let mut v = ReturnValidator::common(result, effects, tree_exists)?;
     v.list(result, validated)
 }
-/// Validate one feed call: `tokened` says whether the call carried a token.
-/// The effects of a part are its fed facts.
+/// Validate one feed call: `tokened` says whether the call carried a token,
+/// and `until` is the time the call gave the facts of its part. The effects
+/// of a part are its fed facts.
 pub(crate) fn validate_feed<F>(
     result: &std::result::Result<wit_types::FeedAnswer, wit_types::ProviderError>,
     effects: &wit_types::Effects,
+    until: Option<u64>,
     tokened: bool,
     tree_exists: F,
 ) -> std::result::Result<(), String>
@@ -498,7 +510,7 @@ where
     F: Fn(u64) -> bool,
 {
     let _ = ReturnValidator::checked(result, effects, tree_exists, true)?;
-    ReturnValidator::<F>::feed(result, tokened)
+    ReturnValidator::<F>::feed(result, effects, until, tokened)
 }
 pub(crate) fn validate_read<F>(
     result: &std::result::Result<wit_types::ReadFileOutcome, wit_types::ProviderError>,

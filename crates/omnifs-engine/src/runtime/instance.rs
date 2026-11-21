@@ -89,7 +89,7 @@ enum Command {
         id: u64,
         path: String,
         token: Option<String>,
-        start: Option<String>,
+        start: Option<wit_types::FeedStart>,
         span: tracing::Span,
         reply: tokio::sync::oneshot::Sender<FeedTransport>,
     },
@@ -155,6 +155,7 @@ type FeedTransport = std::result::Result<
     (
         std::result::Result<wit_types::FeedAnswer, wit_types::ProviderError>,
         wit_types::Effects,
+        Option<u64>,
     ),
     EngineError,
 >;
@@ -359,7 +360,7 @@ impl Instance {
         id: u64,
         path: String,
         token: Option<String>,
-        start: Option<String>,
+        start: Option<wit_types::FeedStart>,
     ) -> FeedTransport {
         let (reply, recv) = tokio::sync::oneshot::channel();
         self.tx

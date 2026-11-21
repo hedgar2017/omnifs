@@ -90,6 +90,19 @@ impl<T: Send + 'static> CalloutsHostWithStore<T> for HostState {
 
 impl CalloutsHost for HostState {}
 
+impl HostState {
+    fn projection(&self) -> Result<&ProjectionReads, wit_types::ProviderError> {
+        self.projection
+            .as_ref()
+            .ok_or_else(|| wit_types::ProviderError {
+                kind: wit_types::ErrorKind::Internal,
+                message: "provider projection reads are not initialized".to_string(),
+                retryable: false,
+                retry_after: None,
+            })
+    }
+}
+
 impl ProjectionHost for HostState {
     fn listing(
         &mut self,
@@ -97,14 +110,10 @@ impl ProjectionHost for HostState {
         path: String,
         form: wit_types::ListingForm,
     ) -> Result<Option<wit_types::ListingFacts>, wit_types::ProviderError> {
-        match &self.projection {
-            Some(projection) => projection.listing(id, &path, form),
-            None => Err(wit_types::ProviderError {
-                kind: wit_types::ErrorKind::Internal,
-                message: "provider projection reads are not initialized".to_string(),
-                retryable: false,
-                retry_after: None,
-            }),
-        }
+        self.projection()?.listing(id, &path, form)
+    }
+
+    fn file(&mut self, id: u64, path: String) -> Result<Option<Vec<u8>>, wit_types::ProviderError> {
+        self.projection()?.file(id, &path)
     }
 }

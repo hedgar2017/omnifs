@@ -97,6 +97,9 @@ interface types {
         exhaustive,
         /// They join the listing, which is complete after them.
         complete,
+        /// They join the listing, which stays as complete as it was, new
+        /// names too.
+        join,
     }
 
     variant path-or-prefix {
@@ -304,17 +307,38 @@ interface types {
     }
 
     /// A feed that answers for the path of an operation. `starts` marks an
-    /// operation on a starting path of the feed.
+    /// operation on a starting path of the feed, and `own` a feed that the
+    /// operation asks for the facts of its own starting paths after the
+    /// answering feed of an outer object.
     record feed-claim {
         object: feed-object,
         starts: bool,
+        %own: bool,
     }
 
-    /// The answer of one `feed` call: the facts of the feed stand, or one
-    /// part of the answer, whose facts are the effects of the call.
+    /// The operation on a starting path of a feed that starts an answer:
+    /// `lacks` for an operation without its fact in the projection, and
+    /// `due` for an operation of the answering feed past its deadline.
+    variant feed-start {
+        lacks(string),
+        due(string),
+    }
+
+    /// The answer of one `feed` call: the facts of the feed stand, one part
+    /// of the answer, whose facts are the effects of the call, or a restart
+    /// of the answer.
     variant feed-answer {
         unchanged,
         part(feed-part),
+        restart(feed-restart),
+    }
+
+    /// A restart of an answer: the token the feed takes in place of the
+    /// token of the answer, and the error of each operation that waits for
+    /// the answer.
+    record feed-restart {
+        token: feed-token,
+        error: provider-error,
     }
 
     /// One part of an answer: the token after it, whether more parts follow
@@ -464,8 +488,8 @@ interface lifecycle {
 }
 
 interface namespace {
-    use types.{canonical-input, correlation-id, cursor, effects, feed-answer, feed-token,
-        file-handle, list-children-result, lookup-child-result, open-file-result,
+    use types.{canonical-input, correlation-id, cursor, effects, feed-answer, feed-start,
+        feed-token, file-handle, list-children-result, lookup-child-result, open-file-result,
         provider-error, read-chunk-result, read-file-outcome, version-token};
 
     lookup-child: async func(id: correlation-id, parent-path: string, name: string)
@@ -482,9 +506,13 @@ interface namespace {
         -> tuple<result<read-chunk-result, provider-error>, effects>;
     close-file: func(handle: file-handle);
     /// One call of the feed of the object anchored at `path`, from `token`.
-    /// `start` is the path of the operation that starts the answer.
-    feed: async func(id: correlation-id, path: string, token: option<feed-token>, start: option<string>)
-        -> tuple<result<feed-answer, provider-error>, effects>;
+    /// `start` is the path of the operation that starts the answer. Beside
+    /// the answer and its effects, the call returns the time, in
+    /// milliseconds of the Unix epoch, after which the facts of its part
+    /// count as lacking for the start of an answer, while the projection
+    /// serves them.
+    feed: async func(id: correlation-id, path: string, token: option<feed-token>, start: option<feed-start>)
+        -> tuple<result<feed-answer, provider-error>, effects, option<u64>>;
 }
 
 interface notify {
@@ -510,6 +538,11 @@ interface projection {
     /// the object of the feed operation `id`; none for a path without one.
     listing: func(id: correlation-id, path: string, form: listing-form)
         -> result<option<listing-facts>, provider-error>;
+    /// The bytes of the fed file at `path` in the projection, for a path in
+    /// the subtree of the object of the feed operation `id`; none for a path
+    /// without one.
+    file: func(id: correlation-id, path: string)
+        -> result<option<list<u8>>, provider-error>;
 }
 
 interface callouts {

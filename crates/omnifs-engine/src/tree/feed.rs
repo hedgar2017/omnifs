@@ -2,9 +2,9 @@
 //! and when it answers before the operation is served from the projection.
 
 use crate::Runtime;
-use crate::cache::RecordKind;
+use crate::cache::{FeedState, RecordKind};
 use crate::clock::now_millis;
-use crate::ops::feed::FeedClaim;
+use crate::ops::feed::{FeedClaim, FeedStart};
 use crate::ops::namespace::{ListOutcome, PageRequest};
 use crate::view::LookupPayload;
 use omnifs_core::path::Path;
@@ -32,13 +32,19 @@ pub(crate) enum FedFact {
 /// answer, whatever its deadline, outside the rate-limit window of the mount.
 /// Else a read or a listing that starts that feed without its fact in the
 /// projection, and a lookup that starts it without its positive lookup before
-/// the end of the first answer of the feed, take an answer with its path under
-/// the anchor of the innermost claim as `start`; after that end, a lookup is
-/// served from the projection, as not found for a path that it lacks. Any
-/// other operation takes an answer once the feed is past its deadline,
-/// outside the rate-limit window of the mount. An operation that waited on
-/// another answer of the same feed, or whose feed another answer moved before
-/// its flight, decides again after it.
+/// the end of the first answer of the feed, or below the anchor of an own
+/// feed, take an answer with `lacks` and their path under the anchor of the
+/// innermost claim as `start`; after that end, a lookup is served from the
+/// projection, as not found for a path that it lacks. Any other operation
+/// takes an answer once the feed is past its deadline, outside the rate-limit
+/// window of the mount, with `due` and its path for an operation on a
+/// starting path of the feed. An operation that waited on another answer of
+/// the same feed, or whose feed another answer moved before its flight,
+/// decides again after it.
+///
+/// Once the answering claim needs no answer, or after its answer that the
+/// operation ran, the operation asks the innermost own claim inner to the
+/// answering one that starts it without its fact (see [`answer_own`]).
 ///
 /// Returns the path of the fact of the operation in the projection, and the
 /// path of the operation under the anchor of the innermost claim. The facts
@@ -56,12 +62,8 @@ pub(crate) async fn answer_claims(
     // The validation of a fed answer rejects one without claims.
     let anchor = &claims[claims.len() - 1].object.path;
     let under_anchor = &under(anchor, path)?;
-    let at = if matches!(fact, FedFact::Lookup) && under_anchor == anchor {
-        path
-    } else {
-        under_anchor
-    };
-    loop {
+    let at = fact_path(path, fact, anchor, under_anchor);
+    let answering = loop {
         let states = claims
             .iter()
             .map(|claim| runtime.resources.feed_state(claim.object.id.as_bytes()))
@@ -84,28 +86,92 @@ pub(crate) async fn answer_claims(
             .has_kept_parts(claim.object.id.as_bytes())
             .map_err(|error| TreeError::internal(error.to_string()))?;
         let first_answer = state.as_ref().is_none_or(|state| !state.ended);
+        let below_own = claim.own && path.segments().count() > claim.object.path.segments().count();
         let start = if kept {
             runtime.rate_limited_until().is_none().then_some(None)
         } else if claim.starts
-            && (first_answer || !matches!(fact, FedFact::Lookup))
+            && (first_answer || below_own || !matches!(fact, FedFact::Lookup))
             && !has_fact(runtime, at, fact)?
         {
-            Some(Some(under_anchor))
-        } else if runtime.rate_limited_until().is_none()
-            && state
-                .as_ref()
-                .is_none_or(|state| state.deadline <= now_millis())
-        {
-            Some(None)
+            Some(Some(FeedStart::Lacks(under_anchor.clone())))
+        } else if runtime.rate_limited_until().is_none() && past_deadline(state.as_ref()) {
+            Some(claim.starts.then(|| FeedStart::Due(under_anchor.clone())))
         } else {
             None
         };
         let Some(start) = start else {
-            return Ok((at.clone(), under_anchor.clone()));
+            break answering;
         };
-        if runtime.feed(&claim.object, start, state.as_ref()).await? {
-            return Ok((at.clone(), under_anchor.clone()));
+        if runtime
+            .feed(&claim.object, start.as_ref(), state.as_ref())
+            .await?
+        {
+            break answering;
         }
+    };
+    answer_own(runtime, path, fact, &claims[answering + 1..]).await?;
+    Ok((at.clone(), under_anchor.clone()))
+}
+
+/// Have the innermost own claim of `inner`, the claims inner to the
+/// answering one, that starts the operation on `path` without its fact
+/// answer with `lacks` and the path of the operation under its anchor as
+/// `start`, the lookup of its anchor only when the feed has no state or is
+/// past its deadline outside the rate-limit window of the mount. An
+/// operation that waited on another answer of the same feed, or whose feed
+/// another answer moved before its flight, decides again after it.
+async fn answer_own(
+    runtime: &Runtime,
+    path: &Path,
+    fact: FedFact,
+    inner: &[FeedClaim],
+) -> Result<()> {
+    loop {
+        let mut asked = None;
+        for claim in inner.iter().rev().filter(|claim| claim.own && claim.starts) {
+            let under_anchor = under(&claim.object.path, path)?;
+            let at = fact_path(path, fact, &claim.object.path, &under_anchor);
+            if !has_fact(runtime, at, fact)? {
+                asked = Some((claim, under_anchor));
+                break;
+            }
+        }
+        let Some((claim, under_anchor)) = asked else {
+            return Ok(());
+        };
+        let state = runtime
+            .resources
+            .feed_state(claim.object.id.as_bytes())
+            .map_err(|error| TreeError::internal(error.to_string()))?;
+        if matches!(fact, FedFact::Lookup)
+            && under_anchor == claim.object.path
+            && !(runtime.rate_limited_until().is_none() && past_deadline(state.as_ref()))
+        {
+            return Ok(());
+        }
+        let start = FeedStart::Lacks(under_anchor);
+        if runtime
+            .feed(&claim.object, Some(&start), state.as_ref())
+            .await?
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// Whether a feed has no state or is past its deadline.
+fn past_deadline(state: Option<&FeedState>) -> bool {
+    state.is_none_or(|state| state.deadline <= now_millis())
+}
+
+/// The path of the fact of an operation on `path` in the projection, for
+/// the claim with `anchor`, `path` under the anchor of the claim being
+/// `under_anchor`: the lookup of the anchor has its fact at its own path.
+fn fact_path<'a>(path: &'a Path, fact: FedFact, anchor: &Path, under_anchor: &'a Path) -> &'a Path {
+    if matches!(fact, FedFact::Lookup) && under_anchor == anchor {
+        path
+    } else {
+        under_anchor
     }
 }
 
@@ -119,7 +185,7 @@ fn incomplete_listing(runtime: &Runtime, at: &Path, anchor: &Path) -> Result<Opt
     if listing == *anchor
         || !listing.has_prefix(anchor)
         || has_fact(runtime, at, FedFact::Lookup)?
-        || has_fact(runtime, &listing, FedFact::Listing)?
+        || complete_listing(runtime, &listing)?
         || !runtime
             .resources
             .is_fed(&listing)
@@ -158,22 +224,38 @@ fn under(anchor: &Path, path: &Path) -> Result<Path> {
         })
 }
 
-/// Whether the projection has the fact an operation on `path` serves: its
-/// positive lookup, its file, or its complete listing.
+/// Whether the projection has the fact an operation on `path` serves for
+/// the start of an answer: its positive lookup, or its file or its complete
+/// listing before the time after which the part that wrote it counts it as
+/// lacking.
 fn has_fact(runtime: &Runtime, path: &Path, fact: FedFact) -> Result<bool> {
     let resources = &runtime.resources;
     let found = match fact {
-        FedFact::Lookup => resources
-            .lookup_payload(path)
-            .map(|lookup| matches!(lookup, Some(LookupPayload::Positive(_)))),
-        FedFact::Listing => resources
-            .dirents_payload(path)
-            .map(|listing| listing.is_some_and(|listing| listing.is_complete_offline())),
+        FedFact::Lookup => {
+            return resources
+                .lookup_payload(path)
+                .map(|lookup| matches!(lookup, Some(LookupPayload::Positive(_))))
+                .map_err(|error| TreeError::internal(error.to_string()));
+        },
+        FedFact::Listing => complete_listing(runtime, path)?,
         FedFact::File => resources
             .cache_get(path, RecordKind::File, None)
-            .map(|record| record.is_some()),
+            .map(|record| record.is_some())
+            .map_err(|error| TreeError::internal(error.to_string()))?,
     };
-    found.map_err(|error| TreeError::internal(error.to_string()))
+    let until = resources
+        .fed_until(path)
+        .map_err(|error| TreeError::internal(error.to_string()))?;
+    Ok(found && until.is_none_or(|until| now_millis() < until))
+}
+
+/// Whether the projection has a complete listing of `path`.
+fn complete_listing(runtime: &Runtime, path: &Path) -> Result<bool> {
+    runtime
+        .resources
+        .dirents_payload(path)
+        .map(|listing| listing.is_some_and(|listing| listing.is_complete_offline()))
+        .map_err(|error| TreeError::internal(error.to_string()))
 }
 
 #[cfg(test)]

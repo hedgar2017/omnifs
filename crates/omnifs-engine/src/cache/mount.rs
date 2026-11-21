@@ -310,17 +310,33 @@ pub(crate) struct FeedState {
 }
 
 /// The feed states one answer of a feed publishes: its own, renewed by an
-/// `unchanged` answer or advanced by a part, which drops its kept parts, and
-/// the inner states the part brought, each a token whose first answer ended.
-/// Every state gets `deadline`. `anchors` pairs each anchor of another facet
-/// that the part writes with the anchor of the claim of its object.
+/// `unchanged` answer, advanced by a part, or moved to the token of a
+/// restart, a part and a restart dropping its kept parts, and the inner
+/// states the part brought, each a token whose first answer ended. Every
+/// state but that of a restart gets `deadline`. `anchors` pairs each anchor
+/// of another facet that the part writes with the anchor of the claim of its
+/// object, and `until` gives each path of the facts of the part with a time
+/// after which they count as lacking for the start of an answer that time.
 #[derive(Debug, Clone)]
 pub(crate) struct FeedWrite {
     pub object: Vec<u8>,
-    pub part: Option<FeedPartWrite>,
+    pub answer: FeedAnswerWrite,
     pub inner: Vec<(Vec<u8>, String)>,
     pub anchors: Vec<(Path, Path)>,
     pub deadline: u64,
+    pub until: HashMap<Path, u64>,
+}
+
+/// What one answer of a feed does to its state.
+#[derive(Debug, Clone)]
+pub(crate) enum FeedAnswerWrite {
+    /// The facts of the feed stand: its state renews its deadline.
+    Unchanged,
+    /// A part, with the token after it.
+    Part(FeedPartWrite),
+    /// A restart: the feed takes the token, with the end of its first answer
+    /// and its deadline as they were.
+    Restart(String),
 }
 
 /// A part of a later answer of the feed of `object`, encoded by its feed
@@ -993,13 +1009,20 @@ impl MountResources {
                 }
             }
 
-            // A feed answer writes fed facts; any other transition leaves
+            // A feed answer writes fed facts, its fed mark with the time
+            // after which they count as lacking; any other transition leaves
             // the fed facts of a path to its feeds.
             let fed_answer = feed.is_some();
+            let fed_mark = |path: &Path| -> Result<Vec<u8>, ProjectionError> {
+                match feed.as_ref().and_then(|feed| feed.until.get(path)) {
+                    Some(until) => Ok(postcard::to_allocvec(until)?),
+                    None => Ok(Vec::new()),
+                }
+            };
             let mut written = Vec::with_capacity(prepared_records.len());
             for record in &prepared_records {
                 if fed_answer {
-                    put(tx, facts, fed_key(&record.path), [])?;
+                    put(tx, facts, fed_key(&record.path), fed_mark(&record.path)?)?;
                 } else if tx.get(facts, fed_key(&record.path))?.is_some() {
                     continue;
                 }
@@ -1046,7 +1069,12 @@ impl MountResources {
             }
             for mutation in &dirents {
                 if fed_answer {
-                    put(tx, facts, fed_key(mutation.path()), [])?;
+                    put(
+                        tx,
+                        facts,
+                        fed_key(mutation.path()),
+                        fed_mark(mutation.path())?,
+                    )?;
                     apply_dirents(tx, facts, mutation)?;
                 } else {
                     let mutation = with_fed_entries(tx, facts, mutation)?;
@@ -1372,6 +1400,16 @@ impl MountResources {
         Ok(self.projection.get(&fed_key(path))?.is_some())
     }
 
+    /// The time after which the fed facts of `path` count as lacking for the
+    /// start of an answer, from the part that wrote them; none for facts
+    /// without one.
+    pub(crate) fn fed_until(&self, path: &Path) -> Result<Option<u64>, ProjectionError> {
+        match self.projection.get(&fed_key(path))? {
+            Some(mark) if !mark.is_empty() => Ok(Some(postcard::from_bytes(&mark)?)),
+            Some(_) | None => Ok(None),
+        }
+    }
+
     /// Whether the feed of the object `id` has kept parts of a later answer.
     pub(crate) fn has_kept_parts(&self, id: &[u8]) -> Result<bool, ProjectionError> {
         Ok(!self.projection.read_prefix(&kept_prefix(id))?.is_empty())
@@ -1637,24 +1675,28 @@ fn write_feed_states(
         .get(facts, &key)?
         .map(|bytes| postcard::from_bytes::<FeedState>(&bytes))
         .transpose()?;
-    let state = match (&feed.part, previous) {
-        (Some(part), previous) => FeedState {
+    let state = match (&feed.answer, previous) {
+        (FeedAnswerWrite::Part(part), previous) => FeedState {
             token: part.token.clone(),
             ended: previous.is_some_and(|state| state.ended) || !part.more,
             deadline: feed.deadline,
         },
-        (None, Some(previous)) => FeedState {
+        (FeedAnswerWrite::Unchanged, Some(previous)) => FeedState {
             deadline: feed.deadline,
             ..previous
         },
-        (None, None) => {
+        (FeedAnswerWrite::Restart(token), Some(previous)) => FeedState {
+            token: token.clone(),
+            ..previous
+        },
+        (FeedAnswerWrite::Unchanged | FeedAnswerWrite::Restart(_), None) => {
             return Err(ProjectionError::Inconsistent(
-                "unchanged answer for a feed without a state".into(),
+                "unchanged or restarted answer for a feed without a state".into(),
             ));
         },
     };
     put(tx, facts, key, postcard::to_allocvec(&state)?)?;
-    if feed.part.is_some() {
+    if !matches!(feed.answer, FeedAnswerWrite::Unchanged) {
         let prefix = kept_prefix(&feed.object);
         let kept = tx
             .prefix(facts, prefix.as_slice())
@@ -3048,18 +3090,95 @@ mod tests {
                 entries,
                 write,
             }],
-            feed: Some(FeedWrite {
-                object: b"feed".to_vec(),
-                part: Some(FeedPartWrite {
-                    token: "token".into(),
-                    more: false,
-                }),
-                inner: Vec::new(),
-                anchors: Vec::new(),
-                deadline: 1_000,
-            }),
+            feed: Some(fed_part("token", HashMap::new())),
             ..ProjectionTransition::default()
         }
+    }
+
+    /// The last part of an answer of the feed `feed` with `token`, its facts
+    /// at the paths of `until` counting until their time.
+    fn fed_part(token: &str, until: HashMap<Path, u64>) -> FeedWrite {
+        FeedWrite {
+            object: b"feed".to_vec(),
+            answer: FeedAnswerWrite::Part(FeedPartWrite {
+                token: token.into(),
+                more: false,
+            }),
+            inner: Vec::new(),
+            anchors: Vec::new(),
+            deadline: 1_000,
+            until,
+        }
+    }
+
+    #[test]
+    fn a_join_keeps_the_completeness_of_its_listing_and_a_part_marks_the_until_of_its_facts() {
+        let (_dir, _caches, store) = open_store("join");
+        let books = p("/shelf/books");
+        store
+            .publish(
+                fed_dir(&books, &["1"], ListingWrite::Complete),
+                store.current_epoch(),
+            )
+            .unwrap();
+
+        // A child that joins the complete listing, through the lookup
+        // reconciliation of its transition too, with the until of the part.
+        let mut join = fed_dir(&books, &["2"], ListingWrite::Join);
+        join.feed = Some(fed_part("token", HashMap::from([(p("/shelf/books/2"), 5)])));
+        store.publish(join, store.current_epoch()).unwrap();
+        let listing = store.dirents_payload(&books).unwrap().unwrap();
+        assert!(listing.is_complete_offline());
+        assert_eq!(listing.entries().count(), 2);
+        assert_eq!(store.fed_until(&p("/shelf/books/2")).unwrap(), Some(5));
+        assert_eq!(store.fed_until(&books).unwrap(), None);
+
+        // A later part without an until writes the facts without one.
+        store
+            .publish(
+                fed_dir(&books, &["2"], ListingWrite::Join),
+                store.current_epoch(),
+            )
+            .unwrap();
+        assert_eq!(store.fed_until(&p("/shelf/books/2")).unwrap(), None);
+        assert!(store.is_fed(&p("/shelf/books/2")).unwrap());
+
+        // A restart takes its token with the end of the first answer and the
+        // deadline as they were, and drops the kept parts.
+        store
+            .publish(
+                ProjectionTransition {
+                    kept: Some(KeptWrite {
+                        object: b"feed".to_vec(),
+                        part: b"kept".to_vec(),
+                    }),
+                    ..ProjectionTransition::default()
+                },
+                store.current_epoch(),
+            )
+            .unwrap();
+        assert!(store.has_kept_parts(b"feed").unwrap());
+        let mut restart = fed_part("restart", HashMap::new());
+        restart.answer = FeedAnswerWrite::Restart("restart".into());
+        restart.deadline = 2_000;
+        store
+            .publish(
+                ProjectionTransition {
+                    feed: Some(restart),
+                    ..ProjectionTransition::default()
+                },
+                store.current_epoch(),
+            )
+            .unwrap();
+        assert!(!store.has_kept_parts(b"feed").unwrap());
+        assert_eq!(
+            store.feed_state(b"feed").unwrap(),
+            Some(FeedState {
+                token: "restart".into(),
+                ended: true,
+                deadline: 1_000,
+            })
+        );
     }
 
     #[test]

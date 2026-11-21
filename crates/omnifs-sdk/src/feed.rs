@@ -13,24 +13,50 @@
 //! below the anchor of the answering feed that is not complete, takes the
 //! answer of that listing first.
 //!
+//! `o.feed(method).own().starts([...])` makes the feed answer the facts of
+//! its own starting paths for an upstream without an inventory of them: a
+//! lookup below its anchor without its positive lookup starts it as a read or
+//! a listing does, after the end of its first answer too, and once the
+//! answering feed of an outer object needs no answer, or after its answer
+//! that the operation ran, the operation asks the innermost own feed inner to
+//! it that starts the operation without its fact, the lookup of its anchor
+//! only when the feed has no state or is past its deadline outside the
+//! rate-limit window of the mount.
+//!
 //! The host calls the feed `method` once per part of an answer with a
 //! [`FeedCx`]: the anchor path and the key of the object, the token the feed
-//! returned last, the declared starting path an operation started the answer
-//! from, the listings of the projection, and the facts the part writes. The
-//! method answers [`Feed::unchanged`] or a [`FeedPart`] with the token after
-//! it, whether more parts follow, and the tokens of the inner feeds it brought.
+//! returned last, the declared starting path an operation without its fact
+//! started the answer from ([`FeedCx::start`]), or of the operation of an
+//! answer past the deadline of the feed ([`FeedCx::due`]), the listings and
+//! the fed files of the projection, and the facts the part writes. The method
+//! answers [`Feed::unchanged`], a [`FeedPart`] with the token after it,
+//! whether more parts follow, the tokens of the inner feeds it brought, and
+//! the time after which its facts count as lacking for the start of an
+//! answer while the projection serves them, or [`Feed::restart`], which drops
+//! the kept parts of the answer, takes its token as the token of the feed,
+//! and gives its error to each operation that waits for the answer.
 
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use crate::browse::{Effects, ListingWrite};
 use crate::cx::Cx;
-use crate::error::Result;
+use crate::error::{ProviderError, Result};
 use crate::identity::IdentityCaptures;
 use crate::object::{Key, Object, ObjectKind};
 use omnifs_core::path::Path;
 use omnifs_wit::provider::types as wit_types;
+
+/// The declared starting path of the operation that started an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FeedStart {
+    /// An operation without its fact in the projection.
+    Lacks(&'static str),
+    /// An operation of an answer past the deadline of the feed.
+    Due(&'static str),
+}
 
 /// The context of one feed call. Derefs to [`Cx`] for callouts and state.
 pub struct FeedCx<K, S = ()> {
@@ -38,7 +64,7 @@ pub struct FeedCx<K, S = ()> {
     path: Path,
     key: K,
     token: Option<String>,
-    start: Option<&'static str>,
+    start: Option<FeedStart>,
     facts: Rc<RefCell<Effects>>,
 }
 
@@ -48,7 +74,7 @@ impl<K, S> FeedCx<K, S> {
         path: Path,
         key: K,
         token: Option<String>,
-        start: Option<&'static str>,
+        start: Option<FeedStart>,
         facts: Rc<RefCell<Effects>>,
     ) -> Self {
         Self {
@@ -80,10 +106,24 @@ impl<K, S> FeedCx<K, S> {
     }
 
     /// The declared starting path, relative to the object, of the operation
-    /// that started this answer (`""` for the anchor itself), or `None` for
-    /// an answer the host asks for once the feed is past its deadline.
+    /// without its fact in the projection that started this answer (`""` for
+    /// the anchor itself), or `None` for an answer the host asks for once the
+    /// feed is past its deadline.
     pub fn start(&self) -> Option<&'static str> {
-        self.start
+        match self.start {
+            Some(FeedStart::Lacks(start)) => Some(start),
+            Some(FeedStart::Due(_)) | None => None,
+        }
+    }
+
+    /// The declared starting path, relative to the object, of the operation
+    /// of an answer the host asks for once the feed is past its deadline,
+    /// `None` for another answer or an operation on no starting path.
+    pub fn due(&self) -> Option<&'static str> {
+        match self.start {
+            Some(FeedStart::Due(due)) => Some(due),
+            Some(FeedStart::Lacks(_)) | None => None,
+        }
     }
 
     /// The listing of the mount-absolute `path` in the host projection, as a
@@ -98,6 +138,17 @@ impl<K, S> FeedCx<K, S> {
         let facts =
             crate::omnifs::provider::projection::listing(self.cx.id(), path.as_ref(), form.into())?;
         Ok(facts.map(ListingFacts::from))
+    }
+
+    /// The bytes of the fed file at the mount-absolute `path` in the host
+    /// projection, without the kept parts of an answer; `None` for a path
+    /// without one. The host answers only for a path in the subtree of the
+    /// feed's object.
+    pub fn read(&self, path: impl AsRef<str>) -> Result<Option<Vec<u8>>> {
+        Ok(crate::omnifs::provider::projection::file(
+            self.cx.id(),
+            path.as_ref(),
+        )?)
     }
 
     /// Write a stable inline file at the mount-absolute `path` as a fact of
@@ -180,6 +231,9 @@ pub enum Feed {
     Unchanged,
     /// One part of the answer; its facts are the writes of the [`FeedCx`].
     Part(FeedPart),
+    /// A restart of the answer, with the token the feed takes and the error
+    /// of the operations that wait for the answer.
+    Restart { token: String, error: ProviderError },
 }
 
 impl Feed {
@@ -195,6 +249,19 @@ impl Feed {
             token: token.into(),
             more: false,
             inner: Vec::new(),
+            until: None,
+        }
+    }
+
+    /// A restart of the answer; valid for a call with a token. The host
+    /// drops the kept parts of the answer, takes `token` as the token of the
+    /// feed, with the end of its first answer and its deadline as they were,
+    /// and gives `error` to each operation that waits for the answer. The
+    /// writes of the call are not facts.
+    pub fn restart(token: impl Into<String>, error: ProviderError) -> Self {
+        Self::Restart {
+            token: token.into(),
+            error,
         }
     }
 }
@@ -210,6 +277,7 @@ pub struct FeedPart {
     token: String,
     more: bool,
     inner: Vec<InnerState>,
+    until: Option<SystemTime>,
 }
 
 impl FeedPart {
@@ -232,8 +300,19 @@ impl FeedPart {
         self
     }
 
-    pub(crate) fn into_parts(self) -> (String, bool, Vec<InnerState>) {
-        (self.token, self.more, self.inner)
+    /// The time after which the facts of this part, a file or a complete
+    /// listing, count as lacking for the start of an answer, while the
+    /// projection serves them. The host refuses it on a part of a later
+    /// answer with [`FeedPart::more`], and takes it for the facts of the
+    /// last part of a later answer.
+    #[must_use]
+    pub fn until(mut self, until: SystemTime) -> Self {
+        self.until = Some(until);
+        self
+    }
+
+    pub(crate) fn into_parts(self) -> (String, bool, Vec<InnerState>, Option<SystemTime>) {
+        (self.token, self.more, self.inner, self.until)
     }
 }
 
@@ -263,7 +342,7 @@ where
               path: Path,
               caps: &crate::captures::Captures,
               token: Option<String>,
-              start: Option<&'static str>,
+              start: Option<FeedStart>,
               facts: Rc<RefCell<Effects>>| {
             match <O::Key as crate::captures::FromCaptures>::from_captures(caps) {
                 Ok(key) => {
@@ -283,6 +362,6 @@ pub(crate) type FeedHandlerFn<S> = dyn Fn(
     Path,
     &crate::captures::Captures,
     Option<String>,
-    Option<&'static str>,
+    Option<FeedStart>,
     Rc<RefCell<Effects>>,
 ) -> FeedFuture;

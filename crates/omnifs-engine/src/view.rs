@@ -784,10 +784,11 @@ impl DirentsPayload {
     }
 
     /// Merge `new_children` into a listing as `write` says: an exhaustive
-    /// write replaces the listing; a partial or complete write replaces
+    /// write replaces the listing; a partial, complete or join write replaces
     /// matching entries in place and appends the rest to the last page, a
     /// partial one keeping the listing complete only without new names, a
-    /// complete one leaving it complete.
+    /// complete one leaving it complete, and a join one leaving it as
+    /// complete as it was.
     pub fn merged(
         existing_record: Option<Self>,
         mut new_children: BTreeMap<String, DirentRecord>,
@@ -826,6 +827,7 @@ impl DirentsPayload {
         payload.exhaustive = match write {
             ListingWrite::Partial => payload.exhaustive && !introduced,
             ListingWrite::Exhaustive | ListingWrite::Complete => true,
+            ListingWrite::Join => payload.exhaustive,
         };
         payload
     }
@@ -840,6 +842,9 @@ pub enum ListingWrite {
     Exhaustive,
     /// They join the listing, which is complete after them.
     Complete,
+    /// They join the listing, which stays as complete as it was, new names
+    /// too.
+    Join,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1105,6 +1110,19 @@ mod tests {
             DirentsPayload::merged(Some(existing), new_children(&["b"]), ListingWrite::Complete);
         assert_eq!(names(&result), vec!["a", "b"]);
         assert!(result.exhaustive);
+    }
+
+    // A join write adds its children, a new name too, and leaves the listing
+    // as complete as it was.
+    #[test]
+    fn merged_join_adds_children_and_keeps_the_completeness_of_the_listing() {
+        for exhaustive in [true, false] {
+            let existing = DirentsPayload::single_page(vec![dir_record("a")], exhaustive, None);
+            let result =
+                DirentsPayload::merged(Some(existing), new_children(&["b"]), ListingWrite::Join);
+            assert_eq!(names(&result), vec!["a", "b"]);
+            assert_eq!(result.exhaustive, exhaustive);
+        }
     }
 
     // A page is found by the cursor that asked for it, with the cursor of the

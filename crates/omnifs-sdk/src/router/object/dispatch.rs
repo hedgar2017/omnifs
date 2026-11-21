@@ -151,7 +151,8 @@ pub(in crate::router) struct ObjectRouteEntry<S> {
 }
 
 /// The feed an object declares: its boxed method, the logical id of the
-/// object from its anchor captures, and its starting paths.
+/// object from its anchor captures, its starting paths, and whether it is an
+/// own feed.
 pub(in crate::router) struct ObjectFeed<S> {
     pub handler: std::rc::Rc<crate::feed::FeedHandlerFn<S>>,
     pub id: fn(&Captures) -> Result<crate::identity::LogicalId>,
@@ -159,6 +160,7 @@ pub(in crate::router) struct ObjectFeed<S> {
     /// the feed, where its facts live for every facet.
     pub facets: FacetExpansion,
     pub starts: Vec<StartPath>,
+    pub own: bool,
 }
 
 /// A declared starting path of a feed, relative to its object (`""` for the
@@ -354,6 +356,7 @@ where
                 id: anchor_id::<O>,
                 facets: FacetExpansion::for_pattern::<O::Key>(pattern)?,
                 starts,
+                own: feed.own,
             })
         })
         .transpose()?;

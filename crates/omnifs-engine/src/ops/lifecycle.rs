@@ -451,7 +451,8 @@ fn merge_transition(
 }
 
 /// The listing write of two merged hint batches: an exhaustive batch
-/// replaces the listing, else a complete one completes it.
+/// replaces the listing, else a complete one completes it, else a partial
+/// one keeps it complete only without new names.
 fn stronger_write(
     left: crate::view::ListingWrite,
     right: crate::view::ListingWrite,
@@ -460,7 +461,8 @@ fn stronger_write(
     match (left, right) {
         (ListingWrite::Exhaustive, _) | (_, ListingWrite::Exhaustive) => ListingWrite::Exhaustive,
         (ListingWrite::Complete, _) | (_, ListingWrite::Complete) => ListingWrite::Complete,
-        (ListingWrite::Partial, ListingWrite::Partial) => ListingWrite::Partial,
+        (ListingWrite::Partial, _) | (_, ListingWrite::Partial) => ListingWrite::Partial,
+        (ListingWrite::Join, ListingWrite::Join) => ListingWrite::Join,
     }
 }
 
