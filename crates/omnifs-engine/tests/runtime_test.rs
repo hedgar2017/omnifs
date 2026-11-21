@@ -82,6 +82,7 @@ async fn all_providers_initialize_and_compile() {
         ("omnifs_provider_docker.wasm", "docker"),
         ("omnifs_provider_kubernetes.wasm", "k8s"),
         ("omnifs_provider_linear.wasm", "linear"),
+        ("omnifs_provider_notion.wasm", "notion"),
         ("omnifs_provider_oura.wasm", "oura"),
         ("omnifs_provider_web.wasm", "web"),
     ];

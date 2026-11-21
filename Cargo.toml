@@ -9,6 +9,7 @@ members = [
     "providers/dns",
     "providers/kubernetes",
     "providers/linear",
+    "providers/notion",
     "providers/oura",
     "providers/web",
     "providers/test",
