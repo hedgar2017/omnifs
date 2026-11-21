@@ -509,8 +509,8 @@ impl DriveFeed<'_> {
 // ===========================================================================
 
 impl File {
-    /// The feed of a file: its content for the start `content` of a file
-    /// with a token; else the file by its ID, its facts with its folder
+    /// The feed of a file: its content, at the revision of the projection,
+    /// for the start `content` of a file with a token; else the file by its ID, its facts with its folder
     /// joining `files/`, or its removal for `404`, in the trash, or that the
     /// mount has not, with the removal of its content for a file whose
     /// content changed, and then its content for the start `content`, or for
@@ -522,12 +522,12 @@ impl File {
             .map(decode_token::<Option<FileToken>>)
             .transpose()?
             .flatten();
-        if let (Some(token), Some("content")) = (&token, cx.start())
+        if let (Some(_), Some("content")) = (&token, cx.start())
             && let Some(object) = cx.read(format!("{}/file.json", file_path(id)))?
         {
             let item: Item = decode(&object)?;
             if let Kind::File(content) = item.kind()? {
-                return file_content(&cx, id, content, &token.revision, true).await;
+                return file_content(&cx, id, content, item.revision(content)?, true).await;
             }
         }
 
