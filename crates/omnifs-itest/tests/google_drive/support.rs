@@ -30,9 +30,9 @@ pub fn drive_harness() -> RuntimeHarness {
     )
 }
 
-/// The name under which a request of a fixture has the version of the bytes
-/// that a blob fetch asks for.
-const VERSION: &str = "blob-version";
+/// The name under which a request of a fixture has the MD5 of the bytes that
+/// a blob fetch asks for.
+const MD5: &str = "blob-md5";
 
 /// The answer of Google Drive to a request of a fixture.
 pub enum Answer {
@@ -72,11 +72,11 @@ pub async fn answering<T>(
                     callout.answer(result);
                 },
                 (Callout::FetchBlob(request), Answer::Blob(status, body)) => {
-                    // The version of the bytes of the request, as a header
-                    // of the request of the fixture.
+                    // The MD5 of the bytes of the request, as a header of the
+                    // request of the fixture.
                     let mut headers = request.headers.clone();
-                    headers.extend(request.version.clone().map(|value| Header {
-                        name: VERSION.to_owned(),
+                    headers.extend(request.md5.clone().map(|value| Header {
+                        name: MD5.to_owned(),
                         value,
                     }));
                     requests.push(HttpRequest {
@@ -212,12 +212,12 @@ pub fn expect_bytes(request: &HttpRequest, id: &str, md5: &str) {
         &format!("/files/{id}"),
         &[("alt", "media"), ("supportsAllDrives", "true")],
     );
-    let version = request
+    let asked = request
         .headers
         .iter()
-        .find(|header| header.name == VERSION)
+        .find(|header| header.name == MD5)
         .map(|header| header.value.as_str());
-    assert_eq!(version, Some(md5), "{}", request.url);
+    assert_eq!(asked, Some(md5), "{}", request.url);
 }
 
 /// Check that `request` is that of the first byte of the uploaded file

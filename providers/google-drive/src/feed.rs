@@ -623,7 +623,7 @@ impl File {
 }
 
 /// The content of a file at `revision` as its file `content`: the bytes of
-/// an uploaded file with that checksum, which the host fetches and holds, or
+/// an uploaded file of that MD5, which the host fetches and holds, or
 /// the export of a file of Google; the removal of a file with `404`.
 async fn file_content(
     cx: &FeedCx<FileKey>,
@@ -640,7 +640,7 @@ async fn file_content(
                     .query("alt", "media")
                     .query("supportsAllDrives", "true")
             };
-            match bytes().into_blob().version(revision).fetch().await {
+            match bytes().into_blob().md5(revision).fetch().await {
                 Ok(blob) => cx.blob(at, &blob)?,
                 Err(error) if error.kind() == ProviderErrorKind::NotFound => {
                     return file_removal(cx, id);
@@ -650,8 +650,9 @@ async fn file_content(
                 // as a request over a quota.
                 Err(error) if error.kind() == ProviderErrorKind::Denied => {
                     let refusal = bytes().header("Range", "bytes=0-0").send().await?;
+                    // A file without a first byte has `416` for it.
                     return Err(match refusal.status() {
-                        200..=299 => error,
+                        200..=299 | 416 => error,
                         _ => status_error(&refusal),
                     });
                 },
