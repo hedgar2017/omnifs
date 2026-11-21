@@ -7,6 +7,7 @@ pub(crate) struct InvalidationState {
     invalidated_prefixes: Mutex<Vec<Path>>,
     invalidated_paths: Mutex<Vec<Path>>,
     changed_dirs: Mutex<Vec<(Path, bool)>>,
+    changed_files: Mutex<Vec<Path>>,
 }
 
 impl InvalidationState {
@@ -20,6 +21,15 @@ impl InvalidationState {
 
     pub(crate) fn record_changed_dir(&self, path: Path, fed: bool) {
         self.changed_dirs.lock().push((path, fed));
+    }
+
+    pub(crate) fn record_changed_file(&self, path: Path) {
+        self.changed_files.lock().push(path);
+    }
+
+    fn drain_changed_files(&self) -> Vec<Path> {
+        let mut paths = self.changed_files.lock();
+        std::mem::take(&mut *paths)
     }
 
     fn drain_prefixes(&self) -> Vec<Path> {
@@ -57,6 +67,17 @@ impl Runtime {
     /// theirs.
     pub fn record_dir_changed(&self, path: &Path, fed: bool) {
         self.invalidation.record_changed_dir(path.clone(), fed);
+    }
+
+    /// Record that a feed answer wrote the fed file `path`. Filesystems see
+    /// its attributes changed in place, so it keeps its identity, as the
+    /// filehandle of a read that waits for the answer.
+    pub fn record_file_changed(&self, path: &Path) {
+        self.invalidation.record_changed_file(path.clone());
+    }
+
+    pub fn drain_changed_files(&self) -> Vec<Path> {
+        self.invalidation.drain_changed_files()
     }
 
     pub fn drain_invalidated_prefixes(&self) -> Vec<Path> {

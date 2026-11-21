@@ -15,11 +15,16 @@ pub struct InvalidationReport {
     pub prefixes: Vec<Path>,
     /// Each changed listing, with whether it is fed.
     pub changed_dirs: Vec<(Path, bool)>,
+    /// Each fed file that a feed answer wrote.
+    pub changed_files: Vec<Path>,
 }
 
 impl InvalidationReport {
     pub(crate) fn is_empty(&self) -> bool {
-        self.paths.is_empty() && self.prefixes.is_empty() && self.changed_dirs.is_empty()
+        self.paths.is_empty()
+            && self.prefixes.is_empty()
+            && self.changed_dirs.is_empty()
+            && self.changed_files.is_empty()
     }
 }
 
@@ -40,16 +45,24 @@ impl EngineNamespace {
         let prefixes = runtime.drain_invalidated_prefixes();
         let paths = runtime.drain_invalidated_paths();
         let changed_dirs = runtime.drain_changed_dirs();
+        let changed_files = runtime.drain_changed_files();
 
-        if !(prefixes.is_empty() && paths.is_empty() && changed_dirs.is_empty()) {
+        if !(prefixes.is_empty()
+            && paths.is_empty()
+            && changed_dirs.is_empty()
+            && changed_files.is_empty())
+        {
             crate::inspector::cache_event(CacheKind::Invalidated);
             // Tree-owned mem eviction; the kernel-notify half stays
             // renderer-side and consumes the returned report.
             runtime.resources.memory_invalidate_paths_if({
                 let paths = paths.clone();
                 let prefixes = prefixes.clone();
+                let changed_files = changed_files.clone();
                 move |path| {
-                    paths.contains(path) || prefixes.iter().any(|prefix| path.has_prefix(prefix))
+                    paths.contains(path)
+                        || changed_files.contains(path)
+                        || prefixes.iter().any(|prefix| path.has_prefix(prefix))
                 }
             });
         }
@@ -58,6 +71,7 @@ impl EngineNamespace {
             paths,
             prefixes,
             changed_dirs,
+            changed_files,
         }
     }
 }

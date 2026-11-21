@@ -100,13 +100,14 @@ impl KeptPart {
     }
 }
 
-/// What one answer of a feed changes: the listings it writes into, whose
-/// directories keep their identity in filesystems, and the files it writes and
-/// the paths it removes, whose answers filesystems drop.
+/// What one answer of a feed changes: the listings it writes into and the
+/// files it writes, which keep their identity in filesystems, and the paths
+/// it removes, whose answers filesystems drop.
 #[derive(Debug, Default)]
 pub(crate) struct FeedChanges {
     pub(crate) listings: Vec<Path>,
-    pub(crate) paths: Vec<Path>,
+    pub(crate) files: Vec<Path>,
+    pub(crate) removals: Vec<Path>,
 }
 
 /// The feed operations in flight, by correlation id, with the anchor path of
@@ -442,7 +443,10 @@ impl Runtime {
                     .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
                 self.record_dir_changed(listing, fed);
             }
-            self.record_view_invalidations(Vec::new(), changes.paths);
+            for file in &changes.files {
+                self.record_file_changed(file);
+            }
+            self.record_view_invalidations(Vec::new(), changes.removals);
             match step {
                 Ok(step) => {
                     inspector::record_outcome(&span, InspectorOutcome::Ok);

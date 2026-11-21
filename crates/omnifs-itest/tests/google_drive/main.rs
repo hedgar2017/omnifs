@@ -6,7 +6,7 @@
 
 mod support;
 
-use omnifs_engine::NsError;
+use omnifs_engine::{Namespace, NsError, NsEvent};
 use omnifs_itest::RuntimeHarness;
 use serde_json::{Value, json};
 use support::{
@@ -144,6 +144,13 @@ async fn the_content_takes_the_bytes_of_an_uploaded_file_and_the_export_of_a_fil
     )
     .await;
 
+    // The file `content` keeps its identity over the answer that writes it,
+    // as the filehandle of the read that waits for the answer.
+    let file = served(&harness, lookup(&harness, "files/file-1/content"))
+        .await
+        .unwrap()
+        .path;
+    let mut events = harness.namespace.subscribe();
     let (content, requests) = answering(
         &harness,
         read(&harness, "files/file-1/content"),
@@ -152,6 +159,23 @@ async fn the_content_takes_the_bytes_of_an_uploaded_file_and_the_export_of_a_fil
     .await;
     assert_eq!(content.unwrap(), "notes");
     expect_bytes(&requests[0], "file-1");
+    // The next operation on the mount gives its events.
+    served(&harness, lookup(&harness, "files/file-1/content"))
+        .await
+        .unwrap();
+    let events = std::iter::from_fn(|| events.try_recv()).collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, NsEvent::AttrsChanged { path, .. } if *path == file)),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, NsEvent::InvalidateSubtree { path } if file.has_prefix(path))
+        ),
+        "{events:?}"
+    );
 
     for (id, mime_type, export) in [
         ("doc-1", "text/markdown", "# Plan"),

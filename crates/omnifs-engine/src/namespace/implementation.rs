@@ -705,6 +705,32 @@ impl EngineNamespace {
             );
             let _ = self.events.send(NsEvent::AttrsChanged { path: dir, attrs });
         }
+
+        // A fed file that a feed answer wrote keeps its identity, as the
+        // filehandle of the read that waited for the answer: its learned
+        // attrs and its ranged handle go, its change counter moves, and
+        // filesystems drop their answers for it in place.
+        for rel in &report.changed_files {
+            let file = mount_full_path(mount, rel);
+            if !unique.insert(file.clone()) {
+                continue;
+            }
+            self.handles.remove(&file);
+            self.node_epochs.insert(file.clone(), epoch);
+            if let Some(mut record) = self.ids.get_mut(&file) {
+                record.attrs = None;
+                record.host = None;
+            }
+            let attrs = attrs_from_cache(
+                EntryKind::File,
+                None,
+                change_counter_parts(&file, None, epoch),
+                true,
+            );
+            let _ = self
+                .events
+                .send(NsEvent::AttrsChanged { path: file, attrs });
+        }
     }
 
     fn sweep_idle_handles(&self) {

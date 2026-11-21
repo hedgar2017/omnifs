@@ -466,16 +466,20 @@ impl<'a> EffectApplier<'a> {
             }
             match write.kind {
                 wit_types::FsKind::Directory(_) => changes.listings.push(path),
-                wit_types::FsKind::File(_) => changes.paths.push(path),
+                wit_types::FsKind::File(_) => changes.files.push(path),
             }
         }
         for path in &transition.removals {
             if let Some((parent, _)) = path.parent_and_name() {
                 changes.listings.push(parent);
             }
-            changes.paths.push(path.clone());
+            changes.removals.push(path.clone());
         }
-        for paths in [&mut changes.listings, &mut changes.paths] {
+        for paths in [
+            &mut changes.listings,
+            &mut changes.files,
+            &mut changes.removals,
+        ] {
             paths.sort_by(|left, right| left.as_str().cmp(right.as_str()));
             paths.dedup();
         }
