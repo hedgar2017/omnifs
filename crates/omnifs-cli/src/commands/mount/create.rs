@@ -360,8 +360,11 @@ pub(crate) async fn assemble_mount_build(
     let mut config = config_bytes(config_raw)?;
     args.apply_mount_overrides(&manifest, &mut config)?;
 
-    let auth_ready = if token.is_none() {
-        if let Some(auth) = auth.as_ref() {
+    // Client credentials of the invocation, as a token of it, are submitted
+    // whatever credential is stored.
+    let given = token.is_some() || args.client_id.is_some() || args.client_secret_file.is_some();
+    let auth_ready = match auth.as_ref() {
+        Some(auth) if !given => {
             let account = auth.account_or_default();
             let key = CredentialKey {
                 provider_name: manifest.id.clone(),
@@ -372,11 +375,8 @@ pub(crate) async fn assemble_mount_build(
                 status.provider == provider_id
                     && matches!(status.status, omnifs_api::CredentialStatusKind::Active)
             })
-        } else {
-            false
-        }
-    } else {
-        false
+        },
+        _ => false,
     };
 
     Ok(MountBuild {

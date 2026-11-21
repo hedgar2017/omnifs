@@ -178,13 +178,6 @@ impl OAuthRequest {
         self.client_secret.as_ref()
     }
 
-    /// Whether the token endpoint gives a new access token for an assertion
-    /// of the client alone, without a refresh token.
-    #[must_use]
-    pub fn renews_by_assertion(&self) -> bool {
-        !self.scheme.flow.needs_user()
-    }
-
     /// The private key of the client for the assertions of the JWT bearer
     /// grant.
     pub(crate) fn assertion_key(&self) -> Result<&SecretString, AuthError> {

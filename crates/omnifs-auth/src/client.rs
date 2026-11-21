@@ -51,7 +51,7 @@ impl OAuthClient {
         request: OAuthRequest,
         current: &CredentialEntry,
     ) -> Result<CredentialEntry, AuthError> {
-        if request.renews_by_assertion() {
+        if !request.scheme.flow.needs_user() {
             return self.assert_again(&request, current).await;
         }
         let client = request.token_client()?;

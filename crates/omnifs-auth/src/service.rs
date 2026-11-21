@@ -287,7 +287,7 @@ impl AuthBinding {
                 || self
                     .request
                     .as_ref()
-                    .is_some_and(OAuthRequest::renews_by_assertion)
+                    .is_some_and(|request| !request.scheme.flow.needs_user())
             {
                 CredentialHealth::Expired
             } else {
@@ -550,7 +550,7 @@ impl CredentialService {
         if Self::stored_satisfies(&stored, observed, OffsetDateTime::now_utc(), force) {
             return Ok(Some(stored));
         }
-        if stored.refresh_token().is_none() && !request.renews_by_assertion() {
+        if stored.refresh_token().is_none() && request.scheme.flow.needs_user() {
             return Err(RefreshFailure {
                 needs_consent: true,
                 pending: false,
@@ -567,7 +567,12 @@ impl CredentialService {
                 persist_durable_refresh(&self.backend, id, expected_version, &stored, refreshed)
                     .await
             },
-            Err(AuthError::TokenEndpoint { error, .. }) if error == "invalid_grant" => {
+            // A flow without a user has no consent to ask again: the token
+            // endpoint takes the next assertion of a client whose key or
+            // clock it refused.
+            Err(AuthError::TokenEndpoint { error, .. })
+                if error == "invalid_grant" && request.scheme.flow.needs_user() =>
+            {
                 Err(RefreshFailure {
                     needs_consent: true,
                     pending: false,

@@ -491,6 +491,67 @@ async fn jwt_bearer_binding_renews_an_expired_token_without_a_refresh_token() {
 }
 
 #[tokio::test]
+async fn jwt_bearer_binding_asserts_again_after_a_refused_assertion() {
+    let fake = FakeAuthServer::start(FakeBehavior::default()).await;
+    let id = CredentialId::new("test-provider", "oauth", "default").unwrap();
+    let entry = CredentialEntry::oauth(
+        SecretString::from("old-access".to_owned()),
+        None,
+        Some(OffsetDateTime::now_utc() - time::Duration::seconds(1)),
+        "Bearer",
+        vec!["read".to_owned(), "write".to_owned()],
+    );
+    let service = Arc::new(CredentialService::new(
+        [(
+            id.clone(),
+            DurableCredentialSnapshot {
+                entry,
+                version: CredentialVersion::initial(),
+            },
+        )],
+        OAuthClient::new().unwrap(),
+        Arc::new(SimpleRefreshSink),
+    ));
+    let mut refused = fake.jwt_bearer_scheme();
+    refused.default_client_id = Some("another-client".to_owned());
+    let request = OAuthRequest::from_runtime(
+        refused,
+        crate::OAuthRuntimeOverrides {
+            client_secret: Some(SecretString::from(ASSERTION_KEY.to_owned())),
+            ..crate::OAuthRuntimeOverrides::default()
+        },
+    )
+    .unwrap();
+    let binding = service
+        .bind_oauth(
+            id,
+            request,
+            vec!["api.example.test".to_owned()],
+            "Authorization".to_owned(),
+            "Bearer ".to_owned(),
+        )
+        .unwrap();
+
+    // The token endpoint refuses the assertion with `invalid_grant`, which
+    // asks no consent of a flow without a user: the next request asserts
+    // again.
+    for attempts in 1..=2 {
+        let error = binding
+            .authorization_for("https://api.example.test/files")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::AuthUnavailable::RefreshFailed(_)),
+            "{error}"
+        );
+        assert_eq!(
+            binding.health(),
+            crate::CredentialHealth::RefreshFailed { attempts }
+        );
+    }
+}
+
+#[tokio::test]
 async fn device_code_refresh_does_not_require_redirect_uri() {
     let fake = FakeAuthServer::start(FakeBehavior::default()).await;
     let scheme = fake.device_scheme(DevicePollCompat::Rfc8628, None);

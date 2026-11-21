@@ -151,10 +151,7 @@ async fn run_oauth(
             .login_client_side_token(request)
             .await
             .with_hint(format!("Re-run `omnifs mount reauth {mount}` to retry"))?,
-        LoginRequest::JwtBearer(request) => client
-            .login_jwt_bearer(request)
-            .await
-            .with_hint(format!("Re-run `omnifs mount reauth {mount}` to retry"))?,
+        LoginRequest::JwtBearer(request) => client.login_jwt_bearer(request).await?,
         LoginRequest::ManualCode(_) if no_input => {
             return Err(anyhow!(
                 "`--no-input` cannot complete the manual-code OAuth flow for `{mount}` (it needs a pasted redirect URL); run it interactively"
