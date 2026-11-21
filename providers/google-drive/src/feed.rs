@@ -608,20 +608,22 @@ impl File {
         let changed = token
             .as_ref()
             .is_some_and(|token| token.revision != revision);
-        if changed {
-            cx.remove(format!("{}/content", file_path(id)))?;
-        }
         write_file(&cx, id, &item, &object, ListingWrite::Join)?;
         let start = if changed { cx.due() } else { cx.start() };
         if start == Some("content") {
             return file_content(&cx, id, content, revision).await;
+        }
+        // The content of another revision leaves; the content that this
+        // answer takes is in its place.
+        if changed {
+            cx.remove(format!("{}/content", file_path(id)))?;
         }
         file_part(revision)
     }
 }
 
 /// The content of a file at `revision` as its file `content`: the bytes of
-/// the revision of an uploaded file, which the host fetches and holds, or
+/// an uploaded file with that checksum, which the host fetches and holds, or
 /// the export of a file of Google; the removal of a file with `404`.
 async fn file_content(
     cx: &FeedCx<FileKey>,
@@ -632,17 +634,26 @@ async fn file_content(
     let at = format!("{}/content", file_path(id));
     match content {
         Content::Bytes => {
-            let fetched = cx
-                .endpoint(DriveApi)
-                .get(format!("/drive/v3/files/{id}/revisions/{revision}"))
-                .query("alt", "media")
-                .into_blob()
-                .fetch()
-                .await;
-            match fetched {
+            let bytes = || {
+                cx.endpoint(DriveApi)
+                    .get(format!("/drive/v3/files/{id}"))
+                    .query("alt", "media")
+                    .query("supportsAllDrives", "true")
+            };
+            match bytes().into_blob().version(revision).fetch().await {
                 Ok(blob) => cx.blob(at, &blob)?,
                 Err(error) if error.kind() == ProviderErrorKind::NotFound => {
                     return file_removal(cx, id);
+                },
+                // The reason of a refusal is in the body of its answer, which
+                // the host holds: the answer to the first byte has it too,
+                // as a request over a quota.
+                Err(error) if error.kind() == ProviderErrorKind::Denied => {
+                    let refusal = bytes().header("Range", "bytes=0-0").send().await?;
+                    return Err(match refusal.status() {
+                        200..=299 => error,
+                        _ => status_error(&refusal),
+                    });
                 },
                 Err(error) => return Err(error),
             }

@@ -11,8 +11,9 @@ use omnifs_itest::RuntimeHarness;
 use serde_json::{Value, json};
 use support::{
     PAST_DEADLINE, answering, blob, bytes, changed, changes, drive_harness, expect_bytes,
-    expect_changes, expect_export, expect_item, expect_listing, expect_start, failure, files,
-    google, lookup, names, ok, read, read_range, removed, served, trashed, uploaded,
+    expect_changes, expect_export, expect_first_byte, expect_item, expect_listing, expect_start,
+    failure, files, google, lookup, names, ok, read, read_range, removed, served, trashed,
+    uploaded,
 };
 
 const EDITED: &str = "2026-11-21T10:00:00.000Z";
@@ -54,7 +55,7 @@ async fn first_full_listing(harness: &RuntimeHarness, items: &[Value]) {
 #[allow(clippy::too_many_lines)]
 async fn the_first_full_listing_takes_the_items_by_next_page_token() {
     let harness = drive_harness();
-    let notes = uploaded("file-1", "notes.md", "rev-1", 5);
+    let notes = uploaded("file-1", "notes.md", "md5-1", 5);
     let document = google("doc-1", "document", "Plan", EDITED);
     let folder = google("folder-1", "folder", "Work", EDITED);
     let (listing, requests) = answering(
@@ -78,8 +79,8 @@ async fn the_first_full_listing_takes_the_items_by_next_page_token() {
                     google("drawing-1", "drawing", "Sketch", EDITED),
                     google("script-1", "script", "Macros", EDITED),
                     google("shortcut-1", "shortcut", "Link", EDITED),
-                    uploaded("video-1", "recording.mp4", "rev-2", LARGE),
-                    trashed(uploaded("file-2", "old.md", "rev-3", 3)),
+                    uploaded("video-1", "recording.mp4", "md5-2", LARGE),
+                    trashed(uploaded("file-2", "old.md", "md5-3", 3)),
                     trashed(google("form-2", "form", "Old survey", EDITED)),
                 ],
                 None,
@@ -158,7 +159,7 @@ async fn the_first_full_listing_takes_the_items_by_next_page_token() {
 }
 
 /// The content of a file at the first read of its `content`: the bytes of
-/// the head revision of an uploaded file, which the host holds and serves a
+/// an uploaded file with its checksum, which the host holds and serves a
 /// range of, and the Markdown of a document, the CSV of a spreadsheet, the
 /// plain text of a presentation, the SVG of a drawing, and the JSON of a
 /// project of Apps Script, each served after it without a request.
@@ -168,7 +169,7 @@ async fn the_content_takes_the_bytes_of_an_uploaded_file_and_the_export_of_a_fil
     first_full_listing(
         &harness,
         &[
-            uploaded("file-1", "notes.md", "rev-1", 5),
+            uploaded("file-1", "notes.md", "md5-1", 5),
             google("doc-1", "document", "Plan", EDITED),
             google("sheet-1", "spreadsheet", "Budget", EDITED),
             google("slides-1", "presentation", "Deck", EDITED),
@@ -192,7 +193,7 @@ async fn the_content_takes_the_bytes_of_an_uploaded_file_and_the_export_of_a_fil
     )
     .await;
     assert_eq!(content.unwrap(), "notes");
-    expect_bytes(&requests[0], "file-1", "rev-1");
+    expect_bytes(&requests[0], "file-1", "md5-1");
     // A read of a range of the file has the bytes of the range alone.
     assert_eq!(
         served(&harness, read_range(&harness, "files/file-1/content", 1, 3))
@@ -264,10 +265,10 @@ async fn the_changes_take_the_files_after_the_token_of_the_answer_before() {
     first_full_listing(
         &harness,
         &[
-            uploaded("file-1", "notes.md", "rev-1", 5),
-            uploaded("file-2", "kept.md", "rev-2", 4),
-            uploaded("file-3", "shared.md", "rev-3", 6),
-            uploaded("file-4", "old.md", "rev-4", 3),
+            uploaded("file-1", "notes.md", "md5-1", 5),
+            uploaded("file-2", "kept.md", "md5-2", 4),
+            uploaded("file-3", "shared.md", "md5-3", 6),
+            uploaded("file-4", "old.md", "md5-4", 3),
             google("doc-1", "document", "Plan", EDITED),
             google("folder-1", "folder", "Work", EDITED),
             google("form-1", "form", "Survey", EDITED),
@@ -298,16 +299,16 @@ async fn the_changes_take_the_files_after_the_token_of_the_answer_before() {
         vec![
             ok(&json!({
                 "changes": [
-                    changed(&uploaded("file-1", "notes.md", "rev-1b", 6)),
-                    changed(&uploaded("file-2", "renamed.md", "rev-2", 4)),
+                    changed(&uploaded("file-1", "notes.md", "md5-1b", 6)),
+                    changed(&uploaded("file-2", "renamed.md", "md5-2", 4)),
                     removed("file-3"),
                 ],
                 "nextPageToken": "changes-1b",
             })),
             ok(&changes(
                 &[
-                    changed(&trashed(uploaded("file-4", "old.md", "rev-4", 3))),
-                    changed(&uploaded("file-6", "new.md", "rev-6", 3)),
+                    changed(&trashed(uploaded("file-4", "old.md", "md5-4", 3))),
+                    changed(&uploaded("file-6", "new.md", "md5-6", 3)),
                     removed("form-1"),
                     changed(&google("form-2", "form", "Poll", EDITED)),
                     changed(&google("doc-1", "document", "Plan", EDITED_LATER)),
@@ -354,7 +355,7 @@ async fn the_changes_take_the_files_after_the_token_of_the_answer_before() {
     )
     .await;
     assert_eq!(content.unwrap(), "notes!");
-    expect_bytes(&requests[0], "file-1", "rev-1b");
+    expect_bytes(&requests[0], "file-1", "md5-1b");
     let (content, requests) = answering(
         &harness,
         read(&harness, "files/doc-1/content"),
@@ -393,8 +394,8 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
     first_full_listing(
         &harness,
         &[
-            uploaded("file-1", "notes.md", "rev-1", 5),
-            uploaded("file-2", "gone.md", "rev-2", 4),
+            uploaded("file-1", "notes.md", "md5-1", 5),
+            uploaded("file-2", "gone.md", "md5-2", 4),
             google("folder-1", "folder", "Work", EDITED),
             google("folder-2", "folder", "Gone", EDITED),
         ],
@@ -433,7 +434,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
     // listing begins again from its first page.
     tokio::time::sleep(PAST_DEADLINE).await;
     let first = files(
-        &[uploaded("file-1", "notes.md", "rev-1", 5)],
+        &[uploaded("file-1", "notes.md", "md5-1", 5)],
         Some("page-2"),
     );
     let (refused, requests) = answering(
@@ -468,7 +469,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
             ok(&first),
             ok(&files(
                 &[
-                    uploaded("file-3", "new.md", "rev-3", 3),
+                    uploaded("file-3", "new.md", "md5-3", 3),
                     google("folder-1", "folder", "Work", EDITED),
                 ],
                 None,
@@ -509,7 +510,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
     let (found, requests) = answering(
         &harness,
         read(&harness, "files/file-1/name"),
-        vec![ok(&uploaded("file-1", "notes.md", "rev-1", 5))],
+        vec![ok(&uploaded("file-1", "notes.md", "md5-1", 5))],
     )
     .await;
     assert_eq!(found.unwrap(), "notes.md");
@@ -521,7 +522,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
     )
     .await;
     assert_eq!(content.unwrap(), "notes");
-    expect_bytes(&requests[0], "file-1", "rev-1");
+    expect_bytes(&requests[0], "file-1", "md5-1");
 
     let (found, requests) = answering(
         &harness,
@@ -546,7 +547,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
         (
             "files/file-3",
             "file-3",
-            ok(&trashed(uploaded("file-3", "old.md", "rev-3", 3))),
+            ok(&trashed(uploaded("file-3", "old.md", "md5-3", 3))),
         ),
         (
             "files/folder-1",
@@ -566,7 +567,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
         (
             "folders/file-1",
             "file-1",
-            ok(&uploaded("file-1", "notes.md", "rev-1", 5)),
+            ok(&uploaded("file-1", "notes.md", "md5-1", 5)),
         ),
     ] {
         let (found, requests) = answering(&harness, lookup(&harness, path), vec![answer]).await;
@@ -575,17 +576,19 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
     }
 }
 
-/// The content that Google Drive refuses is the error of its read, which the
-/// next read asks for again; the content of a file that Google Drive no
-/// longer has removes the file.
+/// The content that Google Drive refuses is the error of its read, by the
+/// reason in the answer to its first byte, as that of a rate limit for a
+/// request over a quota, and the next read asks for it again; the content of
+/// a file that Google Drive no longer has removes the file.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_content_is_the_error_of_its_read_and_a_missing_one_removes_its_file() {
     let harness = drive_harness();
     first_full_listing(
         &harness,
         &[
-            uploaded("file-1", "restricted.pdf", "rev-1", 5),
-            uploaded("file-2", "gone.md", "rev-2", 4),
+            uploaded("file-1", "restricted.pdf", "md5-1", 5),
+            uploaded("file-2", "gone.md", "md5-2", 4),
+            uploaded("file-3", "busy.bin", "md5-3", 4),
             google("sheet-1", "spreadsheet", "Large", EDITED),
         ],
     )
@@ -595,11 +598,12 @@ async fn a_refused_content_is_the_error_of_its_read_and_a_missing_one_removes_it
         let (refused, requests) = answering(
             &harness,
             read(&harness, "files/file-1/content"),
-            vec![blob(403, b"{}")],
+            vec![blob(403, b"{}"), failure(403, "cannotDownloadFile")],
         )
         .await;
         assert!(matches!(refused, Err(NsError::Permission)), "{refused:?}");
-        expect_bytes(&requests[0], "file-1", "rev-1");
+        expect_bytes(&requests[0], "file-1", "md5-1");
+        expect_first_byte(&requests[1], "file-1");
     }
     let (content, _) = answering(
         &harness,
@@ -631,11 +635,24 @@ async fn a_refused_content_is_the_error_of_its_read_and_a_missing_one_removes_it
     )
     .await;
     assert!(matches!(gone, Err(NsError::NotFound)), "{gone:?}");
-    expect_bytes(&requests[0], "file-2", "rev-2");
+    expect_bytes(&requests[0], "file-2", "md5-2");
     assert_eq!(
         served(&harness, names(&harness, "files")).await.unwrap(),
-        sorted(&["file-1", "sheet-1"])
+        sorted(&["file-1", "file-3", "sheet-1"])
     );
+
+    // A refusal over a quota holds the next requests of the mount back.
+    let (limited, requests) = answering(
+        &harness,
+        read(&harness, "files/file-3/content"),
+        vec![blob(403, b"{}"), failure(403, "userRateLimitExceeded")],
+    )
+    .await;
+    assert!(
+        matches!(limited, Err(NsError::RateLimited { .. })),
+        "{limited:?}"
+    );
+    expect_first_byte(&requests[1], "file-3");
 }
 
 /// A `403` of a request over a quota gives a read the error of a rate limit.

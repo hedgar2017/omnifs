@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 pub const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
 
 /// The fields of a file or a folder that the provider asks for.
-pub const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,headRevisionId,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
+pub const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
 
 pub fn drive_harness() -> RuntimeHarness {
     make_initialized_runtime(
@@ -29,6 +29,10 @@ pub fn drive_harness() -> RuntimeHarness {
     "#,
     )
 }
+
+/// The name under which a request of a fixture has the version of the bytes
+/// that a blob fetch asks for.
+const VERSION: &str = "blob-version";
 
 /// The answer of Google Drive to a request of a fixture.
 pub enum Answer {
@@ -68,10 +72,17 @@ pub async fn answering<T>(
                     callout.answer(result);
                 },
                 (Callout::FetchBlob(request), Answer::Blob(status, body)) => {
+                    // The version of the bytes of the request, as a header
+                    // of the request of the fixture.
+                    let mut headers = request.headers.clone();
+                    headers.extend(request.version.clone().map(|value| Header {
+                        name: VERSION.to_owned(),
+                        value,
+                    }));
                     requests.push(HttpRequest {
                         method: request.method.clone(),
                         url: request.url.clone(),
-                        headers: request.headers.clone(),
+                        headers,
                         body: request.body.clone(),
                     });
                     runtime.answer_test_blob(callout, status, &body);
@@ -193,14 +204,36 @@ pub fn expect_item(request: &HttpRequest, id: &str) {
     );
 }
 
-/// Check that `request` is that of the bytes of the revision `revision` of
-/// the uploaded file `id`.
-pub fn expect_bytes(request: &HttpRequest, id: &str, revision: &str) {
+/// Check that `request` is that of the bytes of the uploaded file `id` with
+/// the checksum `md5`, for the host to hold.
+pub fn expect_bytes(request: &HttpRequest, id: &str, md5: &str) {
     expect(
         request,
-        &format!("/files/{id}/revisions/{revision}"),
-        &[("alt", "media")],
+        &format!("/files/{id}"),
+        &[("alt", "media"), ("supportsAllDrives", "true")],
     );
+    let version = request
+        .headers
+        .iter()
+        .find(|header| header.name == VERSION)
+        .map(|header| header.value.as_str());
+    assert_eq!(version, Some(md5), "{}", request.url);
+}
+
+/// Check that `request` is that of the first byte of the uploaded file
+/// `id`, whose answer has the reason of a refusal of its bytes.
+pub fn expect_first_byte(request: &HttpRequest, id: &str) {
+    expect(
+        request,
+        &format!("/files/{id}"),
+        &[("alt", "media"), ("supportsAllDrives", "true")],
+    );
+    let range = request
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("range"))
+        .map(|header| header.value.as_str());
+    assert_eq!(range, Some("bytes=0-0"), "{}", request.url);
 }
 
 /// Check that `request` is that of the export of the file `id` of Google
@@ -246,9 +279,8 @@ pub fn failure(status: u16, reason: &str) -> Answer {
     )
 }
 
-/// An uploaded file `id` with `name`, the head revision `revision` and
-/// `size` bytes.
-pub fn uploaded(id: &str, name: &str, revision: &str, size: u64) -> Value {
+/// An uploaded file `id` with `name`, the checksum `md5` and `size` bytes.
+pub fn uploaded(id: &str, name: &str, md5: &str, size: u64) -> Value {
     json!({
         "id": id,
         "name": name,
@@ -258,7 +290,7 @@ pub fn uploaded(id: &str, name: &str, revision: &str, size: u64) -> Value {
         "createdTime": "2026-11-21T09:00:00.000Z",
         "modifiedTime": "2026-11-21T10:00:00.000Z",
         "size": size.to_string(),
-        "headRevisionId": revision,
+        "md5Checksum": md5,
     })
 }
 

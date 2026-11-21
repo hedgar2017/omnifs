@@ -59,7 +59,7 @@ fn over_quota(body: &[u8]) -> bool {
 
 /// The fields of a file or a folder that the provider asks Google Drive for,
 /// and that `file.json` and `folder.json` have.
-pub(crate) const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,headRevisionId,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
+pub(crate) const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
 
 /// The error of an answer of Google Drive with a failing status.
 pub(crate) fn status_error(response: &HttpResponse) -> ProviderError {
@@ -132,7 +132,7 @@ pub(crate) struct Item {
     mime_type: String,
     pub(crate) trashed: bool,
     modified_time: String,
-    head_revision_id: Option<String>,
+    md5_checksum: Option<String>,
 }
 
 /// What an item is for the mount.
@@ -172,14 +172,12 @@ impl Item {
         }
     }
 
-    /// What changes with the content of a file: the head revision of an
-    /// uploaded file, and the `modifiedTime` of a file of Google.
+    /// What changes with the content of a file: the checksum of an uploaded
+    /// file, and the `modifiedTime` of a file of Google.
     pub(crate) fn revision(&self, content: Content) -> Result<&str> {
         match content {
-            Content::Bytes => self.head_revision_id.as_deref().ok_or_else(|| {
-                ProviderError::invalid_input(
-                    "an uploaded file of Google Drive has no headRevisionId",
-                )
+            Content::Bytes => self.md5_checksum.as_deref().ok_or_else(|| {
+                ProviderError::invalid_input("an uploaded file of Google Drive has no md5Checksum")
             }),
             Content::Export(_) => Ok(&self.modified_time),
         }
