@@ -141,7 +141,7 @@ pub fn ok(body: &Value) -> CalloutResult {
 pub fn failure(status: u16, code: &str) -> CalloutResult {
     answer(
         status,
-        &[],
+        &[("Date", LATER)],
         &json!({
             "object": "error",
             "status": status,

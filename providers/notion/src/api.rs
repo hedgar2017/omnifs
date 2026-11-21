@@ -59,6 +59,7 @@ impl EndpointHooks for NotionApi {
 /// The error object of an answer of Notion.
 #[derive(Deserialize)]
 struct Failure {
+    code: String,
     message: String,
     additional_data: Option<AdditionalData>,
 }
@@ -90,6 +91,15 @@ pub(crate) fn status_error(response: &HttpResponse) -> ProviderError {
         429 => rate_limited(429, response.header("retry-after")),
         status => ProviderError::from_http_status(status),
     }
+}
+
+/// An answer `403` of Notion with the code `restricted_resource`: Notion gives
+/// the connection no access to the part of the object that the request asks
+/// for, as the comments of a page that Notion manages.
+pub(crate) fn restricted(response: &HttpResponse) -> bool {
+    response.status() == 403
+        && serde_json::from_slice::<Failure>(response.body())
+            .is_ok_and(|failure| failure.code == "restricted_resource")
 }
 
 /// Decode the JSON of an answer of Notion.

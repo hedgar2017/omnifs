@@ -28,7 +28,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::api::{
     CommentObject, DataSourceObject, Found, List, Markdown, NotionApi, PageObject, decode,
-    status_error,
+    restricted, status_error,
 };
 use crate::{DataSource, DataSourceKey, Id, Page, PageKey, Workspace, WorkspaceKey};
 
@@ -824,7 +824,8 @@ impl PageFeed<'_> {
 
     /// A request of the comments, by the cursor of the previous one, and at
     /// their last part each comment, `comments/` complete, and the removal of
-    /// each comment of the projection that their answers lack.
+    /// each comment of the projection that their answers lack. The comments
+    /// that Notion restricts for the connection are no comments.
     async fn comments(
         &self,
         last_edited_time: OffsetDateTime,
@@ -842,27 +843,30 @@ impl PageFeed<'_> {
             request = request.query("start_cursor", cursor);
         }
         let response = request.send().await?;
-        match response.status() {
-            200 => {},
+        let none = match response.status() {
+            200 => false,
             404 => return Ok(PageStep::Gone),
             _ if cursor_refused(cursor.as_ref(), &response) => {
                 return Ok(PageStep::Refused(status_error(&response)));
             },
+            _ if restricted(&response) => true,
             _ => return Err(status_error(&response)),
-        }
+        };
         let until = match cursor {
             None => minute_end(last_edited_time, &response)?,
             Some(_) => until,
         };
-        let list: List = decode(response.body())?;
-        let next = list.next()?;
-        comments.extend(list.results);
-        if let Some(cursor) = next {
-            return Ok(PageStep::Next(PageRequest::Comments {
-                cursor: Some(cursor),
-                comments,
-                until,
-            }));
+        if !none {
+            let list: List = decode(response.body())?;
+            let next = list.next()?;
+            comments.extend(list.results);
+            if let Some(cursor) = next {
+                return Ok(PageStep::Next(PageRequest::Comments {
+                    cursor: Some(cursor),
+                    comments,
+                    until,
+                }));
+            }
         }
         let folder = format!("{}/comments", self.path());
         let mut taken = BTreeSet::new();

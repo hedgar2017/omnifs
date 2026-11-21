@@ -694,7 +694,7 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
 #[allow(clippy::too_many_lines)]
 async fn the_comments_take_their_answers_by_next_cursor() {
     let harness = notion_harness();
-    for n in [1, 2, 3, 4] {
+    for n in [1, 2, 3, 4, 5, 6] {
         assert!(found_by_id(&harness, "pages", n, &page(n, &format!("Page {n}"), EDITED)).await);
     }
 
@@ -776,6 +776,33 @@ async fn the_comments_take_their_answers_by_next_cursor() {
             .unwrap()
             .is_missing()
     );
+
+    // The comments that Notion restricts for the connection are no comments,
+    // and the page stays.
+    let (comments, requests) = answering(
+        &harness,
+        names(&harness, &format!("pages/{}/comments", id(5))),
+        vec![failure(403, "restricted_resource")],
+    )
+    .await;
+    assert_eq!(comments.unwrap(), Vec::<String>::new());
+    expect(&requests[0], "GET", &comments_of(5, None), None);
+    assert!(
+        !served(&harness, lookup(&harness, &format!("pages/{}", id(5))))
+            .await
+            .unwrap()
+            .is_missing()
+    );
+
+    // Another refusal of the comments is the error of the read.
+    let (comments, requests) = answering(
+        &harness,
+        names(&harness, &format!("pages/{}/comments", id(6))),
+        vec![failure(403, "unauthorized")],
+    )
+    .await;
+    assert!(matches!(comments, Err(NsError::Permission)), "{comments:?}");
+    expect(&requests[0], "GET", &comments_of(6, None), None);
 
     let (comments, requests) = answering(
         &harness,
