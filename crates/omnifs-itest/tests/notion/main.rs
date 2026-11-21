@@ -359,6 +359,27 @@ async fn the_changes_take_the_search_until_an_older_result() {
     .await;
     assert_eq!(comments.unwrap(), names_of(&[11]));
     expect(&requests[0], "GET", &comments_of(1, None), None);
+    // A content stopped after its first part keeps that part until the page
+    // changes.
+    let (stopped, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(2))),
+        vec![
+            ok(&markdown("Two body", &[21])),
+            answer(
+                429,
+                &[("Retry-After", "1")],
+                &json!({ "object": "error", "status": 429, "code": "rate_limited", "message": "slow down" }),
+            ),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(stopped, Err(NsError::RateLimited { .. })),
+        "{stopped:?}"
+    );
+    expect(&requests[0], "GET", &markdown_of(&id(2)), None);
+    expect(&requests[1], "GET", &markdown_of(&notion_id(21)), None);
 
     tokio::time::sleep(PAST_DEADLINE).await;
     let (title, requests) = answering(
@@ -368,7 +389,7 @@ async fn the_changes_take_the_search_until_an_older_result() {
             ok(&list(
                 &[
                     page(1, "One edited", EDITED_LATER),
-                    page(2, "Two", EDITED),
+                    page(2, "Two edited", EDITED_LATER),
                     page(4, "Four", EDITED),
                 ],
                 Some("cursor-2"),
@@ -380,7 +401,7 @@ async fn the_changes_take_the_search_until_an_older_result() {
         ],
     )
     .await;
-    assert_eq!(title.unwrap(), "Two");
+    assert_eq!(title.unwrap(), "Two edited");
     expect_search(&requests[0], 3, None);
     expect_search(&requests[1], 100, Some("cursor-2"));
     assert_eq!(
@@ -410,6 +431,15 @@ async fn the_changes_take_the_search_until_an_older_result() {
     .await;
     assert!(comments.unwrap().is_empty());
     expect(&requests[0], "GET", &comments_of(1, None), None);
+    // The change drops the part of the content stopped before it.
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(2))),
+        vec![ok(&markdown("Two body edited", &[]))],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Two body edited");
+    expect(&requests[0], "GET", &markdown_of(&id(2)), None);
 
     // The next changes start from the latest time of these, with its count.
     tokio::time::sleep(PAST_DEADLINE).await;
@@ -417,12 +447,16 @@ async fn the_changes_take_the_search_until_an_older_result() {
         &harness,
         read(&harness, &format!("pages/{}/title", id(2))),
         vec![ok(&list(
-            &[page(1, "One edited", EDITED_LATER), page(2, "Two", EDITED)],
+            &[
+                page(1, "One edited", EDITED_LATER),
+                page(2, "Two edited", EDITED_LATER),
+                page(4, "Four", EDITED),
+            ],
             Some("cursor-2"),
         ))],
     )
     .await;
-    expect_search(&requests[0], 2, None);
+    expect_search(&requests[0], 3, None);
 }
 
 /// An object by its ID, a page or a data source: its `GET` at its first
@@ -634,6 +668,21 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
         .unwrap(),
         "Page 4 body, edited in its minute"
     );
+
+    // Past its deadline, a read by its path alone of the content of a page
+    // with another `last_edited_time` takes the page and then its content.
+    let (body, requests) = answering(
+        &harness,
+        read_at(&harness, &format!("pages/{}/body.md", id(2))),
+        vec![
+            ok(&page(2, "Page 2", EDITED_LATER)),
+            ok(&markdown("Page 2 body, edited", &[])),
+        ],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Page 2 body, edited");
+    expect(&requests[0], "GET", &format!("/v1/pages/{}", id(2)), None);
+    expect(&requests[1], "GET", &markdown_of(&id(2)), None);
 }
 
 /// The comments at the first read of `comments/` and of a file of a comment
@@ -759,6 +808,33 @@ async fn the_comments_take_their_answers_by_next_cursor() {
     assert_eq!(comments.unwrap(), names_of(&[41, 43]));
     expect(&requests[0], "GET", &format!("/v1/pages/{}", id(4)), None);
     expect(&requests[1], "GET", &comments_of(4, None), None);
+
+    // Past its deadline, a read by its path alone of a comment of a page with
+    // another `last_edited_time` takes the page and then its comments.
+    let (body, requests) = answering(
+        &harness,
+        read_at(
+            &harness,
+            &format!("pages/{}/comments/{}/body.md", id(1), id(13)),
+        ),
+        vec![
+            ok(&page(1, "Page 1", EDITED_LATER)),
+            ok(&list(&[comment(13, None, "Second, edited")], None)),
+        ],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Second, edited");
+    expect(&requests[0], "GET", &format!("/v1/pages/{}", id(1)), None);
+    expect(&requests[1], "GET", &comments_of(1, None), None);
+    assert_eq!(
+        served(
+            &harness,
+            names(&harness, &format!("pages/{}/comments", id(1)))
+        )
+        .await
+        .unwrap(),
+        names_of(&[13])
+    );
 }
 
 /// A `529` gives a read the error of a rate limit and Notion no request in
