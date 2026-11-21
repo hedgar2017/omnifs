@@ -91,8 +91,17 @@ struct KeptPart {
 }
 
 impl KeptPart {
+    /// The part for the projection, without its token, which the projection
+    /// has of the last kept part alone.
     fn encode(&self) -> Result<Vec<u8>> {
-        postcard::to_allocvec(self)
+        let kept = Self {
+            part: wit_types::FeedPart {
+                token: String::new(),
+                ..self.part.clone()
+            },
+            effects: self.effects.clone(),
+        };
+        postcard::to_allocvec(&kept)
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))
     }
 
@@ -320,16 +329,13 @@ impl Runtime {
         let later = state.as_ref().is_some_and(|state| state.ended);
         let kept = self
             .resources
-            .kept_parts(object.id.as_bytes())
+            .kept_token(object.id.as_bytes())
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
         // The token of the state of the feed, which a published part moves
         // and a kept part does not.
         let mut from = state.map(|state| state.token);
-        let mut token = match kept.last() {
-            Some(last) => Some(KeptPart::decode(last)?.part.token),
-            None => from.clone(),
-        };
-        let mut kept = !kept.is_empty();
+        let mut token = kept.clone().or_else(|| from.clone());
+        let mut kept = kept.is_some();
         loop {
             match self
                 .run_feed_call(object, token, from.clone(), start, later, kept)
@@ -523,6 +529,7 @@ impl Runtime {
             kept: Some(KeptWrite {
                 object: object.id.as_bytes().to_vec(),
                 from,
+                token: kept.part.token.clone(),
                 part: kept.encode()?,
             }),
             ..ProjectionTransition::default()

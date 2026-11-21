@@ -355,6 +355,9 @@ pub(crate) struct KeptWrite {
     /// from, as [`FeedWrite::from`].
     pub from: Option<String>,
     pub part: Vec<u8>,
+    /// The token after the part, from which the answer continues: the
+    /// projection has the token after the last kept part alone.
+    pub token: String,
 }
 
 /// The token after a part, and whether more parts follow in its answer.
@@ -1117,6 +1120,12 @@ impl MountResources {
                     kept_key(&kept.object, next),
                     kept.part.as_slice(),
                 )?;
+                put(
+                    tx,
+                    facts,
+                    kept_token_key(&kept.object),
+                    kept.token.as_bytes(),
+                )?;
             }
             for freshness in &freshness {
                 if !fed_answer && tx.get(facts, fed_key(&freshness.path))?.is_some() {
@@ -1439,6 +1448,19 @@ impl MountResources {
         Ok(!self.projection.read_prefix(&kept_prefix(id))?.is_empty())
     }
 
+    /// The token after the last kept part of the later answer of the feed of
+    /// the object `id`, none without a kept part.
+    pub(crate) fn kept_token(&self, id: &[u8]) -> Result<Option<String>, ProjectionError> {
+        self.projection
+            .get(&kept_token_key(id))?
+            .map(|token| {
+                String::from_utf8(token).map_err(|error| {
+                    ProjectionError::Inconsistent(format!("the token of a kept part: {error}"))
+                })
+            })
+            .transpose()
+    }
+
     /// The kept parts of the later answer of the feed of the object `id`, in
     /// their order.
     pub(crate) fn kept_parts(&self, id: &[u8]) -> Result<Vec<Vec<u8>>, ProjectionError> {
@@ -1689,6 +1711,14 @@ fn kept_key(id: &[u8], index: usize) -> Vec<u8> {
     key
 }
 
+/// The key of the token after the last kept part of the feed of the object
+/// `id`.
+fn kept_token_key(id: &[u8]) -> Vec<u8> {
+    let mut key = b"kt:".to_vec();
+    key.extend_from_slice(hex::encode(id).as_bytes());
+    key
+}
+
 fn write_feed_states(
     tx: &mut fjall::OptimisticWriteTx,
     facts: &fjall::OptimisticTxKeyspace,
@@ -1763,6 +1793,7 @@ fn drop_kept_parts(
     for key in kept {
         delete(tx, facts, key)?;
     }
+    delete(tx, facts, kept_token_key(id))?;
     Ok(())
 }
 
@@ -3199,11 +3230,16 @@ mod tests {
                     object: b"feed".to_vec(),
                     from: None,
                     part: b"kept".to_vec(),
+                    token: "kept token".into(),
                 }),
                 ..ProjectionTransition::default()
             },
         );
         assert!(store.has_kept_parts(b"feed").unwrap());
+        assert_eq!(
+            store.kept_token(b"feed").unwrap(),
+            Some("kept token".into())
+        );
         let mut restart = fed_part("restart", HashMap::new());
         restart.answer = FeedAnswerWrite::Restart("restart".into());
         restart.deadline = 2_000;
@@ -3215,6 +3251,7 @@ mod tests {
             },
         );
         assert!(!store.has_kept_parts(b"feed").unwrap());
+        assert_eq!(store.kept_token(b"feed").unwrap(), None);
         assert_eq!(
             store.feed_state(b"feed").unwrap(),
             Some(FeedState {
@@ -3232,6 +3269,7 @@ mod tests {
                     object: b"inner".to_vec(),
                     from: None,
                     part: b"kept".to_vec(),
+                    token: "kept token".into(),
                 }),
                 ..ProjectionTransition::default()
             },
@@ -3285,6 +3323,7 @@ mod tests {
                         object: b"feed".to_vec(),
                         from: Some("token".into()),
                         part: b"kept".to_vec(),
+                        token: "kept token".into(),
                     }),
                     ..ProjectionTransition::default()
                 },
