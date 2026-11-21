@@ -37,7 +37,11 @@ impl BodyId {
 pub const MAX_INLINE_PROJECTABLE_BYTES: usize = 64 * 1024;
 pub const MAX_EAGER_RESPONSE_BYTES: usize = 512 * 1024;
 pub const MAX_VERSION_TOKEN_BYTES: usize = 256;
-pub const MAX_FEED_TOKEN_BYTES: usize = 64 * 1024;
+/// The bytes of a feed token. A token carries what an answer takes to its
+/// last part, as the IDs of the results of a listing of an upstream without
+/// an inventory or the content of a fed file so far: as many bytes as the
+/// file a read materializes.
+pub const MAX_FEED_TOKEN_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ByteSource {
