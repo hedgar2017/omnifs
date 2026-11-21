@@ -209,7 +209,10 @@ impl<'cx, S> Request<'cx, S> {
     /// [`crate::blob::BlobRef`] can be handed to
     /// [`crate::projection::FileProjection::blob`].
     pub fn into_blob(self) -> BlobRequest<'cx, S> {
-        BlobRequest { inner: self }
+        BlobRequest {
+            inner: self,
+            version: None,
+        }
     }
 }
 
@@ -218,6 +221,7 @@ impl<'cx, S> Request<'cx, S> {
 #[must_use]
 pub struct BlobRequest<'cx, S> {
     inner: Request<'cx, S>,
+    version: Option<String>,
 }
 
 impl<'cx, S> BlobRequest<'cx, S> {
@@ -228,6 +232,14 @@ impl<'cx, S> BlobRequest<'cx, S> {
 
     pub fn body(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.inner = self.inner.body(bytes);
+        self
+    }
+
+    /// The version of the bytes that the request asks for, for a request
+    /// that is the same for each version: the host answers with the blob of
+    /// this version alone.
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
         self
     }
 
@@ -251,6 +263,7 @@ impl<'cx, S> BlobRequest<'cx, S> {
             self.inner.url,
             WitHeaders(&self.inner.headers).into(),
             self.inner.body,
+            self.version,
         );
         CalloutFuture::new(self.inner.cx, callout, crate::blob::extract_blob)
     }

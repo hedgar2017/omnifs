@@ -200,6 +200,7 @@ impl Runtime {
             &request.url,
             &headers,
             request.body.as_deref(),
+            request.version.as_deref(),
         );
         let stored = self
             .resources

@@ -87,7 +87,10 @@ fn attrs_from_cache(
         })
     };
     let stability = attrs.map_or(Stability::Stable, FileAttrsCache::stability);
-    let read_style = if attrs.is_some_and(FileAttrsCache::is_deferred_ranged) {
+    // A fed file is read by its ranges from its body in the projection.
+    let read_style = if attrs.is_some_and(FileAttrsCache::is_deferred_ranged)
+        || (fed && matches!(kind, EntryKind::File))
+    {
         ReadStyle::Ranged
     } else {
         ReadStyle::Whole

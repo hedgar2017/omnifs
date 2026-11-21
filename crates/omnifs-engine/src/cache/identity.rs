@@ -32,14 +32,17 @@ impl ProjectionId {
 }
 
 impl BlobRequestId {
-    /// Hash validated request material plus the stable credential partition.
-    /// Token bytes and refresh generations never enter this identity.
+    /// Hash validated request material plus the stable credential partition
+    /// and the version of the bytes that the provider asks for, as the
+    /// request of each version without one. Token bytes and refresh
+    /// generations never enter this identity.
     pub(crate) fn new(
         auth: Option<&CredentialId>,
         method: &str,
         canonical_url: &str,
         headers: &[(String, String)],
         body: Option<&[u8]>,
+        version: Option<&str>,
     ) -> Self {
         let mut body_material = Vec::new();
         match body {
@@ -50,19 +53,19 @@ impl BlobRequestId {
             None => body_material.push(0),
         }
         let auth_partition = auth.map(ToString::to_string);
-        Self(hash_parts(
-            b"omnifs/blob-request/v1",
-            &[
-                auth_partition
-                    .as_deref()
-                    .unwrap_or("unauthenticated")
-                    .as_bytes(),
-                method.as_bytes(),
-                canonical_url.as_bytes(),
-                &encode_headers(headers),
-                &body_material,
-            ],
-        ))
+        let headers = encode_headers(headers);
+        let mut parts = vec![
+            auth_partition
+                .as_deref()
+                .unwrap_or("unauthenticated")
+                .as_bytes(),
+            method.as_bytes(),
+            canonical_url.as_bytes(),
+            &headers,
+            &body_material,
+        ];
+        parts.extend(version.map(str::as_bytes));
+        Self(hash_parts(b"omnifs/blob-request/v1", &parts))
     }
 
     pub(crate) fn filesystem_name(self) -> String {
@@ -146,12 +149,12 @@ mod tests {
     #[test]
     fn identities_are_unambiguous_and_mount_scoped() {
         assert_ne!(
-            BlobRequestId::new(None, "GET", "https://example.test/A", &[], None),
-            BlobRequestId::new(None, "GET", "https://example.test/a", &[], None),
+            BlobRequestId::new(None, "GET", "https://example.test/A", &[], None, None),
+            BlobRequestId::new(None, "GET", "https://example.test/a", &[], None, None),
         );
         assert_ne!(
-            BlobRequestId::new(None, "POST", "https://example.test", &[], None),
-            BlobRequestId::new(None, "POST", "https://example.test", &[], Some(b"")),
+            BlobRequestId::new(None, "POST", "https://example.test", &[], None, None),
+            BlobRequestId::new(None, "POST", "https://example.test", &[], Some(b""), None),
         );
         assert_ne!(
             GitId::new("mount-a", "remote", Some("main")),
@@ -167,8 +170,16 @@ mod tests {
     fn credential_partitions_reuse_without_cross_account_sharing() {
         let first = CredentialId::new("github", "oauth", "alice").unwrap();
         let second = CredentialId::new("github", "oauth", "bob").unwrap();
-        let same_request =
-            |auth| BlobRequestId::new(auth, "GET", "https://api.example.test/data", &[], None);
+        let same_request = |auth| {
+            BlobRequestId::new(
+                auth,
+                "GET",
+                "https://api.example.test/data",
+                &[],
+                None,
+                None,
+            )
+        };
 
         assert_eq!(same_request(Some(&first)), same_request(Some(&first)));
         assert_ne!(same_request(Some(&first)), same_request(Some(&second)));

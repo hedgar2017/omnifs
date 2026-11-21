@@ -329,6 +329,7 @@ async fn fetch_blob_uses_same_oauth_retry_path() {
                 url: api.url(),
                 headers: Vec::new(),
                 body: None,
+                version: None,
             },
             0,
         )

@@ -1115,6 +1115,11 @@ impl MountResources {
                 write_feed_states(tx, facts, feed)?;
             }
             if let Some(kept) = &kept {
+                // The kept parts of an answer have the token after the last
+                // of them: parts without it are of no answer.
+                if tx.get(facts, kept_token_key(&kept.object))?.is_none() {
+                    drop_kept_parts(tx, facts, &kept.object)?;
+                }
                 let prefix = kept_prefix(&kept.object);
                 let next = tx.prefix(facts, prefix.as_slice()).count();
                 put(
@@ -3567,7 +3572,7 @@ mod tests {
     fn blob_publication_rehydrates_and_scopes_reused_hits() {
         let (_dir, _caches, store) = open_store("m");
         let body = store.body.publish(b"body").unwrap();
-        let request = BlobRequestId::new(None, "GET", "https://example.test/body", &[], None);
+        let request = BlobRequestId::new(None, "GET", "https://example.test/body", &[], None, None);
         let metadata = BlobMetadata {
             size: 4,
             content_type: None,
@@ -3601,7 +3606,8 @@ mod tests {
         assert_eq!(reopened.body, body);
         assert_eq!(reopened.size, 4);
 
-        let corrupt = BlobRequestId::new(None, "GET", "https://example.test/corrupt", &[], None);
+        let corrupt =
+            BlobRequestId::new(None, "GET", "https://example.test/corrupt", &[], None, None);
         let corrupt_fact = DurableFact::Blob(BlobFact {
             body_id: [0; 32],
             length: 4,

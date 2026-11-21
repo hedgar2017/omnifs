@@ -402,7 +402,10 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
     /// blob cache and only a [`BlobHandle`] crosses back. The host derives
     /// identity from the validated request.
     pub fn into_blob(self) -> BlobRequestBuilder<'a, E, S> {
-        BlobRequestBuilder { inner: self }
+        BlobRequestBuilder {
+            inner: self,
+            version: None,
+        }
     }
 }
 
@@ -564,15 +567,28 @@ impl HttpResponse {
 /// [`crate::http::BlobRequest`].
 pub struct BlobRequestBuilder<'a, E, S = ()> {
     inner: RequestBuilder<'a, E, S>,
+    version: Option<String>,
 }
 
 impl<'a, E: EndpointHooks, S> BlobRequestBuilder<'a, E, S> {
+    /// The version of the bytes that the request asks for, for a request
+    /// that is the same for each version: the host answers with the blob of
+    /// this version alone.
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
     /// Fetch the URL into the blob store and return its handle. Applies the
     /// same 4xx/5xx mapping as the structural terminals, so a `BlobHandle`
     /// always refers to a successful response body.
     pub async fn fetch(self) -> Result<BlobHandle> {
         let (request, _policy) = self.inner.into_http_request()?;
-        let blob: BlobRequest<'a, S> = request.into_blob();
+        let mut blob: BlobRequest<'a, S> = request.into_blob();
+        if let Some(version) = self.version {
+            blob = blob.version(version);
+        }
         let blob_ref = blob.send().await?.error_for_status()?;
         Ok(BlobHandle {
             id: blob_ref.id,

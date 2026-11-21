@@ -2,7 +2,7 @@
 //! and when it answers before the operation is served from the projection.
 
 use crate::Runtime;
-use crate::cache::{FeedState, RecordKind};
+use crate::cache::FeedState;
 use crate::clock::now_millis;
 use crate::ops::feed::{FeedClaim, FeedStart};
 use crate::ops::namespace::{ListOutcome, PageRequest};
@@ -238,9 +238,10 @@ fn has_fact(runtime: &Runtime, path: &Path, fact: FedFact) -> Result<bool> {
                 .map_err(|error| TreeError::internal(error.to_string()));
         },
         FedFact::Listing => complete_listing(runtime, path)?,
+        // The record alone answers: the body of a file has no bound.
         FedFact::File => resources
-            .cache_get(path, RecordKind::File, None)
-            .map(|record| record.is_some())
+            .file_body(path, None)
+            .map(|body| body.is_some())
             .map_err(|error| TreeError::internal(error.to_string()))?,
     };
     let until = resources

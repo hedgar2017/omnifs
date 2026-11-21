@@ -147,8 +147,10 @@ impl BlobExecutor {
             {
                 Err(early) => early,
                 Ok(request) => {
-                    let request_id = request
-                        .blob_request_id(self.http.auth_binding_for_url(request.original_url()));
+                    let request_id = request.blob_request_id(
+                        self.http.auth_binding_for_url(request.original_url()),
+                        req.version.as_deref(),
+                    );
                     let lock = self.resources.blob_request_lock(request_id);
                     let _guard = lock.lock().await;
                     match self.resources.blob_for_request(request_id) {
