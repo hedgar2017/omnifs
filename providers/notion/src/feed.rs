@@ -633,8 +633,10 @@ impl Page {
     /// The feed of a page: the next request of its token; else its content
     /// for the start `body.md`, and its comments for a start in `comments`,
     /// each after the page by its ID in the same answer for a page without a
-    /// token; else the page by its ID. Each answer makes a part of each
-    /// request.
+    /// token; else the page by its ID, and after it, in the same answer, the
+    /// content or the comments of a due start of `body.md` or in `comments`
+    /// for a page with another `last_edited_time`. Each answer makes a part
+    /// of each request.
     pub(crate) async fn feed(cx: FeedCx<PageKey>) -> Result<Feed> {
         let feed = PageFeed {
             cx: &cx,
@@ -645,22 +647,7 @@ impl Page {
             .map(decode_token::<Option<PageToken>>)
             .transpose()?
             .flatten();
-        let request = match cx.start() {
-            Some("body.md") => Some(PageRequest::Content {
-                markdown: None,
-                queue: VecDeque::new(),
-                until: None,
-            }),
-            Some(start) if start == "comments" || start.starts_with("comments/") => {
-                Some(PageRequest::Comments {
-                    cursor: None,
-                    comments: Vec::new(),
-                    until: None,
-                })
-            },
-            _ => None,
-        };
-        match (token, request) {
+        match (token, request_of(cx.start())) {
             (
                 Some(PageToken {
                     last_edited_time,
@@ -669,8 +656,28 @@ impl Page {
                 _,
             ) => feed.step(last_edited_time, next).await,
             (Some(token), Some(request)) => feed.step(token.last_edited_time, request).await,
-            (token, request) => feed.page(token, request).await,
+            (token, request) => feed.page(token, request, request_of(cx.due())).await,
         }
+    }
+}
+
+/// The first request of the content of a page for the starting path `start`
+/// `body.md`, and of its comments for a starting path in `comments`.
+fn request_of(start: Option<&str>) -> Option<PageRequest> {
+    match start {
+        Some("body.md") => Some(PageRequest::Content {
+            markdown: None,
+            queue: VecDeque::new(),
+            until: None,
+        }),
+        Some(start) if start == "comments" || start.starts_with("comments/") => {
+            Some(PageRequest::Comments {
+                cursor: None,
+                comments: Vec::new(),
+                until: None,
+            })
+        },
+        _ => None,
     }
 }
 
@@ -681,9 +688,15 @@ impl PageFeed<'_> {
 
     /// The page by its ID: its facts, its folder joining `pages/`, with the
     /// removal of its content and its comments for another `last_edited_time`
-    /// than that of `token`, or its removal for `404` or in the trash; then
-    /// `request`, in the same answer.
-    async fn page(&self, token: Option<PageToken>, request: Option<PageRequest>) -> Result<Feed> {
+    /// than that of `token`, or its removal for `404` or in the trash; then,
+    /// in the same answer, `request`, and `due` for another
+    /// `last_edited_time`.
+    async fn page(
+        &self,
+        token: Option<PageToken>,
+        request: Option<PageRequest>,
+        due: Option<PageRequest>,
+    ) -> Result<Feed> {
         let response = self
             .cx
             .endpoint(NotionApi)
@@ -699,14 +712,15 @@ impl PageFeed<'_> {
         if found.in_trash {
             return self.removal();
         }
-        if token
+        let changed = token
             .as_ref()
-            .is_some_and(|token| token.last_edited_time != found.last_edited_time)
-        {
+            .is_some_and(|token| token.last_edited_time != found.last_edited_time);
+        if changed {
             remove_content(self.cx, self.id)?;
         }
         write_page(self.cx, self.id, &object, ListingWrite::Join)?;
-        page_part(found.last_edited_time, request, None)
+        let next = if changed { due } else { request };
+        page_part(found.last_edited_time, next, None)
     }
 
     /// One request of an unfinished answer of the page, a part with the next

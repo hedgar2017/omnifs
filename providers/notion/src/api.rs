@@ -135,12 +135,16 @@ pub(crate) struct PageObject {
     properties: std::collections::BTreeMap<String, Property>,
 }
 
+/// A property of a page: its title for the type `title`, of which the
+/// provider reads nothing else.
 #[derive(Deserialize)]
-struct Property {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    title: Vec<RichText>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Property {
+    Title {
+        title: Vec<RichText>,
+    },
+    #[serde(other)]
+    Other,
 }
 
 impl PageObject {
@@ -149,8 +153,10 @@ impl PageObject {
     pub(crate) fn title(&self) -> Result<String> {
         self.properties
             .values()
-            .find(|property| property.kind == "title")
-            .map(|property| plain_text(&property.title))
+            .find_map(|property| match property {
+                Property::Title { title } => Some(plain_text(title)),
+                Property::Other => None,
+            })
             .ok_or_else(|| ProviderError::invalid_input("a page of Notion has no title property"))
     }
 }
