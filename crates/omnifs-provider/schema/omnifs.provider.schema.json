@@ -949,6 +949,13 @@
             "type": "string"
           }
         },
+        "headers": {
+          "description": "The value of each header of the probe by its name, sent beside the\ntoken.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "jsonPointer": {
           "type": [
             "string",

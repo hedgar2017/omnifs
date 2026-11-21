@@ -252,6 +252,10 @@ pub struct KeyValue {
 pub struct TokenValidation {
     pub method: String,
     pub url: String,
+    /// The value of each header of the probe by its name, sent beside the
+    /// token.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     pub expect_status: u16,
