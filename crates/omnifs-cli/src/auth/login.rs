@@ -60,7 +60,7 @@ pub(crate) async fn login_for_submission(
         .resolve_oauth_scheme(Some(scheme_key))?
         .clone();
     let config = auth.as_oauth().map(super::OAuth::request_config);
-    let mut request = OAuthRequest::from_config(config.as_ref(), scheme)?;
+    let mut request = OAuthRequest::from_config(config.as_ref(), scheme)?.acting_as(account_label);
     if let Some(scopes) = interactivity.scopes {
         request.override_default_scopes(scopes.to_vec());
     }

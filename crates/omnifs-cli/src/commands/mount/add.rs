@@ -51,6 +51,11 @@ pub struct AddArgs {
     /// private key of a service account.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["token", "token_env"])]
     pub client_secret_file: Option<String>,
+    /// Account that the credential is of, instead of the default one: for a
+    /// client that acts as a user, as a service account with domain-wide
+    /// delegation, the user.
+    #[arg(long, value_name = "ACCOUNT", conflicts_with = "no_auth")]
+    pub account: Option<String>,
     /// Auth scheme to use instead of the provider default.
     #[arg(long, value_name = "SCHEME")]
     pub scheme: Option<String>,
@@ -130,12 +135,13 @@ impl AddArgs {
         if self.no_auth {
             return Ok(None);
         }
+        let account = self.account.clone();
         if self.token.is_some() || self.token_env.is_some() {
-            return Auth::static_token(auth_manifest, self.scheme.as_deref(), None).map(Some);
+            return Auth::static_token(auth_manifest, self.scheme.as_deref(), account).map(Some);
         }
         let auth = match self.scheme.as_deref() {
-            Some(scheme) => Some(Auth::from_scheme(auth_manifest, scheme, None)?),
-            None => Auth::from_provider_default(manifest),
+            Some(scheme) => Some(Auth::from_scheme(auth_manifest, scheme, account)?),
+            None => Auth::from_provider_default(manifest).map(|auth| auth.with_account(account)),
         };
         if self.client_id.is_none() && self.client_secret_file.is_none() {
             return Ok(auth);

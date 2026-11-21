@@ -404,6 +404,21 @@ async fn jwt_bearer_login_takes_an_access_token_for_the_assertion_of_the_client(
 }
 
 #[tokio::test]
+async fn jwt_bearer_login_asserts_the_account_that_the_client_acts_as_as_the_subject() {
+    let fake = FakeAuthServer::start(FakeBehavior::default()).await;
+    let client = OAuthClient::new().unwrap();
+    for (account, token) in [
+        ("default", "assertion-access-1"),
+        ("ada@example.test", "assertion-access-2-of-ada@example.test"),
+    ] {
+        let mut login = jwt_bearer_login(fake.jwt_bearer_scheme(), Some(ASSERTION_KEY));
+        login.oauth = login.oauth.acting_as(account);
+        let entry = client.login_jwt_bearer(login).await.unwrap();
+        assert_eq!(entry.access_token().expose_secret(), token, "{account}");
+    }
+}
+
+#[tokio::test]
 async fn jwt_bearer_login_surfaces_the_error_of_the_token_endpoint_and_of_the_key() {
     let fake = FakeAuthServer::start(FakeBehavior::default()).await;
     let client = OAuthClient::new().unwrap();

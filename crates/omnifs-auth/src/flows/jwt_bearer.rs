@@ -20,6 +20,8 @@ const ASSERTION_LIFETIME: Duration = Duration::HOUR;
 #[derive(Serialize)]
 struct Claims<'a> {
     iss: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<&'a str>,
     scope: String,
     aud: &'a str,
     iat: i64,
@@ -118,14 +120,16 @@ impl OAuthClient {
     }
 }
 
-/// The assertion of the client at `now`: its ID as the issuer, the scopes of
-/// the request, and the token endpoint as the audience, signed with RS256.
+/// The assertion of the client at `now`: its ID as the issuer, the account
+/// that it acts as as the subject, the scopes of the request, and the token
+/// endpoint as the audience, signed with RS256.
 fn assertion(request: &OAuthRequest, now: OffsetDateTime) -> Result<String, AuthError> {
     let issuer = request.effective_client_id()?;
     let key = EncodingKey::from_rsa_pem(request.assertion_key()?.expose_secret().as_bytes())
         .map_err(|error| AuthError::AssertionKey(error.to_string()))?;
     let claims = Claims {
         iss: &issuer,
+        sub: request.subject(),
         scope: request.scheme.default_scopes.join(" "),
         aud: &request.scheme.token_endpoint,
         iat: now.unix_timestamp(),

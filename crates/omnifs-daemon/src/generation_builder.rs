@@ -472,7 +472,8 @@ fn build_auth_binding(
             let request = OAuthRequest::from_runtime(
                 scheme.clone(),
                 runtime_overrides(&credential.overrides)?,
-            )?;
+            )?
+            .acting_as(credential.id.account());
             service.bind_oauth(
                 credential.id.clone(),
                 request,

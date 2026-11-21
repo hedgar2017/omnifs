@@ -85,6 +85,15 @@ impl Auth {
         matches!(self, Self::OAuth(_))
     }
 
+    /// This auth for the credential of `account`.
+    pub(crate) fn with_account(mut self, account: Option<String>) -> Self {
+        match &mut self {
+            Self::StaticToken(config) => config.account = account,
+            Self::OAuth(config) => config.account = account,
+        }
+        self
+    }
+
     pub(crate) fn as_oauth(&self) -> Option<&OAuth> {
         match self {
             Self::OAuth(config) => Some(config),

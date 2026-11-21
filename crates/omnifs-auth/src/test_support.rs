@@ -327,6 +327,7 @@ impl FakeAuthServer {
     ) {
         #[derive(serde::Deserialize)]
         struct Claims {
+            sub: Option<String>,
             scope: String,
             iat: i64,
             exp: i64,
@@ -348,8 +349,12 @@ impl FakeAuthServer {
         assert_eq!(token.claims.scope, "read write");
         assert_eq!(token.claims.exp - token.claims.iat, 3600);
         let id = self.state.next_token.fetch_add(1, Ordering::SeqCst);
+        let subject = token
+            .claims
+            .sub
+            .map_or_else(String::new, |subject| format!("-of-{subject}"));
         let body = serde_json::json!({
-            "access_token": format!("assertion-access-{id}"),
+            "access_token": format!("assertion-access-{id}{subject}"),
             "expires_in": 3599,
             "token_type": "Bearer",
         })

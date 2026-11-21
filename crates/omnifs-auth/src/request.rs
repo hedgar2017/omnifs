@@ -22,6 +22,8 @@ pub struct OAuthRequest {
     pub(crate) scheme: OauthScheme,
     client_id: Option<String>,
     client_secret: Option<SecretString>,
+    /// The account that the client acts as, in place of its own.
+    subject: Option<String>,
 }
 
 /// Client-supplied overrides for one OAuth login.
@@ -66,7 +68,23 @@ impl OAuthRequest {
             scheme,
             client_id: None,
             client_secret: None,
+            subject: None,
         }
+    }
+
+    /// The request of the client for the credential of `account`: its own
+    /// for the default account, and else that of the account that it acts
+    /// as, the subject of its assertions.
+    #[must_use]
+    pub fn acting_as(mut self, account: &str) -> Self {
+        self.subject =
+            (account != crate::AccountId::default_account().as_str()).then(|| account.to_owned());
+        self
+    }
+
+    /// The account that the client acts as, none for its own.
+    pub(crate) fn subject(&self) -> Option<&str> {
+        self.subject.as_deref()
     }
 
     #[must_use]
@@ -88,6 +106,7 @@ impl OAuthRequest {
         right.inject_value_prefix.clear();
 
         left == right
+            && self.subject == other.subject
             && self.client_id == other.client_id
             && self.client_secret.as_ref().map(ExposeSecret::expose_secret)
                 == other
