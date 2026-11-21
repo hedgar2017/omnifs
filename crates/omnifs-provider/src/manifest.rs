@@ -416,6 +416,13 @@ fn validate_oauth_flow(key: &str, oauth: &OauthScheme) -> Result<(), ProviderMet
         &oauth.token_endpoint,
     )?;
     match &oauth.flow {
+        OAuthFlow::JwtBearer => {
+            if !oauth.token_endpoint_auth.is_none() {
+                return Err(ProviderMetadataError::Validation(format!(
+                    "auth.schemes.{key}.tokenEndpointAuth must be none for the flow jwtBearer, whose assertion authenticates the client"
+                )));
+            }
+        },
         OAuthFlow::DeviceCode(d) => {
             validate_https_endpoint(
                 &format!("auth.schemes.{key}.flow.deviceAuthorizationEndpoint"),

@@ -43,11 +43,19 @@ pub struct AddArgs {
     /// OAuth scope to request. Repeat for multiple scopes.
     #[arg(long = "scope")]
     pub scopes: Vec<String>,
+    /// OAuth client ID to use instead of the provider default, as the email
+    /// of a service account.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["token", "token_env"])]
+    pub client_id: Option<String>,
+    /// Read the OAuth client secret from this file, as the PEM of the
+    /// private key of a service account.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["token", "token_env"])]
+    pub client_secret_file: Option<String>,
     /// Auth scheme to use instead of the provider default.
     #[arg(long, value_name = "SCHEME")]
     pub scheme: Option<String>,
     /// Do not write an auth block, even if the provider declares a default.
-    #[arg(long, conflicts_with_all = ["token", "token_env", "scheme"])]
+    #[arg(long, conflicts_with_all = ["token", "token_env", "scheme", "client_id", "client_secret_file"])]
     pub no_auth: bool,
     /// Full provider config JSON object to write into the mount spec.
     #[arg(long = "config-json", value_name = "JSON")]
@@ -125,10 +133,21 @@ impl AddArgs {
         if self.token.is_some() || self.token_env.is_some() {
             return Auth::static_token(auth_manifest, self.scheme.as_deref(), None).map(Some);
         }
-        if let Some(scheme) = self.scheme.as_deref() {
-            return Auth::from_scheme(auth_manifest, scheme, None).map(Some);
+        let auth = match self.scheme.as_deref() {
+            Some(scheme) => Some(Auth::from_scheme(auth_manifest, scheme, None)?),
+            None => Auth::from_provider_default(manifest),
+        };
+        if self.client_id.is_none() && self.client_secret_file.is_none() {
+            return Ok(auth);
         }
-        Ok(Auth::from_provider_default(manifest))
+        let Some(Auth::OAuth(oauth)) = auth else {
+            anyhow::bail!("`--client-id` and `--client-secret-file` need an OAuth auth scheme");
+        };
+        Ok(Some(Auth::OAuth(crate::auth::OAuth {
+            client_id: self.client_id.clone(),
+            client_secret_file: self.client_secret_file.clone(),
+            ..oauth
+        })))
     }
 
     /// Apply `--config-json`'s override onto an already-generated default

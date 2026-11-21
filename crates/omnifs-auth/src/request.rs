@@ -167,7 +167,30 @@ impl OAuthRequest {
                 flow: flow.clone(),
                 oauth: self,
             }),
+            OAuthFlow::JwtBearer => LoginRequest::JwtBearer(JwtBearerLoginRequest { oauth: self }),
         }
+    }
+
+    /// The client secret of the request, which the daemon needs with the
+    /// credential to ask the token endpoint again.
+    #[must_use]
+    pub fn client_secret(&self) -> Option<&SecretString> {
+        self.client_secret.as_ref()
+    }
+
+    /// Whether the token endpoint gives a new access token for an assertion
+    /// of the client alone, without a refresh token.
+    #[must_use]
+    pub fn renews_by_assertion(&self) -> bool {
+        !self.scheme.flow.needs_user()
+    }
+
+    /// The private key of the client for the assertions of the JWT bearer
+    /// grant.
+    pub(crate) fn assertion_key(&self) -> Result<&SecretString, AuthError> {
+        self.client_secret
+            .as_ref()
+            .ok_or(AuthError::MissingClientSecret)
     }
 
     pub(crate) fn effective_client_id(&self) -> Result<String, AuthError> {
@@ -225,7 +248,7 @@ impl OAuthRequest {
                 OAuthFlow::ClientSideToken(flow) => {
                     redirect_uri.clone_into(&mut flow.redirect_uri_template);
                 },
-                OAuthFlow::DeviceCode(_) => {},
+                OAuthFlow::DeviceCode(_) | OAuthFlow::JwtBearer => {},
             }
         }
 
@@ -265,7 +288,7 @@ impl OAuthRequest {
                 OAuthFlow::ClientSideToken(flow) => {
                     redirect_uri.clone_into(&mut flow.redirect_uri_template);
                 },
-                OAuthFlow::DeviceCode(_) => {},
+                OAuthFlow::DeviceCode(_) | OAuthFlow::JwtBearer => {},
             }
         }
 
@@ -289,6 +312,7 @@ pub enum LoginRequest {
     ManualCode(ManualCodeLoginRequest),
     ClientSideToken(ClientSideTokenLoginRequest),
     DeviceCode(DeviceCodeLoginRequest),
+    JwtBearer(JwtBearerLoginRequest),
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +337,11 @@ pub struct ClientSideTokenLoginRequest {
 pub struct DeviceCodeLoginRequest {
     pub(crate) oauth: OAuthRequest,
     pub(crate) flow: DeviceCodeConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct JwtBearerLoginRequest {
+    pub(crate) oauth: OAuthRequest,
 }
 
 fn read_oauth_client_secret(

@@ -15,8 +15,8 @@ pub use error::AuthError;
 pub use flows::{DeviceCodePrompt, ManualCode};
 pub use ids::{AccountId, AuthKind, CredentialId, CredentialIdError, SchemeId};
 pub use request::{
-    DeviceCodeLoginRequest, LoginRequest, LoopbackLoginRequest, ManualCodeLoginRequest,
-    OAuthRequest, OAuthRequestConfig, OAuthRuntimeOverrides,
+    DeviceCodeLoginRequest, JwtBearerLoginRequest, LoginRequest, LoopbackLoginRequest,
+    ManualCodeLoginRequest, OAuthRequest, OAuthRequestConfig, OAuthRuntimeOverrides,
 };
 pub use resolve::SchemeResolveError;
 pub use scheme::{

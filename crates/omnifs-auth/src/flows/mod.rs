@@ -1,5 +1,6 @@
 pub(crate) mod device;
 pub(crate) mod implicit;
+pub(crate) mod jwt_bearer;
 pub(crate) mod loopback;
 pub(crate) mod manual;
 

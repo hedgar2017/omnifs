@@ -318,7 +318,12 @@ pub(crate) async fn assemble_mount_build(
     .resolve(output, mount_add_key_width())?;
     let ImportOutcome { auth, token } = import_outcome;
 
-    if !interactive && token.is_none() && auth.as_ref().is_some_and(Auth::is_oauth) {
+    // An OAuth flow without a user, as the JWT bearer grant of a service
+    // account, completes without a terminal.
+    let needs_user = auth
+        .as_ref()
+        .is_some_and(|auth| oauth_needs_user(auth_manifest.as_ref(), auth));
+    if !interactive && token.is_none() && needs_user {
         return Err(anyhow!(
             "cannot complete OAuth for `{provider_name}` without an interactive terminal"
         ))
@@ -387,6 +392,15 @@ pub(crate) async fn assemble_mount_build(
     })
 }
 
+/// Whether a user signs in for the OAuth scheme of `auth`: not for a flow
+/// without a user, as the JWT bearer grant of a service account.
+fn oauth_needs_user(auth_manifest: Option<&omnifs_auth::AuthManifest>, auth: &Auth) -> bool {
+    auth.is_oauth()
+        && auth_manifest
+            .and_then(|manifest| manifest.resolve_oauth_scheme(auth.scheme()).ok())
+            .is_none_or(|scheme| scheme.flow.needs_user())
+}
+
 impl MountBuild {
     /// Collect fresh credential material before any mutation begins: the
     /// OAuth browser handoff and static-token collection are both
@@ -425,16 +439,22 @@ impl MountBuild {
             // A decline is a clean skip, not a failure; `--no-input` (or a run
             // with no real terminal) also declines rather than attempting a
             // browser handoff nobody is present to complete.
-            let proceed = crate::ui::consent::resolve_confirm(
-                prompt,
-                format!(
-                    "Sign in to {} in your browser now?",
-                    plan.manifest.display_name
-                ),
-                true,
-                false,
-                output,
-            )?;
+            let auth_manifest = plan
+                .manifest
+                .auth
+                .as_ref()
+                .map(ProviderAuthManifest::wasm_auth_manifest);
+            let proceed = !oauth_needs_user(auth_manifest.as_ref(), auth)
+                || crate::ui::consent::resolve_confirm(
+                    prompt,
+                    format!(
+                        "Sign in to {} in your browser now?",
+                        plan.manifest.display_name
+                    ),
+                    true,
+                    false,
+                    output,
+                )?;
             if !proceed {
                 return Ok(MountInitStatus::SignInDeclined);
             }

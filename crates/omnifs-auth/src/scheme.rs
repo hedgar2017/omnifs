@@ -167,6 +167,20 @@ pub enum OAuthFlow {
     PkceManualCode(PkceManualCodeConfig),
     ClientSideToken(ClientSideTokenConfig),
     DeviceCode(DeviceCodeConfig),
+    /// The JWT bearer grant of RFC 7523: the client signs an assertion with
+    /// its own key and the token endpoint answers it with an access token.
+    /// No user signs in and no refresh token exists; the client ID is the
+    /// issuer of the assertion and the client secret is the PEM of its RSA
+    /// private key, as of a service account.
+    JwtBearer,
+}
+
+impl OAuthFlow {
+    /// Whether a user signs in for the first access token of the flow.
+    #[must_use]
+    pub fn needs_user(&self) -> bool {
+        !matches!(self, Self::JwtBearer)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

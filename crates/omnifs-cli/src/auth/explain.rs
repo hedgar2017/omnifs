@@ -23,6 +23,9 @@ pub(crate) fn experience(flow: &OAuthFlow) -> &'static str {
         OAuthFlow::ClientSideToken(_) => {
             "omnifs opens your browser; the provider returns the access token directly in the redirect, with no code exchange. Used by providers that only offer this flow; usually no refresh token."
         },
+        OAuthFlow::JwtBearer => {
+            "omnifs signs an assertion with the private key of the client, as of a service account, and the provider answers it with an access token. No browser opens and nobody signs in, so this works on headless machines."
+        },
     }
 }
 
@@ -32,5 +35,6 @@ pub(crate) fn label(flow: &OAuthFlow) -> &'static str {
         OAuthFlow::PkceLoopback(_) => "OAuth browser redirect (PKCE)",
         OAuthFlow::PkceManualCode(_) => "OAuth paste-the-redirect (PKCE)",
         OAuthFlow::ClientSideToken(_) => "OAuth token redirect",
+        OAuthFlow::JwtBearer => "OAuth JWT bearer grant",
     }
 }

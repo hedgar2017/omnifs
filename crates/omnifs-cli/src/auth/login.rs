@@ -69,6 +69,9 @@ pub(crate) async fn login_for_submission(
         .as_ref()
         .map(|auth| auth.guidance_for(scheme_key))
         .unwrap_or_default();
+    let client_secret = request
+        .client_secret()
+        .map(|secret| SecretBytes::new(secret.expose_secret().as_bytes().to_vec()));
     let entry = run_oauth(
         request,
         manifest.id.as_str(),
@@ -102,7 +105,7 @@ pub(crate) async fn login_for_submission(
         },
         overrides: CredentialClientOverrides {
             client_id: auth.as_oauth().and_then(|oauth| oauth.client_id.clone()),
-            client_secret: None,
+            client_secret,
             redirect_uri: auth.as_oauth().and_then(|oauth| oauth.redirect_uri.clone()),
             scopes: requested_scopes,
         },
@@ -146,6 +149,10 @@ async fn run_oauth(
             .with_hint(format!("Re-run `omnifs mount reauth {mount}` to retry"))?,
         LoginRequest::ClientSideToken(request) => client
             .login_client_side_token(request)
+            .await
+            .with_hint(format!("Re-run `omnifs mount reauth {mount}` to retry"))?,
+        LoginRequest::JwtBearer(request) => client
+            .login_jwt_bearer(request)
             .await
             .with_hint(format!("Re-run `omnifs mount reauth {mount}` to retry"))?,
         LoginRequest::ManualCode(_) if no_input => {

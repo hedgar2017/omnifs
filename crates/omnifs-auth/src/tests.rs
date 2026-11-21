@@ -1,6 +1,8 @@
 use crate::callback::{LoopbackCallback, LoopbackEndpoint, accept_callback_request};
 use crate::request::ClientSideTokenLoginRequest;
-use crate::test_support::{FakeAuthServer, FakeBehavior, FakeOpener, FakeRevocationServer};
+use crate::test_support::{
+    ASSERTION_KEY, FakeAuthServer, FakeBehavior, FakeOpener, FakeRevocationServer,
+};
 use crate::{
     AuthBinding, AuthError, CredentialService, LoginRequest, OAuthClient, OAuthRequest,
     OAuthRequestConfig, OAuthRevokeOutcome, RefreshOutcome, UrlOpener,
@@ -360,6 +362,132 @@ async fn refresh_exchange_parses_rotated_refresh_token() {
     );
     assert_eq!(entry.scopes(), ["read", "write"]);
     assert_eq!(entry.upstream_identity(), Some("user@example.test"));
+}
+
+fn jwt_bearer_login(scheme: OauthScheme, key: Option<&str>) -> crate::JwtBearerLoginRequest {
+    let request = OAuthRequest::from_runtime(
+        scheme,
+        crate::OAuthRuntimeOverrides {
+            client_secret: key.map(|key| SecretString::from(key.to_owned())),
+            ..crate::OAuthRuntimeOverrides::default()
+        },
+    )
+    .unwrap();
+    let LoginRequest::JwtBearer(login) = request.into_login_request() else {
+        panic!("the JWT bearer flow has its own login");
+    };
+    login
+}
+
+#[tokio::test]
+async fn jwt_bearer_login_takes_an_access_token_for_the_assertion_of_the_client() {
+    let fake = FakeAuthServer::start(FakeBehavior::default()).await;
+    let before = OffsetDateTime::now_utc();
+
+    let entry = OAuthClient::new()
+        .unwrap()
+        .login_jwt_bearer(jwt_bearer_login(
+            fake.jwt_bearer_scheme(),
+            Some(ASSERTION_KEY),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(entry.access_token().expose_secret(), "assertion-access-1");
+    assert!(entry.refresh_token().is_none());
+    assert_eq!(entry.scopes(), ["read", "write"]);
+    let lifetime = entry.expires_at().unwrap() - before;
+    assert!(
+        (3599..=3600).contains(&lifetime.whole_seconds()),
+        "{lifetime}"
+    );
+}
+
+#[tokio::test]
+async fn jwt_bearer_login_surfaces_the_error_of_the_token_endpoint_and_of_the_key() {
+    let fake = FakeAuthServer::start(FakeBehavior::default()).await;
+    let client = OAuthClient::new().unwrap();
+
+    let mut other = fake.jwt_bearer_scheme();
+    other.default_client_id = Some("another-client".to_owned());
+    let error = client
+        .login_jwt_bearer(jwt_bearer_login(other, Some(ASSERTION_KEY)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AuthError::TokenEndpoint { error, .. } if error == "invalid_grant"),
+        "{error}"
+    );
+
+    let error = client
+        .login_jwt_bearer(jwt_bearer_login(fake.jwt_bearer_scheme(), Some("no key")))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AuthError::AssertionKey(_)), "{error}");
+
+    let error = client
+        .login_jwt_bearer(jwt_bearer_login(fake.jwt_bearer_scheme(), None))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AuthError::MissingClientSecret), "{error}");
+}
+
+#[tokio::test]
+async fn jwt_bearer_binding_renews_an_expired_token_without_a_refresh_token() {
+    let fake = FakeAuthServer::start(FakeBehavior::default()).await;
+    let id = CredentialId::new("test-provider", "oauth", "default").unwrap();
+    let entry = CredentialEntry::oauth(
+        SecretString::from("old-access".to_owned()),
+        None,
+        Some(OffsetDateTime::now_utc() - time::Duration::seconds(1)),
+        "Bearer",
+        vec!["read".to_owned(), "write".to_owned()],
+    );
+    let service = Arc::new(CredentialService::new(
+        [(
+            id.clone(),
+            DurableCredentialSnapshot {
+                entry,
+                version: CredentialVersion::initial(),
+            },
+        )],
+        OAuthClient::new().unwrap(),
+        Arc::new(SimpleRefreshSink),
+    ));
+    let request = OAuthRequest::from_runtime(
+        fake.jwt_bearer_scheme(),
+        crate::OAuthRuntimeOverrides {
+            client_secret: Some(SecretString::from(ASSERTION_KEY.to_owned())),
+            ..crate::OAuthRuntimeOverrides::default()
+        },
+    )
+    .unwrap();
+    let binding = service
+        .bind_oauth(
+            id,
+            request,
+            vec!["api.example.test".to_owned()],
+            "Authorization".to_owned(),
+            "Bearer ".to_owned(),
+        )
+        .unwrap();
+
+    assert_eq!(binding.health(), crate::CredentialHealth::Expired);
+    let header = binding
+        .authorization_for("https://api.example.test/files")
+        .await
+        .unwrap();
+    assert_eq!(
+        header,
+        Some((
+            "Authorization".to_owned(),
+            "Bearer assertion-access-1".to_owned()
+        ))
+    );
+    assert_eq!(binding.health(), crate::CredentialHealth::Ready);
+    let current = binding.current_for_test().unwrap();
+    assert!(current.refresh_token().is_none());
+    assert_eq!(current.scopes(), ["read", "write"]);
 }
 
 #[tokio::test]

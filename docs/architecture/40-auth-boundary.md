@@ -9,7 +9,7 @@ Providers are sandboxed WASM components. They cannot read the credential store, 
 
 The host implements protocols, not vendors.
 
-The host can know OAuth authorization code with PKCE, OAuth device flow, static token injection, credential storage, refresh, retry, and capability enforcement. It must not know that a specific provider's authorization endpoint, scope shape, or API host belongs to GitHub, Linear, Slack, or another vendor.
+The host can know OAuth authorization code with PKCE, OAuth device flow, the OAuth JWT bearer grant of a client that signs its own assertions (as a service account, with no user and no refresh token), static token injection, credential storage, refresh, retry, and capability enforcement. It must not know that a specific provider's authorization endpoint, scope shape, or API host belongs to GitHub, Linear, Slack, or another vendor.
 
 Vendor knowledge lives in provider metadata and provider docs. A new service should require a provider change, not a host table entry, unless the service needs a new protocol family.
 

@@ -51,6 +51,9 @@ impl OAuthClient {
         request: OAuthRequest,
         current: &CredentialEntry,
     ) -> Result<CredentialEntry, AuthError> {
+        if request.renews_by_assertion() {
+            return self.assert_again(&request, current).await;
+        }
         let client = request.token_client()?;
         let refresh_token = current.refresh_token().ok_or_else(|| {
             AuthError::RequestConfig("OAuth credential has no refresh token".to_owned())

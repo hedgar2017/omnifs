@@ -45,6 +45,10 @@ pub enum AuthError {
         error: String,
         description: Option<String>,
     },
+    #[error("oauth assertion key is not the PEM of an RSA private key: {0}")]
+    AssertionKey(String),
+    #[error("oauth token endpoint answer is invalid: {0}")]
+    TokenAnswer(String),
     #[error("oauth revocation endpoint error: {0}")]
     RevocationEndpoint(String),
     #[error("oauth url error: {0}")]

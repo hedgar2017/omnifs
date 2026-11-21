@@ -13,6 +13,11 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use url::Url;
 
+/// The private key of the client of the JWT bearer grant, of the tests alone.
+pub(super) const ASSERTION_KEY: &str = include_str!("fixtures/assertion_key.pem");
+
+const ASSERTION_PUBLIC_KEY: &str = include_str!("fixtures/assertion_key.pub.pem");
+
 #[derive(Clone, Default)]
 pub(super) struct FakeBehavior {
     pub(super) state_override: Option<String>,
@@ -108,6 +113,12 @@ impl FakeAuthServer {
             }),
             revocation_endpoint,
         )
+    }
+
+    /// A scheme of the JWT bearer grant, whose assertions the key of
+    /// [`ASSERTION_KEY`] signs.
+    pub(super) fn jwt_bearer_scheme(&self) -> OauthScheme {
+        self.scheme(OAuthFlow::JwtBearer, None)
     }
 
     pub(super) fn device_scheme(
@@ -306,11 +317,57 @@ impl FakeAuthServer {
         write_fake_response(stream, "200 OK", "application/json", &body).await;
     }
 
+    /// An access token for an assertion of `client-id` with the scopes of
+    /// the scheme and this token endpoint as its audience, signed with the
+    /// key of [`ASSERTION_KEY`]; the error `invalid_grant` for another.
+    async fn handle_assertion(
+        &self,
+        stream: &mut tokio::net::TcpStream,
+        params: &HashMap<String, String>,
+    ) {
+        #[derive(serde::Deserialize)]
+        struct Claims {
+            scope: String,
+            iat: i64,
+            exp: i64,
+        }
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_issuer(&["client-id"]);
+        validation.set_audience(&[self.endpoint("/token")]);
+        let key = jsonwebtoken::DecodingKey::from_rsa_pem(ASSERTION_PUBLIC_KEY.as_bytes()).unwrap();
+        let Ok(token) = jsonwebtoken::decode::<Claims>(&params["assertion"], &key, &validation)
+        else {
+            let body = serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Invalid JWT Signature.",
+            })
+            .to_string();
+            write_fake_response(stream, "400 Bad Request", "application/json", &body).await;
+            return;
+        };
+        assert_eq!(token.claims.scope, "read write");
+        assert_eq!(token.claims.exp - token.claims.iat, 3600);
+        let id = self.state.next_token.fetch_add(1, Ordering::SeqCst);
+        let body = serde_json::json!({
+            "access_token": format!("assertion-access-{id}"),
+            "expires_in": 3599,
+            "token_type": "Bearer",
+        })
+        .to_string();
+        write_fake_response(stream, "200 OK", "application/json", &body).await;
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn handle_token(&self, stream: &mut tokio::net::TcpStream, body: &str) {
         let params: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
             .into_owned()
             .collect();
+        if params.get("grant_type").map(String::as_str)
+            == Some("urn:ietf:params:oauth:grant-type:jwt-bearer")
+        {
+            self.handle_assertion(stream, &params).await;
+            return;
+        }
         assert_eq!(
             params.get("client_id").map(String::as_str),
             Some("client-id")

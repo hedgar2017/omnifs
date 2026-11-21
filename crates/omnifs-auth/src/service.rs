@@ -283,7 +283,12 @@ impl AuthBinding {
             return CredentialHealth::RefreshFailed { attempts: failures };
         }
         if entry.is_expired_at(now) {
-            return if entry.refresh_token().is_some() {
+            return if entry.refresh_token().is_some()
+                || self
+                    .request
+                    .as_ref()
+                    .is_some_and(OAuthRequest::renews_by_assertion)
+            {
                 CredentialHealth::Expired
             } else {
                 CredentialHealth::NeedsConsent
@@ -545,7 +550,7 @@ impl CredentialService {
         if Self::stored_satisfies(&stored, observed, OffsetDateTime::now_utc(), force) {
             return Ok(Some(stored));
         }
-        if stored.refresh_token().is_none() {
+        if stored.refresh_token().is_none() && !request.renews_by_assertion() {
             return Err(RefreshFailure {
                 needs_consent: true,
                 pending: false,
