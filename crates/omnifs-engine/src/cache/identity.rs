@@ -33,8 +33,8 @@ impl ProjectionId {
 
 impl BlobRequestId {
     /// Hash validated request material plus the stable credential partition
-    /// and the version of the bytes that the provider asks for, as the
-    /// request of each version without one. Token bytes and refresh
+    /// and the MD5 of the bytes that the provider asks for, as the request
+    /// of each content without one. Token bytes and refresh
     /// generations never enter this identity.
     pub(crate) fn new(
         auth: Option<&CredentialId>,
@@ -42,7 +42,7 @@ impl BlobRequestId {
         canonical_url: &str,
         headers: &[(String, String)],
         body: Option<&[u8]>,
-        version: Option<&str>,
+        md5: Option<&str>,
     ) -> Self {
         let mut body_material = Vec::new();
         match body {
@@ -64,7 +64,7 @@ impl BlobRequestId {
             &headers,
             &body_material,
         ];
-        parts.extend(version.map(str::as_bytes));
+        parts.extend(md5.map(str::as_bytes));
         Self(hash_parts(b"omnifs/blob-request/v1", &parts))
     }
 

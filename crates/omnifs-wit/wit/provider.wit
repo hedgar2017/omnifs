@@ -425,15 +425,16 @@ interface types {
 
     /// HTTP fetch that lands its response body in the host's disk-backed
     /// blob cache. The host derives identity from the validated request and
-    /// from `version`, the version of the bytes that the provider asks for
-    /// with a request that is the same for each version: the blob of
-    /// another version is no answer of the request.
+    /// from `md5`, the MD5 in lowercase hexadecimal of the bytes that the
+    /// provider asks for with a request that is the same for each content:
+    /// the host answers a successful status with bytes of that MD5 alone,
+    /// and other bytes are the error of the fetch.
     record blob-fetch-request {
         method: string,
         url: string,
         headers: list<header>,
         body: option<list<u8>>,
-        version: option<string>,
+        md5: option<string>,
     }
 
     /// Result of a successful `fetch-blob`. The body is on disk; only the

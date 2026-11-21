@@ -13,6 +13,7 @@ use crate::callouts::{callout_internal, callout_network, callout_too_large, reco
 use crate::http::{HttpStack, decode_response_headers};
 use crate::log_redaction::{LogUrl, WitHeaders};
 use futures::StreamExt;
+use md5::{Digest as _, Md5};
 use omnifs_wit::host::types as wit_types;
 use std::io::Write;
 use std::sync::Arc;
@@ -61,6 +62,10 @@ enum BlobError {
     },
     #[error("network: {0}")]
     Network(String),
+    /// The upstream answered with other bytes than the provider asked for,
+    /// as of a file that changed after the provider read its MD5.
+    #[error("the upstream answered bytes of the MD5 {actual}, not {expected}")]
+    Content { expected: String, actual: String },
     #[error("I/O error")]
     Io(#[source] std::io::Error),
     #[error("{0}")]
@@ -93,7 +98,7 @@ impl From<BlobError> for wit_types::CalloutResult {
     fn from(error: BlobError) -> Self {
         match error {
             BlobError::TooLarge { .. } => callout_too_large(error.to_string()),
-            BlobError::Network(_) => callout_network(error.to_string()),
+            BlobError::Network(_) | BlobError::Content { .. } => callout_network(error.to_string()),
             BlobError::Io(_) => callout_internal(error.to_string()),
             BlobError::Internal(msg) => callout_internal(msg),
         }
@@ -149,7 +154,7 @@ impl BlobExecutor {
                 Ok(request) => {
                     let request_id = request.blob_request_id(
                         self.http.auth_binding_for_url(request.original_url()),
-                        req.version.as_deref(),
+                        req.md5.as_deref(),
                     );
                     let lock = self.resources.blob_request_lock(request_id);
                     let _guard = lock.lock().await;
@@ -172,7 +177,14 @@ impl BlobExecutor {
                             .unwrap_or_else(|_| Err(idle().into()));
                             match sent {
                                 Ok(response) => {
-                                    match self.materialize(operation_id, request_id, response).await
+                                    match self
+                                        .materialize(
+                                            operation_id,
+                                            request_id,
+                                            response,
+                                            req.md5.as_deref(),
+                                        )
+                                        .await
                                     {
                                         Ok(record) => {
                                             wit_types::CalloutResult::BlobFetched((&record).into())
@@ -200,16 +212,19 @@ impl BlobExecutor {
         operation_id: u64,
         request_id: BlobRequestId,
         response: reqwest::Response,
+        md5: Option<&str>,
     ) -> Result<BlobRecord, BlobError> {
         let status = response.status().as_u16();
         let response_headers = decode_response_headers(response.headers());
         let etag = lookup_header(&response_headers, "etag");
         let content_type = lookup_header(&response_headers, "content-type");
 
+        // The body of a failing status is of no content.
         let staged = stream_response_body(
             response,
             &self.resources.body,
             self.limits.max_fetch_blob_bytes,
+            md5.filter(|_| (200..300).contains(&status)),
         )
         .await
         .map_err(|error| error.with_io_context("fetch blob"))?;
@@ -259,10 +274,13 @@ struct StagedBlob {
     size: u64,
 }
 
+/// Stage the body of `response`, of at most `max_bytes` and, for `md5`, of
+/// bytes of that MD5 alone.
 async fn stream_response_body(
     response: reqwest::Response,
     body: &BodyStore,
     max_bytes: u64,
+    md5: Option<&str>,
 ) -> Result<StagedBlob, BlobError> {
     if let Some(content_length) = response.content_length()
         && content_length > max_bytes
@@ -276,6 +294,7 @@ async fn stream_response_body(
     let mut writer = body.stage().map_err(BlobError::from)?;
     let mut stream = response.bytes_stream();
     let mut total = 0_u64;
+    let mut digest = md5.map(|_| Md5::new());
     while let Some(chunk) = tokio::time::timeout(BLOB_IDLE_TIMEOUT, stream.next())
         .await
         .map_err(|_| idle())?
@@ -298,7 +317,19 @@ async fn stream_response_body(
                 actual: total,
             });
         }
+        if let Some(digest) = &mut digest {
+            digest.update(&chunk);
+        }
         writer.write_all(&chunk).map_err(BlobError::Io)?;
+    }
+    if let (Some(expected), Some(digest)) = (md5, digest) {
+        let actual = hex::encode(digest.finalize());
+        if actual != expected {
+            return Err(BlobError::Content {
+                expected: expected.to_owned(),
+                actual,
+            });
+        }
     }
     Ok(StagedBlob {
         writer,
@@ -336,7 +367,7 @@ mod tests {
             .unwrap()
             .into();
 
-        let result = stream_response_body(response, &body, 4).await;
+        let result = stream_response_body(response, &body, 4, None).await;
 
         assert!(matches!(result, Err(BlobError::TooLarge { actual: 5, .. })));
     }
@@ -354,7 +385,7 @@ mod tests {
             .unwrap()
             .into();
 
-        let result = stream_response_body(response, &body, 4).await;
+        let result = stream_response_body(response, &body, 4, None).await;
 
         assert!(matches!(result, Err(BlobError::TooLarge { actual: 5, .. })));
     }
@@ -368,7 +399,7 @@ mod tests {
             .unwrap()
             .into();
 
-        let staged = stream_response_body(response, &body, 5)
+        let staged = stream_response_body(response, &body, 5, None)
             .await
             .expect("stage body");
 

@@ -329,7 +329,7 @@ async fn fetch_blob_uses_same_oauth_retry_path() {
                 url: api.url(),
                 headers: Vec::new(),
                 body: None,
-                version: None,
+                md5: None,
             },
             0,
         )
@@ -344,6 +344,69 @@ async fn fetch_blob_uses_same_oauth_retry_path() {
     }
     assert_eq!(api.calls(), 2);
     assert_eq!(tokens.refreshes(), 1);
+}
+
+/// A blob fetch with an MD5 answers with the bytes of that MD5 alone: other
+/// bytes are the error of the fetch, which the host keeps nothing of, and
+/// the bytes of each MD5 are the blob of their own request.
+#[tokio::test]
+async fn fetch_blob_answers_the_bytes_of_the_md5_that_the_provider_asks_for() {
+    let tokens = FakeTokenServer::start(false).await;
+    let api = FakeHttpsApiServer::start("Bearer access-refresh-1", "blob-body").await;
+    let (auth, _sink, _key) = oauth_binding(tokens.endpoint(), FakeHttpsApiServer::domain());
+    let stack = Arc::new(HttpStack::with_https_client(
+        Some(auth),
+        RuntimeAuthority::for_test(&[FakeHttpsApiServer::domain().as_str()], &[], &[]),
+        test_https_client(),
+    ));
+    let temp = tempfile::tempdir().unwrap();
+    let caches = Caches::open(temp.path()).unwrap();
+    let name = omnifs_core::MountName::new("test").unwrap();
+    let resources = mount(&caches, &name, b"auth-test").unwrap();
+    let executor = BlobExecutor::new(stack, resources, BlobLimits::default());
+    let fetch = |md5: &str| {
+        let request = wit_types::BlobFetchRequest {
+            method: "GET".to_string(),
+            url: api.url(),
+            headers: Vec::new(),
+            body: None,
+            md5: Some(md5.to_string()),
+        };
+        let executor = &executor;
+        async move { executor.fetch(&request, 0).await }
+    };
+
+    let other = fetch("00000000000000000000000000000000").await;
+    assert!(
+        matches!(
+            &other,
+            wit_types::CalloutResult::CalloutError(error)
+                if error.message.contains("3d93da86c9045cb1b17e96790cd19789")
+        ),
+        "{other:?}"
+    );
+    let calls = api.calls();
+    let again = fetch("00000000000000000000000000000000").await;
+    assert!(
+        matches!(again, wit_types::CalloutResult::CalloutError(_)),
+        "{again:?}"
+    );
+    assert!(api.calls() > calls, "the refused bytes answer no request");
+
+    let calls = api.calls();
+    let asked = fetch("3d93da86c9045cb1b17e96790cd19789").await;
+    assert!(
+        matches!(&asked, wit_types::CalloutResult::BlobFetched(blob) if blob.size == 9),
+        "{asked:?}"
+    );
+    assert!(api.calls() > calls);
+    let calls = api.calls();
+    let held = fetch("3d93da86c9045cb1b17e96790cd19789").await;
+    assert!(
+        matches!(held, wit_types::CalloutResult::BlobFetched(_)),
+        "{held:?}"
+    );
+    assert_eq!(api.calls(), calls, "the host holds the bytes of the MD5");
 }
 
 #[tokio::test]

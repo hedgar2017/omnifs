@@ -404,7 +404,7 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
     pub fn into_blob(self) -> BlobRequestBuilder<'a, E, S> {
         BlobRequestBuilder {
             inner: self,
-            version: None,
+            md5: None,
         }
     }
 }
@@ -567,29 +567,41 @@ impl HttpResponse {
 /// [`crate::http::BlobRequest`].
 pub struct BlobRequestBuilder<'a, E, S = ()> {
     inner: RequestBuilder<'a, E, S>,
-    version: Option<String>,
+    md5: Option<String>,
 }
 
 impl<'a, E: EndpointHooks, S> BlobRequestBuilder<'a, E, S> {
-    /// The version of the bytes that the request asks for, for a request
-    /// that is the same for each version: the host answers with the blob of
-    /// this version alone.
+    /// The MD5 in lowercase hexadecimal of the bytes that the request asks
+    /// for, for a request that is the same for each content: the host
+    /// answers with bytes of this MD5 alone.
     #[must_use]
-    pub fn version(mut self, version: impl Into<String>) -> Self {
-        self.version = Some(version.into());
+    pub fn md5(mut self, md5: impl Into<String>) -> Self {
+        self.md5 = Some(md5.into());
         self
     }
 
     /// Fetch the URL into the blob store and return its handle. Applies the
-    /// same 4xx/5xx mapping as the structural terminals, so a `BlobHandle`
-    /// always refers to a successful response body.
+    /// same 4xx/5xx mapping as the structural terminals, and the rate limit
+    /// of the endpoint by the status and the headers of the answer, whose
+    /// body the host holds, so a `BlobHandle` always refers to a successful
+    /// response body.
     pub async fn fetch(self) -> Result<BlobHandle> {
-        let (request, _policy) = self.inner.into_http_request()?;
+        let (request, policy) = self.inner.into_http_request()?;
         let mut blob: BlobRequest<'a, S> = request.into_blob();
-        if let Some(version) = self.version {
-            blob = blob.version(version);
+        if let Some(md5) = self.md5 {
+            blob = blob.md5(md5);
         }
-        let blob_ref = blob.send().await?.error_for_status()?;
+        let blob_ref = blob.send().await?;
+        let mut answer = Response::builder().status(blob_ref.status);
+        for (name, value) in &blob_ref.response_headers {
+            answer = answer.header(name, value);
+        }
+        policy.apply(
+            &answer
+                .body(Vec::new())
+                .map_err(|error| ProviderError::internal(error.to_string()))?,
+        )?;
+        let blob_ref = blob_ref.error_for_status()?;
         Ok(BlobHandle {
             id: blob_ref.id,
             size: blob_ref.size,

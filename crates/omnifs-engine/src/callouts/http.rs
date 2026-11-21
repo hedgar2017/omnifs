@@ -59,7 +59,7 @@ impl ValidatedRequest {
     pub(crate) fn blob_request_id(
         &self,
         auth: Option<&AuthBinding>,
-        version: Option<&str>,
+        md5: Option<&str>,
     ) -> BlobRequestId {
         BlobRequestId::new(
             auth.map(omnifs_auth::AuthBinding::credential_id),
@@ -67,7 +67,7 @@ impl ValidatedRequest {
             &self.canonical_url,
             &self.headers,
             self.body.as_deref(),
-            version,
+            md5,
         )
     }
 

@@ -211,7 +211,7 @@ impl<'cx, S> Request<'cx, S> {
     pub fn into_blob(self) -> BlobRequest<'cx, S> {
         BlobRequest {
             inner: self,
-            version: None,
+            md5: None,
         }
     }
 }
@@ -221,7 +221,7 @@ impl<'cx, S> Request<'cx, S> {
 #[must_use]
 pub struct BlobRequest<'cx, S> {
     inner: Request<'cx, S>,
-    version: Option<String>,
+    md5: Option<String>,
 }
 
 impl<'cx, S> BlobRequest<'cx, S> {
@@ -235,11 +235,11 @@ impl<'cx, S> BlobRequest<'cx, S> {
         self
     }
 
-    /// The version of the bytes that the request asks for, for a request
-    /// that is the same for each version: the host answers with the blob of
-    /// this version alone.
-    pub fn version(mut self, version: impl Into<String>) -> Self {
-        self.version = Some(version.into());
+    /// The MD5 in lowercase hexadecimal of the bytes that the request asks
+    /// for, for a request that is the same for each content: the host
+    /// answers with bytes of this MD5 alone.
+    pub fn md5(mut self, md5: impl Into<String>) -> Self {
+        self.md5 = Some(md5.into());
         self
     }
 
@@ -263,7 +263,7 @@ impl<'cx, S> BlobRequest<'cx, S> {
             self.inner.url,
             WitHeaders(&self.inner.headers).into(),
             self.inner.body,
-            self.version,
+            self.md5,
         );
         CalloutFuture::new(self.inner.cx, callout, crate::blob::extract_blob)
     }

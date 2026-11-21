@@ -151,7 +151,7 @@ fn blob_fetch_request() -> wit_types::BlobFetchRequest {
             value: "Bearer should-not-leak".into(),
         }],
         body: None,
-        version: None,
+        md5: None,
     }
 }
 
