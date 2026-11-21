@@ -312,8 +312,9 @@ pub(crate) struct FeedState {
 /// The feed states one answer of a feed publishes: its own, renewed by an
 /// `unchanged` answer, advanced by a part, or moved to the token of a
 /// restart, a part and a restart dropping its kept parts, and the inner
-/// states the part brought, each a token whose first answer ended. Every
-/// state but that of a restart gets `deadline`. `anchors` pairs each anchor
+/// states the part brought, each a token whose first answer ended, which
+/// drops the kept parts of its feed. Every state but that of a restart gets
+/// `deadline`. `anchors` pairs each anchor
 /// of another facet that the part writes with the anchor of the claim of its
 /// object, and `until` gives each path of the facts of the part with a time
 /// after which they count as lacking for the start of an answer that time.
@@ -1697,14 +1698,7 @@ fn write_feed_states(
     };
     put(tx, facts, key, postcard::to_allocvec(&state)?)?;
     if !matches!(feed.answer, FeedAnswerWrite::Unchanged) {
-        let prefix = kept_prefix(&feed.object);
-        let kept = tx
-            .prefix(facts, prefix.as_slice())
-            .map(|guard| Ok(guard.key()?.to_vec()))
-            .collect::<Result<Vec<_>, ProjectionError>>()?;
-        for key in kept {
-            delete(tx, facts, key)?;
-        }
+        drop_kept_parts(tx, facts, &feed.object)?;
     }
     for (path, anchor) in &feed.anchors {
         put(
@@ -1714,6 +1708,8 @@ fn write_feed_states(
             postcard::to_allocvec(anchor.as_str())?,
         )?;
     }
+    // An inner state is the token of its feed from then on, so the kept parts
+    // of an answer from another token leave with it.
     for (id, token) in &feed.inner {
         put(
             tx,
@@ -1725,6 +1721,24 @@ fn write_feed_states(
                 deadline: feed.deadline,
             })?,
         )?;
+        drop_kept_parts(tx, facts, id)?;
+    }
+    Ok(())
+}
+
+/// Remove the kept parts of the later answer of the feed of the object `id`.
+fn drop_kept_parts(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    id: &[u8],
+) -> Result<(), ProjectionError> {
+    let prefix = kept_prefix(id);
+    let kept = tx
+        .prefix(facts, prefix.as_slice())
+        .map(|guard| Ok(guard.key()?.to_vec()))
+        .collect::<Result<Vec<_>, ProjectionError>>()?;
+    for key in kept {
+        delete(tx, facts, key)?;
     }
     Ok(())
 }
@@ -3112,7 +3126,8 @@ mod tests {
     }
 
     #[test]
-    fn a_join_keeps_the_completeness_of_its_listing_and_a_part_marks_the_until_of_its_facts() {
+    fn a_join_keeps_the_completeness_of_its_listing_and_a_part_marks_the_until_of_its_facts_and_its_states()
+     {
         let (_dir, _caches, store) = open_store("join");
         let books = p("/shelf/books");
         store
@@ -3178,6 +3193,36 @@ mod tests {
                 ended: true,
                 deadline: 1_000,
             })
+        );
+
+        // An inner state drops the kept parts of its feed.
+        store
+            .publish(
+                ProjectionTransition {
+                    kept: Some(KeptWrite {
+                        object: b"inner".to_vec(),
+                        part: b"kept".to_vec(),
+                    }),
+                    ..ProjectionTransition::default()
+                },
+                store.current_epoch(),
+            )
+            .unwrap();
+        let mut part = fed_part("token", HashMap::new());
+        part.inner = vec![(b"inner".to_vec(), "inner token".into())];
+        store
+            .publish(
+                ProjectionTransition {
+                    feed: Some(part),
+                    ..ProjectionTransition::default()
+                },
+                store.current_epoch(),
+            )
+            .unwrap();
+        assert!(!store.has_kept_parts(b"inner").unwrap());
+        assert_eq!(
+            store.feed_state(b"inner").unwrap().map(|state| state.token),
+            Some("inner token".into())
         );
     }
 
