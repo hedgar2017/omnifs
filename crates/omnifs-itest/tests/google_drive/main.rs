@@ -235,6 +235,7 @@ async fn the_changes_take_the_files_after_the_token_of_the_answer_before() {
                     changed(&google("doc-1", "document", "Plan", EDITED_LATER)),
                     removed("folder-1"),
                     changed(&google("folder-2", "folder", "Home", EDITED)),
+                    json!({ "changeType": "drive", "driveId": "drive-1", "removed": false }),
                 ],
                 "changes-2",
             )),
@@ -296,10 +297,15 @@ async fn the_changes_take_the_files_after_the_token_of_the_answer_before() {
     expect_changes(&requests[0], "changes-2");
 }
 
-/// A token of the changes that Google Drive refuses gives the read its error
-/// and begins a full listing again at the next read, after which the files
-/// and the folders that it lacks leave the mount.
+/// A token of the changes that Google Drive refuses with `400` gives the read
+/// its error and begins a full listing again at the next read, after which
+/// the files and the folders that it lacks leave the mount, with the content
+/// of the others as it was; a page of that listing whose token it refuses
+/// with `400` begins the listing again, and one for which it searched not
+/// every drive is the error of the read. Another failing status of the
+/// changes is the error of the read alone.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
     let harness = drive_harness();
     first_full_listing(
@@ -312,26 +318,74 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
         ],
     )
     .await;
+    let (content, _) = answering(
+        &harness,
+        read(&harness, "files/file-1/content"),
+        vec![bytes(200, b"notes")],
+    )
+    .await;
+    assert_eq!(content.unwrap(), "notes");
+
+    // A status other than `400` leaves the token of the changes as it was.
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (denied, requests) = answering(
+        &harness,
+        names(&harness, "files"),
+        vec![failure(403, "insufficientPermissions")],
+    )
+    .await;
+    assert!(denied.is_err(), "{denied:?}");
+    expect_changes(&requests[0], "changes-1");
 
     tokio::time::sleep(PAST_DEADLINE).await;
     let (refused, requests) = answering(
         &harness,
         names(&harness, "files"),
-        vec![failure(410, "gone")],
+        vec![failure(400, "invalid")],
     )
     .await;
     assert!(refused.is_err(), "{refused:?}");
     expect_changes(&requests[0], "changes-1");
+
+    // The second page of the full listing is refused for its token, and the
+    // listing begins again from its first page.
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let first = files(
+        &[uploaded("file-1", "notes.md", "md5-1", 5)],
+        Some("page-2"),
+    );
+    let (refused, requests) = answering(
+        &harness,
+        names(&harness, "files"),
+        vec![
+            ok(&json!({ "startPageToken": "changes-5" })),
+            ok(&first),
+            failure(400, "invalid"),
+        ],
+    )
+    .await;
+    assert!(refused.is_err(), "{refused:?}");
+    expect_start(&requests[0]);
+    expect_listing(&requests[1], None);
+    expect_listing(&requests[2], Some("page-2"));
+
+    // A page for which Google Drive searched not every drive ends no listing.
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let mut incomplete = first.clone();
+    incomplete["incompleteSearch"] = true.into();
+    let (stopped, requests) =
+        answering(&harness, names(&harness, "files"), vec![ok(&incomplete)]).await;
+    assert!(stopped.is_err(), "{stopped:?}");
+    expect_listing(&requests[0], None);
 
     tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "files"),
         vec![
-            ok(&json!({ "startPageToken": "changes-5" })),
+            ok(&first),
             ok(&files(
                 &[
-                    uploaded("file-1", "notes.md", "md5-1", 5),
                     uploaded("file-3", "new.md", "md5-3", 3),
                     google("folder-1", "folder", "Work", EDITED),
                 ],
@@ -341,8 +395,14 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
     )
     .await;
     assert_eq!(listing.unwrap(), sorted(&["file-1", "file-3"]));
-    expect_start(&requests[0]);
-    expect_listing(&requests[1], None);
+    expect_listing(&requests[0], None);
+    expect_listing(&requests[1], Some("page-2"));
+    assert_eq!(
+        served(&harness, read(&harness, "files/file-1/content"))
+            .await
+            .unwrap(),
+        "notes"
+    );
     assert_eq!(
         served(&harness, names(&harness, "folders")).await.unwrap(),
         ["folder-1"]

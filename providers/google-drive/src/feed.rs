@@ -4,8 +4,10 @@
 //! the token of the changes after now and then a full listing of the files
 //! and the folders, and at each later answer the changes after the token of
 //! the answer before it. A request of the changes that Google Drive refuses
-//! for its token begins a full listing again, after which the files and the
-//! folders of the projection that it lacks leave it. The own feed of a file
+//! with `400` for its token begins a full listing again, after which the
+//! files and the folders of the projection that it lacks leave it, and a
+//! request of a full listing that it refuses with `400` for the token of
+//! its page begins the listing again. The own feed of a file
 //! takes it by its ID, and its content, and the own feed of a folder takes
 //! it by its ID.
 
@@ -17,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::api::{
-    Change, ChangeList, Content, DriveApi, FIELDS, FileList, Item, Kind, StartPageToken, decode,
-    status_error,
+    Change, ChangeList, ChangeType, Content, DriveApi, FIELDS, FileList, Item, Kind,
+    StartPageToken, decode, status_error,
 };
 use crate::{Drive, DriveKey, File, FileKey, Folder, FolderKey, Id};
 
@@ -44,8 +46,9 @@ struct DriveToken {
 #[serde(rename_all = "snake_case")]
 enum Stage {
     /// A full listing at the token of its next page, none for its first
-    /// request, with the token of the changes after its start and the IDs of
-    /// its files and folders so far; `first` for the first full listing.
+    /// request, with the token of the changes after its start, and for a
+    /// full listing other than the first the IDs of its files and folders so
+    /// far; `first` for the first full listing.
     Listing {
         first: bool,
         changes: String,
@@ -261,7 +264,9 @@ impl DriveFeed<'_> {
     /// A request of a full listing: its files and folders, then its next
     /// request, and after its last one `files/` and `folders/` complete,
     /// without the files and the folders of the projection that a full
-    /// listing other than the first lacks.
+    /// listing other than the first lacks. A token of a page that Google
+    /// Drive refuses with `400` begins the listing again, and a page for
+    /// which it searched not every drive is the error of the request.
     async fn listing(
         &mut self,
         first: bool,
@@ -279,15 +284,39 @@ impl DriveFeed<'_> {
             .query("supportsAllDrives", "true")
             .query("q", "trashed = false")
             .query("pageSize", PAGE)
-            .query("fields", format!("nextPageToken,files({FIELDS})"));
+            .query(
+                "fields",
+                format!("nextPageToken,incompleteSearch,files({FIELDS})"),
+            );
         if let Some(page) = &page {
             request = request.query("pageToken", page);
         }
         let response = request.send().await?;
-        if response.status() != 200 {
-            return Err(status_error(&response));
+        match response.status() {
+            200 => {},
+            400 if page.is_some() => {
+                return Ok(Feed::restart(
+                    encode(&DriveToken {
+                        changes: None,
+                        stage: Some(Stage::Listing {
+                            first,
+                            changes,
+                            page: None,
+                            files: BTreeSet::new(),
+                            folders: BTreeSet::new(),
+                        }),
+                    })?,
+                    status_error(&response),
+                ));
+            },
+            _ => return Err(status_error(&response)),
         }
         let list: FileList = decode(response.body())?;
+        if list.incomplete_search {
+            return Err(ProviderError::invalid_input(
+                "Google Drive searched not every drive for a full listing",
+            ));
+        }
         let write = if first {
             ListingWrite::Partial
         } else {
@@ -295,13 +324,13 @@ impl DriveFeed<'_> {
         };
         for object in &list.files {
             match self.take(object, write)? {
-                Taken::File(id) => {
+                Taken::File(id) if !first => {
                     files.insert(id);
                 },
-                Taken::Folder(id) => {
+                Taken::Folder(id) if !first => {
                     folders.insert(id);
                 },
-                Taken::Neither => {},
+                Taken::File(_) | Taken::Folder(_) | Taken::Neither => {},
             }
         }
         if let Some(page) = list.next_page_token {
@@ -333,7 +362,7 @@ impl DriveFeed<'_> {
     /// files and the folders that it brings, and the removal of each that the
     /// account no longer has or that is in the trash; then its next request,
     /// and after its last one the token of the changes after it. A token that
-    /// Google Drive refuses begins a full listing again.
+    /// Google Drive refuses with `400` begins a full listing again.
     async fn changes(&mut self, changes: String, page: String) -> Result<Feed> {
         let response = self
             .cx
@@ -346,13 +375,15 @@ impl DriveFeed<'_> {
             .query("pageSize", PAGE)
             .query(
                 "fields",
-                format!("nextPageToken,newStartPageToken,changes(fileId,removed,file({FIELDS}))"),
+                format!(
+                    "nextPageToken,newStartPageToken,changes(changeType,fileId,removed,file({FIELDS}))"
+                ),
             )
             .send()
             .await?;
         match response.status() {
             200 => {},
-            400..=499 if response.status() != 429 => {
+            400 => {
                 return Ok(Feed::restart(
                     encode(&DriveToken {
                         changes: None,
@@ -376,14 +407,22 @@ impl DriveFeed<'_> {
         }
     }
 
-    /// Take a change into the projection.
+    /// Take a change of a file or a folder into the projection: its object,
+    /// or its removal, as a file and as a folder, for one that the account
+    /// no longer has.
     fn change(&mut self, change: &Change) -> Result<()> {
+        if change.of == ChangeType::Drive {
+            return Ok(());
+        }
         match &change.file {
             Some(object) if !change.removed => {
                 self.take(object, ListingWrite::Complete)?;
             },
             _ => {
-                let id = Id::of(&change.file_id)?;
+                let id = change.file_id.as_deref().ok_or_else(|| {
+                    ProviderError::invalid_input("a change of a file of Google Drive has no fileId")
+                })?;
+                let id = Id::of(id)?;
                 self.remove_file(&id)?;
                 self.remove_folder(&id)?;
             },
@@ -398,12 +437,15 @@ impl DriveFeed<'_> {
     fn take(&mut self, object: &RawValue, write: ListingWrite) -> Result<Taken> {
         let item: Item = decode(object.get().as_bytes())?;
         let id = Id::of(&item.id)?;
+        let kind = item.kind()?;
         if item.trashed {
-            self.remove_file(&id)?;
-            self.remove_folder(&id)?;
+            match kind {
+                Kind::Folder => self.remove_folder(&id)?,
+                Kind::File(_) | Kind::Other => self.remove_file(&id)?,
+            }
             return Ok(Taken::Neither);
         }
-        match item.kind()? {
+        match kind {
             Kind::Folder => {
                 write_folder(self.cx, &id, &item, object, write)?;
                 self.inner
@@ -485,7 +527,7 @@ impl File {
         {
             let item: Item = decode(&object)?;
             if let Kind::File(content) = item.kind()? {
-                return file_content(&cx, id, content, &token.revision).await;
+                return file_content(&cx, id, content, &token.revision, true).await;
             }
         }
 
@@ -516,19 +558,23 @@ impl File {
         write_file(&cx, id, &item, &object, ListingWrite::Join)?;
         let start = if changed { cx.due() } else { cx.start() };
         if start == Some("content") {
-            return file_content(&cx, id, content, revision).await;
+            return file_content(&cx, id, content, revision, false).await;
         }
         file_part(revision)
     }
 }
 
-/// The content of a file: the bytes of an uploaded file, or the export of a
-/// file of Google, as its file `content`; the removal of a file with `404`.
+/// The content of a file at `revision`: the bytes of an uploaded file, or
+/// the export of a file of Google, as its file `content`; the removal of a
+/// file with `404`. For `projected`, a revision of the projection from
+/// before the request, the content is of the file only while the projection
+/// still has that revision after it.
 async fn file_content(
     cx: &FeedCx<FileKey>,
     id: &Id,
     content: Content,
     revision: &str,
+    projected: bool,
 ) -> Result<Feed> {
     let endpoint = cx.endpoint(DriveApi);
     let request = match content {
@@ -546,7 +592,11 @@ async fn file_content(
         404 => return file_removal(cx, id),
         _ => return Err(status_error(&response)),
     }
-    cx.file(format!("{}/content", file_path(id)), response.body())?;
+    // A change of the file during the request left another revision in the
+    // projection, whose content the next read takes.
+    if !projected || projected_revision(cx, id)?.as_deref() == Some(revision) {
+        cx.file(format!("{}/content", file_path(id)), response.body())?;
+    }
     file_part(revision)
 }
 

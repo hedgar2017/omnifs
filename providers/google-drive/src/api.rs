@@ -77,13 +77,15 @@ pub(crate) fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
     })
 }
 
-/// A page of the files of Google Drive: its objects as they came, and the
-/// token of its next page while it has one.
+/// A page of the files of Google Drive: its objects as they came, the token
+/// of its next page while it has one, and whether Google Drive searched not
+/// every drive for it.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileList {
     pub(crate) files: Vec<Box<RawValue>>,
     pub(crate) next_page_token: Option<String>,
+    pub(crate) incomplete_search: bool,
 }
 
 /// A page of the changes of Google Drive: the token of its next page while
@@ -96,14 +98,26 @@ pub(crate) struct ChangeList {
     pub(crate) new_start_page_token: Option<String>,
 }
 
-/// A change of a file or a folder: its ID, whether the account no longer
-/// has it, and its object as it came while the account has it.
+/// A change of Google Drive: what it is of, and for a file or a folder its
+/// ID, whether the account no longer has it, and its object as it came
+/// while the account has it.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Change {
-    pub(crate) file_id: String,
+    #[serde(rename = "changeType")]
+    pub(crate) of: ChangeType,
+    pub(crate) file_id: Option<String>,
     pub(crate) removed: bool,
     pub(crate) file: Option<Box<RawValue>>,
+}
+
+/// What a change is of: a file or a folder, or a shared drive, of which the
+/// mount has nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ChangeType {
+    File,
+    Drive,
 }
 
 /// The token of the changes after now.

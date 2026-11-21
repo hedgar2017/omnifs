@@ -125,7 +125,7 @@ pub fn expect_start(request: &HttpRequest) {
 
 /// Check that `request` is that of a full listing from the token `page`.
 pub fn expect_listing(request: &HttpRequest, page: Option<&str>) {
-    let fields = format!("nextPageToken,files({FIELDS})");
+    let fields = format!("nextPageToken,incompleteSearch,files({FIELDS})");
     let mut query = vec![
         ("corpora", "allDrives"),
         ("includeItemsFromAllDrives", "true"),
@@ -142,7 +142,9 @@ pub fn expect_listing(request: &HttpRequest, page: Option<&str>) {
 
 /// Check that `request` is that of the changes from the token `page`.
 pub fn expect_changes(request: &HttpRequest, page: &str) {
-    let fields = format!("nextPageToken,newStartPageToken,changes(fileId,removed,file({FIELDS}))");
+    let fields = format!(
+        "nextPageToken,newStartPageToken,changes(changeType,fileId,removed,file({FIELDS}))"
+    );
     expect(
         request,
         "/changes",
@@ -254,7 +256,7 @@ pub fn trashed(mut object: Value) -> Value {
 
 /// A page of a full listing with `files` and the token of its next page.
 pub fn files(files: &[Value], next: Option<&str>) -> Value {
-    let mut list = json!({ "files": files });
+    let mut list = json!({ "files": files, "incompleteSearch": false });
     if let Some(next) = next {
         list["nextPageToken"] = next.into();
     }
@@ -263,12 +265,12 @@ pub fn files(files: &[Value], next: Option<&str>) -> Value {
 
 /// A change that brings `object`.
 pub fn changed(object: &Value) -> Value {
-    json!({ "fileId": object["id"], "removed": false, "file": object })
+    json!({ "changeType": "file", "fileId": object["id"], "removed": false, "file": object })
 }
 
 /// A change of the item `id` that the account no longer has.
 pub fn removed(id: &str) -> Value {
-    json!({ "fileId": id, "removed": true })
+    json!({ "changeType": "file", "fileId": id, "removed": true })
 }
 
 /// The last page of the changes with `changes` and the token `next` of the
