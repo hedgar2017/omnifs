@@ -487,7 +487,7 @@ async fn jwt_bearer_binding_renews_an_expired_token_without_a_refresh_token() {
         )
         .unwrap();
 
-    assert_eq!(binding.health(), crate::CredentialHealth::Expired);
+    assert_eq!(binding.health(), crate::CredentialHealth::Ready);
     let header = binding
         .authorization_for("https://api.example.test/files")
         .await

@@ -282,13 +282,17 @@ impl AuthBinding {
         if failures > 0 && !CredentialService::is_fresh(&entry, now) {
             return CredentialHealth::RefreshFailed { attempts: failures };
         }
+        // A flow without a user asserts for the next request by itself: its
+        // credential is ready whatever the time of its last token.
+        if self
+            .request
+            .as_ref()
+            .is_some_and(|request| !request.scheme.flow.needs_user())
+        {
+            return CredentialHealth::Ready;
+        }
         if entry.is_expired_at(now) {
-            return if entry.refresh_token().is_some()
-                || self
-                    .request
-                    .as_ref()
-                    .is_some_and(|request| !request.scheme.flow.needs_user())
-            {
+            return if entry.refresh_token().is_some() {
                 CredentialHealth::Expired
             } else {
                 CredentialHealth::NeedsConsent
