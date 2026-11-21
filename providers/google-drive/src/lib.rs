@@ -1,19 +1,22 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-//! google-drive-provider: the files and the folders of a Google Drive for
-//! omnifs.
+//! google-drive-provider: the items of a Google Drive for omnifs.
 //!
 //! The mount has `files/{id}/` for each file with `name`, `file.json`, and
-//! `content`, and `folders/{id}/` for each folder with `name` and
-//! `folder.json`, by the ID of Google Drive, as in a link of Google Drive.
-//! A file is an uploaded file of at most 64 MiB, whose `content` is its
-//! bytes, a document of Google Docs, whose `content` is its Markdown, a
-//! spreadsheet of Google Sheets, whose `content` is the CSV of its first
-//! sheet, or a presentation of Google Slides, whose `content` is its plain
-//! text; the mount has no other item of the Drive. Their facts come from
-//! feeds alone: the feed of the Drive lists the files and the folders and
-//! takes their changes from the changes of Google Drive, and the own feeds of
-//! a file and of a folder take one by its ID, the content of a file too.
+//! `content`, `folders/{id}/` for each folder with `name` and `folder.json`,
+//! and `others/{id}/` for each other item with `name` and `item.json`, by
+//! the ID of Google Drive, as in a link of Google Drive. A file is an
+//! uploaded file, whose `content` is its bytes, of any size, or a file of
+//! Google with an export: a document of Google Docs, whose `content` is its
+//! Markdown, a spreadsheet of Google Sheets, whose `content` is the CSV of
+//! its first sheet, a presentation of Google Slides, whose `content` is its
+//! plain text, a drawing of Google Drawings, whose `content` is its SVG, or
+//! a project of Google Apps Script, whose `content` is its JSON. Another
+//! item is one of Google without bytes of its own, as a form or a shortcut.
+//! Their facts come from feeds alone: the feed of the Drive lists the items
+//! and takes their changes from the changes of Google Drive, and the own
+//! feed of a file, a folder, or another item takes one by its ID, the
+//! content of a file too.
 
 use std::future::Future;
 
@@ -75,8 +78,12 @@ pub(crate) struct FolderKey {
     pub(crate) id: Id,
 }
 
-/// The Drive of the account, with the files and the folders that it can
-/// read.
+#[omnifs_sdk::path_captures]
+pub(crate) struct OtherKey {
+    pub(crate) id: Id,
+}
+
+/// The Drive of the account, with the items that it can read.
 #[omnifs_sdk::object(kind = "google-drive.drive", key = DriveKey, load = fed_only)]
 #[derive(Deserialize)]
 pub(crate) struct Drive {}
@@ -90,6 +97,11 @@ pub(crate) struct File {}
 #[omnifs_sdk::object(kind = "google-drive.folder", key = FolderKey, load = fed_only)]
 #[derive(Deserialize)]
 pub(crate) struct Folder {}
+
+/// An item of the Drive that is no file and no folder.
+#[omnifs_sdk::object(kind = "google-drive.other", key = OtherKey, load = fed_only)]
+#[derive(Deserialize)]
+pub(crate) struct Other {}
 
 /// The load of an object of the mount, which no face asks for: the objects
 /// have no canonical bytes, and the facts of their faces come from feeds
@@ -108,17 +120,23 @@ fn fed_only<O: Object>(
 #[omnifs_sdk::provider(
     id = "google-drive",
     display_name = "Google Drive",
-    description = "files and folders from your Drive",
+    description = "files, folders, and other items from your Drive",
     mount = "google-drive",
-    projection = 1,
+    projection = 2,
     capabilities(domain(
         "www.googleapis.com",
-        "Fetch the files, the folders, the content of the files, and the changes of a Google Drive."
+        "Fetch the items, the content of the files, and the changes of a Google Drive."
     ),),
-    limits(memory_mb(
-        512,
-        "Leave room for the bytes of a file of 64 MiB and its copies on the way to the host."
-    ),),
+    limits(
+        memory_mb(
+            256,
+            "Leave room for the export of a file of Google, of at most 10 MB, and a page of 1,000 items."
+        ),
+        fetch_blob_bytes(
+            5_497_558_138_880,
+            "The largest file of Google Drive, of 5 TB, whose bytes the host holds."
+        ),
+    ),
     auth = r#"{"default":"service-account","schemes":[{"oauth":{"key":"service-account","displayName":"Google service account","authorizationEndpoint":"https://accounts.google.com/o/oauth2/v2/auth","tokenEndpoint":"https://oauth2.googleapis.com/token","defaultScopes":["https://www.googleapis.com/auth/drive.readonly"],"flow":"jwtBearer","injectDomains":["www.googleapis.com"],"injectValuePrefix":"Bearer "}}],"guidance":{"service-account":{"summary":"The key of a Google service account; no browser and no sign-in.","setupSteps":["Create a service account in a Google Cloud project with the Google Drive API enabled, and a JSON key of it.","Share the folders of the Drive with the email of the service account, or give it domain-wide delegation for the scope of the mount and pass the user whose Drive it reads as --account.","Pass `client_email` of the key as --client-id and a file with `private_key` of the key as --client-secret-file."]}}}"#
 )]
 impl GoogleDriveProvider {
@@ -127,7 +145,8 @@ impl GoogleDriveProvider {
             o.dynamic();
             o.dir("files").fed()?;
             o.dir("folders").fed()?;
-            o.feed(Drive::feed).starts(["files", "folders"])?;
+            o.dir("others").fed()?;
+            o.feed(Drive::feed).starts(["files", "folders", "others"])?;
             Ok(())
         })?;
 
@@ -151,6 +170,17 @@ impl GoogleDriveProvider {
             o.feed(Folder::feed)
                 .own()
                 .starts(["", "name", "folder.json"])?;
+            Ok(())
+        })?;
+
+        r.object::<Other>("/others/{id}", |o| {
+            o.dynamic();
+            o.fed();
+            o.file("name").fed()?;
+            o.file("item.json").fed()?;
+            o.feed(Other::feed)
+                .own()
+                .starts(["", "name", "item.json"])?;
             Ok(())
         })?;
 

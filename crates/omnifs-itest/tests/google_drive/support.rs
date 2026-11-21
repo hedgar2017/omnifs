@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 pub const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
 
 /// The fields of a file or a folder that the provider asks for.
-pub const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
+pub const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,headRevisionId,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
 
 pub fn drive_harness() -> RuntimeHarness {
     make_initialized_runtime(
@@ -30,29 +30,54 @@ pub fn drive_harness() -> RuntimeHarness {
     )
 }
 
+/// The answer of Google Drive to a request of a fixture.
+pub enum Answer {
+    /// The answer to a request whose body the provider reads.
+    Fetch(CalloutResult),
+    /// The status and the body of the answer to a request whose body the
+    /// host holds as a blob.
+    Blob(u16, Vec<u8>),
+}
+
+/// The answer `status` with `body` to a request of the bytes of a file.
+pub fn blob(status: u16, body: &[u8]) -> Answer {
+    Answer::Blob(status, body.to_vec())
+}
+
 /// Run a namespace operation, answer the callouts it makes in order with
 /// `answers`, and return its output with the requests of those callouts. An
 /// operation that makes another number of callouts times out.
 pub async fn answering<T>(
     harness: &RuntimeHarness,
     operation: impl Future<Output = T>,
-    answers: Vec<CalloutResult>,
+    answers: Vec<Answer>,
 ) -> (T, Vec<HttpRequest>) {
     let runtime = &harness.runtime;
     let answer = async {
         let mut requests = Vec::new();
-        for result in answers {
+        for answer in answers {
             let callout = loop {
                 match runtime.try_recv_test_callout() {
                     Some(callout) => break callout,
                     None => tokio::time::sleep(Duration::from_millis(2)).await,
                 }
             };
-            let Callout::Fetch(request) = callout.callout() else {
-                panic!("expected a fetch, got {:?}", callout.callout());
-            };
-            requests.push(request.clone());
-            callout.answer(result);
+            match (callout.callout(), answer) {
+                (Callout::Fetch(request), Answer::Fetch(result)) => {
+                    requests.push(request.clone());
+                    callout.answer(result);
+                },
+                (Callout::FetchBlob(request), Answer::Blob(status, body)) => {
+                    requests.push(HttpRequest {
+                        method: request.method.clone(),
+                        url: request.url.clone(),
+                        headers: request.headers.clone(),
+                        body: request.body.clone(),
+                    });
+                    runtime.answer_test_blob(callout, status, &body);
+                },
+                (callout, _) => panic!("another callout than its answer: {callout:?}"),
+            }
         }
         requests
     };
@@ -168,12 +193,13 @@ pub fn expect_item(request: &HttpRequest, id: &str) {
     );
 }
 
-/// Check that `request` is that of the bytes of the uploaded file `id`.
-pub fn expect_bytes(request: &HttpRequest, id: &str) {
+/// Check that `request` is that of the bytes of the revision `revision` of
+/// the uploaded file `id`.
+pub fn expect_bytes(request: &HttpRequest, id: &str, revision: &str) {
     expect(
         request,
-        &format!("/files/{id}"),
-        &[("alt", "media"), ("supportsAllDrives", "true")],
+        &format!("/files/{id}/revisions/{revision}"),
+        &[("alt", "media")],
     );
 }
 
@@ -188,24 +214,24 @@ pub fn expect_export(request: &HttpRequest, id: &str, mime_type: &str) {
 }
 
 /// An answer of Google Drive with `status` and the bytes `body`.
-pub fn bytes(status: u16, body: &[u8]) -> CalloutResult {
-    CalloutResult::HttpResponse(HttpResponse {
+pub fn bytes(status: u16, body: &[u8]) -> Answer {
+    Answer::Fetch(CalloutResult::HttpResponse(HttpResponse {
         status,
         headers: vec![Header {
             name: "Content-Type".to_owned(),
             value: "application/octet-stream".to_owned(),
         }],
         body: body.to_vec(),
-    })
+    }))
 }
 
 /// An answer `200` with `body`.
-pub fn ok(body: &Value) -> CalloutResult {
+pub fn ok(body: &Value) -> Answer {
     bytes(200, body.to_string().as_bytes())
 }
 
 /// An error answer of Google Drive with `status` and `reason`.
-pub fn failure(status: u16, reason: &str) -> CalloutResult {
+pub fn failure(status: u16, reason: &str) -> Answer {
     bytes(
         status,
         json!({
@@ -220,8 +246,9 @@ pub fn failure(status: u16, reason: &str) -> CalloutResult {
     )
 }
 
-/// An uploaded file `id` with `name`, the checksum `md5` and `size` bytes.
-pub fn uploaded(id: &str, name: &str, md5: &str, size: u64) -> Value {
+/// An uploaded file `id` with `name`, the head revision `revision` and
+/// `size` bytes.
+pub fn uploaded(id: &str, name: &str, revision: &str, size: u64) -> Value {
     json!({
         "id": id,
         "name": name,
@@ -231,7 +258,7 @@ pub fn uploaded(id: &str, name: &str, md5: &str, size: u64) -> Value {
         "createdTime": "2026-11-21T09:00:00.000Z",
         "modifiedTime": "2026-11-21T10:00:00.000Z",
         "size": size.to_string(),
-        "md5Checksum": md5,
+        "headRevisionId": revision,
     })
 }
 
@@ -314,5 +341,19 @@ pub async fn names(harness: &RuntimeHarness, path: &str) -> Result<Vec<String>, 
 pub async fn read(harness: &RuntimeHarness, path: &str) -> Result<String, NsError> {
     let file = lookup(harness, path).await?;
     let read = harness.namespace.read(file.path, 0, u32::MAX).await?;
+    assert!(read.eof, "{path}");
     Ok(String::from_utf8(read.bytes).unwrap())
+}
+
+/// At most `len` bytes of the file at `path` from `offset`, and whether
+/// they reach its end.
+pub async fn read_range(
+    harness: &RuntimeHarness,
+    path: &str,
+    offset: u64,
+    len: u32,
+) -> Result<(String, bool), NsError> {
+    let file = lookup(harness, path).await?;
+    let read = harness.namespace.read(file.path, offset, len).await?;
+    Ok((String::from_utf8(read.bytes).unwrap(), read.eof))
 }

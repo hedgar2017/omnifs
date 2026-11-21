@@ -59,11 +59,7 @@ fn over_quota(body: &[u8]) -> bool {
 
 /// The fields of a file or a folder that the provider asks Google Drive for,
 /// and that `file.json` and `folder.json` have.
-pub(crate) const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
-
-/// The largest uploaded file of the mount in bytes, as the largest file that
-/// the host serves from its projection.
-pub(crate) const MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,headRevisionId,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
 
 /// The error of an answer of Google Drive with a failing status.
 pub(crate) fn status_error(response: &HttpResponse) -> ProviderError {
@@ -127,7 +123,7 @@ pub(crate) struct StartPageToken {
     pub(crate) start_page_token: String,
 }
 
-/// What the provider reads of a file or a folder.
+/// What the provider reads of an item of the Drive.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Item {
@@ -136,8 +132,7 @@ pub(crate) struct Item {
     mime_type: String,
     pub(crate) trashed: bool,
     modified_time: String,
-    md5_checksum: Option<String>,
-    size: Option<String>,
+    head_revision_id: Option<String>,
 }
 
 /// What an item is for the mount.
@@ -145,8 +140,7 @@ pub(crate) struct Item {
 pub(crate) enum Kind {
     Folder,
     File(Content),
-    /// An item that the mount has not: another type of Google, or an
-    /// uploaded file of more than [`MAX_BYTES`].
+    /// An item of Google without bytes of its own, as a form or a shortcut.
     Other,
 }
 
@@ -162,38 +156,30 @@ pub(crate) enum Content {
 const GOOGLE: &str = "application/vnd.google-apps.";
 
 impl Item {
-    /// What the item is for the mount, by its MIME type and its size.
-    pub(crate) fn kind(&self) -> Result<Kind> {
-        Ok(match self.mime_type.strip_prefix(GOOGLE) {
+    /// What the item is for the mount, by its MIME type.
+    pub(crate) fn kind(&self) -> Kind {
+        match self.mime_type.strip_prefix(GOOGLE) {
             Some("folder") => Kind::Folder,
             Some("document") => Kind::File(Content::Export("text/markdown")),
             Some("spreadsheet") => Kind::File(Content::Export("text/csv")),
             Some("presentation") => Kind::File(Content::Export("text/plain")),
+            Some("drawing") => Kind::File(Content::Export("image/svg+xml")),
+            Some("script") => {
+                Kind::File(Content::Export("application/vnd.google-apps.script+json"))
+            },
             Some(_) => Kind::Other,
-            None if self.bytes()? <= MAX_BYTES => Kind::File(Content::Bytes),
-            None => Kind::Other,
-        })
+            None => Kind::File(Content::Bytes),
+        }
     }
 
-    /// The size of an uploaded file in bytes.
-    fn bytes(&self) -> Result<u64> {
-        self.size
-            .as_deref()
-            .ok_or_else(|| {
-                ProviderError::invalid_input("an uploaded file of Google Drive has no size")
-            })?
-            .parse()
-            .map_err(|error| {
-                ProviderError::invalid_input(format!("the size of a file of Google Drive: {error}"))
-            })
-    }
-
-    /// What changes with the content of a file: the checksum of an uploaded
-    /// file, and the `modifiedTime` of a file of Google.
+    /// What changes with the content of a file: the head revision of an
+    /// uploaded file, and the `modifiedTime` of a file of Google.
     pub(crate) fn revision(&self, content: Content) -> Result<&str> {
         match content {
-            Content::Bytes => self.md5_checksum.as_deref().ok_or_else(|| {
-                ProviderError::invalid_input("an uploaded file of Google Drive has no md5Checksum")
+            Content::Bytes => self.head_revision_id.as_deref().ok_or_else(|| {
+                ProviderError::invalid_input(
+                    "an uploaded file of Google Drive has no headRevisionId",
+                )
             }),
             Content::Export(_) => Ok(&self.modified_time),
         }
