@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::object_id::ObjectId;
-use crate::view::{MAX_EAGER_RESPONSE_BYTES, MAX_FEED_TOKEN_BYTES, MAX_VERSION_TOKEN_BYTES};
+use crate::view::{MAX_EAGER_RESPONSE_BYTES, MAX_VERSION_TOKEN_BYTES};
 use crate::wit_protocol::{try_file_attrs_from_attrs, try_file_attrs_from_file_out};
 use omnifs_core::path::{Path, Segment};
 use omnifs_wit::host::types as wit_types;
@@ -83,12 +83,18 @@ where
         })
     }
 
+    /// A feed token carries what an answer takes to its last part, as the
+    /// IDs of the results of a listing of an upstream without an inventory or
+    /// the content of a fed file so far: at most as many bytes as a fed file.
     fn feed_token(token: &str) -> std::result::Result<(), String> {
         if token.is_empty() {
             return Err("feed token must not be empty".to_string());
         }
-        if token.len() > MAX_FEED_TOKEN_BYTES {
-            return Err(format!("feed token exceeds {MAX_FEED_TOKEN_BYTES} bytes"));
+        if u64::try_from(token.len()).map_or(true, |len| len > crate::tree::MATERIALIZE_MAX_BYTES) {
+            return Err(format!(
+                "feed token exceeds {} bytes",
+                crate::tree::MATERIALIZE_MAX_BYTES
+            ));
         }
         Ok(())
     }
