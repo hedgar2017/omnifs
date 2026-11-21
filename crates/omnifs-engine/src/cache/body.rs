@@ -1,7 +1,7 @@
 //! Global content-addressed storage for durable provider bodies.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -252,6 +252,40 @@ impl BodyStore {
         if BodyId::from_bytes(&bytes) != id {
             return Err(BodyStoreError::Digest { id });
         }
+        Ok(bytes)
+    }
+
+    /// At most `len` bytes of the body `id` of `length` bytes from `offset`,
+    /// without the rest of the body in memory. The digest of a body is of
+    /// its whole, which its publication checked.
+    pub(crate) fn read_range(
+        &self,
+        id: BodyId,
+        length: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, BodyStoreError> {
+        let path = self.path(id);
+        let mut file = open_nofollow(&path)?;
+        let metadata = file.metadata()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(BodyStoreError::Destination { id });
+        }
+        if metadata.len() != length {
+            return Err(BodyStoreError::Length {
+                id,
+                expected: length,
+                actual: metadata.len(),
+            });
+        }
+        let end = offset.saturating_add(u64::from(len)).min(length);
+        let Some(count) = end.checked_sub(offset).filter(|count| *count > 0) else {
+            return Ok(Vec::new());
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes =
+            vec![0; usize::try_from(count).expect("a range of at most u32::MAX bytes fits usize")];
+        file.read_exact(&mut bytes)?;
         Ok(bytes)
     }
 

@@ -36,6 +36,37 @@ pub(crate) struct ReadResult {
     pub(crate) attrs: Option<FileAttrsCache>,
 }
 
+/// The bytes of a read of a range of a file, whether they reach its end, and
+/// the attrs it learned.
+pub(crate) struct ReadRange {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) eof: bool,
+    pub(crate) attrs: Option<FileAttrsCache>,
+}
+
+impl ReadRange {
+    /// At most `len` bytes from `offset` of the whole file of `result`.
+    fn of(result: ReadResult, offset: u64, len: u32) -> Self {
+        let ReadResult { data, attrs } = result;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        let end = start.saturating_add(len as usize).min(data.len());
+        Self {
+            bytes: data[start..end].to_vec(),
+            eof: end >= data.len(),
+            attrs,
+        }
+    }
+}
+
+/// A read of a file: the whole file, or the range of the read from a body
+/// of the projection, without the rest of the body in memory.
+enum FileRead {
+    Whole(ReadResult),
+    Range(ReadRange),
+}
+
 /// One ranged chunk from a `RangedHandle`. `learned_attrs` is `Some` on an
 /// EOF-short read when an exact size was learned, so the renderer promotes
 /// st_size.
@@ -123,6 +154,22 @@ impl<'a> FileAttrStore<'a> {
 }
 
 impl EngineNamespace {
+    /// At most `len` bytes of a file from `offset`: of a fed file from its
+    /// body in the projection, which no size bounds, and of another file
+    /// from the whole of it.
+    pub(crate) async fn read(
+        &self,
+        node: &Node,
+        offset: u64,
+        len: u32,
+        ctx: &RequestCtx,
+    ) -> Result<ReadRange> {
+        Ok(match self.read_file(node, offset, len, ctx).await? {
+            FileRead::Whole(result) => ReadRange::of(result, offset, len),
+            FileRead::Range(range) => range,
+        })
+    }
+
     /// Whole-file read. Owns the shared read cache cascade (exact-0
     /// short-circuit, mem hit, durable view hit, backing-fs read), then on a
     /// view miss the cold provider render
@@ -132,15 +179,25 @@ impl EngineNamespace {
     /// The renderer still owns its kernel-side handle caches (the per-`fh` whole
     /// buffer FUSE keeps, the inode size promotion) and kernel offset/size
     /// slicing; the internal read path returns the whole rendered file. A node
-    /// under an anchor of another facet reads the path of its facts.
-    pub(crate) async fn read(&self, node: &Node, _ctx: &RequestCtx) -> Result<ReadResult> {
+    /// under an anchor of another facet reads the path of its facts. A fed
+    /// file gives the range of the read alone.
+    async fn read_file(
+        &self,
+        node: &Node,
+        offset: u64,
+        len: u32,
+        _ctx: &RequestCtx,
+    ) -> Result<FileRead> {
         let node = &node.at_fact();
         // A host-synthesized node (a mount-root ignore file or a `@next`/`@all`
         // pagination control) is served by `Tree`, never the provider. The
         // renderer materializes the result into a per-handle buffer so a partial
         // or repeated read never re-runs the (mutating) control action.
         if let Some(synthetic) = node.synthetic_kind() {
-            return self.read_synthetic(node, &synthetic.content).await;
+            return self
+                .read_synthetic(node, &synthetic.content)
+                .await
+                .map(FileRead::Whole);
         }
 
         // A host-tree node is served by the engine from the retained capability
@@ -167,9 +224,9 @@ impl EngineNamespace {
                 .read_file(path, content_type, captured_epoch)
                 .await?
             {
-                ReadReply::File(result) => finish_read(&runtime, path, result),
+                ReadReply::File(result) => finish_read(&runtime, path, result).map(FileRead::Whole),
                 ReadReply::Feed(claims) => {
-                    serve_fed_read(&runtime, path, &claims, captured_epoch).await
+                    serve_fed_read(&runtime, path, &claims, offset, len).await
                 },
             };
         }
@@ -187,10 +244,10 @@ impl EngineNamespace {
         if let Some(result) =
             projected_read(&attr_store, resources, path, attrs, offline, captured_epoch)?
         {
-            return Ok(result);
+            return Ok(FileRead::Whole(result));
         }
         if let Some(result) = cached_read(resources, path, attrs, offline, now)? {
-            return Ok(result);
+            return Ok(FileRead::Whole(result));
         }
 
         if offline {
@@ -212,7 +269,7 @@ impl EngineNamespace {
         let result = match runtime.read_file(path, content_type, captured_epoch).await {
             Ok(ReadReply::File(result)) => result,
             Ok(ReadReply::Feed(claims)) => {
-                return serve_fed_read(&runtime, path, &claims, captured_epoch).await;
+                return serve_fed_read(&runtime, path, &claims, offset, len).await;
             },
             Err(EngineError::ProviderError(error)) => {
                 warn!(
@@ -230,7 +287,7 @@ impl EngineNamespace {
             },
         };
 
-        finish_read(&runtime, path, result)
+        finish_read(&runtime, path, result).map(FileRead::Whole)
     }
 
     /// Serve a host-synthesized node. A `Fixed` synthetic (a mount-root ignore
@@ -283,33 +340,32 @@ impl EngineNamespace {
     }
 }
 
-/// Serve a fed file from its fact in the projection once the answering feed
-/// among `claims` has answered, or as not found.
+/// Serve at most `len` bytes from `offset` of a fed file from the body of its
+/// file record in the projection once the answering feed among `claims` has
+/// answered, or as not found.
 async fn serve_fed_read(
     runtime: &Runtime,
     path: &omnifs_core::path::Path,
     claims: &[crate::ops::feed::FeedClaim],
-    captured_epoch: u64,
-) -> Result<ReadResult> {
+    offset: u64,
+    len: u32,
+) -> Result<FileRead> {
     let (fact, _) =
         super::feed::answer_claims(runtime, path, super::feed::FedFact::File, claims).await?;
     let path = &fact;
     let resources = &runtime.resources;
-    let attr_store = &FileAttrStore::new(resources, path);
-    let now = now_millis();
-    let attrs = attr_store.cached(now, true)?;
-    if let Some(result) = projected_read(
-        attr_store,
-        resources,
-        path,
-        attrs.as_ref(),
-        false,
-        captured_epoch,
-    )? {
-        return Ok(result);
+    let attrs = FileAttrStore::new(resources, path).cached(now_millis(), true)?;
+    if let Some((body, length)) = resources
+        .file_body(path, None)
+        .map_err(|error| TreeError::internal(error.to_string()))?
+    {
+        let bytes = resources
+            .read_body_range(body, length, offset, len)
+            .map_err(|error| TreeError::internal(error.to_string()))?;
+        let eof = offset.saturating_add(bytes.len() as u64) >= length;
+        return Ok(FileRead::Range(ReadRange { bytes, eof, attrs }));
     }
-    cached_read(resources, path, attrs.as_ref(), false, now)?
-        .ok_or_else(|| TreeError::not_found(path.as_str()))
+    Err(TreeError::not_found(path.as_str()))
 }
 
 fn projected_read(

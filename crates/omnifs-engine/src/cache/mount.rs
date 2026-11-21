@@ -767,16 +767,12 @@ impl MountResources {
             ));
         };
         let body = BodyId::from_digest_bytes(fact.body_id);
-        let stored = self.body.read(body, Some(fact.length))?;
-        if u64::try_from(stored.len()).map_err(|_| {
-            ProjectionError::Inconsistent("blob body length does not fit u64".into())
-        })? != fact.length
-            || fact.metadata.size != fact.length
-        {
+        if fact.metadata.size != fact.length {
             return Err(ProjectionError::Inconsistent(
                 "blob fact length does not match its body".into(),
             ));
         }
+        self.body.validate(body, Some(fact.length))?;
         Ok(Some(self.publish_blob_handle(request, body, fact.metadata)))
     }
 
@@ -797,7 +793,9 @@ impl MountResources {
             response_headers: metadata.response_headers,
         });
         self.blob_handles.insert(id, Arc::clone(&record));
-        self.request_handles.insert(request, id);
+        if (200..300).contains(&record.status) {
+            self.request_handles.insert(request, id);
+        }
         record
     }
 
@@ -808,14 +806,19 @@ impl MountResources {
         body: BodyId,
         metadata: BlobMetadata,
     ) -> Arc<BlobRecord> {
-        self.pending_blob_writes
-            .entry(operation_id)
-            .or_default()
-            .push(BlobWrite {
-                request,
-                body,
-                metadata: metadata.clone(),
-            });
+        // The answer of a failing status answers its own request alone: the
+        // projection keeps none of it, and the next request of it asks the
+        // upstream again.
+        if (200..300).contains(&metadata.status) {
+            self.pending_blob_writes
+                .entry(operation_id)
+                .or_default()
+                .push(BlobWrite {
+                    request,
+                    body,
+                    metadata: metadata.clone(),
+                });
+        }
         self.publish_blob_handle(request, body, metadata)
     }
 
@@ -1284,6 +1287,42 @@ impl MountResources {
         self.cache_get(path, RecordKind::Dirents, None)?
             .map(|record| postcard::from_bytes(&record.payload).map_err(ProjectionError::from))
             .transpose()
+    }
+
+    /// The body and the length of the file record of `path` with `aux`, none
+    /// for a path without one.
+    pub(crate) fn file_body(
+        &self,
+        path: &Path,
+        aux: Option<&str>,
+    ) -> Result<Option<(BodyId, u64)>, ProjectionError> {
+        let Some(bytes) = self
+            .projection
+            .get(&fact_key(path.as_str(), RecordKind::File, aux))?
+        else {
+            return Ok(None);
+        };
+        match postcard::from_bytes(&bytes)? {
+            DurableFact::File {
+                body_id, length, ..
+            } => Ok(Some((BodyId::from_digest_bytes(body_id), length))),
+            _ => Err(ProjectionError::Inconsistent(
+                "durable fact kind does not match its path key".into(),
+            )),
+        }
+    }
+
+    /// At most `len` bytes of `body` of `length` bytes from `offset`.
+    pub(crate) fn read_body_range(
+        &self,
+        body: BodyId,
+        length: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, ProjectionError> {
+        self.body
+            .read_range(body, length, offset, len)
+            .map_err(Into::into)
     }
 
     pub(crate) fn read_body(&self, body: BodyId, length: u64) -> Result<Vec<u8>, ProjectionError> {

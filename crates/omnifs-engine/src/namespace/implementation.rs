@@ -23,7 +23,7 @@ use super::{
 use crate::clock::DYNAMIC_TTL_MILLIS;
 use crate::inspect;
 use crate::registry::{MountEntry, MountTable};
-use crate::tree::{HostKind, ListOutcome, RangedHandle, ReadResult, RequestCtx};
+use crate::tree::{HostKind, ListOutcome, RangedHandle, ReadRange, RequestCtx};
 use crate::view::{self as view_types, EntryMeta, FileAttrsCache, FileSize};
 use crate::{Engine, TreeError, TreeErrorKind};
 
@@ -888,16 +888,10 @@ impl EngineNamespace {
         offset: u64,
         len: u32,
     ) -> Result<ReadAnswer, NsError> {
-        let ReadResult { data, attrs } = self.read(node, &RequestCtx).await?;
+        let ReadRange { bytes, eof, attrs } = self.read(node, offset, len, &RequestCtx).await?;
         if let Some(attrs) = &attrs {
             self.store_learned(id, attrs.clone());
         }
-        let start = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(data.len());
-        let end = start.saturating_add(len as usize).min(data.len());
-        let bytes = data[start..end].to_vec();
-        let eof = end >= data.len();
         let attrs = read_attrs(
             id,
             entry_kind_from_node(node),

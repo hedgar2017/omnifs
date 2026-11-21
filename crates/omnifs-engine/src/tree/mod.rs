@@ -42,7 +42,7 @@ pub(crate) use self::handle::{RangedHandle, spawn_live_follow_pump};
 pub(crate) use self::list::{Cursor, ListOutcome};
 pub(crate) use self::node::HostKind;
 pub(crate) use self::node::{Node, NodeBody};
-pub(crate) use self::read::ReadResult;
+pub(crate) use self::read::ReadRange;
 /// Maximum whole-file payload the tree will materialize in memory for one read.
 ///
 /// Ranged reads stream through [`RangedHandle`] and are not subject to this cap.
