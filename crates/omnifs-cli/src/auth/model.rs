@@ -94,6 +94,26 @@ impl Auth {
         self
     }
 
+    /// This auth with the client ID and the file of the client secret of an
+    /// invocation, which an OAuth scheme alone takes.
+    pub(crate) fn with_client(
+        self,
+        client_id: Option<String>,
+        client_secret_file: Option<String>,
+    ) -> anyhow::Result<Self> {
+        if client_id.is_none() && client_secret_file.is_none() {
+            return Ok(self);
+        }
+        let Self::OAuth(oauth) = self else {
+            anyhow::bail!("`--client-id` and `--client-secret-file` need an OAuth auth scheme");
+        };
+        Ok(Self::OAuth(OAuth {
+            client_id,
+            client_secret_file,
+            ..oauth
+        }))
+    }
+
     pub(crate) fn as_oauth(&self) -> Option<&OAuth> {
         match self {
             Self::OAuth(config) => Some(config),

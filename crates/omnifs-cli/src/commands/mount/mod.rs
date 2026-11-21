@@ -88,6 +88,14 @@ pub struct ReauthArgs {
     /// OAuth scope to request. Repeat for multiple scopes.
     #[arg(long = "scope")]
     pub scopes: Vec<String>,
+    /// OAuth client ID to use instead of the provider default, as the email
+    /// of a service account.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["token", "token_env"])]
+    pub client_id: Option<String>,
+    /// Read the OAuth client secret from this file, as the PEM of the
+    /// private key of a service account.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["token", "token_env"])]
+    pub client_secret_file: Option<String>,
 }
 
 fn effective_oauth_scopes(explicit: &[String], prior: &[String]) -> Vec<String> {
@@ -371,13 +379,14 @@ impl ReauthArgs {
             auth_manifest.as_ref(),
             &auth.scheme,
             Some(auth.account_label.clone()),
-        )?;
+        )?
+        .with_client(self.client_id.clone(), self.client_secret_file.clone())?;
 
         // `--no-input` must never reach an OAuth browser handoff (it would hang
         // on the browser confirm or the manual-code paste). Mirror the add-side
         // guard: bail naming the interactive and static-token alternatives.
         let interactive = prompt.interactive();
-        if !interactive && selected.is_oauth() {
+        if !interactive && create::oauth_needs_user(auth_manifest.as_ref(), &selected) {
             return Err(anyhow!(
                 "`omnifs mount reauth {mount_name}` cannot complete OAuth without a terminal"
             ))

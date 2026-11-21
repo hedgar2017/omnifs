@@ -11,6 +11,10 @@ use url::Url;
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// The longest wait for an answer of an endpoint of an authorization server,
+/// which an operation of a mount waits for before its own request.
+const TOKEN_ENDPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub trait UrlOpener: Send + Sync {
     fn open<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<(), AuthError>>;
 }
@@ -27,6 +31,7 @@ impl OAuthClient {
         Ok(Self {
             http: reqwest::ClientBuilder::new()
                 .redirect(reqwest::redirect::Policy::none())
+                .timeout(TOKEN_ENDPOINT_TIMEOUT)
                 .build()?,
             opener: None,
         })

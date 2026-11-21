@@ -42,7 +42,8 @@ pub enum EntryKind {
 ///   deduping the provider open behind its internal handle cache and learning
 ///   the exact size on an EOF-short read. A filesystem reads through per protocol
 ///   read rather than buffering, so a live (`tail -f`) or large ranged file is
-///   never fully materialized.
+///   never fully materialized. A fed file, whose body in the projection no
+///   size bounds, is `Ranged`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadStyle {
     Whole,

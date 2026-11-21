@@ -143,17 +143,15 @@ impl AddArgs {
             Some(scheme) => Some(Auth::from_scheme(auth_manifest, scheme, account)?),
             None => Auth::from_provider_default(manifest).map(|auth| auth.with_account(account)),
         };
-        if self.client_id.is_none() && self.client_secret_file.is_none() {
-            return Ok(auth);
+        match auth {
+            Some(auth) => auth
+                .with_client(self.client_id.clone(), self.client_secret_file.clone())
+                .map(Some),
+            None if self.client_id.is_none() && self.client_secret_file.is_none() => Ok(None),
+            None => {
+                anyhow::bail!("`--client-id` and `--client-secret-file` need an OAuth auth scheme")
+            },
         }
-        let Some(Auth::OAuth(oauth)) = auth else {
-            anyhow::bail!("`--client-id` and `--client-secret-file` need an OAuth auth scheme");
-        };
-        Ok(Some(Auth::OAuth(crate::auth::OAuth {
-            client_id: self.client_id.clone(),
-            client_secret_file: self.client_secret_file.clone(),
-            ..oauth
-        })))
     }
 
     /// Apply `--config-json`'s override onto an already-generated default

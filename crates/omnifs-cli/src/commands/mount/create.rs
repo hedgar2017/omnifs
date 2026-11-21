@@ -394,7 +394,10 @@ pub(crate) async fn assemble_mount_build(
 
 /// Whether a user signs in for the OAuth scheme of `auth`: not for a flow
 /// without a user, as the JWT bearer grant of a service account.
-fn oauth_needs_user(auth_manifest: Option<&omnifs_auth::AuthManifest>, auth: &Auth) -> bool {
+pub(super) fn oauth_needs_user(
+    auth_manifest: Option<&omnifs_auth::AuthManifest>,
+    auth: &Auth,
+) -> bool {
     auth.is_oauth()
         && auth_manifest
             .and_then(|manifest| manifest.resolve_oauth_scheme(auth.scheme()).ok())
