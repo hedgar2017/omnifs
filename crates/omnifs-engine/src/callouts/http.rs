@@ -121,7 +121,7 @@ impl HttpStack {
         timeout: Duration,
     ) -> Result<reqwest::Response, wit_types::CalloutResult> {
         let request = self.validate(method, url, headers, body)?;
-        self.send_validated(&request, timeout).await
+        self.send_validated(&request, Some(timeout)).await
     }
 
     pub(crate) fn validate(
@@ -168,7 +168,7 @@ impl HttpStack {
     pub(crate) async fn send_validated(
         &self,
         request: &ValidatedRequest,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<reqwest::Response, wit_types::CalloutResult> {
         let response = self
             .send_once(
@@ -217,7 +217,7 @@ impl HttpStack {
         url: &str,
         headers: &[(String, String)],
         body: Option<&[u8]>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<reqwest::Response, wit_types::CalloutResult> {
         let auth_header = match &self.auth {
             Some(auth) => auth
@@ -242,8 +242,10 @@ impl HttpStack {
         let (client, request_url) = self.client_and_url_for(transport)?;
         let mut request = client
             .request(reqwest_method, request_url)
-            .headers(header_map)
-            .timeout(timeout);
+            .headers(header_map);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         if let Some(body) = body {
             request = request.body(body.to_vec());
         }

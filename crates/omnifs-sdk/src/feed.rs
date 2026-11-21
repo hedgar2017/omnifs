@@ -160,6 +160,16 @@ impl<K, S> FeedCx<K, S> {
         Ok(())
     }
 
+    /// Write a stable file at the mount-absolute `path` as a fact of this
+    /// part, with the bytes of `blob`, which the host fetched and holds: no
+    /// size bounds the file, and its bytes cross no boundary of the provider.
+    pub fn blob(&self, path: impl AsRef<str>, blob: &crate::endpoint::BlobHandle) -> Result<()> {
+        self.facts
+            .borrow_mut()
+            .fed_blob(path.as_ref(), blob.id, blob.size)?;
+        Ok(())
+    }
+
     /// Write the directory at the mount-absolute `path`; the files and
     /// directories this part writes directly under it join its listing as
     /// `write` says.

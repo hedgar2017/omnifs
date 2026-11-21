@@ -18,7 +18,10 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-const BLOB_FETCH_TIMEOUT: Duration = Duration::from_mins(2);
+/// The longest wait for the status of the answer of a blob fetch, and for
+/// the next bytes of its body: no time bounds the whole of a body, which no
+/// size bounds beside the limit of its mount.
+const BLOB_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 
 const DEFAULT_MAX_FETCH_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
 /// Host-side size limits for blob fetches.
@@ -159,7 +162,13 @@ impl BlobExecutor {
                             wit_types::CalloutResult::BlobFetched(record.as_ref().into())
                         },
                         Ok(None) => {
-                            match self.http.send_validated(&request, BLOB_FETCH_TIMEOUT).await {
+                            let sent = tokio::time::timeout(
+                                BLOB_IDLE_TIMEOUT,
+                                self.http.send_validated(&request, None),
+                            )
+                            .await
+                            .unwrap_or_else(|_| Err(idle().into()));
+                            match sent {
                                 Ok(response) => {
                                     match self.materialize(operation_id, request_id, response).await
                                     {
@@ -265,7 +274,10 @@ async fn stream_response_body(
     let mut writer = body.stage().map_err(BlobError::from)?;
     let mut stream = response.bytes_stream();
     let mut total = 0_u64;
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::time::timeout(BLOB_IDLE_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| idle())?
+    {
         let chunk = chunk.map_err(|e| BlobError::Network(e.to_string()))?;
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| BlobError::TooLarge {
             operation: "fetch blob",
@@ -290,6 +302,15 @@ async fn stream_response_body(
         writer,
         size: total,
     })
+}
+
+/// The error of a blob fetch whose upstream sent nothing for
+/// [`BLOB_IDLE_TIMEOUT`].
+fn idle() -> BlobError {
+    BlobError::Network(format!(
+        "the upstream sent nothing for {} seconds",
+        BLOB_IDLE_TIMEOUT.as_secs()
+    ))
 }
 
 fn lookup_header(headers: &[(String, String)], name: &str) -> Option<String> {

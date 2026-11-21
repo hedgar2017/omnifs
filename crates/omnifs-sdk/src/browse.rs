@@ -152,6 +152,26 @@ impl Effects {
         Ok(self)
     }
 
+    /// A fed file whose bytes are the blob `blob` of `size` bytes in the
+    /// host, which no size bounds.
+    pub(crate) fn fed_blob(
+        &mut self,
+        path: &str,
+        blob: crate::blob::BlobId,
+        size: u64,
+    ) -> Result<&mut Self> {
+        self.fs.push(wit_types::FsWrite {
+            id: None,
+            path: wire_path(path)?.into(),
+            kind: wit_types::FsKind::File(wit_types::FileOut {
+                content_type: None,
+                attrs: FileAttrs::new(FileSize::Exact(size), Stability::Stable).into(),
+                bytes: wit_types::ByteSource::Blob(blob.raw()),
+            }),
+        });
+        Ok(self)
+    }
+
     /// Retract the facts of `path` and of everything beneath it, leaving the
     /// parent listing as complete as it was.
     pub(crate) fn remove(&mut self, path: impl AsRef<str>) -> Result<&mut Self> {

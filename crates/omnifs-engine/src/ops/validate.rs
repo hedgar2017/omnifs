@@ -389,26 +389,39 @@ where
             })
     }
 
-    /// A fed file: stable inline bytes of the declared exact size, which the
-    /// projection holds whole. Fed files are facts, not eager preloads.
+    /// A fed file: a stable file of its declared exact size without a
+    /// version, with inline bytes, which the projection holds whole, or with
+    /// a blob of the host, which no size bounds. Fed files are facts, not
+    /// eager preloads.
     fn fed_file(file: &wit_types::FileOut) -> std::result::Result<(), String> {
-        let wit_types::ByteSource::Inline(bytes) = &file.bytes else {
-            return Err("a fed file carries inline bytes".to_string());
-        };
-        let len = u64::try_from(bytes.len()).map_err(|_| "fed file length does not fit u64")?;
-        if !matches!(file.attrs.size, wit_types::FileSize::Exact(size) if size == len)
-            || !matches!(file.attrs.stability, wit_types::Stability::Stable)
+        if !matches!(file.attrs.stability, wit_types::Stability::Stable)
             || file.attrs.version_token.is_some()
         {
-            return Err("a fed file is a stable file of its exact size without a version".into());
+            return Err("a fed file is a stable file without a version".into());
         }
-        if len > crate::tree::MATERIALIZE_MAX_BYTES {
-            return Err(format!(
-                "fed file exceeds {} bytes",
-                crate::tree::MATERIALIZE_MAX_BYTES
-            ));
+        let wit_types::FileSize::Exact(size) = file.attrs.size else {
+            return Err("a fed file has its exact size".into());
+        };
+        match &file.bytes {
+            wit_types::ByteSource::Inline(bytes) => {
+                let len =
+                    u64::try_from(bytes.len()).map_err(|_| "fed file length does not fit u64")?;
+                if size != len {
+                    return Err("a fed file has the size of its inline bytes".into());
+                }
+                if len > crate::tree::MATERIALIZE_MAX_BYTES {
+                    return Err(format!(
+                        "fed file with inline bytes exceeds {} bytes",
+                        crate::tree::MATERIALIZE_MAX_BYTES
+                    ));
+                }
+                Ok(())
+            },
+            wit_types::ByteSource::Blob(_) => Ok(()),
+            wit_types::ByteSource::Canonical | wit_types::ByteSource::Deferred(_) => {
+                Err("a fed file carries inline bytes or a blob".to_string())
+            },
         }
-        Ok(())
     }
 
     fn file_out(&mut self, file: &wit_types::FileOut) -> std::result::Result<(), String> {

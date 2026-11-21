@@ -181,6 +181,48 @@ impl PendingTestCallout {
 }
 
 impl Runtime {
+    /// Answer the captured `fetch-blob` callout `pending` as the host does an
+    /// upstream answer with `status` and `body`: the body in the body store,
+    /// and its blob staged for the publication of the operation.
+    #[doc(hidden)]
+    pub fn answer_test_blob(&self, pending: PendingTestCallout, status: u16, body: &[u8]) {
+        let wit_types::Callout::FetchBlob(request) = &pending.callout else {
+            panic!("expected a fetch-blob, got {:?}", pending.callout);
+        };
+        let headers = request
+            .headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect::<Vec<_>>();
+        let request = crate::cache::identity::BlobRequestId::new(
+            None,
+            &request.method,
+            &request.url,
+            &headers,
+            request.body.as_deref(),
+        );
+        let stored = self
+            .resources
+            .body
+            .publish(body)
+            .expect("the body of a test blob publishes");
+        let record = self.resources.stage_blob_write(
+            pending.op_id,
+            request,
+            stored,
+            crate::cache::BlobMetadata {
+                size: body.len() as u64,
+                content_type: None,
+                etag: None,
+                status,
+                response_headers: Vec::new(),
+            },
+        );
+        pending.answer(wit_types::CalloutResult::BlobFetched(
+            record.as_ref().into(),
+        ));
+    }
+
     /// Non-blocking receive of the next captured provider callout, if one has
     /// been issued and not yet answered. Returns `None` outside a mount built by
     /// [`load_mount_table_for_callout_tests`] or when no callout is pending.

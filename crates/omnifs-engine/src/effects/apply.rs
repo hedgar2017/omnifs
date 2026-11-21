@@ -96,7 +96,9 @@ impl<'a> EffectApplier<'a> {
             let path = Path::parse(&write.path).map_err(anyhow::Error::from)?;
             let meta = match (&write.kind, fed) {
                 (wit_types::FsKind::Directory(_), _) => EntryMeta::directory(),
-                (wit_types::FsKind::File(file), true) => fed_file(&mut transition, &path, file)?,
+                (wit_types::FsKind::File(file), true) => {
+                    self.fed_file(&mut transition, &path, file)?
+                },
                 (wit_types::FsKind::File(file), false) => EntryMeta::file(self.file_meta(file)?),
             };
             if fed {
@@ -619,6 +621,62 @@ impl<'a> EffectApplier<'a> {
         });
         Ok((outcome, transition))
     }
+
+    /// A fed file: a stable file of its exact size whose bytes the projection
+    /// holds in its file record, the inline bytes of the write or the body of
+    /// its blob, so a read serves it without the eager cap of an inline
+    /// preload.
+    fn fed_file(
+        &self,
+        transition: &mut ProjectionTransition,
+        path: &Path,
+        file: &wit_types::FileOut,
+    ) -> anyhow::Result<EntryMeta> {
+        let (size, fact) = match &file.bytes {
+            wit_types::ByteSource::Inline(bytes) => (
+                u64::try_from(bytes.len())?,
+                FactPayload::File(
+                    FilePayload::new(None, bytes.clone())
+                        .with_content_type(file.content_type.clone()),
+                ),
+            ),
+            wit_types::ByteSource::Blob(handle) => {
+                let (body, length) = self
+                    .store
+                    .body_for_handle(*handle)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                anyhow::ensure!(
+                    matches!(file.attrs.size, wit_types::FileSize::Exact(size) if size == length),
+                    "fed file {path} has another size than its blob"
+                );
+                (
+                    length,
+                    FactPayload::FileBody {
+                        version_token: None,
+                        content_type: file.content_type.clone(),
+                        body,
+                        length,
+                    },
+                )
+            },
+            wit_types::ByteSource::Canonical | wit_types::ByteSource::Deferred(_) => {
+                anyhow::bail!("fed file {path} has no inline bytes and no blob");
+            },
+        };
+        let attrs = FileAttrsCache::deferred(
+            crate::view::FileSize::Exact(size),
+            crate::view::ReadMode::Full,
+            Stability::Stable,
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        transition.records.push(RecordWrite {
+            path: path.clone(),
+            aux: None,
+            fact,
+        });
+        Ok(EntryMeta::file(attrs))
+    }
 }
 
 /// The facts of a subtree answer at `path`: its Git fact with the commit of
@@ -664,34 +722,6 @@ fn add_lookup_records(transition: &mut ProjectionTransition, path: &Path, meta: 
         aux: None,
         fact: FactPayload::Attr(AttrPayload { meta: meta.clone() }),
     });
-}
-
-/// A fed file: a stable file of its exact size whose bytes the projection
-/// holds in its file record, so a read serves it whole without the eager cap
-/// of an inline preload.
-fn fed_file(
-    transition: &mut ProjectionTransition,
-    path: &Path,
-    file: &wit_types::FileOut,
-) -> anyhow::Result<EntryMeta> {
-    let wit_types::ByteSource::Inline(bytes) = &file.bytes else {
-        anyhow::bail!("fed file {path} has no inline bytes");
-    };
-    let attrs = FileAttrsCache::deferred(
-        crate::view::FileSize::Exact(u64::try_from(bytes.len())?),
-        crate::view::ReadMode::Full,
-        Stability::Stable,
-        None,
-    )
-    .map_err(anyhow::Error::msg)?;
-    transition.records.push(RecordWrite {
-        path: path.clone(),
-        aux: None,
-        fact: FactPayload::File(
-            FilePayload::new(None, bytes.clone()).with_content_type(file.content_type.clone()),
-        ),
-    });
-    Ok(EntryMeta::file(attrs))
 }
 
 fn listing_write_from_wit(write: wit_types::ListingWrite) -> ListingWrite {
