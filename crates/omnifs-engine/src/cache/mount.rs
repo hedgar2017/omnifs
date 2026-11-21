@@ -321,6 +321,11 @@ pub(crate) struct FeedState {
 #[derive(Debug, Clone)]
 pub(crate) struct FeedWrite {
     pub object: Vec<u8>,
+    /// The token of the state of the feed that the call of the answer began
+    /// from, none for a feed without a state: the answer of a call that
+    /// another answer moved the state of, as an inner state of an outer
+    /// feed, is no publication.
+    pub from: Option<String>,
     pub answer: FeedAnswerWrite,
     pub inner: Vec<(Vec<u8>, String)>,
     pub anchors: Vec<(Path, Path)>,
@@ -346,6 +351,9 @@ pub(crate) enum FeedAnswerWrite {
 #[derive(Debug, Clone)]
 pub(crate) struct KeptWrite {
     pub object: Vec<u8>,
+    /// The token of the state of the feed that the call of the part began
+    /// from, as [`FeedWrite::from`].
+    pub from: Option<String>,
     pub part: Vec<u8>,
 }
 
@@ -427,8 +435,13 @@ impl From<ProjectionError> for ProjectionStoreError {
 
 #[derive(Debug)]
 pub(crate) enum PublicationOutcome {
-    Committed { invalidations: Vec<Invalidation> },
+    Committed {
+        invalidations: Vec<Invalidation>,
+    },
     Fenced,
+    /// Another answer moved the state of the feed of the transition after
+    /// the call of its answer began.
+    Moved,
 }
 
 impl Record {
@@ -937,6 +950,16 @@ impl MountResources {
         let mut coherence = self.coherence.lock();
         if captured_epoch != coherence.invalidation_epoch {
             return Ok(PublicationOutcome::Fenced);
+        }
+        for (object, from) in feed
+            .iter()
+            .map(|feed| (&feed.object, &feed.from))
+            .chain(kept.iter().map(|kept| (&kept.object, &kept.from)))
+        {
+            let state = self.feed_state(object)?;
+            if state.map(|state| state.token) != *from {
+                return Ok(PublicationOutcome::Moved);
+            }
         }
         let mut retired = HashSet::new();
         let mut memory_paths = HashSet::new();
@@ -3077,6 +3100,24 @@ mod tests {
         assert!(store.git_for_path(&stale_git).unwrap().is_none());
     }
 
+    /// Publish `transition` as the answer of a call that began from the
+    /// state of its feed in `store`.
+    fn publish_from_state(store: &MountResources, mut transition: ProjectionTransition) {
+        if let Some(feed) = &mut transition.feed {
+            feed.from = store
+                .feed_state(&feed.object)
+                .unwrap()
+                .map(|state| state.token);
+        }
+        if let Some(kept) = &mut transition.kept {
+            kept.from = store
+                .feed_state(&kept.object)
+                .unwrap()
+                .map(|state| state.token);
+        }
+        store.publish(transition, store.current_epoch()).unwrap();
+    }
+
     fn fed_dir(path: &Path, children: &[&str], write: ListingWrite) -> ProjectionTransition {
         let mut records = vec![RecordWrite {
             path: path.clone(),
@@ -3114,6 +3155,7 @@ mod tests {
     fn fed_part(token: &str, until: HashMap<Path, u64>) -> FeedWrite {
         FeedWrite {
             object: b"feed".to_vec(),
+            from: None,
             answer: FeedAnswerWrite::Part(FeedPartWrite {
                 token: token.into(),
                 more: false,
@@ -3130,18 +3172,13 @@ mod tests {
      {
         let (_dir, _caches, store) = open_store("join");
         let books = p("/shelf/books");
-        store
-            .publish(
-                fed_dir(&books, &["1"], ListingWrite::Complete),
-                store.current_epoch(),
-            )
-            .unwrap();
+        publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Complete));
 
         // A child that joins the complete listing, through the lookup
         // reconciliation of its transition too, with the until of the part.
         let mut join = fed_dir(&books, &["2"], ListingWrite::Join);
         join.feed = Some(fed_part("token", HashMap::from([(p("/shelf/books/2"), 5)])));
-        store.publish(join, store.current_epoch()).unwrap();
+        publish_from_state(&store, join);
         let listing = store.dirents_payload(&books).unwrap().unwrap();
         assert!(listing.is_complete_offline());
         assert_eq!(listing.entries().count(), 2);
@@ -3149,42 +3186,34 @@ mod tests {
         assert_eq!(store.fed_until(&books).unwrap(), None);
 
         // A later part without an until writes the facts without one.
-        store
-            .publish(
-                fed_dir(&books, &["2"], ListingWrite::Join),
-                store.current_epoch(),
-            )
-            .unwrap();
+        publish_from_state(&store, fed_dir(&books, &["2"], ListingWrite::Join));
         assert_eq!(store.fed_until(&p("/shelf/books/2")).unwrap(), None);
         assert!(store.is_fed(&p("/shelf/books/2")).unwrap());
 
         // A restart takes its token with the end of the first answer and the
         // deadline as they were, and drops the kept parts.
-        store
-            .publish(
-                ProjectionTransition {
-                    kept: Some(KeptWrite {
-                        object: b"feed".to_vec(),
-                        part: b"kept".to_vec(),
-                    }),
-                    ..ProjectionTransition::default()
-                },
-                store.current_epoch(),
-            )
-            .unwrap();
+        publish_from_state(
+            &store,
+            ProjectionTransition {
+                kept: Some(KeptWrite {
+                    object: b"feed".to_vec(),
+                    from: None,
+                    part: b"kept".to_vec(),
+                }),
+                ..ProjectionTransition::default()
+            },
+        );
         assert!(store.has_kept_parts(b"feed").unwrap());
         let mut restart = fed_part("restart", HashMap::new());
         restart.answer = FeedAnswerWrite::Restart("restart".into());
         restart.deadline = 2_000;
-        store
-            .publish(
-                ProjectionTransition {
-                    feed: Some(restart),
-                    ..ProjectionTransition::default()
-                },
-                store.current_epoch(),
-            )
-            .unwrap();
+        publish_from_state(
+            &store,
+            ProjectionTransition {
+                feed: Some(restart),
+                ..ProjectionTransition::default()
+            },
+        );
         assert!(!store.has_kept_parts(b"feed").unwrap());
         assert_eq!(
             store.feed_state(b"feed").unwrap(),
@@ -3196,33 +3225,86 @@ mod tests {
         );
 
         // An inner state drops the kept parts of its feed.
-        store
-            .publish(
+        publish_from_state(
+            &store,
+            ProjectionTransition {
+                kept: Some(KeptWrite {
+                    object: b"inner".to_vec(),
+                    from: None,
+                    part: b"kept".to_vec(),
+                }),
+                ..ProjectionTransition::default()
+            },
+        );
+        let mut part = fed_part("token", HashMap::new());
+        part.inner = vec![(b"inner".to_vec(), "inner token".into())];
+        publish_from_state(
+            &store,
+            ProjectionTransition {
+                feed: Some(part),
+                ..ProjectionTransition::default()
+            },
+        );
+        assert!(!store.has_kept_parts(b"inner").unwrap());
+        assert_eq!(
+            store.feed_state(b"inner").unwrap().map(|state| state.token),
+            Some("inner token".into())
+        );
+    }
+
+    #[test]
+    fn an_answer_of_a_call_from_another_state_of_its_feed_is_no_publication() {
+        let (_dir, _caches, store) = open_store("moved");
+        let books = p("/shelf/books");
+        publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Complete));
+
+        // An outer feed gives the feed another state, as an inner state.
+        let mut outer = fed_part("outer", HashMap::new());
+        outer.object = b"outer".to_vec();
+        outer.inner = vec![(b"feed".to_vec(), "moved".into())];
+        publish_from_state(
+            &store,
+            ProjectionTransition {
+                feed: Some(outer),
+                ..ProjectionTransition::default()
+            },
+        );
+
+        // The answer and the kept part of a call that began from the state
+        // before write nothing.
+        let mut stale = fed_dir(&books, &["2"], ListingWrite::Complete);
+        stale.feed.as_mut().unwrap().from = Some("token".into());
+        assert!(matches!(
+            store.publish(stale, store.current_epoch()),
+            Ok(PublicationOutcome::Moved)
+        ));
+        assert!(matches!(
+            store.publish(
                 ProjectionTransition {
                     kept: Some(KeptWrite {
-                        object: b"inner".to_vec(),
+                        object: b"feed".to_vec(),
+                        from: Some("token".into()),
                         part: b"kept".to_vec(),
                     }),
                     ..ProjectionTransition::default()
                 },
                 store.current_epoch(),
-            )
-            .unwrap();
-        let mut part = fed_part("token", HashMap::new());
-        part.inner = vec![(b"inner".to_vec(), "inner token".into())];
-        store
-            .publish(
-                ProjectionTransition {
-                    feed: Some(part),
-                    ..ProjectionTransition::default()
-                },
-                store.current_epoch(),
-            )
-            .unwrap();
-        assert!(!store.has_kept_parts(b"inner").unwrap());
+            ),
+            Ok(PublicationOutcome::Moved)
+        ));
         assert_eq!(
-            store.feed_state(b"inner").unwrap().map(|state| state.token),
-            Some("inner token".into())
+            store
+                .dirents_payload(&books)
+                .unwrap()
+                .unwrap()
+                .entries()
+                .count(),
+            1
+        );
+        assert!(!store.has_kept_parts(b"feed").unwrap());
+        assert_eq!(
+            store.feed_state(b"feed").unwrap().map(|state| state.token),
+            Some("moved".into())
         );
     }
 
@@ -3337,19 +3419,9 @@ mod tests {
 
         // A partial part, then a complete one whose child joins the listing
         // and whose lookup reconciliation keeps it complete.
-        store
-            .publish(
-                fed_dir(&books, &["1"], ListingWrite::Partial),
-                store.current_epoch(),
-            )
-            .unwrap();
+        publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Partial));
         assert!(!store.dirents_payload(&books).unwrap().unwrap().exhaustive);
-        store
-            .publish(
-                fed_dir(&books, &["2"], ListingWrite::Complete),
-                store.current_epoch(),
-            )
-            .unwrap();
+        publish_from_state(&store, fed_dir(&books, &["2"], ListingWrite::Complete));
         let listing = store.dirents_payload(&books).unwrap().unwrap();
         assert!(listing.is_complete_offline());
         assert_eq!(listing.entries().count(), 2);

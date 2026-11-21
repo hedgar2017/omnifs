@@ -387,6 +387,23 @@ impl Runtime {
         transition: crate::cache::ProjectionTransition,
         captured_epoch: u64,
     ) -> Result<()> {
+        if self.publish_feed_transition(transition, captured_epoch)? {
+            Ok(())
+        } else {
+            Err(EngineError::ProviderProtocol(
+                "cache publication of no feed found the state of a feed moved".into(),
+            ))
+        }
+    }
+
+    /// Publish `transition`, the answer of a call of a feed: `false` for an
+    /// answer whose feed another answer moved the state of after its call
+    /// began, which is no publication.
+    pub(crate) fn publish_feed_transition(
+        &self,
+        transition: crate::cache::ProjectionTransition,
+        captured_epoch: u64,
+    ) -> Result<bool> {
         let outcome = self
             .resources
             .publish(transition, captured_epoch)
@@ -405,11 +422,12 @@ impl Runtime {
                     }
                 }
                 self.record_view_invalidations(prefixes, paths);
-                Ok(())
+                Ok(true)
             },
             crate::cache::PublicationOutcome::Fenced => Err(EngineError::ProviderProtocol(
                 "cache publication crossed an invalidation fence".into(),
             )),
+            crate::cache::PublicationOutcome::Moved => Ok(false),
         }
     }
 

@@ -455,6 +455,7 @@ impl<'a> EffectApplier<'a> {
         answer: wit_types::FeedAnswer,
         effects: &wit_types::Effects,
         until: HashMap<Path, u64>,
+        from: Option<String>,
         now_millis: u64,
     ) -> anyhow::Result<(ProjectionTransition, FeedChanges)> {
         let mut transition = self.lower_writes(effects, now_millis, true)?;
@@ -486,6 +487,7 @@ impl<'a> EffectApplier<'a> {
         let deadline = now_millis.saturating_add(DYNAMIC_TTL_MILLIS);
         let mut feed = FeedWrite {
             object: object.id.as_bytes().to_vec(),
+            from,
             answer: FeedAnswerWrite::Unchanged,
             inner: Vec::new(),
             anchors: Vec::new(),

@@ -73,11 +73,13 @@ impl FeedStart {
     }
 }
 
-/// What one call of a feed did: the facts of the feed stand, or a part,
-/// published or kept, with the token after it.
+/// What one call of a feed did: the facts of the feed stand, a part,
+/// published or kept, with the token after it, or nothing, for a call whose
+/// feed another answer moved the state of.
 enum FeedStep {
     Unchanged,
     Part { more: bool, token: String },
+    Moved,
 }
 
 /// A part of a later answer of a feed, which the projection keeps until the
@@ -282,11 +284,15 @@ impl Runtime {
                     if state.as_ref() != seen {
                         return Ok(());
                     }
-                    led.store(true, Ordering::Relaxed);
-                    runtime
+                    // After an answer whose feed another answer moved, the
+                    // operation decides again, as after another answer
+                    // before its flight.
+                    let answered = runtime
                         .run_feed_answer(object, start)
                         .await
-                        .map_err(SharedError::from)
+                        .map_err(SharedError::from)?;
+                    led.store(answered, Ordering::Relaxed);
+                    Ok(())
                 },
             )
             .await
@@ -300,8 +306,13 @@ impl Runtime {
     /// the kept parts with it. The answer continues from the token of the
     /// last kept part, else of the last published part, which a failure
     /// keeps. A restart publishes its token, drops the kept parts, and is
-    /// the error of the answer.
-    async fn run_feed_answer(&self, object: &FeedObject, start: Option<&FeedStart>) -> Result<()> {
+    /// the error of the answer. `false` for an answer that another answer
+    /// moved the state of the feed under, which publishes nothing.
+    async fn run_feed_answer(
+        &self,
+        object: &FeedObject,
+        start: Option<&FeedStart>,
+    ) -> Result<bool> {
         let state = self
             .resources
             .feed_state(object.id.as_bytes())
@@ -311,21 +322,28 @@ impl Runtime {
             .resources
             .kept_parts(object.id.as_bytes())
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+        // The token of the state of the feed, which a published part moves
+        // and a kept part does not.
+        let mut from = state.map(|state| state.token);
         let mut token = match kept.last() {
             Some(last) => Some(KeptPart::decode(last)?.part.token),
-            None => state.map(|state| state.token),
+            None => from.clone(),
         };
         let mut kept = !kept.is_empty();
         loop {
             match self
-                .run_feed_call(object, token, start, later, kept)
+                .run_feed_call(object, token, from.clone(), start, later, kept)
                 .await?
             {
-                FeedStep::Unchanged | FeedStep::Part { more: false, .. } => return Ok(()),
+                FeedStep::Unchanged | FeedStep::Part { more: false, .. } => return Ok(true),
+                FeedStep::Moved => return Ok(false),
                 FeedStep::Part {
                     more: true,
                     token: next,
                 } => {
+                    if !later {
+                        from = Some(next.clone());
+                    }
                     token = Some(next);
                     kept = later;
                 },
@@ -342,6 +360,7 @@ impl Runtime {
         &self,
         object: &FeedObject,
         token: Option<String>,
+        from: Option<String>,
         start: Option<&FeedStart>,
         later: bool,
         kept: bool,
@@ -396,14 +415,19 @@ impl Runtime {
                         ));
                     }
                     let token = part.token.clone();
-                    self.keep_feed_part(
+                    let kept = self.keep_feed_part(
                         object,
                         &KeptPart { part, effects },
+                        from,
                         pending_blobs,
                         captured_epoch,
                     )?;
                     inspector::record_outcome(&span, InspectorOutcome::Ok);
-                    return Ok(FeedStep::Part { more: true, token });
+                    return Ok(if kept {
+                        FeedStep::Part { more: true, token }
+                    } else {
+                        FeedStep::Moved
+                    });
                 },
                 wit_types::FeedAnswer::Unchanged if kept => {
                     return Err(EngineError::ProviderProtocol(
@@ -432,10 +456,20 @@ impl Runtime {
                 wit_types::FeedAnswer::Restart(restart) => Err(restart.error.clone()),
             };
             let (mut transition, changes) = EffectApplier::new(&self.resources)
-                .lower_feed(object, answer, &effects, deadlined, clock::now_millis())
+                .lower_feed(
+                    object,
+                    answer,
+                    &effects,
+                    deadlined,
+                    from,
+                    clock::now_millis(),
+                )
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             transition.blobs.extend(pending_blobs);
-            self.publish_transition(transition, captured_epoch)?;
+            if !self.publish_feed_transition(transition, captured_epoch)? {
+                inspector::record_outcome(&span, InspectorOutcome::Ok);
+                return Ok(FeedStep::Moved);
+            }
             for listing in &changes.listings {
                 let fed = self
                     .resources
@@ -464,20 +498,23 @@ impl Runtime {
 
     /// Keep a part of a later answer of the feed of `object`, with the blobs
     /// of its call. Its effects lower first, so that a part that cannot
-    /// publish fails at its own call.
+    /// publish fails at its own call. `false` for a part whose feed another
+    /// answer moved the state of, which the projection does not keep.
     fn keep_feed_part(
         &self,
         object: &FeedObject,
         kept: &KeptPart,
+        from: Option<String>,
         blobs: Vec<crate::cache::BlobWrite>,
         captured_epoch: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         EffectApplier::new(&self.resources)
             .lower_feed(
                 object,
                 wit_types::FeedAnswer::Part(kept.part.clone()),
                 &kept.effects,
                 HashMap::new(),
+                from.clone(),
                 clock::now_millis(),
             )
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
@@ -485,11 +522,12 @@ impl Runtime {
             blobs,
             kept: Some(KeptWrite {
                 object: object.id.as_bytes().to_vec(),
+                from,
                 part: kept.encode()?,
             }),
             ..ProjectionTransition::default()
         };
-        self.publish_transition(transition, captured_epoch)
+        self.publish_feed_transition(transition, captured_epoch)
     }
 }
 
