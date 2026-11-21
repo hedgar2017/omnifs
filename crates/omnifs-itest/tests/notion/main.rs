@@ -1,0 +1,902 @@
+#![cfg(not(target_os = "wasi"))]
+
+//! The requests of the mount `notion` to Notion: the full listings and the
+//! changes of the feed of the workspace, and the pages, data sources,
+//! content, and comments of their own feeds.
+
+mod support;
+
+use std::time::Duration;
+
+use omnifs_engine::{LookupAnswer, NsError};
+use omnifs_itest::RuntimeHarness;
+use omnifs_wit::host::types::CalloutResult;
+use serde_json::{Value, json};
+use support::{
+    EDITED, PAST_DEADLINE, answer, answering, comment, data_source, expect, expect_search, failure,
+    id, list, lookup, markdown, names, network, notion_harness, notion_id, ok, page, read, read_at,
+    row, served, trashed,
+};
+
+/// Earlier `last_edited_time`s than `EDITED`, from the latest.
+const EARLIER: &str = "2026-11-21T09:00:00.000Z";
+const EARLIEST: &str = "2026-11-21T08:00:00.000Z";
+
+/// A later `last_edited_time` than `EDITED`.
+const EDITED_LATER: &str = "2026-11-21T10:05:00.000Z";
+
+/// A `Date` two seconds before the end of the minute of `EDITED`.
+const WITHIN: &str = "Sat, 21 Nov 2026 10:00:58 GMT";
+
+fn names_of(ids: &[u32]) -> Vec<String> {
+    let mut names = ids.iter().map(|n| id(*n)).collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// The first full listing of one answer of the search with `results`.
+async fn first_full_listing(harness: &RuntimeHarness, results: Vec<Value>) {
+    let (listing, requests) = answering(
+        harness,
+        names(harness, "pages"),
+        vec![ok(&list(&results, None))],
+    )
+    .await;
+    listing.unwrap();
+    expect_search(&requests[0], 100, None);
+}
+
+/// The path of the `GET` of the objects of `folder` by their IDs.
+fn request_of(folder: &str) -> &'static str {
+    match folder {
+        "pages" => "/v1/pages",
+        "databases" => "/v1/data_sources",
+        _ => panic!("no objects in {folder}"),
+    }
+}
+
+/// Look up the object `n` of `folder` by its ID, with `answer` to its `GET`.
+async fn by_id(
+    harness: &RuntimeHarness,
+    folder: &str,
+    n: u32,
+    answer: CalloutResult,
+) -> Result<LookupAnswer, NsError> {
+    let (found, requests) = answering(
+        harness,
+        lookup(harness, &format!("{folder}/{}", id(n))),
+        vec![answer],
+    )
+    .await;
+    expect(
+        &requests[0],
+        "GET",
+        &format!("{}/{}", request_of(folder), id(n)),
+        None,
+    );
+    found
+}
+
+/// Whether the object `n` of `folder` by its ID is found, with `object` as
+/// the answer to its `GET`.
+async fn found_by_id(harness: &RuntimeHarness, folder: &str, n: u32, object: &Value) -> bool {
+    !by_id(harness, folder, n, ok(object))
+        .await
+        .unwrap()
+        .is_missing()
+}
+
+/// The path of the request of the comments of the page `n` from `cursor`.
+fn comments_of(n: u32, cursor: Option<&str>) -> String {
+    let path = format!("/v1/comments?block_id={}&page_size=100", id(n));
+    match cursor {
+        Some(cursor) => format!("{path}&start_cursor={cursor}"),
+        None => path,
+    }
+}
+
+/// The path of the request of the markdown of a page or a block by its ID.
+fn markdown_of(id: &str) -> String {
+    format!("/v1/pages/{id}/markdown?markdown_version=v2")
+}
+
+/// The first full listing at the first read of `pages/`: the answers of the
+/// search by `next_cursor`, with pages, rows, and data sources, taken at each
+/// answer; a `429` and a failure of the network in it give each read of
+/// `pages/` and `databases/` their error while the files that it took are
+/// served, and the next read continues from the next request; then each page
+/// and data source of the projection that it lacks by its ID, with the
+/// removal for `404` and for `in_trash`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
+    let harness = notion_harness();
+    for (folder, n, object) in [
+        ("pages", 7, page(7, "Deleted page", EDITED)),
+        ("pages", 8, page(8, "Trashed page", EDITED)),
+        ("databases", 9, data_source(9, "Unsearched", EDITED)),
+    ] {
+        assert!(found_by_id(&harness, folder, n, &object).await, "{n}");
+    }
+
+    let first = list(
+        &[
+            page(1, "Plans", EDITED),
+            row(2, 3, "A task", EARLIER),
+            data_source(3, "Tasks", EARLIER),
+        ],
+        Some("cursor-2"),
+    );
+    let (stopped, requests) = answering(
+        &harness,
+        names(&harness, "pages"),
+        vec![
+            ok(&first),
+            answer(
+                429,
+                &[("Retry-After", "1")],
+                &json!({ "object": "error", "status": 429, "code": "rate_limited", "message": "slow down" }),
+            ),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(stopped, Err(NsError::RateLimited { .. })),
+        "{stopped:?}"
+    );
+    expect_search(&requests[0], 100, None);
+    expect_search(&requests[1], 100, Some("cursor-2"));
+
+    for folder in ["pages", "databases"] {
+        let listing = served(&harness, names(&harness, folder)).await;
+        assert!(
+            matches!(listing, Err(NsError::RateLimited { .. })),
+            "{folder}: {listing:?}"
+        );
+    }
+    for (file, expected) in [
+        (format!("pages/{}/title", id(1)), "Plans"),
+        (format!("pages/{}/title", id(2)), "A task"),
+        (format!("databases/{}/title", id(3)), "Tasks"),
+    ] {
+        assert_eq!(
+            served(&harness, read(&harness, &file)).await.unwrap(),
+            expected,
+            "{file}"
+        );
+    }
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let (stopped, requests) =
+        answering(&harness, names(&harness, "databases"), vec![network()]).await;
+    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    expect_search(&requests[0], 100, Some("cursor-2"));
+
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "pages"),
+        vec![
+            ok(&list(&[page(4, "Notes", EARLIEST)], None)),
+            failure(404, "object_not_found"),
+            ok(&trashed(page(8, "Trashed page", EDITED_LATER))),
+            ok(&data_source(9, "Unsearched", EDITED)),
+        ],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), names_of(&[1, 2, 4]));
+    expect_search(&requests[0], 100, Some("cursor-2"));
+    expect(&requests[1], "GET", &format!("/v1/pages/{}", id(7)), None);
+    expect(&requests[2], "GET", &format!("/v1/pages/{}", id(8)), None);
+    expect(
+        &requests[3],
+        "GET",
+        &format!("/v1/data_sources/{}", id(9)),
+        None,
+    );
+
+    assert_eq!(
+        served(&harness, names(&harness, "databases"))
+            .await
+            .unwrap(),
+        names_of(&[3, 9])
+    );
+    assert_eq!(
+        served(&harness, names(&harness, &format!("pages/{}", id(1))))
+            .await
+            .unwrap(),
+        ["body.md", "comments", "page.json", "title"]
+    );
+    let page_json: Value = serde_json::from_str(
+        &served(
+            &harness,
+            read(&harness, &format!("pages/{}/page.json", id(2))),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(page_json, row(2, 3, "A task", EARLIER));
+    let schema: Value = serde_json::from_str(
+        &served(
+            &harness,
+            read(&harness, &format!("databases/{}/schema.json", id(9))),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(schema, data_source(9, "Unsearched", EDITED));
+    for gone in [7, 8] {
+        assert!(
+            served(&harness, lookup(&harness, &format!("pages/{}", id(gone))))
+                .await
+                .unwrap()
+                .is_missing(),
+            "{gone}"
+        );
+    }
+}
+
+/// A full listing again at a read of `pages/` and of `databases/` past the
+/// deadline of its last answer, taken after its last part, with the removal
+/// of what it lacks after its `GET`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
+    let harness = notion_harness();
+    first_full_listing(
+        &harness,
+        vec![
+            page(1, "One", EDITED),
+            page(2, "Two", EARLIER),
+            data_source(3, "Tasks", EARLIER),
+        ],
+    )
+    .await;
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (stopped, requests) = answering(
+        &harness,
+        names(&harness, "pages"),
+        vec![
+            ok(&list(&[page(1, "One again", EDITED_LATER)], Some("cursor-2"))),
+            answer(
+                429,
+                &[("Retry-After", "1")],
+                &json!({ "object": "error", "status": 429, "code": "rate_limited", "message": "slow down" }),
+            ),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(stopped, Err(NsError::RateLimited { .. })),
+        "{stopped:?}"
+    );
+    expect_search(&requests[0], 100, None);
+    expect_search(&requests[1], 100, Some("cursor-2"));
+    // The kept part waits for the last part of its answer.
+    assert_eq!(
+        served(&harness, read(&harness, &format!("pages/{}/title", id(1))))
+            .await
+            .unwrap(),
+        "One"
+    );
+    assert_eq!(
+        served(&harness, names(&harness, "pages")).await.unwrap(),
+        names_of(&[1, 2])
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "pages"),
+        vec![
+            ok(&list(&[data_source(3, "Tasks", EARLIER)], None)),
+            failure(404, "object_not_found"),
+        ],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), names_of(&[1]));
+    expect_search(&requests[0], 100, Some("cursor-2"));
+    expect(&requests[1], "GET", &format!("/v1/pages/{}", id(2)), None);
+    assert_eq!(
+        served(&harness, read(&harness, &format!("pages/{}/title", id(1))))
+            .await
+            .unwrap(),
+        "One again"
+    );
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "databases"),
+        vec![
+            ok(&list(&[page(1, "One again", EDITED_LATER)], None)),
+            failure(404, "object_not_found"),
+        ],
+    )
+    .await;
+    assert!(listing.unwrap().is_empty());
+    expect_search(&requests[0], 100, None);
+    expect(
+        &requests[1],
+        "GET",
+        &format!("/v1/data_sources/{}", id(3)),
+        None,
+    );
+}
+
+/// The changes at a read of a file of a page past the deadline of the last
+/// answer: the `page_size` of the count of the latest time and one more, then
+/// `100` by `next_cursor`, until an older result; a page with another
+/// `last_edited_time` takes its `body.md` and its `comments/` once more at
+/// their next first read.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn the_changes_take_the_search_until_an_older_result() {
+    let harness = notion_harness();
+    first_full_listing(
+        &harness,
+        vec![
+            page(1, "One", EDITED),
+            page(2, "Two", EDITED),
+            page(3, "Three", EARLIER),
+        ],
+    )
+    .await;
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(1))),
+        vec![ok(&markdown("One body", &[]))],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "One body");
+    expect(&requests[0], "GET", &markdown_of(&id(1)), None);
+    let (comments, requests) = answering(
+        &harness,
+        names(&harness, &format!("pages/{}/comments", id(1))),
+        vec![ok(&list(&[comment(11, Some("Ada"), "Hi")], None))],
+    )
+    .await;
+    assert_eq!(comments.unwrap(), names_of(&[11]));
+    expect(&requests[0], "GET", &comments_of(1, None), None);
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (title, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/title", id(2))),
+        vec![
+            ok(&list(
+                &[
+                    page(1, "One edited", EDITED_LATER),
+                    page(2, "Two", EDITED),
+                    page(4, "Four", EDITED),
+                ],
+                Some("cursor-2"),
+            )),
+            ok(&list(
+                &[page(5, "Five", EDITED), page(3, "Three", EARLIER)],
+                Some("cursor-3"),
+            )),
+        ],
+    )
+    .await;
+    assert_eq!(title.unwrap(), "Two");
+    expect_search(&requests[0], 3, None);
+    expect_search(&requests[1], 100, Some("cursor-2"));
+    assert_eq!(
+        served(&harness, names(&harness, "pages")).await.unwrap(),
+        names_of(&[1, 2, 3, 4, 5])
+    );
+    assert_eq!(
+        served(&harness, read(&harness, &format!("pages/{}/title", id(1))))
+            .await
+            .unwrap(),
+        "One edited"
+    );
+
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(1))),
+        vec![ok(&markdown("One body edited", &[]))],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "One body edited");
+    expect(&requests[0], "GET", &markdown_of(&id(1)), None);
+    let (comments, requests) = answering(
+        &harness,
+        names(&harness, &format!("pages/{}/comments", id(1))),
+        vec![ok(&list(&[], None))],
+    )
+    .await;
+    assert!(comments.unwrap().is_empty());
+    expect(&requests[0], "GET", &comments_of(1, None), None);
+
+    // The next changes start from the latest time of these, with its count.
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (_, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/title", id(2))),
+        vec![ok(&list(
+            &[page(1, "One edited", EDITED_LATER), page(2, "Two", EDITED)],
+            Some("cursor-2"),
+        ))],
+    )
+    .await;
+    expect_search(&requests[0], 2, None);
+}
+
+/// An object by its ID, a page or a data source: its `GET` at its first
+/// lookup without a listing, again at a read past its deadline before the end
+/// of the first full listing, none after it, but for one that the projection
+/// lacks at its lookup past its deadline, as after a `404`; its folder in its
+/// listing.
+async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value) {
+    let harness = notion_harness();
+    let at = |n: u32| format!("{folder}/{}", id(n));
+    let get = |n: u32| format!("{}/{}", request_of(folder), id(n));
+    assert!(found_by_id(&harness, folder, 1, &object(1, "First", EDITED)).await);
+    assert_eq!(
+        served(&harness, read(&harness, &format!("{}/title", at(1))))
+            .await
+            .unwrap(),
+        "First"
+    );
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (title, requests) = answering(
+        &harness,
+        read(&harness, &format!("{}/title", at(1))),
+        vec![ok(&object(1, "First renamed", EDITED))],
+    )
+    .await;
+    assert_eq!(title.unwrap(), "First renamed");
+    expect(&requests[0], "GET", &get(1), None);
+
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, folder),
+        vec![ok(&list(
+            &[
+                object(1, "First renamed", EDITED),
+                object(2, "Second", EDITED),
+            ],
+            None,
+        ))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), names_of(&[1, 2]));
+    expect_search(&requests[0], 100, None);
+
+    // After the end of the first full listing the changes answer for it.
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (title, requests) = answering(
+        &harness,
+        read(&harness, &format!("{}/title", at(1))),
+        vec![ok(&list(
+            &[
+                object(1, "First renamed", EDITED),
+                object(2, "Second", EDITED),
+            ],
+            None,
+        ))],
+    )
+    .await;
+    assert_eq!(title.unwrap(), "First renamed");
+    expect_search(&requests[0], 3, None);
+
+    // One that the projection lacks, at its lookup past its deadline.
+    let found = by_id(&harness, folder, 5, failure(404, "object_not_found")).await;
+    assert!(found.unwrap().is_missing());
+    assert!(
+        served(&harness, lookup(&harness, &at(5)))
+            .await
+            .unwrap()
+            .is_missing()
+    );
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (found, requests) = answering(
+        &harness,
+        lookup(&harness, &at(5)),
+        vec![
+            ok(&list(
+                &[
+                    object(1, "First renamed", EDITED),
+                    object(2, "Second", EDITED),
+                ],
+                None,
+            )),
+            ok(&object(5, "Fifth", EDITED)),
+        ],
+    )
+    .await;
+    assert!(!found.unwrap().is_missing());
+    expect_search(&requests[0], 3, None);
+    expect(&requests[1], "GET", &get(5), None);
+    assert_eq!(
+        served(&harness, names(&harness, folder)).await.unwrap(),
+        names_of(&[1, 2, 5])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_by_its_id() {
+    an_object_by_its_id("pages", page).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_source_by_its_id() {
+    an_object_by_its_id("databases", data_source).await;
+}
+
+/// The content at the first read of `body.md`, by a lookup and by its path
+/// alone: the markdown of the page and of its unknown blocks in turn, a block
+/// with `404` without its markdown, and the removal of the page for its
+/// `404`; a content taken within the minute of its `last_edited_time` by its
+/// `Date` taken once more at the first read after the end of that minute.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() {
+    let harness = notion_harness();
+    for n in [1, 2, 3, 4] {
+        assert!(found_by_id(&harness, "pages", n, &page(n, &format!("Page {n}"), EDITED)).await);
+    }
+
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(1))),
+        vec![
+            ok(&markdown("# Page 1", &[21, 22])),
+            ok(&markdown("Block 21", &[23])),
+            failure(404, "object_not_found"),
+            ok(&markdown("Block 23", &[])),
+        ],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "# Page 1\n\nBlock 21\n\nBlock 23");
+    expect(&requests[0], "GET", &markdown_of(&id(1)), None);
+    for (request, n) in requests[1..].iter().zip([21, 22, 23]) {
+        expect(request, "GET", &markdown_of(&notion_id(n)), None);
+    }
+    assert_eq!(
+        served(
+            &harness,
+            read(&harness, &format!("pages/{}/body.md", id(1)))
+        )
+        .await
+        .unwrap(),
+        "# Page 1\n\nBlock 21\n\nBlock 23"
+    );
+
+    let (body, requests) = answering(
+        &harness,
+        read_at(&harness, &format!("pages/{}/body.md", id(2))),
+        vec![ok(&markdown("Page 2 body", &[]))],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Page 2 body");
+    expect(&requests[0], "GET", &markdown_of(&id(2)), None);
+
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(3))),
+        vec![failure(404, "object_not_found")],
+    )
+    .await;
+    assert!(matches!(body, Err(NsError::NotFound)), "{body:?}");
+    expect(&requests[0], "GET", &markdown_of(&id(3)), None);
+    assert!(
+        served(&harness, lookup(&harness, &format!("pages/{}", id(3))))
+            .await
+            .unwrap()
+            .is_missing()
+    );
+
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(4))),
+        vec![answer(
+            200,
+            &[("Date", WITHIN)],
+            &markdown("Page 4 body", &[]),
+        )],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Page 4 body");
+    expect(&requests[0], "GET", &markdown_of(&id(4)), None);
+    assert_eq!(
+        served(
+            &harness,
+            read(&harness, &format!("pages/{}/body.md", id(4)))
+        )
+        .await
+        .unwrap(),
+        "Page 4 body"
+    );
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(4))),
+        vec![
+            ok(&page(4, "Page 4", EDITED)),
+            ok(&markdown("Page 4 body, edited in its minute", &[])),
+        ],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Page 4 body, edited in its minute");
+    expect(&requests[0], "GET", &format!("/v1/pages/{}", id(4)), None);
+    expect(&requests[1], "GET", &markdown_of(&id(4)), None);
+    assert_eq!(
+        served(
+            &harness,
+            read(&harness, &format!("pages/{}/body.md", id(4)))
+        )
+        .await
+        .unwrap(),
+        "Page 4 body, edited in its minute"
+    );
+}
+
+/// The comments at the first read of `comments/` and of a file of a comment
+/// by its path alone: their answers by `next_cursor`, the files of each
+/// comment, an empty `author` for `resolved_name` `null`, the removal of the
+/// page for `404`, and the comments once more after the end of the minute of
+/// the `last_edited_time` of the page, as the content.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn the_comments_take_their_answers_by_next_cursor() {
+    let harness = notion_harness();
+    for n in [1, 2, 3, 4] {
+        assert!(found_by_id(&harness, "pages", n, &page(n, &format!("Page {n}"), EDITED)).await);
+    }
+
+    let (comments, requests) = answering(
+        &harness,
+        names(&harness, &format!("pages/{}/comments", id(1))),
+        vec![
+            ok(&list(
+                &[
+                    comment(11, Some("Ada"), "First"),
+                    comment(13, None, "Second"),
+                ],
+                Some("cursor-2"),
+            )),
+            ok(&list(&[comment(15, Some("Grace"), "Third")], None)),
+        ],
+    )
+    .await;
+    assert_eq!(comments.unwrap(), names_of(&[11, 13, 15]));
+    expect(&requests[0], "GET", &comments_of(1, None), None);
+    expect(&requests[1], "GET", &comments_of(1, Some("cursor-2")), None);
+    let at = format!("pages/{}/comments/{}", id(1), id(13));
+    assert_eq!(
+        served(&harness, names(&harness, &at)).await.unwrap(),
+        ["author", "body.md", "comment.json"]
+    );
+    for (file, expected) in [("author", ""), ("body.md", "Second")] {
+        assert_eq!(
+            served(&harness, read(&harness, &format!("{at}/{file}")))
+                .await
+                .unwrap(),
+            expected,
+            "{file}"
+        );
+    }
+    let object: Value = serde_json::from_str(
+        &served(&harness, read(&harness, &format!("{at}/comment.json")))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(object, comment(13, None, "Second"));
+    assert_eq!(
+        served(
+            &harness,
+            read(
+                &harness,
+                &format!("pages/{}/comments/{}/author", id(1), id(15))
+            )
+        )
+        .await
+        .unwrap(),
+        "Grace"
+    );
+
+    let (body, requests) = answering(
+        &harness,
+        read_at(
+            &harness,
+            &format!("pages/{}/comments/{}/body.md", id(2), id(21)),
+        ),
+        vec![ok(&list(&[comment(21, Some("Linus"), "Hello")], None))],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Hello");
+    expect(&requests[0], "GET", &comments_of(2, None), None);
+
+    let (comments, requests) = answering(
+        &harness,
+        names(&harness, &format!("pages/{}/comments", id(3))),
+        vec![failure(404, "object_not_found")],
+    )
+    .await;
+    assert!(matches!(comments, Err(NsError::NotFound)), "{comments:?}");
+    expect(&requests[0], "GET", &comments_of(3, None), None);
+    assert!(
+        served(&harness, lookup(&harness, &format!("pages/{}", id(3))))
+            .await
+            .unwrap()
+            .is_missing()
+    );
+
+    let (comments, requests) = answering(
+        &harness,
+        names(&harness, &format!("pages/{}/comments", id(4))),
+        vec![answer(
+            200,
+            &[("Date", WITHIN)],
+            &list(&[comment(41, Some("Ada"), "Early")], None),
+        )],
+    )
+    .await;
+    assert_eq!(comments.unwrap(), names_of(&[41]));
+    expect(&requests[0], "GET", &comments_of(4, None), None);
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (comments, requests) = answering(
+        &harness,
+        names(&harness, &format!("pages/{}/comments", id(4))),
+        vec![
+            ok(&page(4, "Page 4", EDITED)),
+            ok(&list(
+                &[
+                    comment(41, Some("Ada"), "Early"),
+                    comment(43, Some("Grace"), "In the same minute"),
+                ],
+                None,
+            )),
+        ],
+    )
+    .await;
+    assert_eq!(comments.unwrap(), names_of(&[41, 43]));
+    expect(&requests[0], "GET", &format!("/v1/pages/{}", id(4)), None);
+    expect(&requests[1], "GET", &comments_of(4, None), None);
+}
+
+/// A `529` gives a read the error of a rate limit and Notion no request in
+/// the seconds of its `Retry-After`; a `429` of a blocked connection gives a
+/// read its error at once and asks again at the next read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_529_waits_its_retry_after_and_a_blocked_connection_does_not() {
+    let harness = notion_harness();
+    let found = by_id(
+        &harness,
+        "pages",
+        1,
+        answer(
+            529,
+            &[("Retry-After", "1")],
+            &json!({ "object": "error", "status": 529, "code": "service_overload", "message": "overloaded" }),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(found, Err(NsError::RateLimited { .. })),
+        "{found:?}"
+    );
+    let found = served(&harness, lookup(&harness, &format!("pages/{}", id(1)))).await;
+    assert!(
+        matches!(found, Err(NsError::RateLimited { .. })),
+        "{found:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(found_by_id(&harness, "pages", 1, &page(1, "Page 1", EDITED)).await);
+
+    let found = by_id(
+        &harness,
+        "pages",
+        2,
+        answer(
+            429,
+            &[("Retry-After", "60")],
+            &json!({
+                "object": "error",
+                "status": 429,
+                "code": "rate_limited",
+                "message": "This connection's API access has been restricted.",
+                "additional_data": { "rate_limit_reason": "public_api_request_blocked" },
+            }),
+        ),
+    )
+    .await;
+    assert!(matches!(found, Err(NsError::Permission)), "{found:?}");
+    assert!(found_by_id(&harness, "pages", 2, &page(2, "Page 2", EDITED)).await);
+}
+
+/// A `400` to a request with a `start_cursor` of a full listing, of the
+/// changes, and of the comments gives its read its error, and the next read
+/// begins from the first request.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn a_refused_cursor_begins_again_from_the_first_request() {
+    let harness = notion_harness();
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "pages"),
+        vec![
+            ok(&list(&[page(1, "One", EDITED)], Some("cursor-2"))),
+            failure(400, "validation_error"),
+        ],
+    )
+    .await;
+    assert!(matches!(listing, Err(NsError::Invalid)), "{listing:?}");
+    expect_search(&requests[0], 100, None);
+    expect_search(&requests[1], 100, Some("cursor-2"));
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "pages"),
+        vec![ok(&list(
+            &[page(1, "One", EDITED), page(2, "Two", EDITED)],
+            None,
+        ))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), names_of(&[1, 2]));
+    expect_search(&requests[0], 100, None);
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let title = format!("pages/{}/title", id(1));
+    let (stopped, requests) = answering(
+        &harness,
+        read(&harness, &title),
+        vec![
+            ok(&list(
+                &[
+                    page(3, "Three", EDITED),
+                    page(1, "One", EDITED),
+                    page(2, "Two", EDITED),
+                ],
+                Some("cursor-3"),
+            )),
+            failure(400, "validation_error"),
+        ],
+    )
+    .await;
+    assert!(matches!(stopped, Err(NsError::Invalid)), "{stopped:?}");
+    expect_search(&requests[0], 3, None);
+    expect_search(&requests[1], 100, Some("cursor-3"));
+    let (read_title, requests) = answering(
+        &harness,
+        read(&harness, &title),
+        vec![ok(&list(
+            &[page(1, "One", EDITED), page(2, "Two", EDITED)],
+            None,
+        ))],
+    )
+    .await;
+    assert_eq!(read_title.unwrap(), "One");
+    expect_search(&requests[0], 3, None);
+
+    let comments = format!("pages/{}/comments", id(1));
+    let (stopped, requests) = answering(
+        &harness,
+        names(&harness, &comments),
+        vec![
+            ok(&list(
+                &[comment(11, Some("Ada"), "First")],
+                Some("cursor-2"),
+            )),
+            failure(400, "validation_error"),
+        ],
+    )
+    .await;
+    assert!(matches!(stopped, Err(NsError::Invalid)), "{stopped:?}");
+    expect(&requests[0], "GET", &comments_of(1, None), None);
+    expect(&requests[1], "GET", &comments_of(1, Some("cursor-2")), None);
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, &comments),
+        vec![ok(&list(&[comment(11, Some("Ada"), "First")], None))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), names_of(&[11]));
+    expect(&requests[0], "GET", &comments_of(1, None), None);
+}
