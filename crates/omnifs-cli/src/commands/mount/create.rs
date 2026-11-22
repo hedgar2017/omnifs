@@ -371,6 +371,26 @@ pub(crate) async fn assemble_mount_build(
     // A credential of the invocation, as an imported token, is submitted
     // whatever credential is stored.
     let given = token.is_some() || args.gives_credential();
+    // A credential of the invocation is stored for its account alone: one
+    // that another mount holds stays, as of another client of the provider.
+    if args.gives_credential()
+        && let Some(auth) = auth.as_ref()
+        && let Some(holder) = credential_holder(
+            &mounts,
+            &manifest.id,
+            auth.scheme().unwrap_or_default(),
+            auth.account_or_default(),
+        )
+    {
+        return Err(anyhow!(
+            "mount `{holder}` holds the stored credential of the account `{}`",
+            auth.account_or_default()
+        ))
+        .with_hint("pass --account <label> to store the credential of this mount apart")
+        .with_hint(format!(
+            "or run `omnifs mount reauth {holder}` to replace the one of both mounts"
+        ));
+    }
     let auth_ready = match auth.as_ref() {
         Some(auth) if !given => {
             let account = auth.account_or_default();
@@ -398,6 +418,25 @@ pub(crate) async fn assemble_mount_build(
         credential_ready: auth_ready,
         pending_submission: None,
     })
+}
+
+/// The mount of `mounts` that holds the stored credential of `provider` of
+/// `scheme` and `account`.
+fn credential_holder<'a>(
+    mounts: &'a [omnifs_api::MountRecord],
+    provider: &str,
+    scheme: &str,
+    account: &str,
+) -> Option<&'a MountName> {
+    mounts
+        .iter()
+        .find(|mount| {
+            mount.provider.name == provider
+                && mount.definition.auth.as_ref().is_some_and(|credential| {
+                    credential.scheme == scheme && credential.account_label == account
+                })
+        })
+        .map(|mount| &mount.definition.name)
 }
 
 /// Whether a user signs in for the OAuth scheme of `auth`: not for a flow
@@ -616,7 +655,46 @@ pub(crate) fn quick_start_definition(
 
 #[cfg(test)]
 mod tests {
-    use super::{MountName, mount_created_value, sign_in_failed_value};
+    use super::{MountName, credential_holder, mount_created_value, sign_in_failed_value};
+
+    /// A mount holds the stored credential of its provider, scheme and
+    /// account alone.
+    #[test]
+    fn a_mount_holds_the_credential_of_its_provider_scheme_and_account() {
+        let id = omnifs_core::ProviderId::from_digest([0x12; 32]);
+        let mounts = [omnifs_api::MountRecord {
+            definition: omnifs_api::MountDefinition {
+                name: MountName::try_from("drive").unwrap(),
+                provider: id,
+                auth: Some(omnifs_api::MountCredential {
+                    scheme: "service-account".to_owned(),
+                    account_label: "default".to_owned(),
+                }),
+                limits: None,
+                config: b"{}".to_vec(),
+            },
+            provider: omnifs_api::ProviderReference {
+                id,
+                name: "google-drive".to_owned(),
+                version: None,
+            },
+            version: omnifs_core::MountVersion::from_digest([0x34; 32]),
+            revision: omnifs_core::MountRevision::new(1),
+            health: omnifs_api::MountHealth::Active,
+            auth_health: None,
+            last_mutation_id: omnifs_core::MutationId::from_bytes([0x56; 16]),
+        }];
+        let holder = |provider, scheme, account| {
+            credential_holder(&mounts, provider, scheme, account).map(MountName::as_str)
+        };
+        assert_eq!(
+            holder("google-drive", "service-account", "default"),
+            Some("drive")
+        );
+        assert_eq!(holder("google-drive", "service-account", "other"), None);
+        assert_eq!(holder("google-drive", "oauth", "default"), None);
+        assert_eq!(holder("github", "service-account", "default"), None);
+    }
 
     #[test]
     fn mount_created_value_names_the_mount() {
