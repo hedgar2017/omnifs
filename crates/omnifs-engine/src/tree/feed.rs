@@ -200,8 +200,8 @@ fn asks_listing(
     })
 }
 
-/// Record the directory `dir` as changed when it is the anchor of a feed of
-/// full listings past its deadline after the end of its first answer, outside
+/// Record the directory `dir` as changed, once for a deadline, when it is the
+/// anchor of a feed of full listings past its deadline after the end of its first answer, outside
 /// the rate-limit window of the mount: a filesystem lists a directory again
 /// only after a change of its attributes, and that listing asks the feed.
 pub(crate) async fn due_listing(runtime: &Runtime, dir: &Path) -> Result<()> {
@@ -219,8 +219,8 @@ pub(crate) async fn due_listing(runtime: &Runtime, dir: &Path) -> Result<()> {
             .resources
             .feed_state(claim.object.id.as_bytes())
             .map_err(|error| TreeError::internal(error.to_string()))?;
-        if state.as_ref().is_some_and(|state| state.ended) && past_deadline(state.as_ref()) {
-            runtime.record_dir_changed(dir, true);
+        if let Some(state) = state.filter(|state| state.ended && state.deadline <= now_millis()) {
+            runtime.record_dir_due(dir, state.deadline);
         }
     }
     Ok(())

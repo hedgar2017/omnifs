@@ -227,14 +227,18 @@ async fn the_channels_are_the_full_listings_of_users_conversations() {
             .unwrap(),
         "general"
     );
-    assert_ne!(
+    let due = served(&harness, lookup(&harness, "channels"))
+        .await
+        .unwrap();
+    assert_ne!(due.attrs().unwrap().change, folder.attrs().unwrap().change);
+    assert_eq!(
         served(&harness, lookup(&harness, "channels"))
             .await
             .unwrap()
             .attrs()
             .unwrap()
             .change,
-        folder.attrs().unwrap().change
+        due.attrs().unwrap().change
     );
     let (listing, requests) = answering(
         &harness,
