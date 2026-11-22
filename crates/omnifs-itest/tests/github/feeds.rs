@@ -118,6 +118,15 @@ fn node(number: u64, title: &str, state: &str, updated: &str, comments: u64) -> 
     })
 }
 
+/// A pull request as a node of GitHub GraphQL, with `base-1` as its base and
+/// `head-1` as its head.
+fn pull(number: u64, title: &str, state: &str, updated: &str, comments: u64) -> Value {
+    let mut pull = node(number, title, state, updated, comments);
+    pull["baseRefOid"] = json!("base-1");
+    pull["headRefOid"] = json!("head-1");
+    pull
+}
+
 /// A page of the nodes of a kind, with the count of the kind and the cursor
 /// of its last node, `next` while a page follows.
 fn rows(nodes: &[Value], total: u64, end: Option<&str>, next: bool) -> Value {
@@ -275,7 +284,7 @@ async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_count
     one["author"] = Value::Null;
     let three = node(3, "Three", "CLOSED", "2026-11-18T08:00:00Z", 0);
     let four = node(4, "Four", "OPEN", "2026-11-18T09:30:00Z", 0);
-    let two = node(2, "Two", "OPEN", "2026-11-18T10:00:00Z", 1);
+    let two = pull(2, "Two", "OPEN", "2026-11-18T10:00:00Z", 1);
     let mut ten = comment(10, 1, false, "first", "2026-11-18T08:10:00Z");
     ten["user"] = Value::Null;
     let eleven = comment(11, 1, false, "second", "2026-11-18T08:15:00Z");
@@ -313,7 +322,12 @@ async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_count
     );
     assert_eq!(variables["issues"], Value::Null);
     assert_eq!(graphql_of(&requests[1]).1["issues"], "i-1");
-    assert!(graphql_of(&requests[2]).0.contains("pulls: pullRequests("));
+    let (query, _) = graphql_of(&requests[2]);
+    assert!(query.contains("pulls: pullRequests("), "{query}");
+    assert!(
+        query.contains("comments { totalCount } baseRefOid headRefOid }"),
+        "{query}"
+    );
     assert_eq!(http(&requests[3]).url, api(COMMENTS));
     assert_eq!(
         http(&requests[4]).url,
@@ -368,6 +382,10 @@ async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_count
             "# One\n\n- Number: 1\n- State: OPEN\n- User: \n\nOne body\n".to_owned(),
         ),
         ("pulls/open/2/item.json", two.to_string()),
+        (
+            "pulls/open/2/item.md",
+            "# Two\n\n- Number: 2\n- State: OPEN\n- User: octocat\n\nTwo body\n".to_owned(),
+        ),
         ("issues/all/1/comments/10/author", String::new()),
         ("issues/all/1/comments/11/body.md", "second".to_owned()),
         ("issues/all/1/comments/11/comment.json", eleven.to_string()),
@@ -403,7 +421,7 @@ async fn the_attributes_of_the_files_of_an_issue_and_of_a_pull_request_take_no_r
     first_full_listing(
         &harness,
         &[node(1, "One", "OPEN", "2026-11-18T09:00:00Z", 1)],
-        &[node(2, "Two", "OPEN", "2026-11-18T10:00:00Z", 0)],
+        &[pull(2, "Two", "OPEN", "2026-11-18T10:00:00Z", 0)],
         &[comment(10, 1, false, "first", "2026-11-18T08:10:00Z")],
     )
     .await;
@@ -618,7 +636,7 @@ async fn a_comment_deleted_from_an_unchanged_item_leaves_at_the_next_check() {
             node(1, "One", "OPEN", "2026-11-18T08:00:00Z", 2),
             node(3, "Three", "OPEN", "2026-11-18T08:30:00Z", 0),
         ],
-        &[node(2, "Two", "OPEN", "2026-11-18T09:00:00Z", 1)],
+        &[pull(2, "Two", "OPEN", "2026-11-18T09:00:00Z", 1)],
         &[
             comment(10, 1, false, "first", "2026-11-18T08:00:00Z"),
             comment(12, 1, false, "second", "2026-11-18T08:30:00Z"),

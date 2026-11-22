@@ -495,8 +495,6 @@ fn github_provider_missing_item_resources_validate_on_lookup() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn github_pr_lookup_is_fed_and_exposes_diff() {
-    use omnifs_wit::host::types::{BlobContent, BlobFetched, ByteSource, Callout, CalloutResult};
-
     let harness = github_harness();
 
     let lookup = harness
@@ -542,74 +540,17 @@ fn github_pr_lookup_is_fed_and_exposes_diff() {
         other => panic!("expected PR dir listing, got {other:?}"),
     }
 
-    // The diff is the diff between the base and the head that the pull
-    // request names: the host holds the diff of each pair of commits, so a
-    // read asks GitHub for the diff of a pair once, and a push to the pull
-    // request, which moves its head, asks for another diff.
-    for (head, blob) in [("head-1", 1), ("head-2", 2)] {
-        let mut diff = harness
-            .read("/octocat/Hello-World/pulls/open/7/diff.patch")
-            .unwrap();
-        let pull_fetch = diff.expect_single_fetch();
-        assert!(
-            pull_fetch
-                .url
-                .ends_with("/repos/octocat/Hello-World/pulls/7"),
-            "unexpected pull request URL: {}",
-            pull_fetch.url
-        );
-        diff.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: format!(r#"{{"base":{{"sha":"base-1"}},"head":{{"sha":"{head}"}}}}"#)
-                .into_bytes(),
-            redirected: None,
-        })])
+    // The diff is versioned by the commits that the node of the pull request
+    // in the projection names: without that node, the pull request is not
+    // in the projection, and its diff is not found, without a request.
+    let diff = harness
+        .read("/octocat/Hello-World/pulls/open/7/diff.patch")
         .unwrap();
-        let diff_fetch = match diff.callouts() {
-            [Callout::FetchBlob(request)] => request,
-            other => panic!("expected fetch-blob callout, got {other:?}"),
-        };
-        assert!(
-            diff_fetch
-                .url
-                .ends_with("/repos/octocat/Hello-World/pulls/7"),
-            "unexpected PR diff fetch URL: {}",
-            diff_fetch.url
-        );
-        assert!(
-            diff_fetch
-                .headers
-                .iter()
-                .any(|h| h.name.eq_ignore_ascii_case("accept")
-                    && h.value == "application/vnd.github.diff"),
-            "expected diff Accept header, got {:?}",
-            diff_fetch.headers
-        );
-        let version = format!("base-1..{head}");
-        assert_eq!(diff_fetch.version.as_deref(), Some(version.as_str()));
-
-        diff.answer_callouts(vec![CalloutResult::BlobFetched(BlobFetched {
-            status: 200,
-            response_headers: Vec::new(),
-            redirected: None,
-            upstream: true,
-            content: Some(BlobContent { blob, size: 25 }),
-        })])
-        .unwrap();
-
-        match diff.result().unwrap() {
-            Ok(ReadFileOutcome::Found(file)) => {
-                match &file.bytes {
-                    ByteSource::Blob(found) => assert_eq!(*found, blob),
-                    other => panic!("expected blob-backed diff, got {other:?}"),
-                }
-                assert_eq!(file.attrs.stability, Stability::Dynamic);
-                assert_eq!(file.attrs.version_token.as_deref(), Some(version.as_str()));
-            },
-            other => panic!("expected PR diff file after read, got {other:?}"),
-        }
-    }
+    assert!(diff.callouts().is_empty(), "{:?}", diff.callouts());
+    assert!(
+        matches!(diff.into_ok(), Err(_) | Ok(ReadFileOutcome::NotFound(_))),
+        "a pull request that the projection lacks has no diff"
+    );
 }
 
 #[test]
@@ -1323,8 +1264,9 @@ fn item_json_is_the_node_of_its_number() {
         ByteSource, Callout, CalloutResult, HttpResponse, ReadFileOutcome,
     };
 
-    let item_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0}}"#;
-    let answer = |kind: &str, repository: &str| {
+    let issue_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0}}"#;
+    let pull_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0},"baseRefOid":"base-1","headRefOid":"head-1"}"#;
+    let answer = |kind: &str, repository: &str, item_json: &str| {
         format!(
             r#"{{"data":{{"repository":{{"nameWithOwner":"octocat/Hello-World",
             "t42":{{"__typename":"{kind}","number":42,"repository":{{"nameWithOwner":"{repository}"}}}},
@@ -1332,7 +1274,10 @@ fn item_json_is_the_node_of_its_number() {
         )
     };
     let harness = github_harness();
-    for (kind, typename) in [("issues", "Issue"), ("pulls", "PullRequest")] {
+    for (kind, typename, item_json) in [
+        ("issues", "Issue", issue_json),
+        ("pulls", "PullRequest", pull_json),
+    ] {
         let mut step = harness
             .read(&format!("/octocat/Hello-World/{kind}/all/42/item.json"))
             .unwrap();
@@ -1345,10 +1290,14 @@ fn item_json_is_the_node_of_its_number() {
             query.contains("t42: issueOrPullRequest(number: 42)"),
             "{query}"
         );
+        assert!(
+            query.contains("... on PullRequest { number title body state author { login } updatedAt comments { totalCount } baseRefOid headRefOid }"),
+            "{query}"
+        );
         step.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
             status: 200,
             headers: Vec::new(),
-            body: answer(typename, "octocat/Hello-World").into_bytes(),
+            body: answer(typename, "octocat/Hello-World", item_json).into_bytes(),
             redirected: None,
         })])
         .unwrap();
@@ -1374,7 +1323,7 @@ fn item_json_is_the_node_of_its_number() {
         .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
             status: 200,
             headers: Vec::new(),
-            body: answer("Issue", "octocat/elsewhere").into_bytes(),
+            body: answer("Issue", "octocat/elsewhere", issue_json).into_bytes(),
             redirected: None,
         })])
         .unwrap();
@@ -1528,17 +1477,70 @@ async fn github_notifications_are_asked_again_only_after_their_poll_interval() {
 /// before the first full listing of the repository, and again once the feed
 /// is due in a sync.
 fn pull_seven() -> HttpResponse {
+    pull_seven_at("head-1")
+}
+
+/// Pull request 7 by its number, with `base-1` as its base and `head` as its
+/// head.
+fn pull_seven_at(head: &str) -> HttpResponse {
     HttpResponse {
         status: 200,
         headers: Vec::new(),
-        body: br#"{"data":{"repository":{
+        body: format!(
+            r#"{{"data":{{"repository":{{
             "nameWithOwner":"octocat/Hello-World",
-            "t7":{"__typename":"PullRequest","number":7,"repository":{"nameWithOwner":"octocat/Hello-World"}},
-            "n7":{"number":7,"title":"Seven","body":"Seven body","state":"OPEN","author":{"login":"octocat"},
-                  "updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0}}
-        }}}"#
-        .to_vec(),
+            "t7":{{"__typename":"PullRequest","number":7,"repository":{{"nameWithOwner":"octocat/Hello-World"}}}},
+            "n7":{{"number":7,"title":"Seven","body":"Seven body","state":"OPEN","author":{{"login":"octocat"}},
+                  "updatedAt":"2026-11-18T09:00:00Z","comments":{{"totalCount":0}},
+                  "baseRefOid":"base-1","headRefOid":"{head}"}}
+        }}}}}}"#
+        )
+        .into_bytes(),
         redirected: None,
+    }
+}
+
+/// `diff.patch` is the diff between the base and the head that the node of
+/// its pull request in the projection names, with no request of its own for
+/// them: a read asks the host for the diff of that pair of commits, and a
+/// push to the pull request, which its node in the next sync shows, asks for
+/// the diff of the new pair.
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_patch_is_the_diff_of_the_commits_that_its_pull_request_names() {
+    use omnifs_itest::support::{Answer, Request, read};
+
+    let harness = github_harness();
+    let path = "/github/octocat/Hello-World/pulls/all/7/diff.patch";
+    for (head, diff) in [("head-1", "diff one"), ("head-2", "diff two")] {
+        if head == "head-2" {
+            harness.begin_sync();
+        }
+        let (read, requests) = answering(
+            &harness,
+            read(&harness, path),
+            [
+                fetched(pull_seven_at(head)),
+                Answer::Blob(200, diff.as_bytes().to_vec()),
+            ],
+        )
+        .await;
+        assert_eq!(read.unwrap(), diff);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(http(&requests[0]).url, "https://api.github.com/graphql");
+        let Request::Blob(blob) = &requests[1] else {
+            panic!("expected the blob of the diff, got {:?}", requests[1]);
+        };
+        assert!(
+            blob.url.ends_with("/repos/octocat/Hello-World/pulls/7"),
+            "{}",
+            blob.url
+        );
+        assert!(blob.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("accept")
+                && header.value == "application/vnd.github.diff"
+        }));
+        let version = format!("base-1..{head}");
+        assert_eq!(blob.version.as_deref(), Some(version.as_str()));
     }
 }
 
