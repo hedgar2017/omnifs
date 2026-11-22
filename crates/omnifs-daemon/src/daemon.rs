@@ -365,20 +365,28 @@ impl Daemon {
         })
     }
 
+    /// The recovery of the daemon, whose store health reports the error of a
+    /// store that requires recovery.
     pub(crate) async fn recovery(&self) -> anyhow::Result<DaemonRecovery> {
         let state = self.state.serving_state().await?;
         let durable_revision = self.state.mount_revision().await?;
         let serving = self.serving.provenance();
-        let phase = match state.recovery {
-            omnifs_state::RecoveryState::Ready => DaemonPhase::Ready,
-            omnifs_state::RecoveryState::RecoveryRequired { .. } => DaemonPhase::RecoveryRequired,
+        let (phase, store_health) = match state.recovery {
+            omnifs_state::RecoveryState::Ready => (
+                DaemonPhase::Ready,
+                HealthReport::new(HealthState::Healthy, "control store available"),
+            ),
+            omnifs_state::RecoveryState::RecoveryRequired { detail } => (
+                DaemonPhase::RecoveryRequired,
+                HealthReport::new(HealthState::Unhealthy, detail),
+            ),
         };
         Ok(DaemonRecovery {
             phase,
             durable_revision: Some(durable_revision),
             serving_revision: Some(serving.revision()),
             failed_mutation: state.failed_mutation,
-            store_health: HealthReport::new(HealthState::Healthy, "control store available"),
+            store_health,
             repair: None,
         })
     }
@@ -386,6 +394,13 @@ impl Daemon {
     pub(crate) async fn inventory(&self) -> anyhow::Result<DaemonInventory> {
         let recovery = self.recovery().await?;
         let status = self.control_status();
+        // As the inventory of a daemon whose start requires recovery, the
+        // one of a store that requires recovery reports the error in place
+        // of the health of the mounts.
+        let mut health = *status.health;
+        if recovery.phase == DaemonPhase::RecoveryRequired {
+            health.mounts = recovery.store_health;
+        }
         let summaries = self.state.list_credentials().await?;
         let mut credentials = Vec::with_capacity(summaries.len());
         for summary in summaries {
@@ -398,7 +413,7 @@ impl Daemon {
             phase: recovery.phase,
             durable_revision: recovery.durable_revision,
             serving_revision: recovery.serving_revision,
-            health: *status.health,
+            health,
             mounts: self.mount_records().await?,
             credentials,
             attachments: self.vfs.attachments(),

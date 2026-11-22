@@ -710,6 +710,37 @@ async fn tonic_inventory_and_status_use_generated_messages() {
     let status = grpc::daemon_status(&status).unwrap();
     assert!(status.mounts.is_empty());
     assert!(status.active_mutation.is_none());
+
+    // A store that requires recovery under a running daemon reports the
+    // error of the recovery, in its recovery state and in its inventory.
+    runtime
+        .daemon
+        .state
+        .mark_recovery_required(None, "a publish failed".to_owned())
+        .await
+        .unwrap();
+    let recovery = c
+        .get_recovery_state(wire::Empty {})
+        .await
+        .unwrap()
+        .into_inner()
+        .recovery
+        .unwrap();
+    let recovery = grpc::daemon_recovery(&recovery).unwrap();
+    assert_eq!(recovery.phase, DaemonPhase::RecoveryRequired);
+    assert_eq!(recovery.store_health.state, HealthState::Unhealthy);
+    assert_eq!(recovery.store_health.message, "a publish failed");
+    let inventory = c
+        .get_inventory(wire::Empty {})
+        .await
+        .unwrap()
+        .into_inner()
+        .inventory
+        .unwrap();
+    let inventory = grpc::daemon_inventory(&inventory).unwrap();
+    assert_eq!(inventory.phase, DaemonPhase::RecoveryRequired);
+    assert_eq!(inventory.health.mounts.state, HealthState::Unhealthy);
+    assert_eq!(inventory.health.mounts.message, "a publish failed");
     runtime.shutdown().await;
 }
 

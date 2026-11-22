@@ -153,7 +153,7 @@ async fn wait_until_ready(rpc: &RpcClient, child: Option<&mut Child>) -> anyhow:
                         DaemonPhase::RecoveryRequired => {
                             return Err(anyhow::anyhow!(
                                 "daemon requires recovery: {}",
-                                inventory.health.control.message
+                                inventory.health.mounts.message
                             ))
                             .with_exit_code(ExitCode::DaemonUnavailable)
                             .map(Some);
