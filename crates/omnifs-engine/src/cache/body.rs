@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use crate::view::BodyId;
@@ -234,25 +234,31 @@ impl BodyStore {
     pub(crate) fn publish(&self, bytes: &[u8]) -> Result<BodyId, BodyStoreError> {
         let (id, linked) = self.link(bytes)?;
         if linked {
-            sync_directory(&self.root)?;
+            make_durable(&self.root, &[self.path(id)])?;
         }
         Ok(id)
     }
 
     /// Publish each of `bodies` as [`publish`](Self::publish) does, with one
-    /// thread for each thread of the computer, and with one sync of the
-    /// directory after the links of all of them.
+    /// thread for each thread of the computer, and with one barrier of the
+    /// storage device after the links of all of them: the cost of a body is
+    /// its write, not a flush of the device of its own, so that a first
+    /// listing that writes the bodies of its items costs what a listing that
+    /// finds them costs, but for their bytes.
     pub(crate) fn publish_all(&self, bodies: &[&[u8]]) -> Result<(), BodyStoreError> {
         let threads = std::thread::available_parallelism()?;
         let next = AtomicUsize::new(0);
-        let linked = AtomicBool::new(false);
+        let linked = std::sync::Mutex::new(Vec::new());
         let failure = OnceLock::new();
         std::thread::scope(|scope| {
             for _ in 0..threads.get().min(bodies.len()) {
                 scope.spawn(|| {
                     while let Some(bytes) = bodies.get(next.fetch_add(1, Ordering::Relaxed)) {
                         match self.link(bytes) {
-                            Ok((_, true)) => linked.store(true, Ordering::Relaxed),
+                            Ok((id, true)) => linked
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(self.path(id)),
                             Ok((_, false)) => {},
                             Err(error) => {
                                 let _ = failure.set(error);
@@ -265,10 +271,13 @@ impl BodyStore {
                 });
             }
         });
-        let synced = if linked.load(Ordering::Relaxed) {
-            sync_directory(&self.root)
-        } else {
+        let linked = linked
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let synced = if linked.is_empty() {
             Ok(())
+        } else {
+            make_durable(&self.root, &linked)
         };
         if let Some(error) = failure.into_inner() {
             return Err(error);
@@ -276,21 +285,29 @@ impl BodyStore {
         Ok(synced?)
     }
 
-    /// Write and sync the file of `bytes` and link it at its id. Returns
-    /// whether the directory took a link or a removal, which its sync makes
-    /// durable.
+    /// Write the file of `bytes` and rename it to its id, which a reader
+    /// finds whole or not at all. Returns whether the directory took a new
+    /// name, which [`make_durable`] of the file makes durable with its
+    /// bytes before any fact refers to it. A body of the store is a file of
+    /// its length, which no write of this store leaves partial: its bytes
+    /// are the ones of its id, and a publication of it reads none of them.
     fn link(&self, bytes: &[u8]) -> Result<(BodyId, bool), BodyStoreError> {
         let id = BodyId::from_bytes(bytes);
         self.name(id);
         let destination = self.path(id);
+        let length = bytes.len() as u64;
         match fs::symlink_metadata(&destination) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(BodyStoreError::Destination { id });
             },
-            Ok(_) => {
-                Self::verify_file(&destination, id, bytes.len() as u64)?;
-                return Ok((id, false));
+            Ok(metadata) if metadata.len() != length => {
+                return Err(BodyStoreError::Length {
+                    id,
+                    expected: length,
+                    actual: metadata.len(),
+                });
             },
+            Ok(_) => return Ok((id, false)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {},
             Err(error) => return Err(error.into()),
         }
@@ -302,24 +319,12 @@ impl BodyStore {
                 .create_new(true)
                 .open(&temporary)?;
             file.write_all(bytes)?;
-            file.sync_all()?;
             drop(file);
-            Self::verify_file(&temporary, id, bytes.len() as u64)?;
-            match fs::hard_link(&temporary, &destination) {
-                Ok(()) => {
-                    fs::remove_file(&temporary)?;
-                    self.took(bytes.len() as u64);
-                    Ok((id, true))
-                },
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let winner = Self::verify_destination(&destination, id, bytes.len() as u64);
-                    let removed = fs::remove_file(&temporary);
-                    winner?;
-                    removed?;
-                    Ok((id, true))
-                },
-                Err(error) => Err(error.into()),
-            }
+            // A body of the same id that another publication renamed in the
+            // meantime has the same bytes: the rename replaces it with them.
+            fs::rename(&temporary, &destination)?;
+            self.took(length);
+            Ok((id, true))
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -352,7 +357,7 @@ impl BodyStore {
     ) -> Result<BodyHold, BodyStoreError> {
         let file = staged.file.as_mut().expect("staged body file exists");
         file.flush()?;
-        file.sync_all()?;
+        full_sync(file)?;
         let id = BodyId::from_digest_bytes(*staged.hasher.finalize().as_bytes());
         let expected_len = staged.length;
         let metadata = file.metadata()?;
@@ -486,49 +491,6 @@ impl BodyStore {
             .join(format!(".body-{}-{sequence}.tmp", std::process::id()))
     }
 
-    fn verify_file(path: &Path, id: BodyId, expected_len: u64) -> Result<(), BodyStoreError> {
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(BodyStoreError::Destination { id });
-        }
-        let mut file = open_nofollow(path)?;
-        if metadata.len() != expected_len {
-            return Err(BodyStoreError::Length {
-                id,
-                expected: expected_len,
-                actual: metadata.len(),
-            });
-        }
-        let mut hasher = blake3::Hasher::new();
-        let mut length = 0_u64;
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            length += read as u64;
-            hasher.update(&buffer[..read]);
-        }
-        if length != expected_len || hasher.finalize() != blake3::Hash::from_bytes(*id.as_bytes()) {
-            return Err(BodyStoreError::Digest { id });
-        }
-        Ok(())
-    }
-
-    fn verify_destination(
-        path: &Path,
-        id: BodyId,
-        expected_len: u64,
-    ) -> Result<(), BodyStoreError> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                Err(BodyStoreError::Destination { id })
-            },
-            Ok(_) => Self::verify_file(path, id, expected_len),
-            Err(error) => Err(error.into()),
-        }
-    }
 }
 
 /// A body staged by [`BodyStore::stage`]. It owns the temporary file until
@@ -579,7 +541,70 @@ fn body_of_name(name: &str) -> Option<BodyId> {
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    full_sync(&File::open(path)?)
+}
+
+/// A sync of `file` with the storage device under it, the one barrier that
+/// makes what was written before it durable.
+fn full_sync(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    FULL_SYNCS.fetch_add(1, Ordering::Relaxed);
+    file.sync_all()
+}
+
+/// The full syncs of the process, of [`full_sync`] and of the barrier of
+/// [`make_durable`].
+#[cfg(test)]
+static FULL_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Make the bytes of the files of `files` and their links in `root` durable
+/// with one barrier of the storage device: on macOS a write of each to the
+/// device and one flush of the cache of the device, which `F_FULLFSYNC`
+/// gives for every file written before it; on Linux one `syncfs` of the
+/// filesystem of `root`; elsewhere a sync of each and of the directory.
+#[allow(unsafe_code, reason = "fsync, fcntl and syncfs of open descriptors")]
+fn make_durable(root: &Path, files: &[std::path::PathBuf]) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd as _;
+        for path in files {
+            let file = File::open(path)?;
+            // SAFETY: the descriptor is open for the call.
+            if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let directory = File::open(root)?;
+        #[cfg(test)]
+        FULL_SYNCS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the descriptor is open for both calls.
+        if unsafe { libc::fsync(directory.as_raw_fd()) } != 0
+            || unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_FULLFSYNC) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let _ = files;
+        let directory = File::open(root)?;
+        #[cfg(test)]
+        FULL_SYNCS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the descriptor is open for the call.
+        if unsafe { libc::syncfs(directory.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        for path in files {
+            File::open(path)?.sync_all()?;
+        }
+        sync_directory(root)
+    }
 }
 
 fn open_nofollow(path: &Path) -> io::Result<File> {
@@ -741,6 +766,29 @@ mod tests {
         assert!(!store.collection_due());
         store.publish(b"abcd").unwrap();
         assert!(store.collection_due());
+    }
+
+    /// The bodies of one publication take one barrier of the storage
+    /// device, whatever their count, and bodies that the store has take
+    /// none: a first listing costs a write of each new body, not a flush of
+    /// the device for each.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_bodies_of_a_publication_take_one_barrier_of_the_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BodyStore::open(dir.path()).unwrap();
+        let bodies: Vec<Vec<u8>> = (0..64_u32).map(|n| format!("body {n}").into_bytes()).collect();
+        let all: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+        let syncs = || super::FULL_SYNCS.load(std::sync::atomic::Ordering::Relaxed);
+        let before = syncs();
+        store.publish_all(&all).unwrap();
+        assert_eq!(syncs() - before, 1);
+        let before = syncs();
+        store.publish_all(&all).unwrap();
+        assert_eq!(syncs() - before, 0, "the store has each body");
+        for body in &bodies {
+            assert_eq!(&store.read(super::BodyId::from_bytes(body), None).unwrap()[..], &body[..]);
+        }
     }
 
     #[test]
