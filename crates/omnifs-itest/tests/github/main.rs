@@ -6,12 +6,13 @@ mod support;
 
 use omnifs_engine::Namespace;
 use omnifs_itest::ReadFileOpExt;
+use omnifs_itest::support::answering;
 use omnifs_wit::host::types::{
     CalloutResult, Cursor, EntryKind, Header, HttpResponse, ListChildrenResult, LookupChildResult,
     PageValidator, ReadFileOutcome, Stability,
 };
 use support::{
-    TestOpExt, answering, github_harness, not_modified, project_file_stability, project_paths,
+    TestOpExt, fetched, github_harness, http, not_modified, project_file_stability, project_paths,
     request_header, resolve_namespace,
 };
 
@@ -166,13 +167,14 @@ fn github_action_run_list_projects_files() {
     );
     match response.result().unwrap() {
         Ok(ListChildrenResult::Entries(listing)) => {
-            let project_paths = project_paths(response.effects().unwrap());
-            assert_eq!(
-                project_paths,
-                vec![
-                    "/octocat/Hello-World/actions/runs/123/status",
-                    "/octocat/Hello-World/actions/runs/123/conclusion",
-                ]
+            // Each row of the list is the canonical bytes of its run, from
+            // which its files render without a request.
+            let effects = response.effects().unwrap();
+            assert_eq!(canonical_bytes(effects).len(), 1);
+            assert!(
+                std::str::from_utf8(canonical_bytes(effects)[0])
+                    .unwrap()
+                    .contains(r#""id":123"#)
             );
             let names: Vec<&str> = listing
                 .entries
@@ -235,7 +237,7 @@ fn github_provider_action_run_lookup_validates_and_listing_validates() {
                 names.contains(&"conclusion"),
                 "missing conclusion in {names:?}"
             );
-            assert!(names.contains(&"log"), "missing log in {names:?}");
+            assert!(names.contains(&"logs.zip"), "missing logs.zip in {names:?}");
             assert!(
                 !names.contains(&"comments"),
                 "unexpected item comments route leaked into action run listing: {names:?}"
@@ -831,19 +833,10 @@ fn github_pr_files_list_and_read_changed_file_objects() {
                 .collect();
             assert_eq!(names, vec!["src%2Flib.rs"]);
             let effects = listed.effects().unwrap();
-            let mut preloaded = project_paths(effects);
-            preloaded.sort_unstable();
             assert_eq!(
-                preloaded,
-                vec![
-                    "/octocat/Hello-World/pulls/all/7/files/src%2Flib.rs/filename",
-                    "/octocat/Hello-World/pulls/all/7/files/src%2Flib.rs/status",
-                ]
-            );
-            assert!(
-                effects.canonical.is_empty(),
-                "PR files list must not seed changed-file canonicals, got {:?}",
-                effects.canonical
+                canonical_bytes(effects),
+                [CHANGED_FILE_ROW],
+                "the row of a changed file is its canonical bytes"
             );
         },
         other => panic!("expected PR files listing, got {other:?}"),
@@ -923,15 +916,10 @@ fn github_pr_reviews_and_review_comments_list_and_read_objects() {
                 .collect();
             assert_eq!(names, vec!["80"]);
             let effects = reviews.effects().unwrap();
-            assert!(
-                project_paths(effects)
-                    .contains(&"/octocat/Hello-World/pulls/all/7/reviews/80/state"),
-                "missing review state preload"
-            );
-            assert!(
-                effects.canonical.is_empty(),
-                "review list must not seed review canonicals, got {:?}",
-                effects.canonical
+            assert_eq!(
+                canonical_bytes(effects).len(),
+                1,
+                "the row of a review is its canonical bytes"
             );
         },
         other => panic!("expected reviews listing, got {other:?}"),
@@ -1006,9 +994,10 @@ fn github_pr_reviews_and_review_comments_list_and_read_objects() {
                 .map(|entry| entry.name.as_str())
                 .collect();
             assert_eq!(names, vec!["99"]);
-            assert!(
-                comments.effects().unwrap().canonical.is_empty(),
-                "review comment list must not seed canonicals"
+            assert_eq!(
+                canonical_bytes(comments.effects().unwrap()).len(),
+                1,
+                "the row of a review comment is its canonical bytes"
             );
         },
         other => panic!("expected review comments listing, got {other:?}"),
@@ -1129,9 +1118,10 @@ fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
                 Some(Cursor::Opaque(ref cursor))
                     if cursor == r#"{"sha":"abc123","page":2}"#
             ));
-            assert!(
-                checks.effects().unwrap().canonical.is_empty(),
-                "check run list must not seed canonicals"
+            assert_eq!(
+                canonical_bytes(checks.effects().unwrap()).len(),
+                100,
+                "the row of a check run is its canonical bytes"
             );
             assert_eq!(
                 listing
@@ -1439,17 +1429,12 @@ fn github_projected_resource_reads_return_all_fetched_siblings() {
         .unwrap();
     match index_listed.result().unwrap() {
         Ok(ListChildrenResult::Entries(_)) => {
-            let preloaded = project_paths(index_listed.effects().unwrap());
-            assert!(
-                preloaded.contains(&"/octocat/Hello-World/actions/runs/42/status"),
-                "missing run 42 status preload in {preloaded:?}"
-            );
-            assert!(
-                preloaded.contains(&"/octocat/Hello-World/actions/runs/42/conclusion"),
-                "missing run 42 conclusion preload in {preloaded:?}"
+            assert_eq!(
+                canonical_bytes(index_listed.effects().unwrap()),
+                [br#"{"id":42,"status":"in_progress","conclusion":null}"#.as_slice()]
             );
         },
-        other => panic!("expected runs listing with preloads, got {other:?}"),
+        other => panic!("expected runs listing with its canonical rows, got {other:?}"),
     }
 }
 
@@ -1563,118 +1548,67 @@ fn github_provider_resource_reads_do_not_fall_back_to_provider_cache() {
     }
 }
 
-/// The CRC-32 of `bytes`, as a ZIP archive has it.
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xEDB8_8320 & 0_u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
-}
-
-/// A ZIP archive with `files` stored without compression.
-fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut archive = Vec::new();
-    let mut directory = Vec::new();
-    for (name, data) in files {
-        let offset = u32::try_from(archive.len()).unwrap();
-        let size = u32::try_from(data.len()).unwrap();
-        let name_len = u16::try_from(name.len()).unwrap();
-        // Version 2.0, no flags, stored, no time, the CRC-32, both sizes, the
-        // length of the name, and no extra field: the fields a local header
-        // and an entry of the central directory share.
-        let mut shared = Vec::new();
-        for field in [20_u16, 0, 0, 0, 0] {
-            shared.extend(field.to_le_bytes());
-        }
-        for field in [crc32(data), size, size] {
-            shared.extend(field.to_le_bytes());
-        }
-        shared.extend(name_len.to_le_bytes());
-        shared.extend(0_u16.to_le_bytes());
-
-        archive.extend(b"PK\x03\x04");
-        archive.extend(&shared);
-        archive.extend(name.as_bytes());
-        archive.extend(*data);
-
-        directory.extend(b"PK\x01\x02");
-        directory.extend(20_u16.to_le_bytes());
-        directory.extend(&shared);
-        // No comment, disk 0, no internal and no external attributes.
-        directory.extend([0; 10]);
-        directory.extend(offset.to_le_bytes());
-        directory.extend(name.as_bytes());
-    }
-    let entries = u16::try_from(files.len()).unwrap();
-    let directory_offset = u32::try_from(archive.len()).unwrap();
-    let directory_size = u32::try_from(directory.len()).unwrap();
-    archive.extend(directory);
-    archive.extend(b"PK\x05\x06");
-    archive.extend([0; 4]);
-    archive.extend(entries.to_le_bytes());
-    archive.extend(entries.to_le_bytes());
-    archive.extend(directory_size.to_le_bytes());
-    archive.extend(directory_offset.to_le_bytes());
-    archive.extend(0_u16.to_le_bytes());
-    archive
-}
-
-/// `actions/runs/{id}/log` has the files of the archive of the logs of the
-/// run, each under its name. An answer without the archive is an error and
-/// never a file: the redirect to the storage of the archive, which the host
-/// does not follow, and a body that is no archive.
+/// `actions/runs/{id}/logs.zip` is the archive of the logs of the run as a
+/// blob that the host holds, so that no size bounds it: its fetch follows the
+/// redirect of GitHub to the storage of the archive, and a status that is no
+/// success is the error of the read.
 #[test]
-fn github_action_log_has_the_files_of_the_archive_and_fails_without_it() {
-    use omnifs_engine::EngineError;
-    use omnifs_wit::host::types::ErrorKind;
+fn github_action_logs_are_the_archive_that_the_host_holds() {
+    use omnifs_wit::host::types::{BlobContent, BlobFetched, ByteSource, Callout, ErrorKind};
 
-    const LOG: &str = "/octocat/Hello-World/actions/runs/99/log";
+    const LOGS: &str = "/octocat/Hello-World/actions/runs/99/logs.zip";
     let harness = github_harness();
-    let answer = |status: u16, headers: Vec<Header>, body: Vec<u8>| {
-        let mut read = harness.read(LOG).unwrap();
-        let fetch = read.expect_single_fetch();
+    let fetch = |status: u16, content: Option<BlobContent>| {
+        let mut read = harness.read(LOGS).unwrap();
+        let [Callout::FetchBlob(request)] = read.callouts() else {
+            panic!(
+                "expected the blob fetch of the logs, got {:?}",
+                read.callouts()
+            );
+        };
         assert!(
-            fetch
+            request
                 .url
                 .ends_with("/repos/octocat/Hello-World/actions/runs/99/logs"),
             "unexpected logs URL: {}",
-            fetch.url
+            request.url
         );
-        read.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+        assert!(request.follow_redirects);
+        assert_eq!(request.version, None);
+        read.answer_callouts(vec![CalloutResult::BlobFetched(BlobFetched {
             status,
-            headers,
-            body,
-            redirected: None,
+            response_headers: Vec::new(),
+            redirected: Some("https://storage.example/logs.zip".to_string()),
+            upstream: true,
+            content,
         })])
         .unwrap();
         read.into_ok()
     };
-
-    let archive = zip(&[
-        ("build/1_checkout.txt", b"checked out\n"),
-        ("build/2_test.txt", b"tested"),
-    ]);
-    match answer(200, Vec::new(), archive).unwrap() {
-        ReadFileOutcome::Found(file) => assert_eq!(
-            String::from_utf8(omnifs_itest::expect_inline(&file).to_vec()).unwrap(),
-            "=== build/1_checkout.txt ===\nchecked out\n=== build/2_test.txt ===\ntested\n"
-        ),
-        other => panic!("expected the log, got {other:?}"),
+    match fetch(
+        200,
+        Some(BlobContent {
+            blob: 9,
+            size: 4_096,
+        }),
+    )
+    .unwrap()
+    {
+        ReadFileOutcome::Found(file) => {
+            assert!(
+                matches!(file.bytes, ByteSource::Blob(9)),
+                "{:?}",
+                file.bytes
+            );
+            assert_eq!(file.attrs.stability, Stability::Dynamic);
+        },
+        other => panic!("expected the archive, got {other:?}"),
     }
-
-    let redirect = answer(
-        302,
-        vec![header("Location", "https://storage.example/logs.zip")],
-        Vec::new(),
-    );
-    assert!(redirect.is_err(), "{redirect:?}");
-    match answer(200, Vec::new(), b"not an archive".to_vec()) {
-        Err(EngineError::ProviderError(error)) => assert_eq!(error.kind, ErrorKind::InvalidInput),
-        other => panic!("expected the error of a body that is no archive, got {other:?}"),
+    match fetch(410, None) {
+        Err(omnifs_engine::EngineError::ProviderError(error)) => {
+            assert_eq!(error.kind, ErrorKind::InvalidInput);
+        },
+        other => panic!("expected the error of a gone archive, got {other:?}"),
     }
 }
 
@@ -2019,55 +1953,84 @@ fn github_provider_list_routes_preserve_typed_http_errors() {
     }
 }
 
-/// `item.json` bytes equal the single-item GET body verbatim: of the issue
-/// for an issue, and of the pull request for a pull request.
+/// The load of `item.json` of an item, which a read of it without the facts
+/// of its feed asks, is the node of GitHub GraphQL for its number verbatim:
+/// the bytes that the feeds write for it. An item that GitHub answers from
+/// another repository for the number is not found.
 #[test]
-fn item_json_byte_equals_single_get() {
+fn item_json_is_the_node_of_its_number() {
     use omnifs_wit::host::types::{
         ByteSource, Callout, CalloutResult, HttpResponse, ReadFileOutcome,
     };
 
-    let item_json = br#"{
-        "number": 42,
-        "title": "Item forty-two",
-        "body": "Body text",
-        "state": "open",
-        "user": {"login": "octocat"}
-    }"#;
-
+    let item_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0}}"#;
+    let answer = |kind: &str, repository: &str| {
+        format!(
+            r#"{{"data":{{"repository":{{"nameWithOwner":"octocat/Hello-World",
+            "t42":{{"__typename":"{kind}","number":42,"repository":{{"nameWithOwner":"{repository}"}}}},
+            "n42":{item_json}}}}}}}"#
+        )
+    };
     let harness = github_harness();
-    for kind in ["issues", "pulls"] {
+    for (kind, typename) in [("issues", "Issue"), ("pulls", "PullRequest")] {
         let mut step = harness
             .read(&format!("/octocat/Hello-World/{kind}/all/42/item.json"))
             .unwrap();
         let [Callout::Fetch(fetch)] = step.callouts() else {
             panic!("expected item fetch, got {step:?}");
         };
+        assert_eq!(fetch.url, "https://api.github.com/graphql");
+        let query = String::from_utf8(fetch.body.clone().unwrap()).unwrap();
         assert!(
-            fetch
-                .url
-                .ends_with(&format!("/repos/octocat/Hello-World/{kind}/42")),
-            "unexpected URL: {}",
-            fetch.url
+            query.contains("t42: issueOrPullRequest(number: 42)"),
+            "{query}"
         );
-
         step.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
             status: 200,
             headers: Vec::new(),
-            body: item_json.to_vec(),
+            body: answer(typename, "octocat/Hello-World").into_bytes(),
             redirected: None,
         })])
         .unwrap();
         let Ok(ReadFileOutcome::Found(file)) = step.result().unwrap() else {
             panic!("expected read terminal, got {step:?}");
         };
-        assert_eq!(step.effects().unwrap().canonical[0].bytes, item_json);
+        assert_eq!(
+            step.effects().unwrap().canonical[0].bytes,
+            item_json.as_bytes()
+        );
         match &file.bytes {
             ByteSource::Canonical => {},
-            ByteSource::Inline(bytes) => assert_eq!(bytes.as_slice(), item_json),
+            ByteSource::Inline(bytes) => assert_eq!(bytes.as_slice(), item_json.as_bytes()),
             other => panic!("expected canonical or inline item.json bytes, got {other:?}"),
         }
     }
+
+    let mut moved = harness
+        .read("/octocat/Hello-World/issues/all/42/item.json")
+        .unwrap();
+    moved.expect_single_fetch();
+    moved
+        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: answer("Issue", "octocat/elsewhere").into_bytes(),
+            redirected: None,
+        })])
+        .unwrap();
+    assert!(
+        matches!(moved.result().unwrap(), Ok(ReadFileOutcome::NotFound(_))),
+        "an item of another repository is not this one's"
+    );
+}
+
+/// The canonical bytes that `effects` store, each of its object.
+fn canonical_bytes(effects: &omnifs_wit::host::types::Effects) -> Vec<&[u8]> {
+    effects
+        .canonical
+        .iter()
+        .map(|canonical| canonical.bytes.as_slice())
+        .collect()
 }
 
 fn header(name: &str, value: &str) -> Header {
@@ -2106,32 +2069,32 @@ async fn github_action_runs_page_is_asked_again_with_its_etag_after_its_deadline
     let (first, requests) = answering(
         &harness,
         readdir(),
-        vec![HttpResponse {
+        [fetched(HttpResponse {
             status: 200,
             headers: vec![header("ETag", r#""runs-1""#)],
             body: br#"{"workflow_runs":[{"id":123,"status":"completed","conclusion":"success"}]}"#
                 .to_vec(),
             redirected: None,
-        }],
+        })],
     )
     .await;
     assert_eq!(entry_names(&first.unwrap()), ["123"]);
     assert!(
-        requests[0]
+        http(&requests[0])
             .url
             .ends_with("/actions/runs?per_page=30&page=1")
     );
-    assert_eq!(request_header(&requests[0], "if-none-match"), None);
+    assert_eq!(request_header(http(&requests[0]), "if-none-match"), None);
 
-    let (cached, requests) = answering(&harness, readdir(), Vec::new()).await;
+    let (cached, requests) = answering(&harness, readdir(), []).await;
     assert_eq!(entry_names(&cached.unwrap()), ["123"]);
     assert!(requests.is_empty(), "the page serves within its deadline");
 
     tokio::time::sleep(std::time::Duration::from_millis(3_300)).await;
-    let (kept, requests) = answering(&harness, readdir(), vec![not_modified()]).await;
+    let (kept, requests) = answering(&harness, readdir(), [fetched(not_modified())]).await;
     assert_eq!(entry_names(&kept.unwrap()), ["123"]);
     assert_eq!(
-        request_header(&requests[0], "if-none-match"),
+        request_header(http(&requests[0]), "if-none-match"),
         Some(r#""runs-1""#)
     );
 
@@ -2139,12 +2102,12 @@ async fn github_action_runs_page_is_asked_again_with_its_etag_after_its_deadline
     let (limited, _) = answering(
         &harness,
         readdir(),
-        vec![HttpResponse {
+        [fetched(HttpResponse {
             status: 429,
             headers: vec![header("Retry-After", "60")],
             body: br#"{"message":"API rate limit exceeded"}"#.to_vec(),
             redirected: None,
-        }],
+        })],
     )
     .await;
     assert!(matches!(
@@ -2152,7 +2115,7 @@ async fn github_action_runs_page_is_asked_again_with_its_etag_after_its_deadline
         Err(omnifs_engine::NsError::RateLimited { .. })
     ));
 
-    let (windowed, requests) = answering(&harness, readdir(), Vec::new()).await;
+    let (windowed, requests) = answering(&harness, readdir(), []).await;
     assert_eq!(entry_names(&windowed.unwrap()), ["123"]);
     assert!(
         requests.is_empty(),
@@ -2216,7 +2179,7 @@ async fn github_notifications_are_asked_again_only_after_their_poll_interval() {
     let (first, requests) = answering(
         &harness,
         readdir(),
-        vec![HttpResponse {
+        [fetched(HttpResponse {
             status: 200,
             headers: vec![
                 header("ETag", r#""notifications-1""#),
@@ -2232,17 +2195,17 @@ async fn github_notifications_are_asked_again_only_after_their_poll_interval() {
             }]"#
             .to_vec(),
             redirected: None,
-        }],
+        })],
     )
     .await;
     assert_eq!(entry_names(&first.unwrap()), ["README.md", "thread-123"]);
     assert!(
-        requests[0]
+        http(&requests[0])
             .url
             .ends_with("/notifications?per_page=50&page=1")
     );
 
-    let (_, requests) = answering(&harness, readdir(), Vec::new()).await;
+    let (_, requests) = answering(&harness, readdir(), []).await;
     assert!(
         requests.is_empty(),
         "the page serves within its poll interval"
@@ -2252,41 +2215,37 @@ async fn github_notifications_are_asked_again_only_after_their_poll_interval() {
     let (kept, requests) = answering(
         &harness,
         readdir(),
-        vec![HttpResponse {
+        [fetched(HttpResponse {
             status: 304,
             headers: vec![header("X-Poll-Interval", "1")],
             body: Vec::new(),
             redirected: None,
-        }],
+        })],
     )
     .await;
     assert_eq!(entry_names(&kept.unwrap()), ["README.md", "thread-123"]);
     assert_eq!(
-        request_header(&requests[0], "if-none-match"),
+        request_header(http(&requests[0]), "if-none-match"),
         Some(r#""notifications-1""#)
     );
 
-    let (_, requests) = answering(&harness, readdir(), Vec::new()).await;
+    let (_, requests) = answering(&harness, readdir(), []).await;
     assert!(requests.is_empty(), "304 renews the deadline of the page");
 }
 
-/// The row of pull request 7, which its own feed asks for before the first
-/// full listing of the repository, and asks for again with its `ETag` once
-/// the feed is past its deadline.
+/// Pull request 7 by its number, which its own feed asks GitHub GraphQL for
+/// before the first full listing of the repository, and again once the feed
+/// is past its deadline.
 fn pull_seven() -> HttpResponse {
     HttpResponse {
         status: 200,
-        headers: vec![header("ETag", r#""pull-7""#)],
-        body: br#"{
-            "number":7,
-            "title":"Seven",
-            "body":"Seven body",
-            "state":"open",
-            "user":{"login":"octocat"},
-            "updated_at":"2026-11-18T09:00:00Z",
-            "comments":0,
-            "pull_request":{"url":"https://api.github.com/repos/octocat/Hello-World/pulls/7"}
-        }"#
+        headers: Vec::new(),
+        body: br#"{"data":{"repository":{
+            "nameWithOwner":"octocat/Hello-World",
+            "t7":{"__typename":"PullRequest","number":7,"repository":{"nameWithOwner":"octocat/Hello-World"}},
+            "n7":{"number":7,"title":"Seven","body":"Seven body","state":"OPEN","author":{"login":"octocat"},
+                  "updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0}}
+        }}}"#
         .to_vec(),
         redirected: None,
     }
@@ -2310,7 +2269,7 @@ async fn pull_page_is_asked_again_with_its_etag_after_its_deadline(
             harness.namespace.as_ref(),
             &format!("/github/octocat/Hello-World/pulls/open/7/{folder}"),
         ),
-        vec![pull_seven()],
+        [fetched(pull_seven())],
     )
     .await;
     let readdir = || {
@@ -2322,39 +2281,40 @@ async fn pull_page_is_asked_again_with_its_etag_after_its_deadline(
     let (first, requests) = answering(
         &harness,
         readdir(),
-        vec![HttpResponse {
+        [fetched(HttpResponse {
             status: 200,
             headers: vec![header("ETag", r#""page-1""#)],
             body: body.to_vec(),
             redirected: None,
-        }],
+        })],
     )
     .await;
     assert_eq!(entry_names(&first.unwrap()), names);
     assert_eq!(
-        requests[0].url,
+        http(&requests[0]).url,
         format!("https://api.github.com/repos/octocat/Hello-World/pulls/7/{url}")
     );
-    assert_eq!(request_header(&requests[0], "if-none-match"), None);
+    assert_eq!(request_header(http(&requests[0]), "if-none-match"), None);
 
-    let (cached, requests) = answering(&harness, readdir(), Vec::new()).await;
+    let (cached, requests) = answering(&harness, readdir(), []).await;
     assert_eq!(entry_names(&cached.unwrap()), names);
     assert!(requests.is_empty(), "the page serves within its deadline");
 
     tokio::time::sleep(std::time::Duration::from_millis(3_300)).await;
-    let (kept, requests) =
-        answering(&harness, readdir(), vec![not_modified(), not_modified()]).await;
+    let (kept, requests) = answering(
+        &harness,
+        readdir(),
+        [fetched(pull_seven()), fetched(not_modified())],
+    )
+    .await;
     assert_eq!(entry_names(&kept.unwrap()), names);
+    assert_eq!(http(&requests[0]).url, "https://api.github.com/graphql");
     assert_eq!(
-        request_header(&requests[0], "if-none-match"),
-        Some(r#""pull-7""#)
-    );
-    assert_eq!(
-        requests[1].url,
+        http(&requests[1]).url,
         format!("https://api.github.com/repos/octocat/Hello-World/pulls/7/{url}")
     );
     assert_eq!(
-        request_header(&requests[1], "if-none-match"),
+        request_header(http(&requests[1]), "if-none-match"),
         Some(r#""page-1""#)
     );
 }
@@ -2390,4 +2350,117 @@ async fn github_pr_review_comments_page_is_asked_again_with_its_etag_after_its_d
         &["99"],
     )
     .await;
+}
+
+/// The files of an entry of a listing render from the row that the listing
+/// brought, without a request of their own: the files, the reviews, and the
+/// check runs of a pull request, and the workflow runs of a repository.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_files_of_a_listed_entry_render_from_its_row_without_a_request() {
+    use omnifs_itest::support::{names, read, served};
+
+    let harness = github_harness();
+    let page = |body: &str| {
+        fetched(HttpResponse {
+            status: 200,
+            headers: vec![header("ETag", r#""page-1""#)],
+            body: body.as_bytes().to_vec(),
+            redirected: None,
+        })
+    };
+    let pull = "/github/octocat/Hello-World/pulls/open/7";
+    let file =
+        r#"{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"changes":2}"#;
+    let review = r#"{"id":80,"state":"APPROVED","body":"ok","user":{"login":"reviewer"}}"#;
+    let check = r#"{"id":700,"name":"ci","status":"completed","conclusion":"success","output":{"title":null,"summary":null,"text":null}}"#;
+    let run = r#"{"id":123,"status":"completed","conclusion":"success"}"#;
+    let (listing, _) = answering(
+        &harness,
+        names(&harness, &format!("{pull}/files")),
+        [fetched(pull_seven()), page(&format!("[{file}]"))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), ["src%2Flib.rs"]);
+    let (listing, _) = answering(
+        &harness,
+        names(&harness, &format!("{pull}/reviews")),
+        [page(&format!("[{review}]"))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), ["80"]);
+    let (listing, _) = answering(
+        &harness,
+        names(&harness, &format!("{pull}/checks")),
+        [
+            page(r#"{"base":{"sha":"base1"},"head":{"sha":"abc123"}}"#),
+            page(&format!(r#"{{"check_runs":[{check}]}}"#)),
+        ],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), ["700"]);
+    let (listing, _) = answering(
+        &harness,
+        names(&harness, "/github/octocat/Hello-World/actions/runs"),
+        [page(&format!(r#"{{"workflow_runs":[{run}]}}"#))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), ["123"]);
+
+    for (path, expected) in [
+        (format!("{pull}/files/src%2Flib.rs/status"), "modified"),
+        (format!("{pull}/files/src%2Flib.rs/file.json"), file),
+        (format!("{pull}/reviews/80/state"), "APPROVED"),
+        (format!("{pull}/reviews/80/review.json"), review),
+        (format!("{pull}/checks/700/name"), "ci"),
+        (format!("{pull}/checks/700/check.json"), check),
+        (
+            "/github/octocat/Hello-World/actions/runs/123/conclusion".to_owned(),
+            "success",
+        ),
+        (
+            "/github/octocat/Hello-World/actions/runs/123/run.json".to_owned(),
+            run,
+        ),
+    ] {
+        assert_eq!(
+            served(&harness, read(&harness, &path)).await.unwrap(),
+            expected,
+            "{path}"
+        );
+    }
+}
+
+/// The `301` of a repository that moved, and of a comment of an issue that
+/// moved, is not followed: the object is not at its path.
+#[test]
+fn an_object_that_moved_is_not_at_its_path() {
+    use omnifs_wit::host::types::{CalloutResult, HttpResponse, ReadFileOutcome};
+
+    let harness = github_harness();
+    for (path, url) in [
+        (
+            "/octocat/Hello-World/repo.json",
+            "/repos/octocat/Hello-World",
+        ),
+        (
+            "/octocat/Hello-World/issues/all/7/comments/70/comment.json",
+            "/repos/octocat/Hello-World/issues/comments/70",
+        ),
+    ] {
+        let mut read = harness.read(path).unwrap();
+        let fetch = read.expect_single_fetch();
+        assert!(fetch.url.ends_with(url), "{}", fetch.url);
+        assert!(!fetch.follow_redirects, "{path}");
+        read.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status: 301,
+            headers: vec![header("Location", "https://api.github.com/repositories/1")],
+            body: br#"{"message":"Moved Permanently"}"#.to_vec(),
+            redirected: None,
+        })])
+        .unwrap();
+        assert!(
+            matches!(read.result().unwrap(), Ok(ReadFileOutcome::NotFound(_))),
+            "{path}"
+        );
+    }
 }

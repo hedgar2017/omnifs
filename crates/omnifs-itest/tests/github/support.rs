@@ -1,13 +1,11 @@
 //! GitHub provider route-test helpers.
 
-use std::future::Future;
-use std::time::Duration;
-
 use omnifs_core::path::Path;
 use omnifs_engine::{LookupAnswer, Namespace};
+use omnifs_itest::support::{Answer, Request};
 use omnifs_itest::{RuntimeHarness, make_initialized_runtime};
 use omnifs_wit::host::types::{
-    Callout, CalloutResult, Effects, FsKind, HttpRequest, HttpResponse, Stability,
+    CalloutResult, Effects, FsKind, HttpRequest, HttpResponse, Stability,
 };
 
 pub use omnifs_itest::{TestOpExt, project_paths};
@@ -48,38 +46,17 @@ pub fn project_file_stability(effects: &Effects, path: &str) -> Option<Stability
     })
 }
 
-/// Run a namespace operation, answer the fetches it makes in order with
-/// `answers`, and return its output with those requests. An operation that
-/// makes another number of fetches times out.
-pub async fn answering<T>(
-    harness: &RuntimeHarness,
-    operation: impl Future<Output = T>,
-    answers: Vec<HttpResponse>,
-) -> (T, Vec<HttpRequest>) {
-    let runtime = &harness.runtime;
-    let answer = async {
-        let mut requests = Vec::new();
-        for response in answers {
-            let callout = loop {
-                match runtime.try_recv_test_callout() {
-                    Some(callout) => break callout,
-                    None => tokio::time::sleep(Duration::from_millis(2)).await,
-                }
-            };
-            let Callout::Fetch(request) = callout.callout() else {
-                panic!("expected a fetch, got {:?}", callout.callout());
-            };
-            requests.push(request.clone());
-            callout.answer(CalloutResult::HttpResponse(response));
-        }
-        requests
-    };
-    let (output, requests) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(operation, answer)
-    })
-    .await
-    .expect("the operation makes exactly the answered fetches");
-    (output, requests)
+/// The request of a fetch that `answering` answered.
+pub fn http(request: &Request) -> &HttpRequest {
+    match request {
+        Request::Fetch(request) => request,
+        Request::Blob(request) => panic!("a blob fetch of {}", request.url),
+    }
+}
+
+/// The answer of a fetch with `response`.
+pub fn fetched(response: HttpResponse) -> Answer {
+    Answer::Fetch(CalloutResult::HttpResponse(response))
 }
 
 /// An answer `304` without headers.
