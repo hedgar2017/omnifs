@@ -2,21 +2,21 @@
 //!
 //! The feed of the Drive takes a part for each request: at its first answer
 //! the token of the changes after now and then a full listing of the items,
-//! and at each later answer the changes after the token of the answer before
-//! it. A full listing lists the items of the user, and then those of each
-//! shared drive of the account on its own, which Google Drive searches whole,
-//! as it does not each drive of a search of all of them. A request of the
-//! changes that Google Drive refuses with `400` for its token begins a full
-//! listing again, which the items of the projection that it lacks leave, and
-//! a request of a full listing that it refuses with `400` for the token of
-//! its page begins the listing again.
+//! and at each later answer, once in a sync, the changes after the token of
+//! the answer before it. A full listing lists the items of the user, and
+//! then those of each shared drive of the account on its own, which Google
+//! Drive searches whole, as it does not each drive of a search of all of
+//! them. A request of the changes that Google Drive refuses with `400` for
+//! its token begins a full listing again, which the items of the projection
+//! that it lacks leave, and a request of a full listing that it refuses with
+//! `400` for the token of its page begins the listing again.
 //!
 //! The own feed of an item takes it by its ID. An item that the feed of the
-//! Drive did not bring is unlisted: the host asks its own feed past its
-//! deadline at each operation on it, since Google Drive reports no change of
-//! it. The own feed of a file takes its content too: at the revision of the
-//! projection, and at the revision of Google Drive by its ID for the bytes
-//! of another MD5 than those of the projection.
+//! Drive did not bring is unlisted: the host asks its own feed once in each
+//! sync, since Google Drive reports no change of it. The own feed of a file
+//! takes its content too: at the revision of the projection, and at the
+//! revision of Google Drive by its ID for the bytes of another MD5 than those
+//! of the projection.
 //!
 //! An item whose object has an ID, a MIME type, and `trashed` is in the
 //! mount. A file that Google Drive states of it beside those is in its
@@ -24,10 +24,16 @@
 //! states not what it needs, at the request of the item by its ID: its
 //! `name` without the name of its object, and the `content` of a file
 //! without the MD5 or the revision of its bytes, or the time of the
-//! modification of its export.
+//! modification of its export. An object without an ID, a MIME type, or
+//! `trashed`, and a change without the ID of what it is of, are the error of
+//! the answer that brings them, which its last part gives after the facts of
+//! the other items publish.
 
 use omnifs_sdk::error::ProviderErrorKind;
+use omnifs_sdk::feed::FeedPart;
 use omnifs_sdk::prelude::*;
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -58,15 +64,18 @@ enum DriveToken {
     Relisting,
     /// The page of `corpus` in a full listing at its token, the first page
     /// without one; `changes` is the token of the changes after the start of
-    /// the listing, and `first` says that the listing is the first.
+    /// the listing, `first` says that the listing is the first, and `errors`
+    /// are those of the parts of the listing before.
     Listing {
         first: bool,
         changes: String,
         corpus: Corpus,
         page: Option<String>,
+        errors: Vec<String>,
     },
-    /// The changes at the token `page`.
-    Changes { page: String },
+    /// The changes at the token `page`, with the errors of the parts of the
+    /// answer before.
+    Changes { page: String, errors: Vec<String> },
 }
 
 /// A corpus of a full listing, in its order: the items of the user, the
@@ -211,11 +220,14 @@ fn answer_error(response: &omnifs_sdk::endpoint::HttpResponse, status: u16) -> P
     )
 }
 
-/// One call of the feed of the Drive: its context and the tokens of the own
-/// feeds of the items of its part.
+/// One call of the feed of the Drive: its context, the tokens of the own
+/// feeds of the items of its part, the items that it writes, and the errors
+/// of its answer so far.
 struct DriveFeed<'a> {
     cx: &'a FeedCx<DriveKey>,
     inner: Vec<(Kind, Id, Option<ItemState>)>,
+    written: HashSet<(Kind, String)>,
+    errors: Vec<String>,
 }
 
 impl Drive {
@@ -223,6 +235,8 @@ impl Drive {
         let mut feed = DriveFeed {
             cx: &cx,
             inner: Vec::new(),
+            written: HashSet::new(),
+            errors: Vec::new(),
         };
         match cx.token::<DriveToken>()? {
             None => feed.start(true).await,
@@ -232,18 +246,22 @@ impl Drive {
                 changes,
                 corpus,
                 page,
-            }) => feed.listing(first, changes, corpus, page).await,
-            Some(DriveToken::Changes { page }) => feed.changes(page).await,
+                errors,
+            }) => {
+                feed.errors = errors;
+                feed.listing(first, changes, corpus, page).await
+            },
+            Some(DriveToken::Changes { page, errors }) => {
+                feed.errors = errors;
+                feed.changes(page).await
+            },
         }
     }
 }
 
 impl DriveFeed<'_> {
     /// The token of the changes after now, before the first request of a
-    /// full listing, whose answers the changes after it complete. A listing
-    /// other than the first begins with the removal of each item of the
-    /// projection: the host keeps the items that the listing writes after
-    /// it, with their content, so that the ones that it lacks leave.
+    /// full listing, whose answers the changes after it complete.
     async fn start(&mut self, first: bool) -> Result<Feed> {
         let start: StartPageToken = self
             .cx
@@ -252,29 +270,37 @@ impl DriveFeed<'_> {
             .query("supportsAllDrives", "true")
             .json()
             .await?;
-        if !first {
-            for kind in Kind::ALL {
-                if let Some(listed) = self.cx.names::<Id>(dir(kind))? {
-                    for id in listed.names {
-                        self.remove(kind, id)?;
-                    }
-                }
-            }
-        }
-        self.part(
-            &DriveToken::Listing {
-                first,
-                changes: start.start_page_token,
-                corpus: Corpus::User,
-                page: None,
-            },
-            true,
-        )
+        self.listing_part(first, start.start_page_token, Corpus::User, None)
+    }
+
+    /// The part of a full listing before its page `page` of `corpus`.
+    fn listing_part(
+        &mut self,
+        first: bool,
+        changes: String,
+        corpus: Corpus,
+        page: Option<String>,
+    ) -> Result<Feed> {
+        let errors = std::mem::take(&mut self.errors);
+        Ok(self
+            .part(
+                &DriveToken::Listing {
+                    first,
+                    changes,
+                    corpus,
+                    page,
+                    errors,
+                },
+                true,
+            )?
+            .into())
     }
 
     /// A request of a full listing in `corpus` from the token `page`: its
     /// items, or the shared drives, then its next request, and after its
-    /// last one the listing of each kind complete. A token of a page that
+    /// last one the listing of each kind complete, without the items of the
+    /// projection that a full listing other than the first lacks. A token of
+    /// a page that
     /// Google Drive refuses with `400` begins the listing again, and a page
     /// for which it searched not all of its corpus is the error of the
     /// request.
@@ -326,6 +352,7 @@ impl DriveFeed<'_> {
                         changes,
                         corpus: Corpus::User,
                         page: None,
+                        errors: Vec::new(),
                     }
                 } else {
                     DriveToken::Relisting
@@ -381,20 +408,56 @@ impl DriveFeed<'_> {
             }
         };
         if let Some((corpus, page)) = next {
-            return self.part(
-                &DriveToken::Listing {
-                    first,
-                    changes,
-                    corpus,
-                    page,
-                },
-                true,
-            );
+            return self.listing_part(first, changes, corpus, page);
         }
         for kind in Kind::ALL {
+            if !first {
+                self.sweep(kind)?;
+            }
             self.cx.dir(dir(kind), ListingWrite::Complete)?;
         }
-        self.part(&DriveToken::Changes { page: changes }, false)
+        self.end(changes)
+    }
+
+    /// The removal of each item of `kind` of the projection that neither
+    /// the kept parts of a full listing nor its last part wrote or removed.
+    fn sweep(&mut self, kind: Kind) -> Result<()> {
+        let Some(listed) = self.cx.names::<Id>(dir(kind))? else {
+            return Ok(());
+        };
+        let kept = self.cx.kept::<String>(dir(kind))?;
+        let taken = kept
+            .written
+            .into_iter()
+            .chain(kept.removed)
+            .collect::<HashSet<_>>();
+        for id in listed.names {
+            let name = id.to_string();
+            if !taken.contains(&name) && !self.written.contains(&(kind, name)) {
+                self.remove(kind, id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The last part of an answer, with the token `page` of the changes
+    /// after it, and the errors of the answer for the operations that wait
+    /// for it.
+    fn end(&mut self, page: String) -> Result<Feed> {
+        let errors = std::mem::take(&mut self.errors);
+        let part = self.part(
+            &DriveToken::Changes {
+                page,
+                errors: Vec::new(),
+            },
+            false,
+        )?;
+        Ok(if errors.is_empty() {
+            part
+        } else {
+            part.error(ProviderError::invalid_input(errors.join("; ")))
+        }
+        .into())
     }
 
     /// A request of the changes at the token `page`: the items that it
@@ -433,8 +496,13 @@ impl DriveFeed<'_> {
             self.change(change).await?;
         }
         match (list.next_page_token, list.new_start_page_token) {
-            (Some(page), _) => self.part(&DriveToken::Changes { page }, true),
-            (None, Some(page)) => self.part(&DriveToken::Changes { page }, false),
+            (Some(page), _) => {
+                let errors = std::mem::take(&mut self.errors);
+                Ok(self
+                    .part(&DriveToken::Changes { page, errors }, true)?
+                    .into())
+            },
+            (None, Some(page)) => self.end(page),
             (None, None) => Err(ProviderError::invalid_input(
                 "the last page of the changes of Google Drive has no newStartPageToken",
             )),
@@ -447,20 +515,23 @@ impl DriveFeed<'_> {
     /// has.
     async fn change(&mut self, change: &DriveChange) -> Result<()> {
         if change.change_type == ChangeType::Drive {
-            let drive = change.drive_id.as_deref().ok_or_else(|| {
-                ProviderError::invalid_input("a change of a shared drive has no driveId")
-            })?;
-            if change.removed {
-                self.leave_drive(drive)?;
+            match change.drive_id.as_deref() {
+                Some(drive) if change.removed => self.leave_drive(drive)?,
+                Some(_) => {},
+                None => self
+                    .errors
+                    .push("a change of a shared drive has no driveId".to_owned()),
             }
             return Ok(());
         }
         if let (Some(object), false) = (&change.file, change.removed) {
             return self.take(object, ListingWrite::Complete);
         }
-        let id = change.file_id.as_ref().ok_or_else(|| {
-            ProviderError::invalid_input("a change of an item of Google Drive has no fileId")
-        })?;
+        let Some(id) = change.file_id.as_ref() else {
+            self.errors
+                .push("a change of an item of Google Drive has no fileId".to_owned());
+            return Ok(());
+        };
         let object = if change.removed {
             None
         } else {
@@ -475,9 +546,16 @@ impl DriveFeed<'_> {
     /// Take the item of an object of an answer into the projection, under
     /// its kind alone, with its folder joining the listing of its kind as
     /// `listed` says and the removal of the content of a file whose content
-    /// changed; the removal of an item in the trash.
+    /// changed; the removal of an item in the trash. An object without what
+    /// places it in the mount is an error of the answer.
     fn take(&mut self, object: &RawValue, listed: ListingWrite) -> Result<()> {
-        let item: Item = decode(object.get().as_bytes())?;
+        let item: Item = match decode(object.get().as_bytes()) {
+            Ok(item) => item,
+            Err(error) => {
+                self.errors.push(error.message().to_owned());
+                return Ok(());
+            },
+        };
         if item.trashed {
             return self.leave(&item.id, None);
         }
@@ -495,6 +573,7 @@ impl DriveFeed<'_> {
             self.cx.remove(content_path(&item.id))?;
         }
         write_item(self.cx, kind, &item, object, listed)?;
+        self.written.insert((kind, item.id.to_string()));
         self.inner.push((
             kind,
             item.id,
@@ -543,7 +622,7 @@ impl DriveFeed<'_> {
 
     /// A part with `token`, followed by `more` parts, with the tokens of the
     /// own feeds of its items.
-    fn part(&mut self, token: &DriveToken, more: bool) -> Result<Feed> {
+    fn part(&mut self, token: &DriveToken, more: bool) -> Result<FeedPart> {
         let mut part = Feed::part(token)?.more(more);
         for (kind, id, state) in self.inner.drain(..) {
             let key = ItemKey { id };
@@ -553,7 +632,7 @@ impl DriveFeed<'_> {
                 Kind::Other => part.inner::<Other>(&key, &state)?,
             };
         }
-        Ok(part.into())
+        Ok(part)
     }
 }
 
@@ -657,15 +736,13 @@ async fn take_content(cx: &FeedCx<ItemKey>, id: &Id, content: &Content<'_>) -> R
             .endpoint(DriveApi)
             .get(format!("/drive/v3/files/{id}"))
             .query("alt", "media")
-            .query("supportsAllDrives", "true")
-            .follow_redirects(),
+            .query("supportsAllDrives", "true"),
         Content::Export { mime_type, .. } => cx
             .endpoint(DriveApi)
             .get(format!("/drive/v3/files/{id}/export"))
-            .query("mimeType", mime_type)
-            .follow_redirects(),
+            .query("mimeType", mime_type),
     };
-    let blob = request().into_blob();
+    let blob = request().follow_redirects().into_blob();
     let blob = match content {
         Content::Bytes { md5: Some(md5), .. } => blob.md5(*md5),
         Content::Bytes { md5: None, .. } | Content::Export { .. } => blob.version(revision),
@@ -677,7 +754,9 @@ async fn take_content(cx: &FeedCx<ItemKey>, id: &Id, content: &Content<'_>) -> R
         // The reason of a refusal is in the body of its answer, which the
         // host keeps not: an inline request has it too, as a request over a
         // quota. For the bytes, the request is of the first byte, which a
-        // file without one has with `416`.
+        // file without one has with `416`. The host refuses a redirect to a
+        // host of no domain of the mount as a refusal too, whose request
+        // Google Drive answers with the redirect.
         Err(error) if error.kind() == ProviderErrorKind::Denied => {
             let refusal = match content {
                 Content::Bytes { .. } => request().header("Range", "bytes=0-0"),
@@ -690,7 +769,7 @@ async fn take_content(cx: &FeedCx<ItemKey>, id: &Id, content: &Content<'_>) -> R
                     cx.file(at, refusal.body())?;
                     Ok(true)
                 },
-                (200..=299 | 416, _) => Err(error),
+                (200..=399 | 416, _) => Err(error),
                 (404, _) => Ok(false),
                 (status, _) => Err(answer_error(&refusal, status)),
             };

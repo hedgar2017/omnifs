@@ -19,10 +19,10 @@
 //! Their facts come from feeds alone. The feed of the Drive lists the items
 //! of the account in `files/`, `folders/`, and `others/` and takes their
 //! changes from the changes of Google Drive. The own feed of a file, a
-//! folder, or another item takes one by its ID, and again at each operation
-//! on it past its deadline while the feed of the Drive did not bring it,
-//! since Google Drive reports no change of an item that the account has by
-//! its link alone; the own feed of a file takes its content too.
+//! folder, or another item takes one by its ID, and again once in each sync
+//! while the feed of the Drive did not bring it, since Google Drive reports
+//! no change of an item that the account has by its link alone; the own
+//! feed of a file takes its content too.
 
 use omnifs_sdk::prelude::*;
 use serde::Deserialize;
@@ -87,21 +87,11 @@ pub(crate) struct Other {}
     display_name = "Google Drive",
     description = "files, folders, and other items from your Drive",
     mount = "google-drive",
-    projection = 4,
+    projection = 5,
     capabilities(domain(
         "www.googleapis.com",
         "Fetch the items, the content of the files, and the changes of a Google Drive."
     ),),
-    limits(
-        memory_mb(
-            256,
-            "Leave room for a page of 1,000 items, and the names of the items of a listing of the projection."
-        ),
-        fetch_blob_bytes(
-            5_497_558_138_880,
-            "The largest file of Google Drive, of 5 TB, and an export, of at most 10 MB, whose bytes the host holds."
-        ),
-    ),
     auth = r#"{"default":"service-account","schemes":[{"oauth":{"key":"service-account","displayName":"Google service account","tokenEndpoint":"https://oauth2.googleapis.com/token","defaultScopes":["https://www.googleapis.com/auth/drive.readonly"],"flow":{"jwtBearerScopeClaim":{"claim":"scope"}},"injectDomains":["www.googleapis.com"],"injectValuePrefix":"Bearer "}}],"guidance":{"service-account":{"summary":"The key of a Google service account; no browser and no sign-in.","setupSteps":["Create a service account in a Google Cloud project with the Google Drive API enabled, and a JSON key of it.","Share the folders of the Drive with the email of the service account, or give it domain-wide delegation for the scope of the mount and pass the user whose Drive it reads as --account.","Pass `client_email` of the key as --client-id and a file with `private_key` of the key as --client-secret-file."]}}}"#
 )]
 impl GoogleDriveProvider {

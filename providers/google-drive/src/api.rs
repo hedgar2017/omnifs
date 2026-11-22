@@ -142,7 +142,7 @@ pub(crate) struct Item {
 }
 
 /// What an item is for the mount.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Kind {
     File,
     Folder,
