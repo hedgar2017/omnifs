@@ -7,9 +7,9 @@
 //! sources of the projection that it lacks by their IDs after its last page,
 //! and else the changes, from the latest `last_edited_time` that the results
 //! of its answers brought. A result with an earlier `last_edited_time` than
-//! its object of the projection leaves the projection as it is. The own feed of a page takes it by its ID, its
-//! content, and its comments, and the own feed of a data source takes it by
-//! its ID, a part for each request.
+//! its object of the projection leaves the projection as it is. The own feed
+//! of a page takes it by its ID, its content, and its comments, and the own
+//! feed of a data source takes it by its ID, a part for each request.
 //!
 //! Notion gives `last_edited_time` by the minute, so the content and the
 //! comments that Notion may have read within the minute of the
