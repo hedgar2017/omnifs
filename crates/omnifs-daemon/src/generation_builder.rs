@@ -704,6 +704,24 @@ mod tests {
             .state
     }
 
+    /// The subject of a stored credential is the one of its OAuth request,
+    /// and no override of a static token.
+    #[test]
+    fn the_subject_of_a_credential_is_the_subject_of_its_oauth_request() {
+        let overrides = CredentialClientOverrides {
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
+            scopes: None,
+            subject: Some("ada@example.test".to_owned()),
+        };
+        assert_eq!(
+            runtime_overrides(&overrides).unwrap().subject.as_deref(),
+            Some("ada@example.test")
+        );
+        assert!(!no_overrides(&overrides));
+    }
+
     /// A credential whose fingerprint is not the one of the auth scheme of
     /// the provider of its mount, as one that an earlier omnifs stored,
     /// leaves that mount alone without a credential.

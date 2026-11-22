@@ -318,6 +318,48 @@ mod tests {
         }
     }
 
+    /// The account of an invocation is the label of its stored credential,
+    /// and the subject is of its OAuth client, which an OAuth scheme alone
+    /// takes.
+    #[test]
+    fn the_selected_auth_has_the_account_apart_from_the_subject_of_its_oauth_client() {
+        let manifest = provider_manifest();
+        let auth_manifest = manifest
+            .auth
+            .as_ref()
+            .map(omnifs_provider::ProviderAuthManifest::wasm_auth_manifest);
+        let selected = |arguments: &[&str]| {
+            add_args(arguments).selected_auth(&manifest, auth_manifest.as_ref())
+        };
+
+        let auth = selected(&["linear", "--account", "work"]).unwrap().unwrap();
+        assert_eq!(auth.account(), Some("work"));
+        assert_eq!(auth.as_oauth().unwrap().subject, None);
+
+        let auth = selected(&[
+            "linear",
+            "--account",
+            "work",
+            "--client-id",
+            "client",
+            "--subject",
+            "ada@example.test",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(auth.account(), Some("work"));
+        let oauth = auth.as_oauth().unwrap();
+        assert_eq!(oauth.client_id.as_deref(), Some("client"));
+        assert_eq!(oauth.subject.as_deref(), Some("ada@example.test"));
+
+        assert!(selected(&["linear", "--scheme", "pat", "--subject", "ada@example.test"]).is_err());
+        assert!(
+            add_args(&["web", "--subject", "ada@example.test"])
+                .selected_auth(&web_manifest(), None)
+                .is_err()
+        );
+    }
+
     #[test]
     fn config_override_skips_default_generation_for_required_fields() {
         // A provider whose config has a required field with no default (db's
