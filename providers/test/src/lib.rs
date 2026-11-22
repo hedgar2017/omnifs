@@ -967,46 +967,7 @@ impl TestProvider {
 
         // Object feeds: the shelf feed answers for its books, the book feed
         // for a title before the first answer of its shelf ends.
-        r.object::<Shelf>("/shelves/{shelf}", |o| {
-            o.stable();
-            o.file("shelf.json").canonical::<Json>()?;
-            o.file("seen").fed()?;
-            o.file("listed").fed()?;
-            o.file("catalog").fed()?;
-            o.file("catalog-read").fed()?;
-            o.dir("books").fed()?;
-            o.dir("cards").fed()?;
-            o.dir("prints").fed()?;
-            o.feed(Shelf::feed).starts(["books", "cards", "prints"])?;
-            Ok(())
-        })?;
-        r.object::<Print>("/shelves/{shelf}/prints/{print}", |o| {
-            o.dynamic();
-            o.fed();
-            o.file("print.json").canonical::<Json>()?;
-            o.file("print.md").representation::<Markdown>()?;
-            Ok(())
-        })?;
-        r.object::<Memo>("/memos/{memo}", |o| {
-            o.dynamic();
-            o.file("memo.json").canonical::<Json>()?;
-            o.file("memo.md").representation::<Markdown>()?;
-            Ok(())
-        })?;
-        r.object::<Card>("/shelves/{shelf}/cards/{card}", |o| {
-            o.stable();
-            o.fed();
-            o.file("text").fed()?;
-            Ok(())
-        })?;
-        r.object::<Book>("/shelves/{shelf}/books/{book}", |o| {
-            o.stable();
-            o.fed();
-            o.file("book.json").canonical::<Json>()?;
-            o.file("title").fed()?;
-            o.feed(Book::feed).starts(["title"])?;
-            Ok(())
-        })?;
+        fed_objects(r)?;
         r.file("/hello/shelf-log").handler(shelf_log)?;
         r.file("/hello/shelf-change").handler(shelf_change)?;
 
@@ -1521,6 +1482,52 @@ impl RangeReader for LargeRangedReader {
             ))
         })
     }
+}
+
+/// The objects with fed faces: a shelf, its prints, cards and books, and a
+/// memo beside them.
+fn fed_objects(r: &mut Router<State>) -> Result<()> {
+    r.object::<Shelf>("/shelves/{shelf}", |o| {
+        o.stable();
+        o.file("shelf.json").canonical::<Json>()?;
+        o.file("seen").fed()?;
+        o.file("listed").fed()?;
+        o.file("catalog").fed()?;
+        o.file("catalog-read").fed()?;
+        o.dir("books").fed()?;
+        o.dir("cards").fed()?;
+        o.dir("prints").fed()?;
+        o.feed(Shelf::feed).starts(["books", "cards", "prints"])?;
+        Ok(())
+    })?;
+    r.object::<Print>("/shelves/{shelf}/prints/{print}", |o| {
+        o.dynamic();
+        o.fed();
+        o.file("print.json").canonical::<Json>()?;
+        o.file("print.md").representation::<Markdown>()?;
+        Ok(())
+    })?;
+    r.object::<Memo>("/memos/{memo}", |o| {
+        o.dynamic();
+        o.file("memo.json").canonical::<Json>()?;
+        o.file("memo.md").representation::<Markdown>()?;
+        Ok(())
+    })?;
+    r.object::<Card>("/shelves/{shelf}/cards/{card}", |o| {
+        o.stable();
+        o.fed();
+        o.file("text").fed()?;
+        Ok(())
+    })?;
+    r.object::<Book>("/shelves/{shelf}/books/{book}", |o| {
+        o.stable();
+        o.fed();
+        o.file("book.json").canonical::<Json>()?;
+        o.file("title").fed()?;
+        o.feed(Book::feed).starts(["title"])?;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
