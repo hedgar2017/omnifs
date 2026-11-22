@@ -14,9 +14,9 @@ use omnifs_provider::Artifact;
 use serde_json::Value;
 use support::{
     answering, blob, channel, elsewhere, expect_channels, expect_file, expect_history,
-    expect_message, expect_new, expect_replies, expect_users, failure, file, hidden, lookup,
-    message, names, names_at, network, ok, page, rate_limited, read, reply, served, slack_harness,
-    thread, ts, unedited, user, with_files,
+    expect_message, expect_replies, expect_users, failure, file, hidden, lookup, message, names,
+    names_at, network, ok, page, rate_limited, read, reply, served, slack_harness, thread, ts,
+    unedited, user, with_files,
 };
 
 /// The `ts` of the fixtures `ns`, sorted.
@@ -52,7 +52,8 @@ async fn first_full_listing(harness: &RuntimeHarness, channel: &str, messages: &
 }
 
 /// The check of the token of a mount at its creation, which the provider
-/// declares: a `POST` of `auth.test` whose answer `200` has a `bot_id`.
+/// declares: a `POST` of `auth.test` whose answer `200` has a `bot_id`; and
+/// no limit of its own.
 #[test]
 fn the_token_of_a_mount_is_that_of_a_bot_by_auth_test() {
     let provider = "omnifs_provider_slack.wasm";
@@ -64,16 +65,17 @@ fn the_token_of_a_mount_is_that_of_a_bot_by_auth_test() {
     assert_eq!(check["url"], "https://slack.com/api/auth.test");
     assert_eq!(check["expectStatus"], 200);
     assert_eq!(check["jsonPointer"], "/bot_id");
+    assert_eq!(manifest.get("limits"), None);
 }
 
 /// The first full listing of the users at the first read of `users/`, by
 /// `next_cursor`, each page at its answer: a `429` in it gives the read the
 /// error of the stop while the users of the pages before it are served, and
 /// the next read continues from the next `cursor`; `name` of the `real_name`
-/// of a user or nothing; past the deadline no request for a read of a user
-/// that the source filesystem has, a full listing for `users/` and one for a
-/// user that it lacks, which removes a user that the listing lacks, and no
-/// request for a user that it lacks within the deadline.
+/// of a user or nothing; in a sync no request for a read of a user that the
+/// projection has, a full listing for `users/` and one for a user that it
+/// lacks, which removes a user that the listing lacks, and no request for a
+/// user that it lacks outside a sync.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_users_are_the_full_listings_of_users_list() {
@@ -216,12 +218,11 @@ async fn the_users_are_the_full_listings_of_users_list() {
 }
 
 /// The first full listing of the channels at the first read of `channels/`,
-/// by `next_cursor`; past the deadline no request for a read of a channel
-/// that the source filesystem has, a change of the attributes of `channels/`
-/// at its lookup alone, a full listing for `channels/` and one
-/// for a channel that it lacks, which removes a channel that the listing
-/// lacks with its messages, and no request for a channel that it lacks
-/// outside a sync.
+/// by `next_cursor`; in a sync no request for a read of a channel that the
+/// projection has, no change of the attributes of `channels/` by the sync
+/// alone, a full listing for `channels/` and one for a channel that it
+/// lacks, which removes a channel that the listing lacks with its messages,
+/// and no request for a channel that it lacks outside a sync.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_channels_are_the_full_listings_of_users_conversations() {
@@ -355,8 +356,7 @@ async fn the_channels_are_the_full_listings_of_users_conversations() {
 /// error of the stop while the files of the messages that it took are
 /// served, and the next read continues from the next `cursor`; it keeps a
 /// newer message than its pages have, which a read took by its `ts`
-/// meanwhile, and which the messages after the latest one of the sweep bring
-/// again, since Slack gives no messages after a `ts` but one.
+/// meanwhile, and which the sweep of the next sync brings with each page.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_first_full_listing_of_a_channel_takes_each_page_at_its_answer() {
@@ -441,13 +441,18 @@ async fn the_first_full_listing_of_a_channel_takes_each_page_at_its_answer() {
         read(&harness, &format!("{}/text", at(4))),
         vec![ok(&page(
             "messages",
-            &[message(4, Some("U01"), "Fourth")],
+            &[
+                message(4, Some("U01"), "Fourth"),
+                message(3, Some("U01"), "Third"),
+                message(2, Some("U02"), "Second"),
+                message(1, None, "First"),
+            ],
             None,
         ))],
     )
     .await;
     assert_eq!(text.unwrap(), "Fourth");
-    expect_new(&requests[0], "C01", &ts(3), None);
+    expect_history(&requests[0], "C01", None);
     assert_eq!(
         served(&harness, names(&harness, "/slack/channels/C01/messages"))
             .await
@@ -476,17 +481,16 @@ async fn the_first_full_listing_of_a_channel_takes_each_page_at_its_answer() {
 }
 
 /// The changes that the answers of `conversations.history` tell, with no
-/// other request: at a read of a file of a message past the deadline, the
-/// messages after the latest one alone; at a read of `messages/` past the
-/// deadline, a sweep of each page, which takes an edit of a message and the
-/// removal of a message that its pages lack, writes `messages/` complete
-/// after a last page without a new message, leaves the replies of a thread
-/// whose `reply_count` and `latest_reply` are those of the replies of the
-/// projection, which their next read takes from the projection, writes
-/// `messages/` complete for each read within the deadline, and removes the
-/// replies of a thread with another `reply_count` and `latest_reply`, which
-/// their next read takes once more; and a read of `messages/` sweeps in place
-/// of an unfinished answer of the messages after the latest one.
+/// other request: in each sync, at the first operation in the channel, a
+/// sweep of each page, which takes a new message, an edit of a message, and
+/// the removal of a message that its pages lack, and writes `messages/`
+/// complete after a last page without a new message; it leaves the replies
+/// of a thread whose `reply_count` and `latest_reply` are those of the
+/// replies of the projection, which their next read takes from the
+/// projection, and removes the replies of a thread with another
+/// `reply_count` and `latest_reply`, which their next read takes once more.
+/// Each other operation of the sync, and each one after it, is served from
+/// the projection.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
@@ -530,20 +534,33 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
     assert_eq!(listing.unwrap(), stamps(&[21]));
     expect_replies(&requests[0], "C01", &ts(2), None);
 
-    // The messages after the latest one.
-    harness.begin_sync();
+    // A new message, at a read of a file in the channel in a sync.
+    let sync = harness.begin_sync();
     let (text, requests) = answering(
         &harness,
         read(&harness, &format!("{}/text", at(3))),
-        vec![ok(&page(
-            "messages",
-            &[message(4, Some("U02"), "Fourth")],
-            None,
-        ))],
+        vec![
+            ok(&page(
+                "messages",
+                &[
+                    message(4, Some("U02"), "Fourth"),
+                    message(3, Some("U01"), "Third"),
+                    question(1, 21),
+                ],
+                Some("cursor-2"),
+            )),
+            ok(&page("messages", &[message(1, Some("U01"), "First")], None)),
+        ],
     )
     .await;
     assert_eq!(text.unwrap(), "Third");
-    expect_new(&requests[0], "C01", &ts(3), None);
+    expect_history(&requests[0], "C01", None);
+    expect_history(&requests[1], "C01", Some("cursor-2"));
+    assert_eq!(
+        served(&harness, names(&harness, messages)).await.unwrap(),
+        stamps(&[1, 2, 3, 4])
+    );
+    harness.end_sync(sync);
     assert_eq!(
         served(&harness, names(&harness, messages)).await.unwrap(),
         stamps(&[1, 2, 3, 4])
@@ -645,51 +662,11 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
     .await;
     assert_eq!(listing.unwrap(), stamps(&[21, 22]));
     expect_replies(&requests[0], "C01", &ts(2), None);
-
-    // A read of `messages/` sweeps from the first page in place of an
-    // unfinished answer of the new messages.
-    harness.begin_sync();
-    let (stopped, requests) = answering(
-        &harness,
-        read(&harness, &format!("{}/text", at(4))),
-        vec![
-            ok(&page(
-                "messages",
-                &[message(6, Some("U01"), "Sixth")],
-                Some("cursor-2"),
-            )),
-            network(),
-        ],
-    )
-    .await;
-    assert_eq!(stopped.unwrap(), "Fourth");
-    expect_new(&requests[0], "C01", &ts(5), None);
-    expect_new(&requests[1], "C01", &ts(5), Some("cursor-2"));
-    harness.begin_sync();
-    let (listing, requests) = answering(
-        &harness,
-        names(&harness, messages),
-        vec![ok(&page(
-            "messages",
-            &[
-                message(6, Some("U01"), "Sixth"),
-                message(5, Some("U01"), "Fifth"),
-                message(4, Some("U02"), "Fourth"),
-                edited(),
-                question(2, 22),
-            ],
-            None,
-        ))],
-    )
-    .await;
-    assert_eq!(listing.unwrap(), stamps(&[2, 3, 4, 5, 6]));
-    expect_history(&requests[0], "C01", None);
 }
 
 /// A message by its `ts` before the end of the first full listing of its
-/// channel: for a message that the source filesystem lacks, and again 3
-/// seconds or more after the answer with it, and none of it for an answer
-/// without it.
+/// channel, for a message that the projection lacks alone, not again in a
+/// sync, and none of it for an answer without it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_message_by_its_ts_before_the_end_of_the_first_full_listing() {
     let harness = slack_harness();
@@ -713,18 +690,10 @@ async fn a_message_by_its_ts_before_the_end_of_the_first_full_listing() {
     );
 
     harness.begin_sync();
-    let (read_text, requests) = answering(
-        &harness,
-        read(&harness, &text),
-        vec![ok(&page(
-            "messages",
-            &[message(1, Some("U01"), "First, edited")],
-            None,
-        ))],
-    )
-    .await;
-    assert_eq!(read_text.unwrap(), "First, edited");
-    expect_message(&requests[0], "C01", &ts(1));
+    assert_eq!(
+        served(&harness, read(&harness, &text)).await.unwrap(),
+        "First"
+    );
 
     let gone = format!("/slack/channels/C01/messages/{}", ts(2));
     let (found, requests) = answering(
@@ -747,11 +716,10 @@ async fn a_message_by_its_ts_before_the_end_of_the_first_full_listing() {
 /// message itself, whose files are those of `conversations.history`, and
 /// without a reply of another thread, no
 /// request for a reply that they lack or for a `reply_count` of `0`, the
-/// removal of the message for `thread_not_found`, and, before the end of the
-/// first full listing of its channel, the replies again for a read of
-/// `replies/` by its path alone past the deadline of a message with another
-/// `latest_reply`, without a reply that they lack, and no reply without a
-/// request of them for a message without a `reply_count` then.
+/// removal of the message for `thread_not_found`, no request of them in a
+/// sync before a sweep, which ends the first one; the replies again after a
+/// sweep with another `latest_reply`, without a reply that they lack, and
+/// none, without a request of them, after a sweep without a `reply_count`.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_replies_take_the_pages_of_conversations_replies() {
@@ -781,7 +749,7 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
     expect_history(&requests[0], "C01", None);
     expect_history(&requests[1], "C01", Some("cursor-2"));
 
-    // The replies are asked after the window of the stop.
+    // The replies are asked after the `Retry-After` of the stop.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     let replies = |n: u32| format!("/slack/channels/C01/messages/{}/replies", ts(n));
     let asked = thread(message(1, Some("U01"), "Question, edited"), 2, 3);
@@ -868,28 +836,61 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
         .is_missing()
     );
 
-    harness.begin_sync();
+    // In a sync, the replies of the projection, and the end of the first
+    // sweep.
+    let sync = harness.begin_sync();
+    assert_eq!(
+        served(&harness, names_at(&harness, &replies(1)))
+            .await
+            .unwrap(),
+        stamps(&[2, 3])
+    );
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "/slack/channels/C01/messages"),
+        vec![ok(&page("messages", &[], None))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), stamps(&[1, 4]));
+    expect_history(&requests[0], "C01", Some("cursor-2"));
+    harness.end_sync(sync);
+
+    let sweep = |question: Value| {
+        vec![ok(&page(
+            "messages",
+            &[
+                thread(message(4, Some("U02"), "Unanswered"), 0, 4),
+                question,
+            ],
+            None,
+        ))]
+    };
     let edited = thread(message(1, Some("U01"), "Question"), 2, 7);
+    harness.begin_sync();
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "/slack/channels/C01/messages"),
+        sweep(edited.clone()),
+    )
+    .await;
+    assert_eq!(listing.unwrap(), stamps(&[1, 4]));
+    expect_history(&requests[0], "C01", None);
     let (listing, requests) = answering(
         &harness,
         names_at(&harness, &replies(1)),
-        vec![
-            ok(&page("messages", std::slice::from_ref(&edited), None)),
-            ok(&page(
-                "messages",
-                &[
-                    edited,
-                    reply(2, 1, "U02", "An answer"),
-                    reply(7, 1, "U03", "Another answer"),
-                ],
-                None,
-            )),
-        ],
+        vec![ok(&page(
+            "messages",
+            &[
+                edited,
+                reply(2, 1, "U02", "An answer"),
+                reply(7, 1, "U03", "Another answer"),
+            ],
+            None,
+        ))],
     )
     .await;
     assert_eq!(listing.unwrap(), stamps(&[2, 7]));
-    expect_message(&requests[0], "C01", &ts(1));
-    expect_replies(&requests[1], "C01", &ts(1), None);
+    expect_replies(&requests[0], "C01", &ts(1), None);
     assert_eq!(
         served(
             &harness,
@@ -903,16 +904,18 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
     harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
-        names_at(&harness, &replies(1)),
-        vec![ok(&page(
-            "messages",
-            &[message(1, Some("U01"), "Question")],
-            None,
-        ))],
+        names(&harness, "/slack/channels/C01/messages"),
+        sweep(message(1, Some("U01"), "Question")),
     )
     .await;
-    assert!(listing.unwrap().is_empty());
-    expect_message(&requests[0], "C01", &ts(1));
+    assert_eq!(listing.unwrap(), stamps(&[1, 4]));
+    expect_history(&requests[0], "C01", None);
+    assert!(
+        served(&harness, names_at(&harness, &replies(1)))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         served(
             &harness,
@@ -1086,10 +1089,10 @@ async fn the_content_of_a_file_is_the_blob_of_its_edit_timestamp() {
 
 /// The first request again after `invalid_cursor` to a request with a
 /// `cursor`: of a full listing of the users, of the channels, of the first
-/// sweep of a channel, of the replies of a message, of the messages after the
-/// latest one, and of a later sweep of each page, each after the window
-/// of its timeout, which is the error of its read, or with its read served
-/// what the projection has after the end of the first sweep of the channel.
+/// sweep of a channel, of the replies of a message, and of a later sweep,
+/// each in the next sync, with the timeout of its read, or with its read
+/// served what the projection has after the end of the first sweep of the
+/// channel.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
@@ -1176,13 +1179,16 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     expect_replies(&requests[0], "C01", &ts(1), None);
     expect_replies(&requests[1], "C01", &ts(1), Some("cursor-2"));
     harness.begin_sync();
-    // The channel is past its deadline after the window of the stop: its
-    // new messages come before the replies.
+    // The sweep of the channel in the sync comes before the replies.
     let (listing, requests) = answering(
         &harness,
         names(&harness, &replies),
         vec![
-            ok(&page("messages", &[], None)),
+            ok(&page(
+                "messages",
+                &[message(2, Some("U02"), "Second"), question()],
+                None,
+            )),
             ok(&page(
                 "messages",
                 &[question(), reply(11, 1, "U02", "An answer")],
@@ -1192,7 +1198,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     )
     .await;
     assert_eq!(listing.unwrap(), stamps(&[11]));
-    expect_new(&requests[0], "C01", &ts(2), None);
+    expect_history(&requests[0], "C01", None);
     expect_replies(&requests[1], "C01", &ts(1), None);
 
     let history = || {
@@ -1217,35 +1223,15 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
         ]
     };
     harness.begin_sync();
-    let text = format!("/slack/channels/C01/messages/{}/text", ts(2));
-    let (stopped, requests) = answering(&harness, read(&harness, &text), stop()).await;
-    // The read of the new messages that stopped is served what the
-    // projection has.
-    assert_eq!(stopped.unwrap(), "Second");
-    expect_new(&requests[0], "C01", &ts(2), None);
-    expect_new(&requests[1], "C01", &ts(2), Some("cursor-2"));
-    harness.begin_sync();
-    let (read_text, requests) = answering(
-        &harness,
-        read(&harness, &text),
-        vec![ok(&page(
-            "messages",
-            &[message(3, Some("U01"), "Third")],
-            None,
-        ))],
-    )
-    .await;
-    assert_eq!(read_text.unwrap(), "Second");
-    expect_new(&requests[0], "C01", &ts(2), None);
-
-    harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "/slack/channels/C01/messages"),
         stop(),
     )
     .await;
-    assert_eq!(stopped.unwrap(), stamps(&[1, 2, 3]));
+    // The read of a later sweep that stopped is served what the projection
+    // has.
+    assert_eq!(stopped.unwrap(), stamps(&[1, 2]));
     expect_history(&requests[0], "C01", None);
     expect_history(&requests[1], "C01", Some("cursor-2"));
     harness.begin_sync();
@@ -1262,7 +1248,10 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
 /// The removal of a channel for `channel_not_found` and for
 /// `not_in_channel`, of the history, of a message by its `ts`, and of the
 /// replies of a message, the error of its kind for each other `error` of
-/// `ok` of `false`, and the wait of `Retry-After` after `429`.
+/// `ok` of `false`, with the `error` of Slack, an error that the provider
+/// does not know as the failure of its request with it, and the wait of
+/// `Retry-After` after `429`, after which a channel without a message has
+/// `messages/` complete and empty.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_errors_of_slack_remove_fail_and_wait() {
@@ -1343,16 +1332,27 @@ async fn the_errors_of_slack_remove_fail_and_wait() {
             vec![failure(error)],
         )
         .await;
-        let refused = listing.unwrap_err().to_string();
-        assert!(refused.starts_with(kind), "{error}: {refused}");
+        let refused = listing.unwrap_err();
+        assert!(refused.to_string().starts_with(kind), "{error}: {refused}");
         expect_history(&requests[0], "C03", None);
-        // The next request waits for the end of the window of a failure for
-        // now.
+        // A failure for now is asked again in the next sync.
         if matches!(kind, "network error" | "timeout") {
             harness.begin_sync();
         }
     }
 
+    // An error that the provider does not know is the failure of its
+    // request with the `error` of Slack.
+    let (listing, _) = answering(
+        &harness,
+        names(&harness, "/slack/channels/C03/messages"),
+        vec![failure("an_error_of_another_name")],
+    )
+    .await;
+    assert!(
+        matches!(&listing, Err(NsError::Internal { message }) if message.contains("an_error_of_another_name")),
+        "{listing:?}"
+    );
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/slack/channels/C03/messages"),
@@ -1378,21 +1378,23 @@ async fn the_errors_of_slack_remove_fail_and_wait() {
     .await;
     assert!(listing.unwrap().is_empty());
     expect_history(&requests[0], "C03", None);
+    assert!(
+        served(&harness, names(&harness, "/slack/channels/C03/messages"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A sweep of each page from its first one, without the kept pages of its
-/// answer, for a channel whose messages the projection lost: one that left
-/// the listing of the channels and came back after an unfinished first
-/// sweep, after an unfinished answer of the messages after the latest one,
-/// whose kept page had a message that Slack has no more, and without a
-/// message, which has `messages/` complete and empty again; and one that the
-/// feed of a message removed during its first sweep, which a read of a
-/// message by its `ts` after its return does not list.
+/// answer, for a channel that left the listing of the channels and came
+/// back: after an unfinished first sweep, and after an unfinished later
+/// sweep whose kept page had a message that Slack has no more.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_channel_that_left_and_came_back_takes_each_page_again() {
     let harness = slack_harness();
-    let both = [channel("C01", "general"), channel("C02", "quiet")];
+    let both = [channel("C01", "general")];
     channels(&harness, &both).await;
     let pages = |newest: &[u32], older: &[u32]| {
         let of = |ns: &[u32]| {
@@ -1420,7 +1422,6 @@ async fn a_channel_that_left_and_came_back_takes_each_page_again() {
         channels(&harness, &both).await;
     };
     let messages = "/slack/channels/C01/messages";
-    first_full_listing(&harness, "C02", &[]).await;
 
     let (stopped, requests) = answering(
         &harness,
@@ -1446,23 +1447,9 @@ async fn a_channel_that_left_and_came_back_takes_each_page_again() {
     assert_eq!(listing.unwrap(), stamps(&[1, 2, 3, 4]));
     expect_history(&requests[0], "C01", None);
     expect_history(&requests[1], "C01", Some("cursor-2"));
-    let (listing, requests) = answering(
-        &harness,
-        names(&harness, "/slack/channels/C02/messages"),
-        vec![ok(&page("messages", &[], None))],
-    )
-    .await;
-    assert!(listing.unwrap().is_empty());
-    expect_history(&requests[0], "C02", None);
-    assert!(
-        served(&harness, names(&harness, "/slack/channels/C02/messages"))
-            .await
-            .unwrap()
-            .is_empty()
-    );
 
-    // The kept page of the new messages has message 6, which Slack has no
-    // more when the channel comes back.
+    // The kept page of a later sweep has message 6, which Slack has no more
+    // when the channel comes back.
     harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
@@ -1479,8 +1466,8 @@ async fn a_channel_that_left_and_came_back_takes_each_page_again() {
     .await;
     // The read of the failure is served what the projection has.
     assert_eq!(stopped.unwrap(), "A message");
-    expect_new(&requests[0], "C01", &ts(4), None);
-    expect_new(&requests[1], "C01", &ts(4), Some("cursor-2"));
+    expect_history(&requests[0], "C01", None);
+    expect_history(&requests[1], "C01", Some("cursor-2"));
     leave_and_come_back().await;
     let (listing, requests) = answering(
         &harness,
@@ -1501,8 +1488,8 @@ async fn a_channel_that_left_and_came_back_takes_each_page_again() {
 
 /// The removal of a channel by the feed of a message during the first sweep
 /// of the channel, after whose return a read of a message that the removal
-/// took asks Slack for nothing within the deadline, and a read of
-/// `messages/` sweeps each page from the first one.
+/// took asks Slack for nothing, and a read of `messages/` sweeps each page
+/// from the first one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_channel_that_the_feed_of_a_message_removed_takes_each_page_again() {
     let harness = slack_harness();
@@ -1554,11 +1541,11 @@ async fn a_channel_that_the_feed_of_a_message_removed_takes_each_page_again() {
     expect_history(&requests[1], "C01", Some("cursor-2"));
 }
 
-/// A walk of the mount, each listing and each file, and a second walk past
-/// the deadline with nothing changed in Slack: the second asks for the
-/// channels and for each page of the history alone, with no request of the
-/// replies of a thread and no request of the bytes of a file, of a message
-/// or of a reply, with an `edit_timestamp` or without one.
+/// A walk of the mount, each listing and each file, and a second walk in a
+/// sync with nothing changed in Slack: the second asks for the pages of the
+/// listings of the users, of the channels, and of the history alone, with no
+/// request of the replies of a thread and no request of the bytes of a file,
+/// of a message or of a reply, with an `edit_timestamp` or without one.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_second_walk_with_nothing_changed_asks_for_no_replies_and_no_file() {
@@ -1608,6 +1595,9 @@ async fn a_second_walk_with_nothing_changed_asks_for_no_replies_and_no_file() {
         }
     };
 
+    let users = || vec![ok(&page("members", &[user("U01", Some("Ada"))], None))];
+    let (listing, _) = answering(&harness, names(&harness, "/slack/users"), users()).await;
+    assert_eq!(listing.unwrap(), ["U01"]);
     channels(&harness, &[channel("C01", "general")]).await;
     let (listing, _) = answering(&harness, names(&harness, messages), history()).await;
     assert_eq!(listing.unwrap(), stamps(&[1, 2]));
@@ -1632,6 +1622,9 @@ async fn a_second_walk_with_nothing_changed_asks_for_no_replies_and_no_file() {
     expect_file(&requests[1], "F02", "plain.txt", None);
 
     harness.begin_sync();
+    let (listing, requests) = answering(&harness, names(&harness, "/slack/users"), users()).await;
+    assert_eq!(listing.unwrap(), ["U01"]);
+    expect_users(&requests[0], None);
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/slack/channels"),
@@ -1666,18 +1659,21 @@ async fn each_page_of_the_replies_is_written_at_its_answer() {
     channels(&harness, &[channel("C01", "general")]).await;
     let messages = "/slack/channels/C01/messages";
     first_full_listing(&harness, "C01", &[message(1, Some("U01"), "First")]).await;
-    // A message of the messages after the latest one, whose feed has no
-    // state yet.
+    // A new message of a later sweep, whose feed has no state yet.
     harness.begin_sync();
     let question = thread(message(2, Some("U01"), "Question"), 2, 22);
     let (text, requests) = answering(
         &harness,
         read(&harness, &format!("{messages}/{}/text", ts(1))),
-        vec![ok(&page("messages", std::slice::from_ref(&question), None))],
+        vec![ok(&page(
+            "messages",
+            &[question.clone(), message(1, Some("U01"), "First")],
+            None,
+        ))],
     )
     .await;
     assert_eq!(text.unwrap(), "First");
-    expect_new(&requests[0], "C01", &ts(1), None);
+    expect_history(&requests[0], "C01", None);
     let replies = format!("{messages}/{}/replies", ts(2));
     let (stopped, requests) = answering(
         &harness,

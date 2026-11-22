@@ -92,17 +92,6 @@ pub fn expect_history(request: &Request, channel: &str, cursor: Option<&str>) {
     );
 }
 
-/// Check that `request` is that of the page of the messages of `channel`
-/// after `oldest` from `cursor`.
-pub fn expect_new(request: &Request, channel: &str, oldest: &str, cursor: Option<&str>) {
-    expect(
-        request,
-        "conversations.history",
-        &[("channel", channel), ("oldest", oldest), ("limit", "999")],
-        cursor,
-    );
-}
-
 /// Check that `request` is that of the message `ts` of `channel` by its
 /// `ts`.
 pub fn expect_message(request: &Request, channel: &str, ts: &str) {
