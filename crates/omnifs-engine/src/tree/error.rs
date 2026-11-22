@@ -133,6 +133,7 @@ impl From<ProviderErrorClass> for TreeErrorKind {
             ProviderErrorClass::NotFound => Self::NotFound,
             ProviderErrorClass::NotDirectory => Self::NotDirectory,
             ProviderErrorClass::IsDirectory => Self::IsDirectory,
+            ProviderErrorClass::Unauthenticated => Self::AuthRequired,
             ProviderErrorClass::PermissionDenied => Self::PermissionDenied,
             ProviderErrorClass::InvalidInput => Self::InvalidInput,
             ProviderErrorClass::TooLarge => Self::TooLarge,
@@ -141,5 +142,32 @@ impl From<ProviderErrorClass> for TreeErrorKind {
             ProviderErrorClass::Timeout => Self::Timeout,
             ProviderErrorClass::Internal => Self::Internal,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TreeError, TreeErrorKind};
+    use omnifs_wit::host::types as wit_types;
+
+    #[test]
+    fn a_credential_that_the_upstream_rejects_is_apart_from_a_denied_path() {
+        let kind = |kind| {
+            TreeError::from(crate::EngineError::ProviderError(wit_types::ProviderError {
+                kind,
+                message: String::new(),
+                retryable: false,
+                retry_after: None,
+            }))
+            .kind
+        };
+        assert_eq!(
+            kind(wit_types::ErrorKind::PermissionDenied),
+            TreeErrorKind::AuthRequired
+        );
+        assert_eq!(
+            kind(wit_types::ErrorKind::Denied),
+            TreeErrorKind::PermissionDenied
+        );
     }
 }

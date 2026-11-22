@@ -22,7 +22,10 @@ pub(super) fn ns_error_errno(error: &NsError) -> Errno {
             _ => Errno::EIO,
         },
         NsRetryClass::Terminal => match error {
-            NsError::AuthRequired | NsError::Permission => Errno::EACCES,
+            // A mount without a credential that its upstream takes is apart
+            // from a path that the credential may not read.
+            NsError::AuthRequired => Errno::EPERM,
+            NsError::Permission => Errno::EACCES,
             NsError::Invalid => Errno::EINVAL,
             _ => Errno::EIO,
         },
@@ -58,9 +61,13 @@ mod tests {
     }
 
     #[test]
-    fn auth_required_maps_to_access_denied() {
+    fn a_missing_credential_is_apart_from_a_denied_path() {
         assert_eq!(
             i32::from(ns_error_errno(&NsError::AuthRequired)),
+            i32::from(Errno::EPERM)
+        );
+        assert_eq!(
+            i32::from(ns_error_errno(&NsError::Permission)),
             i32::from(Errno::EACCES)
         );
     }

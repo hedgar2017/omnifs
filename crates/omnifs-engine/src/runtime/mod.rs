@@ -121,6 +121,8 @@ pub(crate) enum ProviderErrorClass {
     NotFound,
     NotDirectory,
     IsDirectory,
+    /// The upstream took no credential of the request, as a `401`.
+    Unauthenticated,
     PermissionDenied,
     InvalidInput,
     TooLarge,
@@ -156,9 +158,8 @@ impl From<wit_types::ErrorKind> for ProviderErrorClass {
             wit_types::ErrorKind::NotFound => Self::NotFound,
             wit_types::ErrorKind::NotADirectory => Self::NotDirectory,
             wit_types::ErrorKind::NotAFile => Self::IsDirectory,
-            wit_types::ErrorKind::PermissionDenied | wit_types::ErrorKind::Denied => {
-                Self::PermissionDenied
-            },
+            wit_types::ErrorKind::PermissionDenied => Self::Unauthenticated,
+            wit_types::ErrorKind::Denied => Self::PermissionDenied,
             wit_types::ErrorKind::InvalidInput => Self::InvalidInput,
             wit_types::ErrorKind::TooLarge => Self::TooLarge,
             wit_types::ErrorKind::RateLimited => Self::RateLimited,

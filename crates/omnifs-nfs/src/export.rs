@@ -4,8 +4,8 @@ use crate::protocol::consts::{
     NFS4ERR_FHEXPIRED, NFS4ERR_INVAL, NFS4ERR_IO, NFS4ERR_ISDIR, NFS4ERR_LOCK_NOTSUPP,
     NFS4ERR_MINOR_VERS_MISMATCH, NFS4ERR_NO_GRACE, NFS4ERR_NOENT, NFS4ERR_NOFILEHANDLE,
     NFS4ERR_NOTDIR, NFS4ERR_NOTSUPP, NFS4ERR_OLD_STATEID, NFS4ERR_OP_ILLEGAL, NFS4ERR_OPENMODE,
-    NFS4ERR_RESOURCE, NFS4ERR_ROFS, NFS4ERR_STALE, NFS4ERR_STALE_CLIENTID, NFS4ERR_SYMLINK,
-    NFS4ERR_TOOSMALL, OPEN_STATE_LEASE_SECONDS, OPEN4_SHARE_ACCESS_READ,
+    NFS4ERR_PERM, NFS4ERR_RESOURCE, NFS4ERR_ROFS, NFS4ERR_STALE, NFS4ERR_STALE_CLIENTID,
+    NFS4ERR_SYMLINK, NFS4ERR_TOOSMALL, OPEN_STATE_LEASE_SECONDS, OPEN4_SHARE_ACCESS_READ,
 };
 use dashmap::DashMap;
 use omnifs_vfs::{NsError, NsRetryClass};
@@ -36,6 +36,7 @@ pub enum Status {
     OldStateId,
     OpenMode,
     OpIllegal,
+    Perm,
     ReadOnlyFs,
     Resource,
     Stale,
@@ -48,6 +49,7 @@ impl Status {
     pub(crate) fn wire(self) -> u32 {
         match self {
             Self::Access => NFS4ERR_ACCESS,
+            Self::Perm => NFS4ERR_PERM,
             Self::BadCookie => NFS4ERR_BAD_COOKIE,
             Self::BadHandle => NFS4ERR_BADHANDLE,
             Self::BadStateId => NFS4ERR_BAD_STATEID,
@@ -93,7 +95,10 @@ impl From<&NsError> for Status {
                 _ => Self::Io,
             },
             NsRetryClass::Terminal => match error {
-                NsError::AuthRequired | NsError::Permission => Self::Access,
+                // A mount without a credential that its upstream takes is
+                // apart from a path that the credential may not read.
+                NsError::AuthRequired => Self::Perm,
+                NsError::Permission => Self::Access,
                 NsError::Invalid => Self::Invalid,
                 _ => Self::Io,
             },
@@ -432,7 +437,9 @@ mod tests {
     }
 
     #[test]
-    fn auth_required_maps_to_access_denied() {
-        assert_eq!(Status::from(&NsError::AuthRequired), Status::Access);
+    fn a_missing_credential_is_apart_from_a_denied_path() {
+        assert_eq!(Status::from(&NsError::AuthRequired), Status::Perm);
+        assert_eq!(Status::from(&NsError::Permission), Status::Access);
+        assert_ne!(Status::Perm.wire(), Status::Access.wire());
     }
 }

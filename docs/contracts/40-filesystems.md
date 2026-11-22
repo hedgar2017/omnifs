@@ -91,7 +91,7 @@ When the namespace returns a transient upstream error (`RateLimited`, `Timeout`,
 
 **Concurrent dispatch.** Per-connection RPC dispatch runs each call on its own handler thread; replies carry their own XID. One slow op does not head-of-line block other RPCs on the same TCP connection.
 
-**Ownership.** `async_singleflight::Group` owns exact-key OAuth refresh dedupe in `omnifs-auth`. The engine namespace computes truth and owns cache; it does not know about `NFS4ERR_DELAY`. `Status::from(&NsError)` maps transient upstream errors without background continuation. FUSE owns its own blocking tolerance; it has no `DELAY` equivalent.
+**Ownership.** `async_singleflight::Group` owns exact-key OAuth refresh dedupe in `omnifs-auth`. The engine namespace computes truth and owns cache; it does not know about `NFS4ERR_DELAY`. `Status::from(&NsError)` maps transient upstream errors without background continuation. A mount without a credential that its upstream takes, at a `401` too, answers `NFS4ERR_PERM` and `EPERM`, apart from the `NFS4ERR_ACCESS` and `EACCES` of a path that the credential may not read, so that a reader tells a credential to renew from a refused path. FUSE owns its own blocking tolerance; it has no `DELAY` equivalent.
 
 ## Must not
 

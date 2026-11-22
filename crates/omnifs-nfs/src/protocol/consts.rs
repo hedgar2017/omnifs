@@ -49,6 +49,7 @@ pub(crate) const MAX_RPC_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 pub const NFS4_OK: u32 = 0;
 pub const NFS4ERR_NOENT: u32 = 2;
 pub const NFS4ERR_IO: u32 = 5;
+pub const NFS4ERR_PERM: u32 = 1;
 pub const NFS4ERR_ACCESS: u32 = 13;
 pub const NFS4ERR_NOTDIR: u32 = 20;
 pub const NFS4ERR_ISDIR: u32 = 21;
