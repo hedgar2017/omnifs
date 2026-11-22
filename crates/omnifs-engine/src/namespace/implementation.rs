@@ -31,8 +31,10 @@ const TTL_STATIC: Duration = Duration::from_secs(u32::MAX as u64);
 /// Zero TTL for entries whose size or content can move under the reader.
 const TTL_DYNAMIC: Duration = Duration::ZERO;
 const EVENT_CAPACITY: usize = 1024;
-#[allow(clippy::duration_suboptimal_units)] // 60s reads clearer than 1min here.
-const HANDLE_IDLE: Duration = Duration::from_secs(60);
+/// The ranged read handles that the namespace keeps open: past it, the
+/// least recently read one closes, and its next read opens it again, so a
+/// handle ends by its use and never by a time.
+const HANDLE_CAPACITY: usize = 256;
 const MOUNT_ENUMERATION_MOUNT: &str = "";
 
 fn entry_kind_from_node(node: &crate::Node) -> EntryKind {
@@ -424,7 +426,6 @@ impl EngineNamespace {
                 for mount in this.registry.mounts() {
                     this.process_invalidations(&mount);
                 }
-                this.sweep_idle_handles();
             }
         });
         *tick = Some(handle);
@@ -783,16 +784,17 @@ impl EngineNamespace {
         }
     }
 
-    fn sweep_idle_handles(&self) {
-        let stale: Vec<Path> = self
-            .handles
-            .iter()
-            .filter_map(|entry| {
-                (entry.value().last_use.elapsed() >= HANDLE_IDLE).then(|| entry.key().clone())
-            })
-            .collect();
-        for id in stale {
-            self.handles.remove(&id);
+    /// Close the least recently read handle past [`HANDLE_CAPACITY`].
+    fn evict_handles(&self) {
+        while self.handles.len() > HANDLE_CAPACITY {
+            let Some(oldest) = least_recent(
+                self.handles
+                    .iter()
+                    .map(|entry| (entry.key().clone(), entry.value().last_use)),
+            ) else {
+                return;
+            };
+            self.handles.remove(&oldest);
         }
     }
 
@@ -1049,6 +1051,7 @@ impl EngineNamespace {
                 last_use: Instant::now(),
             },
         );
+        self.evict_handles();
         handle
     }
 
@@ -2284,5 +2287,26 @@ mod tests {
             inspector_identity("", &path),
             (INSPECTOR_SYNTHETIC_ROOT.to_string(), "/".to_string())
         );
+    }
+}
+
+/// The key of the least recently used of `entries`, by the order of their
+/// uses alone.
+fn least_recent<K>(entries: impl Iterator<Item = (K, Instant)>) -> Option<K> {
+    entries.min_by_key(|(_, used)| *used).map(|(key, _)| key)
+}
+
+#[cfg(test)]
+mod handle_tests {
+    /// The least recently used entry is the one whose use is the oldest.
+    #[test]
+    fn the_least_recent_entry_is_the_oldest_use() {
+        let first = std::time::Instant::now();
+        let second = first + std::time::Duration::from_nanos(1);
+        assert_eq!(
+            super::least_recent([("b", second), ("a", first)].into_iter()),
+            Some("a")
+        );
+        assert_eq!(super::least_recent(std::iter::empty::<((), _)>()), None);
     }
 }
