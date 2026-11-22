@@ -1,4 +1,4 @@
-//! The typed endpoints of Slack, the answers of its methods, and the objects
+//! The typed endpoint of Slack, the answers of its methods, and the objects
 //! of its answers.
 //!
 //! A method of Slack answers a failure in its JSON, with `ok` of `false` and
@@ -18,11 +18,6 @@ use crate::{Id, Result, Ts};
 #[derive(omnifs_sdk::Endpoint)]
 #[endpoint(base = "https://slack.com")]
 pub(crate) struct SlackApi;
-
-/// The host of the bytes of the files of Slack.
-#[derive(omnifs_sdk::Endpoint)]
-#[endpoint(base = "https://files.slack.com")]
-pub(crate) struct SlackFiles;
 
 /// An answer of a method of Slack: `ok`, the `error` of `ok` of `false`, the
 /// cursor of the next page, and the objects of the page, under the name that
@@ -162,7 +157,7 @@ fn refusal(error: &str) -> Refusal {
 
 /// The rate-limited error of an answer `429` with the seconds of its
 /// `Retry-After`.
-fn rate_limited(retry_after: Option<&str>) -> ProviderError {
+pub(crate) fn rate_limited(retry_after: Option<&str>) -> ProviderError {
     let message = match retry_after {
         Some(value) => format!("HTTP 429; retry_after={value}"),
         None => "HTTP 429".to_owned(),

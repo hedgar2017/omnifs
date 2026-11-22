@@ -43,8 +43,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::api::{
-    ConversationObject, MessageObject, Refusal, Refused, SlackApi, SlackFiles, UserObject, decode,
-    page,
+    ConversationObject, MessageObject, Refusal, Refused, SlackApi, UserObject, decode, page,
+    rate_limited,
 };
 use crate::{
     ChannelKey, Channels, File, FileKey, History, Id, Message, MessageKey, ReplyFile, ReplyFileKey,
@@ -875,30 +875,37 @@ impl ReplyFile {
     }
 }
 
-/// The `content` of the file of `cx`: the path of the URL of its token on
-/// `SlackFiles` as a blob fetch with the version of its `edit_timestamp`, and
-/// without one for a file without it.
+/// The `content` of the file of `cx`: the bytes of the URL of its token as a
+/// blob fetch with the version of its `edit_timestamp`, and without one for a
+/// file without it. Slack answers the bytes of a file with the status `200`
+/// alone: each other answer is the error of its status, the rate-limited
+/// error with the seconds of its `Retry-After` for `429`.
 async fn content<K>(cx: &FeedCx<K>) -> Result<Feed> {
     let token = cx.token().ok_or_else(|| {
         ProviderError::internal("the feed of a file has no token of the feed that took the file")
     })?;
     let file: FileToken = decode_token(token)?;
-    let path = file
-        .url
-        .strip_prefix(SlackFiles.base())
-        .filter(|path| path.starts_with('/'))
-        .ok_or_else(|| {
-            ProviderError::invalid_input(format!(
-                "the url_private_download {} of Slack is not of {}",
-                file.url,
-                SlackFiles.base()
-            ))
-        })?;
-    let mut request = cx.endpoint(SlackFiles).get(path).into_blob();
+    let mut request = cx.http().get(file.url).into_blob();
     if let Some(edited) = file.edit_timestamp {
         request = request.version(edited.to_string());
     }
-    let blob = request.fetch().await?;
-    cx.blob(format!("{}/content", cx.path()), &blob)?;
+    let blob = request.send().await?;
+    match blob.status {
+        200 => {},
+        429 => {
+            let retry_after = blob
+                .response_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, value)| value.as_str());
+            return Err(rate_limited(retry_after));
+        },
+        status => return Err(ProviderError::from_http_status(status)),
+    }
+    let handle = BlobHandle {
+        id: blob.id,
+        size: blob.size,
+    };
+    cx.blob(format!("{}/content", cx.path()), &handle)?;
     Ok(Feed::part(token).into())
 }
