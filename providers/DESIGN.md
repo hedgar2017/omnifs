@@ -844,13 +844,18 @@ indexed `comments/{idx}` files.
 The pull diff is a blob face, not a direct file. It is `Dynamic`, with the
 base and the head of the pull request as its version and as the version of
 its blob request, so that the host holds the diff of each pair of commits and
-a push to the pull request brings another diff:
+a push to the pull request brings another diff. The feed writes the base and
+the head into the node of the pull request, and the face reads them from the
+projection without a request; the read follows the lookup of the pull
+request, so a pull request that the projection lacks has no diff:
 
 ```rust
 async fn diff(cx: Cx<GitHub>, key: PullRequestKey) -> Result<BlobFile<Diff>> {
+    let Some(pull) = cx.object::<PullRequest>(&key)? else {
+        return Err(ProviderError::not_found("the projection has no pull request"));
+    };
     let path = format!("/repos/{}/pulls/{}", key.repo(), key.number());
-    let pull: PullCommits = cx.endpoint(GitHubApi).get(path.as_str()).json().await?;
-    let version = format!("{}..{}", pull.base.sha, pull.head.sha);
+    let version = format!("{}..{}", pull.base_ref_oid, pull.head_ref_oid);
     let blob = cx
         .endpoint(GitHubApi)
         .get(path)

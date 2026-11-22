@@ -64,7 +64,7 @@ Before the first full listing ends, an item answers from GitHub GraphQL by its n
 
 The owner and the repository are named as the path spells them. The sync program asks GitHub for their canonical spelling and reads that path alone; a path in another spelling is a repository of its own, which takes its own first full listing and shows its own whole tree from it, never one mixed with the facts of another spelling, and is never part of a sync.
 
-The entries of `files/`, `reviews/`, and `reviews/{id}/comments/` render from the row that their listing brought, and a page is the last when its answer has no link `next`. `diff.patch` is the diff between the base and the head of the pull request, which each read asks `GET /repos/{owner}/{repo}/pulls/{number}` for; the host downloads the diff of a pair of commits once. A secondary rate limit without `Retry-After` states no window, and the feed is asked again in the next sync.
+The entries of `files/`, `reviews/`, and `reviews/{id}/comments/` render from the row that their listing brought, and a page is the last when its answer has no link `next`. `diff.patch` is the diff between the base and the head of the pull request, which its node in the projection names, without a request for them; the host downloads the diff of a pair of commits once. A read of the diff of a pull request that the projection lacks is not found. A secondary rate limit without `Retry-After` states no window, and the feed is asked again in the next sync.
 
 ## Capabilities
 
