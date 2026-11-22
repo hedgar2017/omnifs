@@ -95,10 +95,6 @@ pub struct ReauthArgs {
     /// private key of a service account.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["token", "token_env"])]
     pub client_secret_file: Option<String>,
-    /// Subject that an OAuth client without a sign-in asserts instead of
-    /// itself, as the user that a service account acts as.
-    #[arg(long, value_name = "SUBJECT", conflicts_with_all = ["token", "token_env"])]
-    pub subject: Option<String>,
 }
 
 impl MountArgs {
@@ -388,10 +384,9 @@ impl ReauthArgs {
 
     /// The credential of this invocation for the mount of `record`, whose
     /// provider has `manifest` and whose stored credential has the status
-    /// `stored`. An OAuth credential keeps the subject and the scopes of the
-    /// stored one unless the invocation gives others, and without a stored
-    /// one it has the subject of the invocation alone and the scopes that
-    /// the manifest declares.
+    /// `stored`. An OAuth credential keeps the scopes of the stored one
+    /// unless the invocation gives others, and without a stored one it has
+    /// the scopes that the manifest declares.
     async fn submission(
         &self,
         record: &MountRecord,
@@ -417,14 +412,10 @@ impl ReauthArgs {
             &auth.scheme,
             Some(auth.account_label.clone()),
         )?
-        .with_client(
-            crate::auth::OAuthClientArgs {
-                client_id: self.client_id.clone(),
-                client_secret_file: self.client_secret_file.clone(),
-                subject: self.subject.clone(),
-            },
-            auth_manifest.as_ref(),
-        )?
+        .with_client(crate::auth::OAuthClientArgs {
+            client_id: self.client_id.clone(),
+            client_secret_file: self.client_secret_file.clone(),
+        })?
         .with_scopes(&self.scopes)?;
 
         let interactive = prompt.interactive();
@@ -451,9 +442,6 @@ impl ReauthArgs {
             auth.scheme
         );
         let selected = crate::auth::Auth::OAuth(crate::auth::OAuth {
-            subject: oauth
-                .subject
-                .or_else(|| stored.and_then(|stored| stored.subject.clone())),
             scopes: oauth
                 .scopes
                 .or_else(|| stored.map(|stored| stored.scopes.clone())),
@@ -676,9 +664,9 @@ mod tests {
         mount
     }
 
-    /// The status of the stored credential of `reauth_mount`, which asserts
-    /// `subject` and has `scopes`.
-    fn stored_credential(subject: Option<&str>, scopes: &[&str]) -> CredentialStatus {
+    /// The status of the stored credential of `reauth_mount`, which has
+    /// `scopes`.
+    fn stored_credential(scopes: &[&str]) -> CredentialStatus {
         CredentialStatus {
             key: CredentialKey {
                 provider_name: "demo".to_owned(),
@@ -688,7 +676,6 @@ mod tests {
             provider: omnifs_core::ProviderId::from_digest([0x12; 32]),
             kind: omnifs_api::CredentialKind::OAuth,
             scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-            subject: subject.map(str::to_owned),
             auth_fingerprint: omnifs_core::AuthRuntimeFingerprint::from_digest([5; 32]),
             version: omnifs_core::CredentialVersion::initial(),
             generation: omnifs_core::CredentialGeneration::initial(),
@@ -707,7 +694,6 @@ mod tests {
             scopes: Vec::new(),
             client_id: None,
             client_secret_file: None,
-            subject: None,
         }
     }
 
@@ -827,21 +813,17 @@ mod tests {
         serde_json::json!({ "jwtBearerScopeClaim": { "claim": "scope" } })
     }
 
-    /// A re-authentication without a subject and without scopes of its own
-    /// asserts the subject of the stored credential with its scopes, and
-    /// stores them again.
+    /// A re-authentication without scopes of its own asserts the account of
+    /// its mount as the subject with the scopes of the stored credential,
+    /// and stores them again.
     #[tokio::test]
-    async fn a_reauthentication_keeps_the_subject_and_the_scopes_of_the_stored_credential() {
-        let stored = stored_credential(Some("ada@demo.test"), &["stored", "other"]);
+    async fn a_reauthentication_keeps_the_scopes_of_the_stored_credential() {
+        let stored = stored_credential(&["stored", "other"]);
         let (submission, assertion) =
             reauthenticate(reauth_args(), scope_claim(), Some(&stored)).await;
         assert_eq!(assertion.claims["iss"], "robot@demo.test");
-        assert_eq!(assertion.claims["sub"], "ada@demo.test");
+        assert_eq!(assertion.claims["sub"], "work");
         assert_eq!(assertion.claims["scope"], "stored other");
-        assert_eq!(
-            submission.overrides.subject.as_deref(),
-            Some("ada@demo.test")
-        );
         assert_eq!(
             submission.overrides.scopes,
             Some(vec!["stored".to_owned(), "other".to_owned()])
@@ -850,42 +832,34 @@ mod tests {
         assert_eq!(submission.scheme, "service-account");
     }
 
-    /// The subject and the scopes of the invocation stand in place of the
-    /// stored ones.
+    /// The scopes of the invocation stand in place of the stored ones.
     #[tokio::test]
-    async fn a_reauthentication_takes_the_subject_and_the_scopes_of_its_invocation() {
-        let stored = stored_credential(Some("ada@demo.test"), &["stored"]);
+    async fn a_reauthentication_takes_the_scopes_of_its_invocation() {
+        let stored = stored_credential(&["stored"]);
         let args = ReauthArgs {
-            subject: Some("bob@demo.test".to_owned()),
             scopes: vec!["given".to_owned()],
             ..reauth_args()
         };
         let (submission, assertion) = reauthenticate(args, scope_claim(), Some(&stored)).await;
-        assert_eq!(assertion.claims["sub"], "bob@demo.test");
         assert_eq!(assertion.claims["scope"], "given");
-        assert_eq!(
-            submission.overrides.subject.as_deref(),
-            Some("bob@demo.test")
-        );
         assert_eq!(submission.overrides.scopes, Some(vec!["given".to_owned()]));
     }
 
     /// Without a stored credential, as after `omnifs credential rm`, a
     /// re-authentication requests the scopes that the manifest of the
-    /// provider declares, never none, and asserts no subject.
+    /// provider declares, never none.
     #[tokio::test]
     async fn a_reauthentication_without_a_stored_credential_takes_the_scopes_of_the_manifest() {
         let deleted = CredentialStatus {
             status: CredentialStatusKind::Deleted,
-            ..stored_credential(None, &[])
+            ..stored_credential(&[])
         };
         for stored in [None, Some(&deleted)] {
             let (submission, assertion) =
                 reauthenticate(reauth_args(), serde_json::json!("jwtBearer"), stored).await;
             assert_eq!(assertion.form["scope"], "declared");
-            assert!(assertion.claims.get("sub").is_none());
+            assert_eq!(assertion.claims["sub"], "work");
             assert_eq!(submission.overrides.scopes, None);
-            assert_eq!(submission.overrides.subject, None);
 
             let (_, assertion) = reauthenticate(reauth_args(), scope_claim(), stored).await;
             assert_eq!(assertion.claims["scope"], "declared");
@@ -894,8 +868,8 @@ mod tests {
     }
 
     /// A re-authentication refuses what the auth scheme of its mount cannot
-    /// take: a static token for an OAuth scheme, and a client, a subject or
-    /// scopes for a static token.
+    /// take: a static token for an OAuth scheme, and a client or scopes for
+    /// a static token.
     #[tokio::test]
     async fn a_reauthentication_refuses_what_the_auth_scheme_of_its_mount_cannot_take() {
         let address = "127.0.0.1:9".parse().unwrap();
@@ -927,17 +901,6 @@ mod tests {
             )
             .await,
             "`--token` and `--token-env` give a static token, and mount `github` has the OAuth auth scheme `service-account`"
-        );
-        assert_eq!(
-            refusal(
-                ReauthArgs {
-                    subject: Some("ada@demo.test".to_owned()),
-                    ..reauth_args()
-                },
-                "pat"
-            )
-            .await,
-            "`--subject` needs an OAuth auth scheme, and the auth scheme `pat` takes a static token"
         );
         assert_eq!(
             refusal(

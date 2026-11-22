@@ -26,8 +26,6 @@ pub struct OAuthRequest {
     pub(crate) scheme: OauthScheme,
     client_id: Option<String>,
     client_secret: Option<SecretString>,
-    /// The subject of the assertions of a JWT bearer grant, in place of the
-    /// client itself.
     subject: Option<String>,
 }
 
@@ -40,7 +38,6 @@ pub struct OAuthRequestConfig {
     pub redirect_uri: Option<String>,
     pub client_id: Option<String>,
     pub client_secret_file: Option<String>,
-    pub subject: Option<String>,
 }
 
 /// Daemon-validated OAuth overrides stored with submitted credential material.
@@ -50,7 +47,6 @@ pub struct OAuthRuntimeOverrides {
     pub redirect_uri: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<SecretString>,
-    pub subject: Option<String>,
 }
 
 impl std::fmt::Debug for OAuthRuntimeOverrides {
@@ -64,7 +60,6 @@ impl std::fmt::Debug for OAuthRuntimeOverrides {
                 "client_secret",
                 &self.client_secret.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("subject", &self.subject)
             .finish()
     }
 }
@@ -79,21 +74,19 @@ impl OAuthRequest {
         }
     }
 
-    /// The subject of the assertions of a JWT bearer grant, none for the
-    /// client itself.
-    pub(crate) fn subject(&self) -> Option<&str> {
-        self.subject.as_deref()
+    /// The request of the client for the credential of `account`: its own
+    /// for the default account, and else that of the account that it acts
+    /// as, the subject of its assertions.
+    #[must_use]
+    pub fn acting_as(mut self, account: &str) -> Self {
+        self.subject =
+            (account != crate::AccountId::default_account().as_str()).then(|| account.to_owned());
+        self
     }
 
-    /// Takes `subject`, which a JWT bearer grant alone asserts.
-    fn set_subject(&mut self, subject: &str, source: &str) -> Result<(), AuthError> {
-        if self.scheme.flow.needs_user() {
-            return Err(AuthError::RequestConfig(format!(
-                "{source} needs the flow of a JWT bearer grant, whose client asserts its subject"
-            )));
-        }
-        self.subject = Some(subject.to_owned());
-        Ok(())
+    /// The account that the client acts as, none for its own.
+    pub(crate) fn subject(&self) -> Option<&str> {
+        self.subject.as_deref()
     }
 
     #[must_use]
@@ -281,9 +274,6 @@ impl OAuthRequest {
         if let Some(client_secret) = read_oauth_client_secret(config)? {
             request.client_secret = Some(client_secret);
         }
-        if let Some(subject) = non_empty_config_value(config.subject.as_deref(), "auth.subject")? {
-            request.set_subject(subject, "auth.subject")?;
-        }
         Ok(request)
     }
 
@@ -326,11 +316,6 @@ impl OAuthRequest {
         if let Some(client_secret) = overrides.client_secret {
             validate_non_empty_secret(&client_secret)?;
             request.client_secret = Some(client_secret);
-        }
-        if let Some(subject) =
-            non_empty_config_value(overrides.subject.as_deref(), "oauth subject")?
-        {
-            request.set_subject(subject, "oauth subject")?;
         }
         Ok(request)
     }
@@ -452,7 +437,6 @@ mod tests {
                 redirect_uri: Some("https://localhost/callback".to_owned()),
                 client_id: Some("client".to_owned()),
                 client_secret: Some(secret),
-                subject: None,
             },
         )
         .unwrap();
@@ -466,27 +450,6 @@ mod tests {
         };
         assert_eq!(flow.redirect_uri, "https://localhost/callback");
         assert!(!format!("{request:?}").contains("client-secret"));
-    }
-
-    /// A flow in which a user signs in asserts no subject.
-    #[test]
-    fn a_subject_needs_the_flow_of_a_jwt_bearer_grant() {
-        let subject = || OAuthRuntimeOverrides {
-            subject: Some("ada@example.test".to_owned()),
-            ..OAuthRuntimeOverrides::default()
-        };
-        let result = OAuthRequest::from_runtime(scheme(), subject());
-        assert!(matches!(result, Err(AuthError::RequestConfig(_))));
-
-        let request = OAuthRequest::from_runtime(
-            OauthScheme {
-                flow: OAuthFlow::JwtBearer,
-                ..scheme()
-            },
-            subject(),
-        )
-        .unwrap();
-        assert_eq!(request.subject(), Some("ada@example.test"));
     }
 
     /// The client secret of a request is the content of its file, and a

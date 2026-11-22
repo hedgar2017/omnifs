@@ -615,7 +615,7 @@
           ]
         },
         {
-          "description": "The JWT bearer grant of RFC 7523: the client signs an assertion with\nits own key and the token endpoint answers it with an access token.\nNo user signs in and no refresh token exists; the client ID is the\nissuer of the assertion and the client secret is the PEM of its RSA\nprivate key. The assertion names the subject of a credential with\none, and no subject without one. The scopes are the `scope` parameter\nof the token request.",
+          "description": "The JWT bearer grant of RFC 7523: the client signs an assertion with\nits own key and the token endpoint answers it with an access token.\nNo user signs in and no refresh token exists; the client ID is the\nissuer of the assertion and the client secret is the PEM of its RSA\nprivate key. The assertion names the account that the client acts as\nas its subject, and none for the default account. The scopes are the `scope` parameter\nof the token request.",
           "type": "string",
           "const": "jwtBearer"
         },

@@ -282,7 +282,7 @@ mod tests {
 
     /// A mutation begins on a daemon of the control protocol of the command
     /// alone: a daemon of another one, which would drop what it does not
-    /// know of a request, as the subject of a credential, gets none.
+    /// know of a request, gets none.
     #[tokio::test]
     async fn a_mutation_begins_on_a_daemon_of_the_control_protocol_of_the_command_alone() {
         use crate::fake_daemon::{Answers, FakeDaemon, info};

@@ -1,7 +1,7 @@
 //! The JWT bearer grant of RFC 7523: an access token for an assertion that
 //! the client signs with its own key, without a sign-in and without a
-//! refresh token. The assertion names a subject only for a credential with
-//! one, as a user whose data a delegated client reads.
+//! refresh token. The assertion names the account that the client acts as
+//! as its subject, and none for the default account.
 
 use crate::CredentialEntry;
 use crate::OAuthFlow;
@@ -89,8 +89,8 @@ impl OAuthClient {
 }
 
 /// The assertion of the client at `now`, signed with RS256: its ID as the
-/// issuer; the subject of a credential with one as the subject, and no
-/// subject without one; the token endpoint as the audience; `now` as the
+/// issuer; the account that it acts as as the subject, and no subject for
+/// the default account; the token endpoint as the audience; `now` as the
 /// time of its issue, and its expiry [`ASSERTION_LIFETIME`] after that; and
 /// its scopes in the claim of a flow that declares one.
 fn assertion(request: &OAuthRequest, now: OffsetDateTime) -> Result<String, AuthError> {
@@ -163,10 +163,10 @@ mod tests {
     }
 
     /// An assertion names the time of its signature as the time of its
-    /// issue, expires its lifetime after it, and names no subject for a
-    /// credential without one.
+    /// issue, expires its lifetime after it, and names no subject for the
+    /// default account.
     #[test]
-    fn an_assertion_is_issued_at_its_signature_without_a_subject_of_its_own() {
+    fn an_assertion_is_issued_at_its_signature_without_a_subject_for_the_default_account() {
         #[derive(serde::Deserialize)]
         struct Times {
             iat: i64,

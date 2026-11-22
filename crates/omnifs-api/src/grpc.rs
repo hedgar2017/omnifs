@@ -964,7 +964,6 @@ fn credential_overrides(v: &wire::CredentialClientOverrides) -> CredentialClient
             .map(|x| SecretBytes::new(x.to_vec())),
         redirect_uri: v.redirect_uri.clone(),
         scopes: v.scopes.as_ref().map(|x| x.values.clone()),
-        subject: v.subject.clone(),
     }
 }
 pub fn credential_submission(
@@ -1023,7 +1022,6 @@ fn to_credential_overrides(v: &CredentialClientOverrides) -> wire::CredentialCli
             .scopes
             .as_ref()
             .map(|x| wire::StringList { values: x.clone() }),
-        subject: v.subject.clone(),
     }
 }
 
@@ -1036,7 +1034,6 @@ pub fn to_credential_status(v: &CredentialStatus) -> wire::CredentialStatus {
             CredentialKind::OAuth => wire::CredentialKind::CredentialOauth as i32,
         },
         scopes: v.scopes.clone(),
-        subject: v.subject.clone(),
         auth_fingerprint: v.auth_fingerprint.as_bytes().to_vec().into(),
         version: v.version.get(),
         generation: v.generation.get(),
@@ -1091,7 +1088,6 @@ pub fn credential_status(v: &wire::CredentialStatus) -> Result<CredentialStatus,
         provider: provider_id(&v.provider)?,
         kind,
         scopes: v.scopes.clone(),
-        subject: v.subject.clone(),
         auth_fingerprint: auth_fingerprint(&v.auth_fingerprint)?,
         version: CredentialVersion::new(nz(v.version, "credential version")?),
         generation: CredentialGeneration::new(nz(v.generation, "credential generation")?),
@@ -1208,7 +1204,6 @@ mod tests {
                 client_secret: None,
                 redirect_uri: None,
                 scopes: None,
-                subject: None,
             },
         });
         match mutation_op(&to_mutation_op(&submit)).unwrap() {
@@ -1255,7 +1250,6 @@ mod tests {
             provider: ProviderId::from_wasm_bytes(b"provider"),
             kind: CredentialKind::OAuth,
             scopes: vec!["read".into()],
-            subject: Some("ada@example.test".into()),
             auth_fingerprint: AuthRuntimeFingerprint::from_digest([5; 32]),
             version: CredentialVersion::new(std::num::NonZeroU64::new(1).unwrap()),
             generation: CredentialGeneration::new(std::num::NonZeroU64::new(2).unwrap()),
@@ -1373,7 +1367,6 @@ mod tests {
                 client_secret: Some(SecretBytes::new(b"client-secret".to_vec())),
                 redirect_uri: None,
                 scopes: Some(vec![]),
-                subject: None,
             },
         };
         let debug = format!("{value:?}");
@@ -1390,7 +1383,6 @@ mod tests {
             client_secret: None,
             redirect_uri: None,
             scopes: Some(vec![]),
-            subject: None,
         };
         let wire = to_credential_overrides(&present);
         assert!(wire.scopes.is_some());
@@ -1415,7 +1407,6 @@ mod tests {
                 client_secret: Some(SecretBytes::new(b"client-secret".to_vec())),
                 redirect_uri: None,
                 scopes: Some(vec![]),
-                subject: None,
             },
         };
         let decoded = credential_submission(&to_credential_submission(&submission)).unwrap();
@@ -1441,7 +1432,6 @@ mod tests {
             provider: submission.provider,
             kind: CredentialKind::OAuth,
             scopes: vec!["read".into()],
-            subject: Some("ada@example.test".into()),
             auth_fingerprint: AuthRuntimeFingerprint::from_digest([5; 32]),
             version: CredentialVersion::new(std::num::NonZeroU64::new(1).unwrap()),
             generation: CredentialGeneration::new(std::num::NonZeroU64::new(2).unwrap()),

@@ -42,18 +42,12 @@ pub(crate) struct OAuth {
     pub(crate) redirect_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scopes: Option<Vec<String>>,
-    /// The subject of the assertions of a JWT bearer grant, in place of the
-    /// client itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) subject: Option<String>,
 }
 
-/// The OAuth client of an invocation: its ID, the file of its secret, and
-/// the subject that it asserts.
+/// The OAuth client of an invocation: its ID and the file of its secret.
 pub(crate) struct OAuthClientArgs {
     pub(crate) client_id: Option<String>,
     pub(crate) client_secret_file: Option<String>,
-    pub(crate) subject: Option<String>,
 }
 
 impl OAuthClientArgs {
@@ -63,7 +57,6 @@ impl OAuthClientArgs {
         let given: Vec<&str> = [
             ("`--client-id`", self.client_id.is_some()),
             ("`--client-secret-file`", self.client_secret_file.is_some()),
-            ("`--subject`", self.subject.is_some()),
         ]
         .into_iter()
         .filter_map(|(flag, given)| given.then_some(flag))
@@ -87,7 +80,6 @@ impl OAuth {
             redirect_uri: self.redirect_uri.clone(),
             client_id: self.client_id.clone(),
             client_secret_file: self.client_secret_file.clone(),
-            subject: self.subject.clone(),
         }
     }
 }
@@ -127,33 +119,14 @@ impl Auth {
     }
 
     /// This auth with the client of an invocation, which an OAuth scheme
-    /// alone takes, and whose subject a flow without a sign-in alone
-    /// asserts: the user of a sign-in is the subject of its own grant.
-    pub(crate) fn with_client(
-        self,
-        client: OAuthClientArgs,
-        auth_manifest: Option<&omnifs_auth::AuthManifest>,
-    ) -> anyhow::Result<Self> {
+    /// alone takes.
+    pub(crate) fn with_client(self, client: OAuthClientArgs) -> anyhow::Result<Self> {
         match self {
-            Self::OAuth(oauth) => {
-                if client.subject.is_some()
-                    && let Some(scheme) = auth_manifest.and_then(|manifest| {
-                        manifest.resolve_oauth_scheme(oauth.scheme.as_deref()).ok()
-                    })
-                    && scheme.flow.needs_user()
-                {
-                    anyhow::bail!(
-                        "`--subject` needs the auth scheme of a JWT bearer grant, whose client asserts its subject, and the auth scheme `{}` has a sign-in, whose user is its subject",
-                        scheme.key
-                    );
-                }
-                Ok(Self::OAuth(OAuth {
-                    client_id: client.client_id,
-                    client_secret_file: client.client_secret_file,
-                    subject: client.subject,
-                    ..oauth
-                }))
-            },
+            Self::OAuth(oauth) => Ok(Self::OAuth(OAuth {
+                client_id: client.client_id,
+                client_secret_file: client.client_secret_file,
+                ..oauth
+            })),
             Self::StaticToken(token) => {
                 client.refuse(&format!(
                     "the auth scheme `{}` takes a static token",

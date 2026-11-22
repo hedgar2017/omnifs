@@ -9,7 +9,7 @@ Providers are sandboxed WASM components. They cannot read the credential store, 
 
 The host implements protocols, not vendors.
 
-The host can know OAuth authorization code with PKCE, OAuth device flow, the OAuth JWT bearer grant of RFC 7523 of a client that signs its own assertions (as a service account, with no sign-in and no refresh token, for itself or for the subject of its credential), static token injection, credential storage, refresh, retry, and capability enforcement. It must not know that a specific provider's authorization endpoint, scope shape, or API host belongs to GitHub, Linear, Slack, or another vendor.
+The host can know OAuth authorization code with PKCE, OAuth device flow, the OAuth JWT bearer grant of RFC 7523 of a client that signs its own assertions (as a service account, with no sign-in and no refresh token, for itself or for the account of its credential), static token injection, credential storage, refresh, retry, and capability enforcement. It must not know that a specific provider's authorization endpoint, scope shape, or API host belongs to GitHub, Linear, Slack, or another vendor.
 
 Vendor knowledge lives in provider metadata and provider docs. A new service should require a provider change, not a host table entry, unless the service needs a new protocol family.
 
@@ -30,10 +30,6 @@ The daemon extracts that metadata and binds each mount's credential while buildi
 Provider-specific OAuth details belong next to the provider, usually in `providers/<name>/README.md`, when they help a user understand setup or scope consequences.
 
 Where an authorization server departs from the RFC of a grant, the provider declares the departure in its flow and the host follows the declaration: `devicePollCompat` of the device flow, and `jwtBearerScopeClaim` for a server that takes the scopes of a JWT bearer grant from a claim of the assertion. Without a declaration the host does what the RFC says.
-
-## Account and subject
-
-The account of a mount addresses its stored credential and is never sent upstream, and the subject is a fact of a credential that a JWT bearer client asserts. They are apart so that two mounts of one provider can hold different credentials without a change of what either asserts. `docs/contracts/10-system.md` owns the rules of both.
 
 ## Grants and needs
 

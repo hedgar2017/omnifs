@@ -334,34 +334,16 @@ impl TryFrom<StoredProvider> for LoadedProvider {
     }
 }
 
-/// The facts of a stored credential that its status shows, none of them a
-/// secret: the scopes that the upstream granted to an OAuth credential, and
-/// the subject that its client asserts in place of itself.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct CredentialFacts {
-    pub(crate) scopes: Vec<String>,
-    pub(crate) subject: Option<String>,
-}
-
-/// The facts of `stored`, none for a deleted credential, which has no
-/// material.
+/// Return the non-secret scopes granted by a stored OAuth credential.
 ///
-/// Credential material stays daemon-owned. Callers receive only these narrow
-/// presentation facts, never the access or refresh token.
-pub(crate) fn credential_facts(stored: &StoredCredential) -> anyhow::Result<CredentialFacts> {
+/// Credential material stays daemon-owned. Callers receive only this narrow
+/// presentation fact, never the access or refresh token.
+pub(crate) fn credential_scopes(stored: &StoredCredential) -> anyhow::Result<Vec<String>> {
     if stored.summary.state == CredentialState::Deleted {
-        return Ok(CredentialFacts::default());
+        return Ok(Vec::new());
     }
     let payload = decode_payload(stored.material.expose())?;
-    Ok(CredentialFacts {
-        scopes: material_scopes(&payload.material),
-        subject: payload.overrides.subject,
-    })
-}
-
-/// The scopes that the upstream granted to the stored OAuth credential.
-pub(crate) fn credential_scopes(stored: &StoredCredential) -> anyhow::Result<Vec<String>> {
-    credential_facts(stored).map(|facts| facts.scopes)
+    Ok(material_scopes(&payload.material))
 }
 
 /// The input of a mount: unavailable with the error of its provider, whose
@@ -481,7 +463,8 @@ fn build_auth_binding(
             let request = OAuthRequest::from_runtime(
                 scheme.clone(),
                 runtime_overrides(&credential.overrides)?,
-            )?;
+            )?
+            .acting_as(credential.id.account());
             service.bind_oauth(
                 credential.id.clone(),
                 request,
@@ -588,7 +571,6 @@ fn runtime_overrides(
             .as_ref()
             .map(secret_string)
             .transpose()?,
-        subject: overrides.subject.clone(),
     })
 }
 
@@ -597,7 +579,6 @@ fn no_overrides(overrides: &CredentialClientOverrides) -> bool {
         && overrides.client_secret.is_none()
         && overrides.redirect_uri.is_none()
         && overrides.scopes.is_none()
-        && overrides.subject.is_none()
 }
 
 #[cfg(test)]
@@ -739,7 +720,6 @@ mod tests {
             client_secret: None,
             redirect_uri: None,
             scopes: None,
-            subject: None,
         }
     }
 
@@ -761,24 +741,6 @@ mod tests {
             no_overrides_of_a_token(),
             fingerprint,
         )
-    }
-
-    /// The subject of a stored credential is the one of its OAuth request,
-    /// and no override of a static token.
-    #[test]
-    fn the_subject_of_a_credential_is_the_subject_of_its_oauth_request() {
-        let overrides = CredentialClientOverrides {
-            client_id: None,
-            client_secret: None,
-            redirect_uri: None,
-            scopes: None,
-            subject: Some("ada@example.test".to_owned()),
-        };
-        assert_eq!(
-            runtime_overrides(&overrides).unwrap().subject.as_deref(),
-            Some("ada@example.test")
-        );
-        assert!(!no_overrides(&overrides));
     }
 
     /// A credential whose fingerprint is not the one of the auth scheme of
@@ -884,7 +846,6 @@ mod tests {
                 client_secret: Some(SecretBytes::new(b"key".to_vec())),
                 redirect_uri: None,
                 scopes: None,
-                subject: None,
             },
             earlier_auth_fingerprint,
         );

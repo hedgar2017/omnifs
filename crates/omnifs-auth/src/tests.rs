@@ -366,19 +366,10 @@ async fn refresh_exchange_parses_rotated_refresh_token() {
 }
 
 fn jwt_bearer_login(scheme: OauthScheme, key: Option<&str>) -> crate::JwtBearerLoginRequest {
-    jwt_bearer_login_of(scheme, key, None)
-}
-
-fn jwt_bearer_login_of(
-    scheme: OauthScheme,
-    key: Option<&str>,
-    subject: Option<&str>,
-) -> crate::JwtBearerLoginRequest {
     let request = OAuthRequest::from_runtime(
         scheme,
         crate::OAuthRuntimeOverrides {
             client_secret: key.map(|key| SecretString::from(key.to_owned())),
-            subject: subject.map(str::to_owned),
             ..crate::OAuthRuntimeOverrides::default()
         },
     )
@@ -467,22 +458,20 @@ async fn jwt_bearer_login_takes_no_expiry_of_an_answer_without_one_and_refuses_o
     assert!(matches!(error, AuthError::TokenAnswer(_)), "{error}");
 }
 
-/// The subject of an assertion is the subject of the credential, and an
-/// assertion of a credential without one names no subject.
+/// The subject of an assertion is the account that the client acts as, and
+/// an assertion for the default account names no subject.
 #[tokio::test]
-async fn jwt_bearer_login_asserts_the_subject_of_a_credential_with_one_alone() {
+async fn jwt_bearer_login_asserts_the_account_that_the_client_acts_as_as_the_subject() {
     let fake = FakeAuthServer::start(FakeBehavior::default()).await;
     let client = OAuthClient::new().unwrap();
-    for (subject, token) in [
-        (None, "assertion-access-1-of-client"),
-        (
-            Some("ada@example.test"),
-            "assertion-access-2-of-ada@example.test",
-        ),
+    for (account, token) in [
+        ("default", "assertion-access-1-of-client"),
+        ("ada@example.test", "assertion-access-2-of-ada@example.test"),
     ] {
-        let login = jwt_bearer_login_of(fake.jwt_bearer_scheme(), Some(ASSERTION_KEY), subject);
+        let mut login = jwt_bearer_login(fake.jwt_bearer_scheme(), Some(ASSERTION_KEY));
+        login.oauth = login.oauth.acting_as(account);
         let entry = client.login_jwt_bearer(login).await.unwrap();
-        assert_eq!(entry.access_token().expose_secret(), token, "{subject:?}");
+        assert_eq!(entry.access_token().expose_secret(), token, "{account}");
     }
 }
 

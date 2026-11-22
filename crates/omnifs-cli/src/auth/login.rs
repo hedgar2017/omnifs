@@ -34,7 +34,7 @@ pub(crate) struct LoginInteractivity {
 }
 
 /// Run the provider-declared OAuth flow for a daemon credential submission,
-/// with the client, the subject and the scopes of `auth`: no scopes of
+/// with the client and the scopes of `auth`, acting as `account_label`: no scopes of
 /// `auth` request the ones that the manifest of the provider declares, and
 /// an empty list of them requests none. This performs only the user-facing
 /// flow. The daemon receives the resulting material and owns all durable
@@ -60,7 +60,7 @@ pub(crate) async fn login_for_submission(
         .resolve_oauth_scheme(Some(scheme_key))?
         .clone();
     let config = auth.as_oauth().map(super::OAuth::request_config);
-    let request = OAuthRequest::from_config(config.as_ref(), scheme)?;
+    let request = OAuthRequest::from_config(config.as_ref(), scheme)?.acting_as(account_label);
     let guidance = manifest
         .auth
         .as_ref()
@@ -102,7 +102,6 @@ pub(crate) async fn login_for_submission(
             client_secret,
             redirect_uri: auth.as_oauth().and_then(|oauth| oauth.redirect_uri.clone()),
             scopes: requested_scopes,
-            subject: auth.as_oauth().and_then(|oauth| oauth.subject.clone()),
         },
     })
 }

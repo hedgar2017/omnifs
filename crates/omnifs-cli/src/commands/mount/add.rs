@@ -56,15 +56,11 @@ pub struct AddArgs {
     /// different accounts.
     #[arg(long, value_name = "ACCOUNT", conflicts_with = "no_auth")]
     pub account: Option<String>,
-    /// Subject that an OAuth client without a sign-in asserts instead of
-    /// itself, as the user that a service account acts as.
-    #[arg(long, value_name = "SUBJECT", conflicts_with_all = ["token", "token_env"])]
-    pub subject: Option<String>,
     /// Auth scheme to use instead of the provider default.
     #[arg(long, value_name = "SCHEME")]
     pub scheme: Option<String>,
     /// Do not write an auth block, even if the provider declares a default.
-    #[arg(long, conflicts_with_all = ["token", "token_env", "scheme", "client_id", "client_secret_file", "subject"])]
+    #[arg(long, conflicts_with_all = ["token", "token_env", "scheme", "client_id", "client_secret_file"])]
     pub no_auth: bool,
     /// Full provider config JSON object to write into the mount spec.
     #[arg(long = "config-json", value_name = "JSON")]
@@ -134,7 +130,6 @@ impl AddArgs {
             || self.token_env.is_some()
             || self.client_id.is_some()
             || self.client_secret_file.is_some()
-            || self.subject.is_some()
     }
 
     /// This invocation's chosen auth, before any ambient-credential import
@@ -162,7 +157,6 @@ impl AddArgs {
         let client = OAuthClientArgs {
             client_id: self.client_id.clone(),
             client_secret_file: self.client_secret_file.clone(),
-            subject: self.subject.clone(),
         };
         let Some(auth) = auth else {
             // A provider without auth has no credential to label, no client,
@@ -179,7 +173,7 @@ impl AddArgs {
             );
             return Ok(None);
         };
-        auth.with_client(client, auth_manifest)?
+        auth.with_client(client)?
             .with_scopes(&self.scopes)
             .map(Some)
     }
@@ -284,7 +278,6 @@ pub(crate) async fn run_static_token_init(
             client_secret: None,
             redirect_uri: None,
             scopes: None,
-            subject: None,
         },
     })
 }
@@ -324,7 +317,6 @@ mod tests {
             &["--token-env", "TOKEN"],
             &["--client-id", "client"],
             &["--client-secret-file", "key.pem"],
-            &["--subject", "ada@example.test"],
         ] {
             assert!(
                 add_args(&[&["github"], given].concat()).gives_credential(),
@@ -334,10 +326,9 @@ mod tests {
     }
 
     /// The account of an invocation is the label of its stored credential,
-    /// and the subject is of its OAuth client, which the scheme of a JWT
-    /// bearer grant alone takes.
+    /// with the client and the scopes of its OAuth scheme.
     #[test]
-    fn the_selected_auth_has_the_account_apart_from_the_subject_of_its_oauth_client() {
+    fn the_selected_auth_has_the_account_with_its_oauth_client() {
         let manifest = provider_manifest();
         let auth_manifest = manifest
             .auth
@@ -349,7 +340,6 @@ mod tests {
 
         let auth = selected(&["linear", "--account", "work"]).unwrap().unwrap();
         assert_eq!(auth.account(), Some("work"));
-        assert_eq!(auth.as_oauth().unwrap().subject, None);
 
         let auth = selected(&[
             "linear",
@@ -359,8 +349,6 @@ mod tests {
             "work",
             "--client-id",
             "client",
-            "--subject",
-            "ada@example.test",
             "--scope",
             "read",
         ])
@@ -369,14 +357,12 @@ mod tests {
         assert_eq!(auth.account(), Some("work"));
         let oauth = auth.as_oauth().unwrap();
         assert_eq!(oauth.client_id.as_deref(), Some("client"));
-        assert_eq!(oauth.subject.as_deref(), Some("ada@example.test"));
         assert_eq!(oauth.scopes, Some(vec!["read".to_owned()]));
     }
 
     /// An invocation refuses each flag that its auth cannot use, in place of
-    /// leaving it out: an account, a client, a subject or scopes for a
-    /// provider without auth; a client, a subject or scopes for a static
-    /// token; and a subject for a flow with a sign-in.
+    /// leaving it out: an account, a client or scopes for a provider without
+    /// auth, and a client or scopes for a static token.
     #[test]
     fn the_selected_auth_refuses_each_flag_that_it_cannot_use() {
         let manifest = provider_manifest();
@@ -402,10 +388,6 @@ mod tests {
             "`--account` labels the stored credential of a mount, and provider `web` declares no auth"
         );
         assert_eq!(
-            without_auth(&["web", "--subject", "ada@example.test"]),
-            "`--subject` needs an OAuth auth scheme, and provider `web` declares no auth"
-        );
-        assert_eq!(
             without_auth(&["web", "--client-id", "client"]),
             "`--client-id` needs an OAuth auth scheme, and provider `web` declares no auth"
         );
@@ -421,8 +403,8 @@ mod tests {
         );
 
         assert_eq!(
-            refusal(&["linear", "--scheme", "pat", "--subject", "ada@example.test"]),
-            "`--subject` needs an OAuth auth scheme, and the auth scheme `pat` takes a static token"
+            refusal(&["linear", "--scheme", "pat", "--client-id", "client"]),
+            "`--client-id` needs an OAuth auth scheme, and the auth scheme `pat` takes a static token"
         );
         assert_eq!(
             refusal(&["linear", "--scheme", "pat", "--scope", "read"]),
@@ -431,10 +413,6 @@ mod tests {
         assert_eq!(
             refusal(&["linear", "--token-env", "TOKEN", "--scope", "read"]),
             "`--scope` needs an OAuth auth scheme, and the auth scheme `pat` takes a static token"
-        );
-        assert_eq!(
-            refusal(&["linear", "--subject", "ada@example.test"]),
-            "`--subject` needs the auth scheme of a JWT bearer grant, whose client asserts its subject, and the auth scheme `oauth` has a sign-in, whose user is its subject"
         );
     }
 

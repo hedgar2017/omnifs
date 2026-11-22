@@ -93,9 +93,6 @@ pub struct CredentialClientOverrides {
     pub client_secret: Option<SecretBytes>,
     pub redirect_uri: Option<String>,
     pub scopes: Option<Vec<String>>,
-    /// The subject of the assertions of a JWT bearer grant, in place of the
-    /// client itself.
-    pub subject: Option<String>,
 }
 
 impl std::fmt::Debug for CredentialClientOverrides {
@@ -109,7 +106,6 @@ impl std::fmt::Debug for CredentialClientOverrides {
             )
             .field("redirect_uri", &self.redirect_uri)
             .field("scopes", &self.scopes)
-            .field("subject", &self.subject)
             .finish()
     }
 }
@@ -158,10 +154,6 @@ pub struct CredentialStatus {
     /// Static-token credentials always report an empty list. This field is
     /// non-secret and intentionally excludes the token material itself.
     pub scopes: Vec<String>,
-    /// The subject that the stored OAuth client asserts in place of itself,
-    /// which is not a secret; none for a client that asserts itself, for a
-    /// static token, and for a credential without stored material.
-    pub subject: Option<String>,
     pub auth_fingerprint: AuthRuntimeFingerprint,
     pub version: CredentialVersion,
     pub generation: CredentialGeneration,
@@ -193,7 +185,6 @@ mod tests {
                 client_secret: Some(SecretBytes::new(b"client-secret".to_vec())),
                 redirect_uri: None,
                 scopes: None,
-                subject: None,
             },
         };
         let debug = format!("{submission:?}");

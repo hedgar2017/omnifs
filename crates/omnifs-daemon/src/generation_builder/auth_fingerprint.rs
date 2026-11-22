@@ -31,20 +31,16 @@ struct FingerprintClient<'a> {
     client_id: &'a Option<String>,
     redirect_uri: &'a Option<String>,
     scopes: &'a Option<Vec<String>>,
-    subject: &'a Option<String>,
 }
 
 /// The client of a credential in the fingerprint of an earlier omnifs: a
-/// none in the place of the client secret, and the subject of a credential
-/// with one alone.
+/// none in the place of the client secret.
 #[derive(Serialize)]
 struct EarlierFingerprintClient<'a> {
     client_id: &'a Option<String>,
     no_client_secret: Option<()>,
     redirect_uri: &'a Option<String>,
     scopes: &'a Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    subject: &'a Option<String>,
 }
 
 /// The fingerprint of a credential of `provider` with `overrides`, issued
@@ -63,7 +59,6 @@ pub(super) fn auth_fingerprint(
                 client_id: &overrides.client_id,
                 redirect_uri: &overrides.redirect_uri,
                 scopes: &overrides.scopes,
-                subject: &overrides.subject,
             },
         },
     )
@@ -88,7 +83,6 @@ pub(super) fn earlier_auth_fingerprint(
                 no_client_secret: None,
                 redirect_uri: &overrides.redirect_uri,
                 scopes: &overrides.scopes,
-                subject: &overrides.subject,
             },
         },
     )
@@ -114,29 +108,7 @@ mod tests {
             client_secret: client_secret.map(|secret| SecretBytes::new(secret.to_vec())),
             redirect_uri: None,
             scopes: None,
-            subject: None,
         }
-    }
-
-    fn with_subject(subject: &str) -> CredentialClientOverrides {
-        CredentialClientOverrides {
-            subject: Some(subject.to_owned()),
-            ..overrides(None)
-        }
-    }
-
-    /// The subject of a credential is of its fingerprint.
-    #[test]
-    fn the_fingerprint_has_the_subject_of_a_credential() {
-        let provider = ProviderId::from_digest([7; 32]);
-        let of = |overrides: &CredentialClientOverrides| {
-            auth_fingerprint(provider, &AuthScheme::None, overrides).unwrap()
-        };
-        assert_ne!(of(&with_subject("ada@example.test")), of(&overrides(None)));
-        assert_ne!(
-            of(&with_subject("ada@example.test")),
-            of(&with_subject("bob@example.test"))
-        );
     }
 
     #[test]
@@ -149,14 +121,14 @@ mod tests {
         assert_eq!(of(&overrides(Some(b"one"))), without);
         assert_eq!(of(&overrides(Some(b"another"))), without);
 
-        // The fingerprint is of the provider, the scheme, and the four facts
+        // The fingerprint is of the provider, the scheme, and the three facts
         // of the client alone, without a place for the client secret.
         let none: Option<String> = None;
         let scopes: Option<Vec<String>> = None;
         let input = postcard::to_allocvec(&(
             provider.as_bytes(),
             &AuthScheme::None,
-            (Some("client"), &none, &scopes, &none),
+            (Some("client"), &none, &scopes),
         ))
         .unwrap();
         let mut hasher = blake3::Hasher::new_derive_key("omnifs auth runtime fingerprint v2");
@@ -187,10 +159,6 @@ mod tests {
         assert_eq!(
             earlier(&overrides(Some(b"key"))),
             "8a27c87c3ebc8475e94b91ee5be769bb88357439edb44401eb30723dbf8137a0"
-        );
-        assert_eq!(
-            earlier(&with_subject("ada@example.test")),
-            "67b61a001283834f25452955e214e5b58f87c4836882f3a82315338fa28b1378"
         );
         assert_ne!(
             earlier_auth_fingerprint(provider, &AuthScheme::None, &overrides(None)).unwrap(),

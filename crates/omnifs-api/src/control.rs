@@ -9,9 +9,8 @@ use serde::{Deserialize, Serialize};
 /// The number of the control protocol of this build, which a daemon names in
 /// its info. It moves with each change of `control.proto` that a peer of the
 /// earlier number would not honour, as a field of a request that it would
-/// drop: 2 has the subject of the client overrides of a credential. A daemon
-/// of a build before the number names 0.
-pub const CONTROL_PROTOCOL: u32 = 2;
+/// drop. A daemon of a build before the number names 0.
+pub const CONTROL_PROTOCOL: u32 = 1;
 /// Limit for one unary protobuf message.
 pub const CONTROL_MESSAGE_MAX_BYTES: usize = 1024 * 1024;
 /// Limit for each item on a control stream.
