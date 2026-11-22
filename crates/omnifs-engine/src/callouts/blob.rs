@@ -1,9 +1,10 @@
 //! Provider-facing `fetch-blob` executor.
 //!
 //! Provider HTTP fetches whose payload should never cross the WIT
-//! boundary are streamed into the mount-owned blob cache.
-//! Other host-side machinery consumes the file in place, so the bytes never
-//! round-trip back through the provider.
+//! boundary are streamed into the body store of the host. The tree reads a
+//! file of such a body in place, by ranges, so the bytes never round-trip
+//! back through the provider. `docs/contracts/10-system.md` owns the
+//! identity of a blob request and the answer that the host keeps for it.
 
 use crate::cache::MountResources;
 use crate::cache::body::{BodyStore, BodyStoreError};

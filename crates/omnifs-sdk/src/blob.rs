@@ -2,10 +2,11 @@
 //!
 //! Blobs keep large bodies host-side by design.
 //! `cx.http().get(url).into_blob().send()` (or the typed
-//! [`crate::endpoint::RequestBuilder::into_blob`]) lands the response body in
-//! the host's blob cache and returns a [`BlobRef`] carrying metadata only.
-//! The host derives the request identity and body generation from validated
-//! request facts, so providers never name cache entries.
+//! [`crate::endpoint::RequestBuilder::into_blob`]) lands the body of a
+//! successful answer in the body store of the host and returns a
+//! [`BlobAnswer`] without it, whose [`BlobAnswer::error_for_status`] gives
+//! the [`BlobRef`] of the blob. The host derives the identity of the request
+//! from its validated facts, so providers never name cache entries.
 //!
 //! A stored blob is consumed by:
 //! - [`crate::projection::FileProjection::blob`]: serve the bytes verbatim

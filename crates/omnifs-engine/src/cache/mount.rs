@@ -618,8 +618,11 @@ impl Caches {
         let body = Arc::new(BodyStore::open(dir.join("bodies"))?);
         let collector = Collector::new(Arc::clone(&body), projection_database.clone());
         // What a stop between the publication of a body and the commit of
-        // its fact left leaves here, before an operation.
-        collector.collect()?;
+        // its fact left leaves here, before an operation. A collection
+        // that fails removes nothing, and the store serves as it is.
+        if let Err(error) = collector.collect() {
+            tracing::warn!(%error, "the collection of the body store at its start failed");
+        }
         Ok(Arc::new(Self {
             body,
             collector,
