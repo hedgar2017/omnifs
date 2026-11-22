@@ -97,6 +97,10 @@ pub fn provider(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `load = path::to::fn` (default `Self::load`): the provider-written
 ///   inherent `async fn(cx, key, since) -> Result<Load<Self>>` that
 ///   `Object::load` forwards to.
+/// - `no_load`: the object has no canonical bytes and no load, in place of
+///   `canonical`, `decode`, and `load`: its facts come from fed, direct,
+///   blob, or stream faces and dir faces alone, and the declaration of a
+///   face that serves canonical bytes fails for it (`Object::LOADS`).
 ///
 /// Stability is declared in the object builder, not here: call
 /// `o.stable()` / `o.dynamic()` / `o.live()` for a constant, or

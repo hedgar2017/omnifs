@@ -493,3 +493,24 @@ async fn a_feed_reads_a_fed_file_by_its_ranges_and_a_record_whole_within_its_byt
         );
     }
 }
+
+/// An object declared without a load serves its fed faces from the facts of
+/// the feed of the object above it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_object_without_a_load_serves_its_fed_faces() {
+    let harness = make_initialized_runtime(CONFIG);
+    assert_eq!(
+        names(&harness, &["shelves", "oak", "cards"]).await.unwrap(),
+        ["1"]
+    );
+    assert_eq!(
+        names(&harness, &["shelves", "oak", "cards", "1"])
+            .await
+            .unwrap(),
+        ["text"]
+    );
+    assert_eq!(
+        read(&harness, &["shelves", "oak", "cards", "1", "text"]).await,
+        "Card 1"
+    );
+}

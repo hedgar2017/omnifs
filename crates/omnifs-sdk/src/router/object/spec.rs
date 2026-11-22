@@ -405,6 +405,18 @@ impl<O: Object> ObjectBlock<O> {
         self.stability(|_| Stability::Live)
     }
 
+    /// Refuse a face that serves canonical bytes, or the canonical that a
+    /// feed writes, for an object of type `C` without them.
+    pub(in crate::router) fn loads<C: Object>(template: &str, face: &str) -> Result<()> {
+        if C::LOADS {
+            return Ok(());
+        }
+        Err(ProviderError::invalid_input(format!(
+            "object route {template}: {face} serves canonical bytes, and the object {} declares no load",
+            C::kind().as_str()
+        )))
+    }
+
     fn validate_leaf_path(&self, name: &str) -> Result<()> {
         // A file-shaped anchor IS its single face: the path itself is the leaf,
         // so there is no `template/name` child to claim (and `name` is empty).
@@ -549,6 +561,7 @@ impl<'a, O: Object> FileFace<'a, O> {
     /// The canonical source leaf: the verbatim upstream bytes. Exactly one
     /// canonical face per object; its `F` MUST equal [`Object::Canonical`].
     pub fn canonical<F: Format>(mut self) -> Result<&'a mut ObjectBlock<O>> {
+        self.loads::<O>("a canonical face")?;
         self.file_shape_guard()?;
         if F::CT != <O::Canonical as Format>::CT {
             return Err(ProviderError::invalid_input(format!(
@@ -580,6 +593,7 @@ impl<'a, O: Object> FileFace<'a, O> {
     where
         O: Representable<F>,
     {
+        self.loads::<O>("a representation face")?;
         self.file_shape_guard()?;
         self.block.renders.push((F::CT, render_fn::<O, F>()));
         self.block.validate_leaf_path(self.name)?;
@@ -595,6 +609,7 @@ impl<'a, O: Object> FileFace<'a, O> {
     /// default (preloaded when the anchor or collection entry is listed; must
     /// be inline bytes); [`Self::lazy`] excludes it from preload.
     pub fn computed(mut self, method: ComputedFn<O>) -> Result<&'a mut ObjectBlock<O>> {
+        self.loads::<O>("a computed face")?;
         self.file_shape_guard()?;
         self.block.validate_leaf_path(self.name)?;
         let leaf_name = self.leaf_name();
@@ -729,6 +744,7 @@ impl<'a, O: Object> FileFace<'a, O> {
         O: 'static,
         O::State: 'static,
     {
+        self.loads::<C>("an object face")?;
         self.file_shape_guard()?;
         self.block.validate_leaf_path(self.name)?;
         let leaf_name = self.leaf_name();
@@ -758,6 +774,11 @@ impl<'a, O: Object> FileFace<'a, O> {
             kind: LiveFaceKind::Object,
         });
         Ok(self.block)
+    }
+
+    /// [`ObjectBlock::loads`] for the face `face` of this name.
+    fn loads<C: Object>(&self, face: &str) -> Result<()> {
+        ObjectBlock::<O>::loads::<C>(self.block.template, &format!("{face} {:?}", self.name))
     }
 
     fn leaf_name(&self) -> String {

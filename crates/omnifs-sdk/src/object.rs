@@ -165,6 +165,8 @@ impl<O: Object> ObjectEntry<O> {
 /// A typed canonical resource. Usually paired with
 /// `#[omnifs_sdk::object(kind = "...", key = ...)]`, which emits everything
 /// except [`Self::load`] (a hand-written async fn the macro forwards to).
+/// `#[omnifs_sdk::object(kind = "...", key = ..., no_load)]` declares an
+/// object without canonical bytes and without a load ([`Self::LOADS`]).
 ///
 /// [`Self::decode`] must accept the exact bytes [`Self::load`] stored in
 /// [`Canonical`]: it runs again on every warm read when the host pushes cached
@@ -178,6 +180,14 @@ pub trait Object: Sized {
     /// The format of the verbatim canonical bytes. The canonical face serves
     /// these bytes as-is under [`Format::CT`].
     type Canonical: Format;
+
+    /// Whether the object has canonical bytes, which [`Self::load`] fetches
+    /// and [`Self::decode`] parses. An object declared with `no_load` has
+    /// none: its facts come from its other faces alone, a fed, direct, blob
+    /// or stream face or a dir face, and the declaration of a face that
+    /// serves canonical bytes, a canonical, representation, computed or
+    /// object face or the canonical that a feed writes, fails for it.
+    const LOADS: bool = true;
 
     /// Fetch the object from upstream, honoring `since` as a conditional
     /// validator (map it to `If-None-Match`). Return `Load::Fresh` with the
@@ -239,6 +249,17 @@ impl FacetMetadata for () {
     fn facet_axes() -> &'static [FacetAxis] {
         &[]
     }
+}
+
+/// The error of the load and of the decode of an object declared with
+/// `no_load`, which no route calls: each face that serves canonical bytes
+/// fails at its declaration for an object without [`Object::LOADS`].
+#[doc(hidden)]
+pub fn no_canonical<O: Object>() -> ProviderError {
+    ProviderError::internal(format!(
+        "the object {} has no canonical bytes",
+        O::kind().as_str()
+    ))
 }
 
 /// Decode helper for the default JSON canonical: providers whose canonical is

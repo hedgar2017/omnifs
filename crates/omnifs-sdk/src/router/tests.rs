@@ -1197,3 +1197,132 @@ fn the_feed_export_runs_the_feed_of_the_object_at_its_path() {
     let error = poll_ready(router.feed(&cx, "/elsewhere", None, None)).unwrap_err();
     assert_eq!(error.kind(), ProviderErrorKind::NotFound);
 }
+
+// ---------------------------------------------------------------------------
+// Objects without canonical bytes
+// ---------------------------------------------------------------------------
+
+/// An object without canonical bytes, as `#[object(.., no_load)]` declares
+/// one.
+struct FedObj;
+
+impl Object for FedObj {
+    type Key = DemoKey;
+    type State = ();
+    type Canonical = Json;
+
+    const LOADS: bool = false;
+
+    fn load(
+        _cx: &Cx<()>,
+        _key: &DemoKey,
+        _since: Option<Validator>,
+    ) -> impl Future<Output = Result<Load<Self>>> {
+        std::future::ready(Err(crate::object::no_canonical::<Self>()))
+    }
+
+    fn decode(_bytes: &[u8]) -> Result<Self> {
+        Err(crate::object::no_canonical::<Self>())
+    }
+
+    fn kind() -> ObjectKind {
+        ObjectKind("demo.fed")
+    }
+}
+
+impl Representable<Markdown> for FedObj {
+    fn represent(&self) -> Vec<u8> {
+        Vec::new()
+    }
+}
+
+#[allow(clippy::unused_async)]
+async fn fed_obj_feed(_cx: crate::feed::FeedCx<DemoKey, ()>) -> Result<crate::feed::Feed> {
+    Ok(crate::feed::Feed::unchanged())
+}
+
+#[allow(clippy::unused_async)]
+async fn fed_obj_direct(_cx: Cx<()>, key: DemoKey) -> Result<FileProjection> {
+    Ok(FileProjection::body(format!("direct:{}", key.id)).build())
+}
+
+#[test]
+fn an_object_without_a_load_declares_the_faces_that_serve_no_canonical_bytes() {
+    let mut router = Router::<()>::new();
+    router
+        .object::<FedObj>("/items/{id}", |o| {
+            o.stable();
+            o.fed();
+            o.file("summary").fed()?;
+            o.file("live").direct(fed_obj_direct)?;
+            o.dir("parts").fed()?;
+            o.feed(fed_obj_feed).starts(["", "summary", "parts"])?;
+            Ok(())
+        })
+        .unwrap();
+    let router = router.compile().unwrap();
+    let cx = Cx::new(1, Rc::new(RefCell::new(())));
+
+    // Its anchor lists its faces, and its faces answer, without a load.
+    let names = list_entries(&router, "/items/7")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["live", "parts", "summary"]);
+    let (lookup, _) = poll_ready(router.lookup_child(&cx, "/items/7", "summary"))
+        .unwrap()
+        .into_result_and_effects();
+    assert_eq!(claims_of(lookup)[0].object.id.kind, "demo.fed");
+    assert_eq!(read_text(&router, "/items/7/live"), "direct:7");
+}
+
+#[test]
+fn an_object_without_a_load_declares_no_face_that_serves_canonical_bytes() {
+    let declared = |face: fn(&mut ObjectBlock<FedObj>) -> Result<()>| {
+        let Err(error) = Router::<()>::new().object::<FedObj>("/items/{id}", |o| {
+            o.stable();
+            face(o)
+        }) else {
+            panic!("a face of canonical bytes must not declare without a load");
+        };
+        error.message().to_owned()
+    };
+    for (face, named) in [
+        (
+            declared(|o| o.file("item.json").canonical::<Json>().map(|_| ())),
+            "a canonical face \"item.json\"",
+        ),
+        (
+            declared(|o| o.file("item.md").representation::<Markdown>().map(|_| ())),
+            "a representation face \"item.md\"",
+        ),
+        (
+            declared(|o| o.file("title").computed(|_, _| unreachable!()).map(|_| ())),
+            "a computed face \"title\"",
+        ),
+    ] {
+        assert_eq!(
+            face,
+            format!(
+                "object route /items/{{id}}: {named} serves canonical bytes, \
+                 and the object demo.fed declares no load"
+            )
+        );
+    }
+
+    // An object face of another object serves the canonical bytes of that
+    // object.
+    let Err(error) = Router::<()>::new().object::<DemoObj>("/items/{id}", |o| {
+        o.stable();
+        o.file("fed").object::<FedObj>()?;
+        Ok(())
+    }) else {
+        panic!("an object face must not declare an object without a load");
+    };
+    assert!(
+        error
+            .message()
+            .contains("an object face \"fed\" serves canonical bytes, and the object demo.fed"),
+        "{error}"
+    );
+}

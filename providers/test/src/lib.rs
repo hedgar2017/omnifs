@@ -392,8 +392,8 @@ impl Shelf {
     }
 
     /// The feed of a shelf: its first answer lists books 1 and 2 in two
-    /// parts, each with the inner token of its book, and a third part
-    /// completes `books`; the `flaky` shelf stops once before its second
+    /// parts, each with the inner token of its book, the first with card 1
+    /// too, and a third part completes `books`; the `flaky` shelf stops once before its second
     /// part. After the first answer, an answer is `unchanged` until the
     /// shelf version moves, and then renames book 1, adds book 3, and records
     /// in `seen` the names the host listed for `books` and in `listed` the
@@ -428,6 +428,10 @@ impl Shelf {
         };
         match token {
             None => {
+                let cards = format!("/shelves/{shelf}/cards");
+                cx.dir(&cards, ListingWrite::Complete)?;
+                cx.dir(format!("{cards}/1"), ListingWrite::Complete)?;
+                cx.file(format!("{cards}/1/text"), b"Card 1".to_vec())?;
                 cx.dir(&books, ListingWrite::Partial)?;
                 book(1, "Book 1")?;
                 Ok(Feed::part(&ShelfToken::Page(1))?
@@ -604,6 +608,19 @@ impl core::fmt::Display for BookToken {
 #[omnifs_sdk::path_captures]
 struct ShelfKey {
     shelf: String,
+}
+
+/// A card of a shelf, whose facts come from the feed of its shelf alone: an
+/// object without canonical bytes and without a load.
+#[omnifs_sdk::object(kind = "test.card", key = CardKey, no_load)]
+struct Card;
+
+#[omnifs_sdk::path_captures]
+struct CardKey {
+    #[allow(dead_code)]
+    shelf: String,
+    #[allow(dead_code)]
+    card: u64,
 }
 
 #[omnifs_sdk::object(kind = "test.book", key = BookKey)]
@@ -846,7 +863,14 @@ impl TestProvider {
             o.file("catalog").fed()?;
             o.file("catalog-read").fed()?;
             o.dir("books").fed()?;
-            o.feed(Shelf::feed).starts(["books"])?;
+            o.dir("cards").fed()?;
+            o.feed(Shelf::feed).starts(["books", "cards"])?;
+            Ok(())
+        })?;
+        r.object::<Card>("/shelves/{shelf}/cards/{card}", |o| {
+            o.stable();
+            o.fed();
+            o.file("text").fed()?;
             Ok(())
         })?;
         r.object::<Book>("/shelves/{shelf}/books/{book}", |o| {

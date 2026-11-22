@@ -11,6 +11,8 @@ pub(crate) struct ObjectArgs {
     pub canonical: Option<Ident>,
     pub decode: Option<Path>,
     pub load: Option<Path>,
+    /// The object has no canonical bytes and no load.
+    pub no_load: bool,
 }
 
 impl Parse for ObjectArgs {
@@ -20,10 +22,17 @@ impl Parse for ObjectArgs {
         let mut canonical: Option<Ident> = None;
         let mut decode: Option<Path> = None;
         let mut load: Option<Path> = None;
+        let mut no_load: Option<Ident> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             match key.to_string().as_str() {
+                "no_load" => {
+                    if no_load.is_some() {
+                        return Err(syn::Error::new(key.span(), "duplicate `no_load` argument"));
+                    }
+                    no_load = Some(key);
+                },
                 "kind" => {
                     if kind.is_some() {
                         return Err(syn::Error::new(key.span(), "duplicate `kind` argument"));
@@ -65,7 +74,7 @@ impl Parse for ObjectArgs {
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "supported object arguments are `kind = \"...\"`, `key = Type`, `canonical = Ident`, `decode = path::to::function`, and `load = path::to::function`",
+                        "supported object arguments are `kind = \"...\"`, `key = Type`, `canonical = Ident`, `decode = path::to::function`, `load = path::to::function`, and `no_load`",
                     ));
                 },
             }
@@ -87,12 +96,22 @@ impl Parse for ObjectArgs {
             )
         })?;
 
+        if let Some(no_load) = &no_load
+            && (canonical.is_some() || decode.is_some() || load.is_some())
+        {
+            return Err(syn::Error::new(
+                no_load.span(),
+                "an object with `no_load` has no canonical bytes: it takes no `canonical`, `decode`, or `load` argument",
+            ));
+        }
+
         Ok(Self {
             kind,
             key: object_key,
             canonical,
             decode,
             load,
+            no_load: no_load.is_some(),
         })
     }
 }
@@ -102,6 +121,38 @@ pub(crate) fn object_item_impl(args: &ObjectArgs, item: &ItemStruct) -> syn::Res
     let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
     let kind_val = &args.kind;
     let object_key = &args.key;
+
+    if args.no_load {
+        return Ok(quote! {
+            #item
+
+            impl #impl_generics omnifs_sdk::object::Object for #struct_ident #ty_generics #where_clause {
+                type Key = #object_key;
+                type State = crate::__OmnifsProviderState;
+                type Canonical = omnifs_sdk::repr::Json;
+
+                const LOADS: bool = false;
+
+                fn load(
+                    _cx: &omnifs_sdk::Cx<Self::State>,
+                    _key: &Self::Key,
+                    _since: ::core::option::Option<omnifs_sdk::object::Validator>,
+                ) -> impl ::core::future::Future<
+                    Output = omnifs_sdk::error::Result<omnifs_sdk::object::Load<Self>>,
+                > {
+                    ::core::future::ready(Err(omnifs_sdk::object::no_canonical::<Self>()))
+                }
+
+                fn decode(_bytes: &[u8]) -> omnifs_sdk::error::Result<Self> {
+                    Err(omnifs_sdk::object::no_canonical::<Self>())
+                }
+
+                fn kind() -> omnifs_sdk::object::ObjectKind {
+                    omnifs_sdk::object::ObjectKind(#kind_val)
+                }
+            }
+        });
+    }
 
     let canonical_ident = args
         .canonical
