@@ -35,8 +35,7 @@ pub(crate) enum FedFact {
 /// starting path of the feed, without its positive lookup take an answer,
 /// once the feed is past its deadline, outside the rate-limit window of the
 /// mount, with `due` and their path for an operation on a starting path of
-/// the feed, and each other operation is served from the projection (see
-/// [`due_listing`] for the lookup of that anchor).
+/// the feed, and each other operation is served from the projection.
 /// Else a read or a listing that starts that feed without its fact in the
 /// projection, and a lookup that starts it without its positive lookup before
 /// the end of the first answer of the feed, or below the anchor of an own
@@ -200,10 +199,12 @@ fn asks_listing(
     })
 }
 
-/// Record the directory `dir` as changed, once for a deadline, when it is the
-/// anchor of a feed of full listings past its deadline after the end of its first answer, outside
-/// the rate-limit window of the mount: a filesystem lists a directory again
-/// only after a change of its attributes, and that listing asks the feed.
+/// Record the fed directory `dir` as changed, once for a deadline, when the
+/// feed that answers its listing is past its deadline, outside the rate-limit
+/// window of the mount: a filesystem lists a directory again only after a
+/// change of its attributes, and that listing asks the feed. The answering
+/// feed is the outer claim whose first answer ended, else the innermost one,
+/// as for each operation.
 pub(crate) async fn due_listing(runtime: &Runtime, dir: &Path) -> Result<()> {
     if runtime.rate_limited_until().is_some() {
         return Ok(());
@@ -211,17 +212,19 @@ pub(crate) async fn due_listing(runtime: &Runtime, dir: &Path) -> Result<()> {
     let Some(claims) = listing_claims(runtime, dir).await? else {
         return Ok(());
     };
-    for claim in claims
+    let states = claims
         .iter()
-        .filter(|claim| claim.full_listings && claim.object.path == *dir)
+        .map(|claim| runtime.resources.feed_state(claim.object.id.as_bytes()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| TreeError::internal(error.to_string()))?;
+    let answering = states
+        .iter()
+        .find(|state| state.as_ref().is_some_and(|state| state.ended))
+        .or(states.last());
+    if let Some(Some(state)) = answering
+        && state.deadline <= now_millis()
     {
-        let state = runtime
-            .resources
-            .feed_state(claim.object.id.as_bytes())
-            .map_err(|error| TreeError::internal(error.to_string()))?;
-        if let Some(state) = state.filter(|state| state.ended && state.deadline <= now_millis()) {
-            runtime.record_dir_due(dir, state.deadline);
-        }
+        runtime.record_dir_due(dir, state.deadline);
     }
     Ok(())
 }

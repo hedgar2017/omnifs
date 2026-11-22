@@ -9,8 +9,8 @@ pub(crate) struct InvalidationState {
     invalidated_paths: Mutex<Vec<Path>>,
     changed_dirs: Mutex<Vec<(Path, bool)>>,
     changed_files: Mutex<Vec<Path>>,
-    /// The deadline of the feed of full listings for which each anchor was
-    /// last recorded as changed.
+    /// The deadline of the feed of its listing for which each fed directory
+    /// was last recorded as changed.
     due_dirs: Mutex<HashMap<Path, u64>>,
 }
 
@@ -73,10 +73,9 @@ impl Runtime {
         self.invalidation.record_changed_dir(path.clone(), fed);
     }
 
-    /// Record once that directory `path`, the anchor of a feed of full
-    /// listings, is past the `deadline` of that feed: its attributes change
-    /// in place, and stay until a listing of it gives the feed another
-    /// deadline.
+    /// Record once that the fed directory `path` is past the `deadline` of the
+    /// feed that answers its listing: its attributes change in place, and
+    /// stay until an answer gives the feed another deadline.
     pub fn record_dir_due(&self, path: &Path, deadline: u64) {
         if self
             .invalidation
