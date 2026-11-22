@@ -2,6 +2,7 @@
 
 use omnifs_api::events::CacheKind;
 use omnifs_core::path::Path;
+use std::collections::HashSet;
 
 use crate::EngineNamespace;
 
@@ -56,9 +57,9 @@ impl EngineNamespace {
             // Tree-owned mem eviction; the kernel-notify half stays
             // renderer-side and consumes the returned report.
             runtime.resources.memory_invalidate_paths_if({
-                let paths = paths.clone();
+                let paths: HashSet<Path> = paths.iter().cloned().collect();
                 let prefixes = prefixes.clone();
-                let changed_files = changed_files.clone();
+                let changed_files: HashSet<Path> = changed_files.iter().cloned().collect();
                 move |path| {
                     paths.contains(path)
                         || changed_files.contains(path)

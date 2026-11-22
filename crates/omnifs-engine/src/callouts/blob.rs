@@ -24,32 +24,22 @@ use std::time::Duration;
 
 /// The longest wait for the status of the answer of a blob fetch, and for
 /// the next bytes of its body: no time bounds the whole of a body, which no
-/// size bounds beside the limit of its mount.
+/// size bounds beside the limit that its mount declares.
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 
-const DEFAULT_MAX_FETCH_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
-/// Host-side size limits for blob fetches.
-///
-/// Fetch limits bound how much data the host stores on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Host-side size limits for blob fetches: the limit that the mount
+/// declares bounds how much data the host stores on disk for one fetch, and
+/// no size bounds the fetch of a mount without one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BlobLimits {
     /// Maximum response-body bytes accepted by `fetch-blob`.
-    pub max_fetch_blob_bytes: u64,
-}
-
-impl Default for BlobLimits {
-    fn default() -> Self {
-        Self {
-            max_fetch_blob_bytes: DEFAULT_MAX_FETCH_BLOB_BYTES,
-        }
-    }
+    pub max_fetch_blob_bytes: Option<u64>,
 }
 
 impl BlobLimits {
     pub fn from_max_fetch_bytes(max_fetch_blob_bytes: Option<u64>) -> Self {
-        let defaults = Self::default();
         Self {
-            max_fetch_blob_bytes: max_fetch_blob_bytes.unwrap_or(defaults.max_fetch_blob_bytes),
+            max_fetch_blob_bytes,
         }
     }
 }
@@ -300,14 +290,15 @@ struct StagedBlob {
     size: u64,
 }
 
-/// Stage the body of `response`, of at most `max_bytes` and, for `md5`, of
-/// bytes of that MD5 alone.
+/// Stage the body of `response`, of at most the `limit` bytes of a mount
+/// with one and, for `md5`, of bytes of that MD5 alone.
 async fn stream_response_body(
     response: reqwest::Response,
     body: &BodyStore,
-    max_bytes: u64,
+    limit: Option<u64>,
     md5: Option<&str>,
 ) -> Result<StagedBlob, BlobError> {
+    let max_bytes = limit.unwrap_or(u64::MAX);
     if let Some(content_length) = response.content_length()
         && content_length > max_bytes
     {
@@ -409,7 +400,7 @@ mod tests {
             .unwrap()
             .into();
 
-        let result = stream_response_body(response, &body, 4, None).await;
+        let result = stream_response_body(response, &body, Some(4), None).await;
 
         assert!(matches!(result, Err(BlobError::TooLarge { actual: 5, .. })));
     }
@@ -427,7 +418,7 @@ mod tests {
             .unwrap()
             .into();
 
-        let result = stream_response_body(response, &body, 4, None).await;
+        let result = stream_response_body(response, &body, Some(4), None).await;
 
         assert!(matches!(result, Err(BlobError::TooLarge { actual: 5, .. })));
     }
@@ -441,7 +432,9 @@ mod tests {
             .unwrap()
             .into();
 
-        let staged = stream_response_body(response, &body, 5, None)
+        // No size bounds the body of a mount without a limit.
+        assert_eq!(BlobLimits::default().max_fetch_blob_bytes, None);
+        let staged = stream_response_body(response, &body, None, None)
             .await
             .expect("stage body");
 
