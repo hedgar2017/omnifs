@@ -129,10 +129,19 @@ impl List {
     }
 }
 
+/// What the search of Notion gives: a page, a row of a data source too, or a
+/// data source.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Kind {
+    Page,
+    DataSource,
+}
+
 /// What a result of the search, a page, or a data source has in common.
 #[derive(Deserialize)]
 pub(crate) struct Found {
-    pub(crate) object: String,
+    pub(crate) object: Kind,
     pub(crate) id: String,
     #[serde(with = "time::serde::rfc3339")]
     pub(crate) last_edited_time: OffsetDateTime,

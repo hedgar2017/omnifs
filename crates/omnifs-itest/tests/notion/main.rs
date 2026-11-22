@@ -559,26 +559,31 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
     let (title, requests) = answering(
         &harness,
         read(&harness, &format!("{}/title", at(1))),
-        vec![ok(&object(1, "First renamed", EDITED))],
+        vec![ok(&object(1, "First renamed", EDITED_LATER))],
     )
     .await;
     assert_eq!(title.unwrap(), "First renamed");
     expect(&requests[0], "GET", &get(1), None);
 
+    // A result of the search with an earlier `last_edited_time` than the
+    // object of the projection leaves it.
     let (listing, requests) = answering(
         &harness,
         names(&harness, folder),
         vec![ok(&list(
-            &[
-                object(1, "First renamed", EDITED),
-                object(2, "Second", EDITED),
-            ],
+            &[object(1, "First", EDITED), object(2, "Second", EDITED)],
             None,
         ))],
     )
     .await;
     assert_eq!(listing.unwrap(), names_of(&[1, 2]));
     expect_search(&requests[0], 100, None);
+    assert_eq!(
+        served(&harness, read(&harness, &format!("{}/title", at(1))))
+            .await
+            .unwrap(),
+        "First renamed"
+    );
     // An ID with its hyphens or with uppercase digits names no folder.
     for name in [notion_id(1), id(0xabc).to_uppercase()] {
         assert!(
@@ -597,7 +602,7 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
         read(&harness, &format!("{}/title", at(1))),
         vec![ok(&list(
             &[
-                object(1, "First renamed", EDITED),
+                object(1, "First renamed", EDITED_LATER),
                 object(2, "Second", EDITED),
             ],
             None,
@@ -623,7 +628,7 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
         vec![
             ok(&list(
                 &[
-                    object(1, "First renamed", EDITED),
+                    object(1, "First renamed", EDITED_LATER),
                     object(2, "Second", EDITED),
                 ],
                 None,
@@ -633,7 +638,7 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
     )
     .await;
     assert!(!found.unwrap().is_missing());
-    expect_search(&requests[0], 3, None);
+    expect_search(&requests[0], 2, None);
     expect(&requests[1], "GET", &get(5), None);
     assert_eq!(
         served(&harness, names(&harness, folder)).await.unwrap(),
@@ -772,6 +777,27 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
     assert_eq!(body.unwrap(), "Page 2 body, edited");
     expect(&requests[0], "GET", &format!("/v1/pages/{}", id(2)), None);
     expect(&requests[1], "GET", &markdown_of(&id(2)), None);
+
+    // A result of the search with an earlier `last_edited_time` than the page
+    // of the projection leaves its content.
+    first_full_listing(
+        &harness,
+        vec![
+            page(1, "Page 1", EDITED),
+            page(2, "Page 2", EDITED),
+            page(4, "Page 4", EDITED),
+        ],
+    )
+    .await;
+    assert_eq!(
+        served(
+            &harness,
+            read(&harness, &format!("pages/{}/body.md", id(2)))
+        )
+        .await
+        .unwrap(),
+        "Page 2 body, edited"
+    );
 }
 
 /// The comments at the first read of `comments/` and of a file of a comment
@@ -1015,7 +1041,8 @@ async fn a_529_waits_its_retry_after_and_a_blocked_connection_does_not() {
 
 /// A `400` to a request with a `start_cursor` of a full listing, of the
 /// changes, and of the comments, and a `404` to one of the comments, gives its
-/// read its error, and the next read begins from the first request.
+/// read its error, and the next read begins from the first request, a read of
+/// `pages/` after that of the changes with a full listing.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_refused_cursor_begins_again_from_the_first_request() {
@@ -1036,46 +1063,67 @@ async fn a_refused_cursor_begins_again_from_the_first_request() {
         &harness,
         names(&harness, "pages"),
         vec![ok(&list(
-            &[page(1, "One", EDITED), page(2, "Two", EDITED)],
+            &[
+                page(1, "One", EDITED),
+                page(2, "Two", EDITED),
+                page(3, "Three", EDITED),
+                page(4, "Four", EDITED),
+            ],
             None,
         ))],
     )
     .await;
-    assert_eq!(listing.unwrap(), names_of(&[1, 2]));
+    let all = [
+        page(1, "One", EDITED),
+        page(2, "Two", EDITED),
+        page(3, "Three", EDITED),
+        page(4, "Four", EDITED),
+    ];
+    assert_eq!(listing.unwrap(), names_of(&[1, 2, 3, 4]));
     expect_search(&requests[0], 100, None);
 
-    tokio::time::sleep(PAST_DEADLINE).await;
     let title = format!("pages/{}/title", id(1));
-    let (stopped, requests) = answering(
-        &harness,
-        read(&harness, &title),
-        vec![
-            ok(&list(
-                &[
-                    page(3, "Three", EDITED),
-                    page(1, "One", EDITED),
-                    page(2, "Two", EDITED),
-                ],
-                Some("cursor-3"),
-            )),
-            failure(400, "validation_error"),
-        ],
-    )
-    .await;
-    assert!(matches!(stopped, Err(NsError::Invalid)), "{stopped:?}");
-    expect_search(&requests[0], 3, None);
-    expect_search(&requests[1], 100, Some("cursor-3"));
-    let (read_title, requests) = answering(
-        &harness,
-        read(&harness, &title),
-        vec![ok(&list(
-            &[page(1, "One", EDITED), page(2, "Two", EDITED)],
-            None,
-        ))],
-    )
-    .await;
-    assert_eq!(read_title.unwrap(), "One");
-    expect_search(&requests[0], 3, None);
+    let mut changed = vec![page(5, "Five", EDITED)];
+    changed.extend(all.clone());
+    for after in ["the changes", "a full listing"] {
+        tokio::time::sleep(PAST_DEADLINE).await;
+        let (stopped, requests) = answering(
+            &harness,
+            read(&harness, &title),
+            vec![
+                ok(&list(&changed, Some("cursor-3"))),
+                failure(400, "validation_error"),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(stopped, Err(NsError::Invalid)),
+            "{after}: {stopped:?}"
+        );
+        expect_search(&requests[0], 5, None);
+        expect_search(&requests[1], 100, Some("cursor-3"));
+        if after == "the changes" {
+            let (read_title, requests) = answering(
+                &harness,
+                read(&harness, &title),
+                vec![ok(&list(&all, None))],
+            )
+            .await;
+            assert_eq!(read_title.unwrap(), "One");
+            expect_search(&requests[0], 5, None);
+        } else {
+            // A read of `pages/` after the refusal takes a full listing.
+            let (listing, requests) = answering(
+                &harness,
+                names(&harness, "pages"),
+                vec![ok(&list(&all[..3], None)), failure(404, "object_not_found")],
+            )
+            .await;
+            assert_eq!(listing.unwrap(), names_of(&[1, 2, 3]));
+            expect_search(&requests[0], 100, None);
+            expect(&requests[1], "GET", &format!("/v1/pages/{}", id(4)), None);
+        }
+    }
 
     // A `404` to a `start_cursor` of the comments refuses the cursor too, and
     // the page stays.

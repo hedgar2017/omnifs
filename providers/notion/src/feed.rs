@@ -6,7 +6,8 @@
 //! feed, by `last_edited_time` from the latest, with the pages and the data
 //! sources of the projection that it lacks by their IDs after its last page,
 //! and else the changes, from the latest `last_edited_time` that the results
-//! of its answers brought. The own feed of a page takes it by its ID, its
+//! of its answers brought. A result with an earlier `last_edited_time` than
+//! its object of the projection leaves the projection as it is. The own feed of a page takes it by its ID, its
 //! content, and its comments, and the own feed of a data source takes it by
 //! its ID, a part for each request.
 //!
@@ -27,13 +28,13 @@ use time::format_description::well_known::Rfc2822;
 use time::{Duration, OffsetDateTime};
 
 use crate::api::{
-    CommentObject, DataSourceObject, Found, List, Markdown, NotionApi, PageObject, decode,
+    CommentObject, DataSourceObject, Found, Kind, List, Markdown, NotionApi, PageObject, decode,
     restricted, status_error,
 };
 use crate::{DataSource, DataSourceKey, Id, Page, PageKey, Workspace, WorkspaceKey};
 
-/// The results of a request of a full listing or of the changes, and the
-/// comments of a request of the comments of a page.
+/// The most results of a request of the search, and the comments of a
+/// request of the comments of a page.
 const PAGE: usize = 100;
 
 // ===========================================================================
@@ -77,27 +78,48 @@ impl Latest {
 #[serde(rename_all = "snake_case")]
 enum Stage {
     /// A full listing at its next cursor, none for its first request, with
-    /// the IDs of its results; `first` for the first full listing.
+    /// what its results lack so far; `first` for the first full listing.
     Listing {
         first: bool,
         cursor: Option<String>,
-        pages: BTreeSet<Id>,
-        databases: BTreeSet<Id>,
+        lacking: Lacking,
         seen: Option<Latest>,
     },
-    /// The IDs of the pages and the data sources of the projection that a
-    /// full listing lacks.
+    /// What the results of a full listing lack, each by its ID in turn.
     Missing {
         first: bool,
-        pages: BTreeSet<Id>,
-        databases: BTreeSet<Id>,
+        lacking: Lacking,
         seen: Option<Latest>,
     },
-    /// The changes at their next cursor, none for their first request.
+    /// The changes at their next cursor.
     Changes {
-        cursor: Option<String>,
+        cursor: String,
         seen: Option<Latest>,
     },
+}
+
+/// The IDs of the pages and the data sources of the projection at the first
+/// request of a full listing that its results lack.
+#[derive(Serialize, Deserialize)]
+struct Lacking {
+    pages: BTreeSet<Id>,
+    databases: BTreeSet<Id>,
+}
+
+impl Lacking {
+    /// The first of them, a page before a data source, which leaves them.
+    fn pop(&mut self) -> Option<(Kind, Id)> {
+        let page = self.pages.pop_first().map(|id| (Kind::Page, id));
+        page.or_else(|| self.databases.pop_first().map(|id| (Kind::DataSource, id)))
+    }
+
+    /// Leave out `id` of `kind`, which a result brought.
+    fn found(&mut self, kind: Kind, id: &Id) {
+        match kind {
+            Kind::Page => self.pages.remove(id),
+            Kind::DataSource => self.databases.remove(id),
+        };
+    }
 }
 
 /// The token of the feed of a page: the `last_edited_time` of the page, its
@@ -160,18 +182,14 @@ impl Content {
 #[derive(Default, Serialize, Deserialize)]
 struct Comments {
     cursor: Option<String>,
-    comments: Vec<Box<RawValue>>,
+    objects: Vec<Box<RawValue>>,
     #[serde(with = "time::serde::rfc3339::option")]
     until: Option<OffsetDateTime>,
 }
 
-/// The token of the feed of a data source: its `last_edited_time`. The token
-/// of a removed data source is `null`.
-#[derive(Serialize, Deserialize)]
-struct DataSourceToken {
-    #[serde(with = "time::serde::rfc3339")]
-    last_edited_time: OffsetDateTime,
-}
+/// The token of the feed of a data source, which keeps nothing from an
+/// answer to the next.
+const DATA_SOURCE_TOKEN: &str = "null";
 
 fn encode<T: Serialize>(token: &T) -> Result<String> {
     serde_json::to_string(token)
@@ -257,7 +275,7 @@ fn listed<K>(cx: &FeedCx<K>, path: &str) -> Result<BTreeSet<Id>> {
 
 /// A request of Notion with a `start_cursor` whose answer has a status from
 /// `400` to `499` other than `429`: Notion no longer takes the cursor.
-fn cursor_refused(cursor: Option<&String>, response: &HttpResponse) -> bool {
+fn cursor_refused(cursor: Option<&str>, response: &HttpResponse) -> bool {
     cursor.is_some() && matches!(response.status(), 400..=499) && response.status() != 429
 }
 
@@ -290,11 +308,11 @@ fn minute_end(
 // The feed of the workspace
 // ===========================================================================
 
-/// The token of the feed of a page or a data source, as an inner state of
-/// the feed of the workspace.
+/// The state that a part gives the feed of a page, with its token, or of a
+/// data source.
 enum Inner {
     Page(Id, String),
-    DataSource(Id, String),
+    DataSource(Id),
 }
 
 /// One call of the feed of the workspace: its context, the latest time of
@@ -306,52 +324,37 @@ struct WorkspaceFeed<'a> {
 }
 
 impl Workspace {
-    /// The feed of the pages and the data sources of the workspace.
+    /// The feed of the pages and the data sources of the workspace: the next
+    /// request of the stage of its token, else the first request of a full
+    /// listing for a read of `pages/` or `databases/`, its starting paths,
+    /// and of the changes for another read.
     pub(crate) async fn feed(cx: FeedCx<WorkspaceKey>) -> Result<Feed> {
         let token = cx.token().map(decode_token::<WorkspaceToken>).transpose()?;
         let first = token.is_none();
-        let (latest, stage) = match token {
-            Some(WorkspaceToken { latest, stage }) => (latest, stage),
-            None => (None, None),
-        };
-        let listing = [cx.start(), cx.due()]
-            .into_iter()
-            .flatten()
-            .any(|start| start == "pages" || start == "databases");
-        let stage = match stage {
-            Some(stage) => stage,
-            None if first || listing => Stage::Listing {
-                first,
-                cursor: None,
-                pages: BTreeSet::new(),
-                databases: BTreeSet::new(),
-                seen: None,
-            },
-            None => Stage::Changes {
-                cursor: None,
-                seen: None,
-            },
-        };
+        let (latest, stage) = token.map_or((None, None), |token| (token.latest, token.stage));
         let mut feed = WorkspaceFeed {
             cx: &cx,
             latest,
             inner: Vec::new(),
         };
         match stage {
-            Stage::Listing {
+            Some(Stage::Listing {
                 first,
                 cursor,
-                pages,
-                databases,
+                lacking,
                 seen,
-            } => feed.listing(first, cursor, pages, databases, seen).await,
-            Stage::Missing {
+            }) => feed.listing(first, cursor, lacking, seen).await,
+            Some(Stage::Missing {
                 first,
-                pages,
-                databases,
+                lacking,
                 seen,
-            } => feed.missing(first, pages, databases, seen).await,
-            Stage::Changes { cursor, seen } => feed.changes(cursor, seen).await,
+            }) => feed.missing(first, lacking, seen).await,
+            Some(Stage::Changes { cursor, seen }) => feed.changes(Some(cursor), seen).await,
+            None if cx.start().or(cx.due()).is_some() => {
+                let lacking = feed.projected()?;
+                feed.listing(first, None, lacking, None).await
+            },
+            None => feed.changes(None, None).await,
         }
     }
 }
@@ -366,13 +369,13 @@ enum Search {
 impl WorkspaceFeed<'_> {
     /// A request of the search: the results with `page_size`, from
     /// `cursor`, by `last_edited_time` from the latest.
-    async fn search(&self, cursor: Option<&String>, page_size: usize) -> Result<Search> {
+    async fn search(&self, cursor: Option<&str>, page_size: usize) -> Result<Search> {
         let mut body = json!({
             "sort": { "direction": "descending", "timestamp": "last_edited_time" },
             "page_size": page_size,
         });
         if let Some(cursor) = cursor {
-            body["start_cursor"] = cursor.clone().into();
+            body["start_cursor"] = cursor.into();
         }
         let response = self
             .cx
@@ -388,42 +391,57 @@ impl WorkspaceFeed<'_> {
         }
     }
 
-    /// The restart of an answer whose cursor Notion refused, with the token
-    /// of the answer at its first request.
-    fn restart(&self, stage: Stage, error: ProviderError) -> Result<Feed> {
+    /// The restart of an answer whose cursor Notion refused, with `stage` in
+    /// the token of the feed: the first full listing at its first request,
+    /// and none after it, so that the next read decides between a full
+    /// listing and the changes.
+    fn restart(&self, stage: Option<Stage>, error: ProviderError) -> Result<Feed> {
         Ok(Feed::restart(
             encode(&WorkspaceToken {
                 latest: self.latest,
-                stage: Some(stage),
+                stage,
             })?,
             error,
         ))
     }
 
-    /// Take a result of the search, or of a request by its ID, into the
-    /// projection, its folder joining its listing as `write` says, and give
-    /// its feed its token: the removal of one in the trash, and the facts of
-    /// another, with the removal of the content and the comments of a page
-    /// with another `last_edited_time` than its `page.json`.
-    fn take(&mut self, object: &RawValue, write: ListingWrite) -> Result<(Found, Id)> {
-        let found: Found = decode(object.get().as_bytes())?;
+    /// The pages and the data sources of the projection, which a full
+    /// listing lacks before its first request.
+    fn projected(&self) -> Result<Lacking> {
+        Ok(Lacking {
+            pages: listed(self.cx, PAGES)?,
+            databases: listed(self.cx, DATABASES)?,
+        })
+    }
+
+    /// Take the result `found` of the search, or of a request by its ID,
+    /// with its `object`, into the projection, its folder joining its listing
+    /// as `write` says: the removal of one in the trash; nothing of one with
+    /// an earlier `last_edited_time` than its object of the projection; and
+    /// the facts of another, with the state of its feed for a data source
+    /// and for a page that the projection lacks or has with another
+    /// `last_edited_time`, whose content and comments it removes.
+    fn take(&mut self, found: &Found, object: &RawValue, write: ListingWrite) -> Result<Id> {
         let id = Id::of(&found.id)?;
-        match found.object.as_str() {
-            "page" if found.in_trash => {
-                self.cx.remove(page_path(&id))?;
-                self.inner
-                    .push(Inner::Page(id.clone(), encode(&None::<PageToken>)?));
-            },
-            "page" => {
-                let projected = self
-                    .cx
-                    .read(format!("{}/page.json", page_path(&id)))?
-                    .map(|page| decode::<Found>(&page))
-                    .transpose()?;
-                if projected
-                    .as_ref()
-                    .is_none_or(|page| page.last_edited_time != found.last_edited_time)
-                {
+        if found.in_trash {
+            self.remove(found.object, id.clone())?;
+            return Ok(id);
+        }
+        let projected = self
+            .cx
+            .read(match found.object {
+                Kind::Page => format!("{}/page.json", page_path(&id)),
+                Kind::DataSource => format!("{}/schema.json", data_source_path(&id)),
+            })?
+            .map(|projected| decode::<Found>(&projected))
+            .transpose()?
+            .map(|projected| projected.last_edited_time);
+        if projected.is_some_and(|projected| projected > found.last_edited_time) {
+            return Ok(id);
+        }
+        match found.object {
+            Kind::Page => {
+                if projected != Some(found.last_edited_time) {
                     if projected.is_some() {
                         remove_content(self.cx, &id)?;
                     }
@@ -433,130 +451,106 @@ impl WorkspaceFeed<'_> {
                 }
                 write_page(self.cx, &id, object, write)?;
             },
-            "data_source" if found.in_trash => {
-                self.cx.remove(data_source_path(&id))?;
-                self.inner.push(Inner::DataSource(
-                    id.clone(),
-                    encode(&None::<DataSourceToken>)?,
-                ));
-            },
-            "data_source" => {
+            Kind::DataSource => {
                 write_data_source(self.cx, &id, object, write)?;
-                let token = DataSourceToken {
-                    last_edited_time: found.last_edited_time,
-                };
-                self.inner
-                    .push(Inner::DataSource(id.clone(), encode(&Some(token))?));
-            },
-            object => {
-                return Err(ProviderError::invalid_input(format!(
-                    "the search of Notion gave a {object}"
-                )));
+                self.inner.push(Inner::DataSource(id.clone()));
             },
         }
-        Ok((found, id))
+        Ok(id)
     }
 
-    /// A request of a full listing: its results, then its next request, the
-    /// pages and the data sources of the projection that its results lack,
-    /// or its end.
+    /// Remove the page or the data source `id` from the projection, with
+    /// the state of a removed one for its feed.
+    fn remove(&mut self, kind: Kind, id: Id) -> Result<()> {
+        match kind {
+            Kind::Page => {
+                self.cx.remove(page_path(&id))?;
+                self.inner
+                    .push(Inner::Page(id, encode(&None::<PageToken>)?));
+            },
+            Kind::DataSource => {
+                self.cx.remove(data_source_path(&id))?;
+                self.inner.push(Inner::DataSource(id));
+            },
+        }
+        Ok(())
+    }
+
+    /// A request of a full listing: its results, which `lacking` leaves,
+    /// then its next request, or after its last one what it lacks.
     async fn listing(
         &mut self,
         first: bool,
         cursor: Option<String>,
-        mut pages: BTreeSet<Id>,
-        mut databases: BTreeSet<Id>,
+        mut lacking: Lacking,
         mut seen: Option<Latest>,
     ) -> Result<Feed> {
-        let list = match self.search(cursor.as_ref(), PAGE).await? {
+        let list = match self.search(cursor.as_deref(), PAGE).await? {
             Search::List(list) => list,
             Search::Refused(error) => {
-                let stage = Stage::Listing {
-                    first,
-                    cursor: None,
-                    pages: BTreeSet::new(),
-                    databases: BTreeSet::new(),
-                    seen: None,
+                let stage = if first {
+                    Some(Stage::Listing {
+                        first,
+                        cursor: None,
+                        lacking: self.projected()?,
+                        seen: None,
+                    })
+                } else {
+                    None
                 };
                 return self.restart(stage, error);
             },
         };
-        let write = listing_write(first);
         for result in &list.results {
-            let (found, id) = self.take(result, write)?;
-            if found.object == "page" {
-                pages.insert(id);
-            } else {
-                databases.insert(id);
-            }
+            let found: Found = decode(result.get().as_bytes())?;
+            let id = self.take(&found, result, listing_write(first))?;
+            lacking.found(found.object, &id);
             seen = Some(Latest::with(seen, found.last_edited_time));
         }
-        if let Some(cursor) = list.next()? {
-            let stage = Stage::Listing {
+        self.part(Some(match list.next()? {
+            Some(cursor) => Stage::Listing {
                 first,
                 cursor: Some(cursor),
-                pages,
-                databases,
+                lacking,
                 seen,
-            };
-            return self.part(Some(stage));
-        }
-        let pages = &listed(self.cx, PAGES)? - &pages;
-        let databases = &listed(self.cx, DATABASES)? - &databases;
-        if pages.is_empty() && databases.is_empty() {
-            return self.end(first, seen);
-        }
-        self.part(Some(Stage::Missing {
-            first,
-            pages,
-            databases,
-            seen,
+            },
+            None => Stage::Missing {
+                first,
+                lacking,
+                seen,
+            },
         }))
     }
 
-    /// A request of a page or a data source of the projection that a full
-    /// listing lacks, by its ID: its facts, or its removal for `404` or in
-    /// the trash, with the token of a removed one for its feed.
+    /// A request of the first page or data source that a full listing
+    /// lacks, by its ID: its facts, or its removal for `404` or in the trash;
+    /// the last part of the listing once it lacks none.
     async fn missing(
         &mut self,
         first: bool,
-        mut pages: BTreeSet<Id>,
-        mut databases: BTreeSet<Id>,
+        mut lacking: Lacking,
         seen: Option<Latest>,
     ) -> Result<Feed> {
-        let (request, removed) = if let Some(id) = pages.pop_first() {
-            let removed = Inner::Page(id.clone(), encode(&None::<PageToken>)?);
-            (format!("/v1/pages/{id}"), removed)
-        } else if let Some(id) = databases.pop_first() {
-            let removed = Inner::DataSource(id.clone(), encode(&None::<DataSourceToken>)?);
-            (format!("/v1/data_sources/{id}"), removed)
-        } else {
-            return Err(ProviderError::invalid_input(
-                "a full listing takes no missing page or data source",
-            ));
+        let Some((kind, id)) = lacking.pop() else {
+            return self.end(first, seen);
+        };
+        let request = match kind {
+            Kind::Page => format!("/v1/pages/{id}"),
+            Kind::DataSource => format!("/v1/data_sources/{id}"),
         };
         let response = self.cx.endpoint(NotionApi).get(request).send().await?;
         match response.status() {
             200 => {
                 let object: Box<RawValue> = decode(response.body())?;
-                self.take(&object, listing_write(first))?;
+                let found: Found = decode(object.get().as_bytes())?;
+                self.take(&found, &object, listing_write(first))?;
             },
-            404 => {
-                self.cx.remove(match &removed {
-                    Inner::Page(id, _) => page_path(id),
-                    Inner::DataSource(id, _) => data_source_path(id),
-                })?;
-                self.inner.push(removed);
-            },
+            404 => self.remove(kind, id)?,
             _ => return Err(status_error(&response)),
-        }
-        if pages.is_empty() && databases.is_empty() {
-            return self.end(first, seen);
         }
         self.part(Some(Stage::Missing {
             first,
-            pages,
-            databases,
+            lacking,
             seen,
         }))
     }
@@ -569,15 +563,9 @@ impl WorkspaceFeed<'_> {
             Some(_) => PAGE,
             None => self.latest.map_or(1, |latest| latest.count + 1).min(PAGE),
         };
-        let list = match self.search(cursor.as_ref(), page_size).await? {
+        let list = match self.search(cursor.as_deref(), page_size).await? {
             Search::List(list) => list,
-            Search::Refused(error) => {
-                let stage = Stage::Changes {
-                    cursor: None,
-                    seen: None,
-                };
-                return self.restart(stage, error);
-            },
+            Search::Refused(error) => return self.restart(None, error),
         };
         let mut older = false;
         for result in &list.results {
@@ -589,14 +577,11 @@ impl WorkspaceFeed<'_> {
                 older = true;
                 break;
             }
-            self.take(result, ListingWrite::Complete)?;
+            self.take(&found, result, ListingWrite::Complete)?;
             seen = Some(Latest::with(seen, found.last_edited_time));
         }
         match list.next()? {
-            Some(cursor) if !older => self.part(Some(Stage::Changes {
-                cursor: Some(cursor),
-                seen,
-            })),
+            Some(cursor) if !older => self.part(Some(Stage::Changes { cursor, seen })),
             _ => self.end(false, seen),
         }
     }
@@ -627,8 +612,8 @@ impl WorkspaceFeed<'_> {
         for inner in self.inner.drain(..) {
             part = match inner {
                 Inner::Page(id, token) => part.inner::<Page>(&PageKey { id }, token),
-                Inner::DataSource(id, token) => {
-                    part.inner::<DataSource>(&DataSourceKey { id }, token)
+                Inner::DataSource(id) => {
+                    part.inner::<DataSource>(&DataSourceKey { id }, DATA_SOURCE_TOKEN)
                 },
             };
         }
@@ -837,7 +822,7 @@ impl PageFeed<'_> {
     async fn comments(&self, mut token: PageToken) -> Result<Feed> {
         let Comments {
             cursor,
-            mut comments,
+            mut objects,
             mut until,
         } = token.comments.take().unwrap_or_default();
         let mut request = self
@@ -853,7 +838,7 @@ impl PageFeed<'_> {
         let response = request.send().await?;
         let none = match response.status() {
             200 => false,
-            _ if cursor_refused(cursor.as_ref(), &response) => {
+            _ if cursor_refused(cursor.as_deref(), &response) => {
                 return Ok(Feed::restart(
                     encode(&Some(token))?,
                     status_error(&response),
@@ -869,19 +854,19 @@ impl PageFeed<'_> {
         if !none {
             let list: List = decode(response.body())?;
             let next = list.next()?;
-            comments.extend(list.results);
+            objects.extend(list.results);
             if let Some(cursor) = next {
                 token.comments = Some(Comments {
                     cursor: Some(cursor),
-                    comments,
+                    objects,
                     until,
                 });
                 return page_part(&token, true, None);
             }
         }
         let folder = format!("{}/comments", self.path());
-        let mut taken = BTreeSet::new();
-        for object in &comments {
+        let mut written = BTreeSet::new();
+        for object in &objects {
             let comment: CommentObject = decode(object.get().as_bytes())?;
             let id = Id::of(&comment.id)?;
             let at = format!("{folder}/{id}");
@@ -892,10 +877,10 @@ impl PageFeed<'_> {
                 .file(format!("{at}/body.md"), comment.body().into_bytes())?;
             self.cx
                 .file(format!("{at}/comment.json"), object.get().as_bytes())?;
-            taken.insert(id);
+            written.insert(id);
         }
         self.cx.dir(&folder, ListingWrite::Complete)?;
-        for id in listed(self.cx, &folder)?.difference(&taken) {
+        for id in listed(self.cx, &folder)?.difference(&written) {
             self.cx.remove(format!("{folder}/{id}"))?;
         }
         token.comments_until = until;
@@ -934,10 +919,7 @@ impl DataSource {
             return data_source_removal(&cx, id);
         }
         write_data_source(&cx, id, &object, ListingWrite::Join)?;
-        let token = DataSourceToken {
-            last_edited_time: found.last_edited_time,
-        };
-        Ok(Feed::part(encode(&Some(token))?).into())
+        Ok(Feed::part(DATA_SOURCE_TOKEN).into())
     }
 }
 
@@ -952,8 +934,8 @@ fn page_part(token: &PageToken, more: bool, until: Option<OffsetDateTime>) -> Re
     .into())
 }
 
-/// The removal of a data source, with the token of a removed data source.
+/// The removal of a data source.
 fn data_source_removal(cx: &FeedCx<DataSourceKey>, id: &Id) -> Result<Feed> {
     cx.remove(data_source_path(id))?;
-    Ok(Feed::part(encode(&None::<DataSourceToken>)?).into())
+    Ok(Feed::part(DATA_SOURCE_TOKEN).into())
 }
