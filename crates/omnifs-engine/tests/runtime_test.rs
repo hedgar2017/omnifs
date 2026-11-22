@@ -85,6 +85,7 @@ async fn all_providers_initialize_and_compile() {
         ("omnifs_provider_google_drive.wasm", "google-drive"),
         ("omnifs_provider_notion.wasm", "notion"),
         ("omnifs_provider_oura.wasm", "oura"),
+        ("omnifs_provider_slack.wasm", "slack"),
         ("omnifs_provider_web.wasm", "web"),
     ];
     for (wasm, mount) in providers {

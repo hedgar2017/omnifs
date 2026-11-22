@@ -3534,6 +3534,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnifs-provider-slack"
+version = "0.2.1"
+dependencies = [
+ "omnifs-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "omnifs-provider-web"
 version = "0.2.1"
 dependencies = [

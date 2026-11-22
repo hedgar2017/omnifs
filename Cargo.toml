@@ -12,6 +12,7 @@ members = [
     "providers/google-drive",
     "providers/notion",
     "providers/oura",
+    "providers/slack",
     "providers/web",
     "providers/test",
 ]
