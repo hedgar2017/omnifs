@@ -350,7 +350,7 @@ async fn the_first_full_listing_of_a_channel_takes_each_page_at_its_answer() {
 /// A full listing again at a read of `messages/` past the deadline, after its
 /// last page, with the removal of a message with its replies; a full listing
 /// for a channel without a message; and the new messages after the latest
-/// `ts` at a read of a file of a message past the deadline.
+/// `ts` by `next_cursor` at a read of a file of a message past the deadline.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_full_listing_again_removes_what_it_lacks_and_the_new_messages_follow_the_latest() {
@@ -429,21 +429,40 @@ async fn a_full_listing_again_removes_what_it_lacks_and_the_new_messages_follow_
     let (text, requests) = answering(
         &harness,
         read(&harness, &format!("channels/C01/messages/{}/text", ts(2))),
-        vec![ok(&page(
-            "messages",
-            &[message(4, Some("U02"), "Fourth")],
-            None,
-        ))],
+        vec![
+            ok(&page(
+                "messages",
+                &[message(5, Some("U01"), "Fifth")],
+                Some("cursor-2"),
+            )),
+            ok(&page(
+                "messages",
+                &[message(4, Some("U02"), "Fourth")],
+                None,
+            )),
+        ],
     )
     .await;
     assert_eq!(text.unwrap(), "Second");
     expect_history(&requests[0], "C01", Some(ts(3).as_str()), None);
+    expect_history(&requests[1], "C01", Some(ts(3).as_str()), Some("cursor-2"));
     assert_eq!(
         served(&harness, names(&harness, "channels/C01/messages"))
             .await
             .unwrap(),
-        stamps(&[2, 3, 4])
+        stamps(&[2, 3, 4, 5])
     );
+
+    // The next new messages are those after the latest of these.
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (text, requests) = answering(
+        &harness,
+        read(&harness, &format!("channels/C01/messages/{}/text", ts(4))),
+        vec![ok(&page("messages", &[], None))],
+    )
+    .await;
+    assert_eq!(text.unwrap(), "Fourth");
+    expect_history(&requests[0], "C01", Some(ts(5).as_str()), None);
 }
 
 /// A message by its `ts` before the end of the first full listing of its
@@ -503,18 +522,18 @@ async fn a_message_by_its_ts_before_the_end_of_the_first_full_listing() {
     );
 }
 
-/// The replies by `next_cursor` at the first read of `replies/`, without the
-/// message itself and a reply of another thread, no request for a
-/// `reply_count` of `0`, the removal of the message for `thread_not_found`,
-/// and, before the end of the first full listing of its channel, the replies
-/// again for a read of `replies/` by its path alone past the deadline of a
-/// message with another `latest_reply`, without a reply that they lack.
+/// The replies by `next_cursor` at the first read of `replies/`, with the
+/// message itself as the message and without a reply of another thread, no
+/// request for a `reply_count` of `0`, the removal of the message for
+/// `thread_not_found`, and, before the end of the first full listing of its
+/// channel, the replies again for a read of `replies/` by its path alone past
+/// the deadline of a message with another `latest_reply`, without a reply
+/// that they lack.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_replies_take_the_pages_of_conversations_replies() {
     let harness = slack_harness();
     channels(&harness, &[channel("C01", "general")]).await;
-    let first = thread(message(1, Some("U01"), "Question"), 2, 3);
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "channels/C01/messages"),
@@ -524,7 +543,7 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
                 &[
                     thread(message(5, Some("U01"), "Gone"), 1, 6),
                     thread(message(4, Some("U02"), "Unanswered"), 0, 4),
-                    first.clone(),
+                    thread(message(1, Some("U01"), "Question"), 2, 3),
                 ],
                 Some("cursor-2"),
             )),
@@ -537,13 +556,14 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
     expect_history(&requests[1], "C01", None, Some("cursor-2"));
 
     let replies = |n: u32| format!("channels/C01/messages/{}/replies", ts(n));
+    let asked = thread(message(1, Some("U01"), "Question, edited"), 2, 3);
     let (listing, requests) = answering(
         &harness,
         names(&harness, &replies(1)),
         vec![
             ok(&page(
                 "messages",
-                &[first, reply(2, 1, "U02", "An answer")],
+                &[asked.clone(), reply(2, 1, "U02", "An answer")],
                 Some("cursor-2"),
             )),
             ok(&page(
@@ -569,6 +589,22 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
         .unwrap(),
         "An answer"
     );
+    // The message itself of the replies is the message of the last answer
+    // with it.
+    let at = format!("channels/C01/messages/{}", ts(1));
+    assert_eq!(
+        served(&harness, read(&harness, &format!("{at}/text")))
+            .await
+            .unwrap(),
+        "Question, edited"
+    );
+    let object: Value = serde_json::from_str(
+        &served(&harness, read(&harness, &format!("{at}/message.json")))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(object, asked);
 
     assert!(
         served(&harness, names(&harness, &replies(4)))
@@ -693,13 +729,126 @@ async fn the_content_of_a_file_is_the_blob_of_its_edit_timestamp() {
     expect_file(&requests[0], "F01", "notes.txt", Some("1700000100"));
 }
 
-/// The removal of a channel for `channel_not_found` and for
-/// `not_in_channel`, the first request again after `invalid_cursor`, the
-/// error of `ok` of `false` for a read, and the wait of `Retry-After` after
-/// `429`.
+/// The first request again after `invalid_cursor` to a request with a
+/// `cursor`: of a full listing of the users, of a full listing of a channel,
+/// of the replies of a message, and of the new messages of a channel, each
+/// with the error of its read.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn the_errors_of_slack_remove_restart_fail_and_wait() {
+async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
+    let harness = slack_harness();
+    let (stopped, requests) = answering(
+        &harness,
+        names(&harness, "users"),
+        vec![
+            ok(&page("members", &[user("U01", None)], Some("cursor-2"))),
+            failure("invalid_cursor"),
+        ],
+    )
+    .await;
+    assert!(matches!(stopped, Err(NsError::Permission)), "{stopped:?}");
+    expect_users(&requests[0], None);
+    expect_users(&requests[1], Some("cursor-2"));
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "users"),
+        vec![ok(&page("members", &[user("U01", None)], None))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), ["U01"]);
+    expect_users(&requests[0], None);
+
+    channels(&harness, &[channel("C01", "general")]).await;
+    let question = || thread(message(1, Some("U01"), "Question"), 1, 11);
+    let (stopped, requests) = answering(
+        &harness,
+        names(&harness, "channels/C01/messages"),
+        vec![
+            ok(&page("messages", &[question()], Some("cursor-2"))),
+            failure("invalid_cursor"),
+        ],
+    )
+    .await;
+    assert!(matches!(stopped, Err(NsError::Permission)), "{stopped:?}");
+    expect_history(&requests[0], "C01", None, None);
+    expect_history(&requests[1], "C01", None, Some("cursor-2"));
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "channels/C01/messages"),
+        vec![ok(&page(
+            "messages",
+            &[message(2, Some("U02"), "Second"), question()],
+            None,
+        ))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), stamps(&[1, 2]));
+    expect_history(&requests[0], "C01", None, None);
+
+    let replies = format!("channels/C01/messages/{}/replies", ts(1));
+    let (stopped, requests) = answering(
+        &harness,
+        names(&harness, &replies),
+        vec![
+            ok(&page("messages", &[question()], Some("cursor-2"))),
+            failure("invalid_cursor"),
+        ],
+    )
+    .await;
+    assert!(matches!(stopped, Err(NsError::Permission)), "{stopped:?}");
+    expect_replies(&requests[0], "C01", &ts(1), None);
+    expect_replies(&requests[1], "C01", &ts(1), Some("cursor-2"));
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, &replies),
+        vec![ok(&page(
+            "messages",
+            &[question(), reply(11, 1, "U02", "An answer")],
+            None,
+        ))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), stamps(&[11]));
+    expect_replies(&requests[0], "C01", &ts(1), None);
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let text = format!("channels/C01/messages/{}/text", ts(2));
+    let (stopped, requests) = answering(
+        &harness,
+        read(&harness, &text),
+        vec![
+            ok(&page(
+                "messages",
+                &[message(3, Some("U01"), "Third")],
+                Some("cursor-2"),
+            )),
+            failure("invalid_cursor"),
+        ],
+    )
+    .await;
+    assert!(matches!(stopped, Err(NsError::Permission)), "{stopped:?}");
+    expect_history(&requests[0], "C01", Some(ts(2).as_str()), None);
+    expect_history(&requests[1], "C01", Some(ts(2).as_str()), Some("cursor-2"));
+    let (read_text, requests) = answering(
+        &harness,
+        read(&harness, &text),
+        vec![ok(&page(
+            "messages",
+            &[message(3, Some("U01"), "Third")],
+            None,
+        ))],
+    )
+    .await;
+    assert_eq!(read_text.unwrap(), "Second");
+    expect_history(&requests[0], "C01", Some(ts(2).as_str()), None);
+}
+
+/// The removal of a channel for `channel_not_found` and for
+/// `not_in_channel`, the error of `ok` of `false` for a read, and the wait of
+/// `Retry-After` after `429`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn the_errors_of_slack_remove_fail_and_wait() {
     let harness = slack_harness();
     channels(
         &harness,
@@ -734,27 +883,6 @@ async fn the_errors_of_slack_remove_restart_fail_and_wait() {
         served(&harness, names(&harness, "channels")).await.unwrap(),
         ["C03"]
     );
-
-    let (stopped, requests) = answering(
-        &harness,
-        names(&harness, "users"),
-        vec![
-            ok(&page("members", &[user("U01", None)], Some("cursor-2"))),
-            failure("invalid_cursor"),
-        ],
-    )
-    .await;
-    assert!(matches!(stopped, Err(NsError::Permission)), "{stopped:?}");
-    expect_users(&requests[0], None);
-    expect_users(&requests[1], Some("cursor-2"));
-    let (listing, requests) = answering(
-        &harness,
-        names(&harness, "users"),
-        vec![ok(&page("members", &[user("U01", None)], None))],
-    )
-    .await;
-    assert_eq!(listing.unwrap(), ["U01"]);
-    expect_users(&requests[0], None);
 
     let (listing, requests) = answering(
         &harness,
