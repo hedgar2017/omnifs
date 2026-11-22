@@ -717,7 +717,6 @@ mod tests {
             version: None,
             wit_package: None,
             sdk_version: None,
-            refresh_interval_secs: 0,
             projection: 1,
             capabilities: vec![AccessNeed::Domain {
                 value: "api.linear.app".to_string(),

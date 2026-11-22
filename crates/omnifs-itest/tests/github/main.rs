@@ -1892,35 +1892,6 @@ fn github_provider_polls_events_and_invalidates_caches() {
         Ok(_) => {},
         other => panic!("expected comment ReadFile result, got {other:?}"),
     }
-    // TimerTick returns immediately with no callouts or cache invalidations.
-    let first_tick = harness.timer_tick().unwrap();
-    assert!(
-        first_tick.callouts().is_empty(),
-        "timer tick should not issue callouts, got {:?}",
-        first_tick.callouts()
-    );
-    match first_tick.result().unwrap() {
-        Ok(()) => {
-            assert!(
-                first_tick.effects().unwrap().invalidations.is_empty(),
-                "timer tick should not invalidate anything, got {:?}",
-                first_tick.effects().unwrap().invalidations
-            );
-        },
-        other => panic!("expected OnEvent terminal from timer tick, got {other:?}"),
-    }
-
-    // A second tick is equally a no-op.
-    let second_tick = harness.timer_tick().unwrap();
-    assert!(
-        matches!(second_tick.result().unwrap(), Ok(())),
-        "expected second timer tick OnEvent terminal, got {second_tick:?}"
-    );
-    assert!(
-        second_tick.callouts().is_empty(),
-        "second timer tick should not issue callouts, got {:?}",
-        second_tick.callouts()
-    );
 }
 
 #[test]

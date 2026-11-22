@@ -364,18 +364,27 @@ fn omnifs_export_invalidates_path_state_and_open_cache() {
     assert_eq!(read.data, b"scoped\n".to_vec());
 
     let runtime = harness.registry.get("test").expect("test runtime");
-    harness
-        .runtime
-        .block_on(runtime.call_timer_tick())
-        .expect("timer tick");
+    let effects = omnifs_wit::host::types::Effects {
+        canonical: Vec::new(),
+        fs: Vec::new(),
+        invalidations: vec![omnifs_wit::host::types::Invalidation::Listing(
+            omnifs_wit::host::types::PathOrPrefix::Path("/scoped/item".to_owned()),
+        )],
+        removals: Vec::new(),
+    };
+    omnifs_engine::test_support::cache::publish_effects_for_test(
+        &runtime,
+        &effects,
+        omnifs_engine::test_support::cache::current_epoch(&runtime),
+    )
+    .expect("the invalidation publishes");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // The invalidation reaches the export through the event that the test
+    // harness forwards to it.
     loop {
         match export.attr(item) {
             Err(Status::Stale) => break,
-            Ok(_) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            },
+            Ok(_) => std::thread::yield_now(),
             result => panic!("item did not become stale after invalidation: {result:?}"),
         }
     }

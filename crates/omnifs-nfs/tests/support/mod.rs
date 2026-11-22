@@ -109,12 +109,7 @@ pub fn test_export_with_mount(mount: &str) -> TestExport {
         .expect("mount config");
 
     let runtime = Runtime::new().expect("tokio runtime");
-    let registry = load_registry_from_mount_dir(
-        cache_dir.path(),
-        clone_dir.path(),
-        &mounts_dir,
-        runtime.handle(),
-    );
+    let registry = load_registry_from_mount_dir(cache_dir.path(), clone_dir.path(), &mounts_dir);
     let registry = Arc::new(registry);
     let namespace = EngineNamespace::online(Arc::clone(&registry), runtime.handle().clone());
     let (events, _) = broadcast::channel(64);

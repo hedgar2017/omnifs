@@ -281,7 +281,6 @@ impl EngineNamespace {
     /// filesystem's complete `dyn Namespace` implementation.
     pub fn online(registry: Arc<MountTable>, rt: Handle) -> Arc<Self> {
         registry.activate_resources();
-        registry.activate_timers(&rt);
         Self::construct(registry, rt, true)
     }
 

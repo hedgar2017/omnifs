@@ -14,9 +14,7 @@ use omnifs_provider::ProviderManifest;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::sync::watch;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// One selected mount revision. Cache-only entries deliberately have no
 /// provider runtime and never fabricate provider handles; a mount whose
@@ -28,7 +26,6 @@ pub struct MountEntry {
     resources: Option<Arc<MountResources>>,
     trees: Arc<TreeRefs>,
     runtime: Option<Arc<Runtime>>,
-    provider_interval_secs: u32,
 }
 
 /// Daemon-supplied, already-validated input for one durable mount.
@@ -105,9 +102,6 @@ impl MountEntry {
 /// Fixed selected mount table used by the single namespace implementation.
 pub struct MountTable {
     entries: BTreeMap<String, MountEntry>,
-    timer_shutdown: watch::Sender<bool>,
-    timer_tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    timers_active: AtomicBool,
     shutdown: AtomicBool,
 }
 
@@ -125,7 +119,6 @@ impl MountTable {
         inputs: Vec<MountBuildInput>,
         capture_test_callouts: bool,
     ) -> Result<Self, RegistryError> {
-        let (timer_shutdown, _) = watch::channel(false);
         let built = inputs
             .into_iter()
             .map(|input| Self::build_durable_mount(host, input, capture_test_callouts))
@@ -137,9 +130,6 @@ impl MountTable {
             .collect();
         Ok(Self {
             entries,
-            timer_shutdown,
-            timer_tasks: parking_lot::Mutex::new(Vec::new()),
-            timers_active: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
         })
     }
@@ -203,9 +193,6 @@ impl MountTable {
             })
             .transpose()?;
         let trees = Arc::new(TreeRefs::new());
-        let provider_interval_secs = provider
-            .as_ref()
-            .map_or(0, |provider| provider.manifest.refresh_interval_secs);
         let runtime = match (&availability, provider, &resources) {
             (MountAvailability::Active, Some(provider), Some(resources)) => match Runtime::build(
                 host.engine(),
@@ -243,7 +230,6 @@ impl MountTable {
             resources,
             trees,
             runtime,
-            provider_interval_secs,
         })
     }
 
@@ -292,38 +278,6 @@ impl MountTable {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.begin_retirement();
-        for task in self.timer_tasks.lock().drain(..) {
-            task.abort();
-        }
-        self.shutdown_runtimes();
-    }
-
-    pub(crate) fn begin_retirement(&self) {
-        let _ = self.timer_shutdown.send(true);
-    }
-
-    pub(crate) async fn shutdown_all_joined(&self, deadline: tokio::time::Instant) {
-        if self.shutdown.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.begin_retirement();
-        let mut tasks = std::mem::take(&mut *self.timer_tasks.lock());
-        if tokio::time::timeout_at(deadline, async {
-            for task in &mut tasks {
-                let _ = task.await;
-            }
-        })
-        .await
-        .is_err()
-        {
-            for task in &tasks {
-                task.abort();
-            }
-            for task in tasks {
-                let _ = task.await;
-            }
-        }
         self.shutdown_runtimes();
     }
 
@@ -355,72 +309,6 @@ impl MountTable {
         {
             resources.retire();
         }
-    }
-
-    /// Start generation-owned timers exactly once after durable commit.
-    pub fn activate_timers(&self, handle: &tokio::runtime::Handle) {
-        if self
-            .timers_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        for entry in self.entries.values() {
-            if let Some(runtime) = entry.runtime() {
-                self.start_timer(
-                    entry.name.as_str(),
-                    &runtime,
-                    entry.provider_interval_secs,
-                    handle,
-                );
-            }
-        }
-    }
-
-    fn start_timer(
-        &self,
-        mount: &str,
-        runtime: &Arc<Runtime>,
-        provider_interval_secs: u32,
-        handle: &tokio::runtime::Handle,
-    ) {
-        if provider_interval_secs == 0 {
-            return;
-        }
-
-        let mount = mount.to_string();
-        let runtime = Arc::clone(runtime);
-        let mut shutdown = self.timer_shutdown.subscribe();
-        let task = handle.spawn({
-            let mount = mount.clone();
-            async move {
-                if *shutdown.borrow_and_update() {
-                    return;
-                }
-                let period = Duration::from_secs(u64::from(provider_interval_secs));
-                let mut interval = tokio::time::interval_at(
-                    tokio::time::Instant::now() + period,
-                    period,
-                );
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            if let Err(e) = runtime.call_timer_tick().await
-                            {
-                                debug!(mount = mount.as_str(), error = %e, "provider timer tick failed");
-                            }
-                        }
-                        changed = shutdown.changed() => {
-                            if changed.is_ok() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        self.timer_tasks.lock().push(task);
     }
 }
 
@@ -553,8 +441,6 @@ mod tests {
     use omnifs_provider::{Artifact, ProviderManifest};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
 
     fn wasm_artifact_path(file_name: &str) -> PathBuf {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -760,7 +646,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn durable_input_builds_before_timer_activation() {
+    async fn durable_input_builds_before_its_activation() {
         let root = tempfile::tempdir().expect("temp root");
         let path = test_provider_wasm_path();
         assert!(path.exists(), "build providers before the host fixture");
@@ -783,7 +669,6 @@ mod tests {
             )
             .expect("prepare durable mount"),
         );
-        assert!(!table.timers_active.load(Ordering::Acquire));
         assert!(table.get("test").is_some());
         let prepared = PreparedGeneration::new(
             Arc::clone(&table),
@@ -792,7 +677,6 @@ mod tests {
         );
         assert!(!prepared.background_active());
         let _cell = ServingCell::new([0x42; 16], prepared.activate());
-        assert!(table.timers_active.load(Ordering::Acquire));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -954,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn durable_input_publishes_all_mounts_and_joins_timers() {
+    async fn durable_input_publishes_all_mounts() {
         let root = tempfile::tempdir().expect("temp root");
         let path = test_provider_wasm_path();
         if !path.exists() {
@@ -978,12 +862,5 @@ mod tests {
         )
         .expect("prepare durable mount");
         assert_eq!(table.mounts(), ["test"]);
-        table.activate_timers(&tokio::runtime::Handle::current());
-        assert_eq!(table.timer_tasks.lock().len(), 1);
-        table.begin_retirement();
-        table
-            .shutdown_all_joined(tokio::time::Instant::now() + Duration::from_secs(1))
-            .await;
-        assert!(table.timer_tasks.lock().is_empty());
     }
 }

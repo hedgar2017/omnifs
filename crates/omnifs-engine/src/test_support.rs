@@ -337,21 +337,6 @@ impl Runtime {
         ))?;
         TestOp::from_transport(self, id, Ok(transport))
     }
-
-    #[doc(hidden)]
-    pub fn start_event(
-        &self,
-        event: wit_types::ProviderEvent,
-    ) -> crate::runtime::Result<TestOp<'_, ()>> {
-        let id = self.next_operation_id();
-        if self.test_callouts.is_some() {
-            return TestOp::start_callout(self, id, move |instance| async move {
-                instance.on_event(id, event).await
-            });
-        }
-        let transport = futures::executor::block_on(self.instance.on_event(id, event))?;
-        TestOp::from_transport(self, id, Ok(transport))
-    }
 }
 
 impl<'a, T> TestOp<'a, T> {

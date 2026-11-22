@@ -901,7 +901,6 @@ mod tests {
                 "defaultMount": "demo",
                 "witPackage": omnifs_engine::test_support::PROVIDER_WIT_PACKAGE,
                 "projection": 1,
-                "refreshIntervalSecs": 0,
                 "capabilities": [{
                     "kind": "domain",
                     "value": "api.demo.test",

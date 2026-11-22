@@ -58,12 +58,6 @@
       "description": "Filename of the provider WASM component.",
       "type": "string"
     },
-    "refreshIntervalSecs": {
-      "description": "Provider timer interval declared by `events(timer(...))`. Zero means\nthat the provider declares no timer event.",
-      "type": "integer",
-      "format": "uint32",
-      "minimum": 0
-    },
     "sdkVersion": {
       "description": "`omnifs-sdk` crate version used to generate the provider component.",
       "type": [
@@ -92,8 +86,7 @@
     "displayName",
     "provider",
     "defaultMount",
-    "projection",
-    "refreshIntervalSecs"
+    "projection"
   ],
   "$defs": {
     "AccessNeed": {
@@ -622,7 +615,7 @@
           ]
         },
         {
-          "description": "The JWT bearer grant of RFC 7523: the client signs an assertion with\nits own key and the token endpoint answers it with an access token.\nNo user signs in and no refresh token exists; the client ID is the\nissuer of the assertion and the client secret is the PEM of its RSA\nprivate key. The subject of the assertion is the one of the\ncredential, and the client itself for a credential without one. The\nscopes are the `scope` parameter of the token request.",
+          "description": "The JWT bearer grant of RFC 7523: the client signs an assertion with\nits own key and the token endpoint answers it with an access token.\nNo user signs in and no refresh token exists; the client ID is the\nissuer of the assertion and the client secret is the PEM of its RSA\nprivate key. The assertion names the subject of a credential with\none, and no subject without one. The scopes are the `scope` parameter\nof the token request.",
           "type": "string",
           "const": "jwtBearer"
         },

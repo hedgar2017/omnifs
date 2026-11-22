@@ -56,12 +56,6 @@ mod util;
 /// - The config metadata is derived from the inferred or explicit config type's
 ///   static config dialect (via `#[config]`) and spliced in automatically; no
 ///   argument is needed.
-/// - `events(timer(<seconds>, Self::method))`: register a timer
-///   handler `async fn method(cx: Cx<State>) -> Result<Invalidation>`; the
-///   interval is exported as the manifest's `refresh-interval-secs`. The
-///   returned [`Invalidation`](../omnifs_sdk/invalidation/struct.Invalidation.html)
-///   lowers to the host invalidation effect channel. Provider events without a
-///   registered handler warn and return no invalidations.
 ///
 /// What the expansion does, so debugging is not archaeology: it defines the
 /// provider type, thread-local `STATE`/`ROUTER`/range-handle

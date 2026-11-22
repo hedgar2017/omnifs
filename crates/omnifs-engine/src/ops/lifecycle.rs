@@ -340,34 +340,6 @@ impl Runtime {
         .await
     }
 
-    pub(crate) async fn run_event(
-        &self,
-        event: wit_types::ProviderEvent,
-        captured_epoch: u64,
-    ) -> Result<()> {
-        let id = self.next_operation_id();
-        let span =
-            inspector::provider_span(id, &self.mount_name, &self.provider_name, "on_event", "");
-        let _blobs = self.resources.operation_blobs(id);
-        async {
-            let (wire_result, effects) = self.instance.on_event(id, event).await?;
-            crate::op_validate::validate_event(&wire_result, &effects, |tree| {
-                self.tree_ref(tree).is_some()
-            })
-            .map_err(EngineError::ProviderProtocol)?;
-            inspect_result(&span, &wire_result);
-            self.provider_result(wire_result)?;
-            let transition = EffectApplier::new(&self.resources)
-                .lower_effects(&effects, clock::now_millis())
-                .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-            self.publish_transition(transition, captured_epoch)?;
-            inspector::record_outcome(&span, InspectorOutcome::Ok);
-            Ok(())
-        }
-        .instrument(span.clone())
-        .await
-    }
-
     pub(crate) fn publish_transition(
         &self,
         transition: crate::cache::ProjectionTransition,

@@ -94,7 +94,6 @@ impl GenerationProvenance {
 pub struct PreparedGeneration {
     namespace: Arc<crate::EngineNamespace>,
     table: Arc<crate::MountTable>,
-    runtime: Handle,
     provenance: GenerationProvenance,
 }
 
@@ -105,11 +104,10 @@ impl PreparedGeneration {
         runtime: Handle,
         provenance: GenerationProvenance,
     ) -> Self {
-        let namespace = crate::EngineNamespace::prepared(Arc::clone(&table), runtime.clone());
+        let namespace = crate::EngineNamespace::prepared(Arc::clone(&table), runtime);
         Self {
             namespace,
             table,
-            runtime,
             provenance,
         }
     }
@@ -126,7 +124,6 @@ impl PreparedGeneration {
             ready: ReadyNamespace::Engine {
                 namespace: self.namespace,
                 table: self.table,
-                runtime: self.runtime,
                 provenance: self.provenance,
             },
         }
@@ -146,7 +143,6 @@ enum ReadyNamespace {
     Engine {
         namespace: Arc<crate::EngineNamespace>,
         table: Arc<crate::MountTable>,
-        runtime: Handle,
         provenance: GenerationProvenance,
     },
     #[cfg(test)]
@@ -165,11 +161,9 @@ impl PublishReadyGeneration {
             ReadyNamespace::Engine {
                 namespace,
                 table,
-                runtime,
                 provenance,
             } => {
                 table.activate_resources();
-                table.activate_timers(&runtime);
                 namespace.activate();
                 let engine = Arc::clone(&namespace);
                 let namespace: Arc<dyn Namespace> = namespace;
@@ -496,7 +490,6 @@ impl GenerationInner {
     fn begin_retirement(&self) {
         if let Some(table) = &self.table {
             table.retire_resources();
-            table.begin_retirement();
         }
         if let Some(engine) = &self.engine {
             engine.begin_retirement();
@@ -508,7 +501,7 @@ impl GenerationInner {
             engine.shutdown_background(deadline).await;
         }
         if let Some(table) = &self.table {
-            table.shutdown_all_joined(deadline).await;
+            table.shutdown_all();
         }
     }
 }

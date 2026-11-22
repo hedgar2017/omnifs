@@ -978,7 +978,6 @@ fn token_provider_wasm(probe: std::net::SocketAddr) -> Vec<u8> {
         "provider": "demo.wasm",
         "defaultMount": "demo",
         "projection": 1,
-        "refreshIntervalSecs": 0,
         "capabilities": [{
             "kind": "domain",
             "value": "api.demo.test",

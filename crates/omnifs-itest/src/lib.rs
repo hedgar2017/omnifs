@@ -187,11 +187,6 @@ impl RuntimeHarness {
         self.runtime.start_read_file(&path, &content_type, None)
     }
 
-    pub fn timer_tick(&self) -> Result<TestOp<'_, ()>, EngineError> {
-        self.runtime
-            .start_event(omnifs_wit::host::types::ProviderEvent::TimerTick)
-    }
-
     pub fn current_epoch(&self) -> u64 {
         omnifs_engine::test_support::cache::current_epoch(&self.runtime)
     }

@@ -19,7 +19,6 @@ pub use crate::handler::{
     Cursor, DirCx, DirIntent, FileChunk, MemoryRangeReader, RangeReader, Tree, TreeRef,
 };
 pub use crate::identity::{Facet, IdentityCaptures, LogicalId};
-pub use crate::invalidation::Invalidation;
 pub use crate::object::{
     Canonical, FacetAxis, FacetMetadata, Key, Load, Object, ObjectEntry, ObjectKind, Preloads,
     Validator, decode_json,
@@ -36,5 +35,3 @@ pub use omnifs_core::ContentType;
 pub use omnifs_core::path::{ParseError, Path, Segment};
 
 pub use omnifs_sdk_macros::{Endpoint, config, object, path_captures, path_segment, provider};
-
-pub use omnifs_wit::provider::types::ProviderEvent;

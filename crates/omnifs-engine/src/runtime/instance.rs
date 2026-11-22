@@ -79,12 +79,6 @@ enum Command {
         span: tracing::Span,
         reply: tokio::sync::oneshot::Sender<ChunkTransport>,
     },
-    OnEvent {
-        id: u64,
-        event: wit_types::ProviderEvent,
-        span: tracing::Span,
-        reply: tokio::sync::oneshot::Sender<EventTransport>,
-    },
     Feed {
         id: u64,
         path: String,
@@ -140,13 +134,6 @@ type OpenTransport = std::result::Result<
 type ChunkTransport = std::result::Result<
     (
         std::result::Result<wit_types::ReadChunkResult, wit_types::ProviderError>,
-        wit_types::Effects,
-    ),
-    EngineError,
->;
-type EventTransport = std::result::Result<
-    (
-        std::result::Result<(), wit_types::ProviderError>,
         wit_types::Effects,
     ),
     EngineError,
@@ -323,27 +310,6 @@ impl Instance {
                 handle,
                 offset,
                 length,
-                span: tracing::Span::current(),
-                reply,
-            })
-            .map_err(|_| {
-                EngineError::ProviderProtocol("provider instance driver stopped".to_string())
-            })?;
-        recv.await.map_err(|_| {
-            EngineError::ProviderProtocol("provider operation reply dropped".to_string())
-        })?
-    }
-
-    pub(crate) async fn on_event(
-        &self,
-        id: u64,
-        event: wit_types::ProviderEvent,
-    ) -> EventTransport {
-        let (reply, recv) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(Command::OnEvent {
-                id,
-                event,
                 span: tracing::Span::current(),
                 reply,
             })
@@ -552,17 +518,6 @@ async fn drive_instance(
                                     let result = namespace
                                         .omnifs_provider_namespace()
                                         .call_feed(accessor, id, path, token, start)
-                                        .await
-                                        .map_err(Into::into);
-                                    let _ = reply.send(result);
-                                }.instrument(span)));
-                            },
-                            Command::OnEvent { id, event, span, reply } => {
-                                let notify = Arc::clone(&bindings);
-                                calls.push(Box::pin(async move {
-                                    let result = notify
-                                        .omnifs_provider_notify()
-                                        .call_on_event(accessor, id, event)
                                         .await
                                         .map_err(Into::into);
                                     let _ = reply.send(result);

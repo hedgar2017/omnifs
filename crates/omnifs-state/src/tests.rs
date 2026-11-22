@@ -1452,8 +1452,7 @@ fn provider_wasm(description_bytes: usize) -> Vec<u8> {
         "description": "x".repeat(description_bytes),
         "provider": "demo.wasm",
         "defaultMount": "demo",
-        "projection": 1,
-        "refreshIntervalSecs": 0
+        "projection": 1
     }))
     .unwrap();
     let name = omnifs_provider::PROVIDER_METADATA_SECTION_NAME.as_bytes();

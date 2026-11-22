@@ -586,7 +586,16 @@ where
     let _ = ReturnValidator::common(result, effects, tree_exists)?;
     Ok(())
 }
-pub(crate) fn validate_event<F>(
+fn effects_empty(effects: &wit_types::Effects) -> bool {
+    effects.canonical.is_empty()
+        && effects.fs.is_empty()
+        && effects.invalidations.is_empty()
+        && effects.removals.is_empty()
+}
+
+/// The checks of the effects of any terminal, for the tests of them alone.
+#[cfg(test)]
+fn validate_effects<F>(
     result: &std::result::Result<(), wit_types::ProviderError>,
     effects: &wit_types::Effects,
     tree_exists: F,
@@ -596,13 +605,6 @@ where
 {
     let _ = ReturnValidator::common(result, effects, tree_exists)?;
     Ok(())
-}
-
-fn effects_empty(effects: &wit_types::Effects) -> bool {
-    effects.canonical.is_empty()
-        && effects.fs.is_empty()
-        && effects.invalidations.is_empty()
-        && effects.removals.is_empty()
 }
 
 #[cfg(test)]
@@ -719,7 +721,7 @@ mod tests {
             fs: vec![fs_file_write("bad".to_string(), deferred_exact(1))],
             ..effects()
         };
-        let error = validate_event(&Ok(()), &effects, |_| true).unwrap_err();
+        let error = validate_effects(&Ok(()), &effects, |_| true).unwrap_err();
         assert!(error.contains("fs-write path") && error.contains("valid protocol path"));
     }
 
@@ -731,7 +733,7 @@ mod tests {
             fs: vec![fs_file_write("/bad".to_string(), bad_size_file)],
             ..effects()
         };
-        let error = validate_event(&Ok(()), &bad_size_effects, |_| true).unwrap_err();
+        let error = validate_effects(&Ok(()), &bad_size_effects, |_| true).unwrap_err();
         assert!(error.contains("declares size 4"));
 
         let aggregate_effects = wit_types::Effects {
@@ -750,7 +752,7 @@ mod tests {
                 .collect(),
             ..effects()
         };
-        let error = validate_event(&Ok(()), &aggregate_effects, |_| true).unwrap_err();
+        let error = validate_effects(&Ok(()), &aggregate_effects, |_| true).unwrap_err();
         assert!(error.contains("aggregate eager byte limit"));
     }
 
@@ -863,7 +865,7 @@ mod tests {
             )],
             ..effects()
         };
-        let error = validate_event(&result, &effects, |_| true).unwrap_err();
+        let error = validate_effects(&result, &effects, |_| true).unwrap_err();
         assert!(error.contains("error returns must not carry effects"));
     }
 

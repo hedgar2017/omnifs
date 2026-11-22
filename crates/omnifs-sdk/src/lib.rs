@@ -192,7 +192,6 @@ pub mod git;
 pub mod handler;
 pub mod http;
 pub mod identity;
-pub mod invalidation;
 pub mod object;
 pub mod prelude;
 pub mod projection;

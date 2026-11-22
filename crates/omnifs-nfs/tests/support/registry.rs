@@ -2,13 +2,11 @@ use omnifs_engine::MountTable;
 use omnifs_engine::{MountBuildInput, MountBuildState, ProviderBuildInput, RuntimeMountConfig};
 use omnifs_provider::Artifact;
 use std::path::Path;
-use std::time::Duration;
 
 pub fn load_registry_from_mount_dir(
     cache_dir: &Path,
     clone_dir: &Path,
     mounts_dir: &Path,
-    handle: &tokio::runtime::Handle,
 ) -> MountTable {
     let host =
         omnifs_engine::test_support::open_test_host(cache_dir, clone_dir).expect("open test host");
@@ -36,7 +34,7 @@ pub fn load_registry_from_mount_dir(
     let (artifact, manifest) =
         Artifact::from_bytes_with_manifest("test_provider.wasm", provider_bytes.clone())
             .expect("parse test provider artifact");
-    let registry = MountTable::prepare_durable(
+    MountTable::prepare_durable(
         &host,
         vec![MountBuildInput {
             config: RuntimeMountConfig {
@@ -56,18 +54,5 @@ pub fn load_registry_from_mount_dir(
             },
         }],
     )
-    .unwrap_or_else(|error| panic!("load mount snapshot: {error}"));
-    registry.activate_timers(handle);
-
-    // The provider timer interval fires once immediately after spawn. Tests
-    // that assert explicit invalidation behavior start from a quiet fixture.
-    handle.block_on(async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    });
-    for (_mount, runtime) in registry.runtime_entries() {
-        let _ = runtime.drain_invalidated_prefixes();
-        let _ = runtime.drain_invalidated_paths();
-    }
-
-    registry
+    .unwrap_or_else(|error| panic!("load mount snapshot: {error}"))
 }

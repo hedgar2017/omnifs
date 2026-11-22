@@ -178,7 +178,6 @@ mod tests {
             "provider": "demo.wasm",
             "defaultMount": "demo",
             "projection": 1,
-            "refreshIntervalSecs": 0,
             "capabilities": [{
                 "kind": "domain",
                 "value": "api.demo.test",
@@ -320,6 +319,48 @@ mod tests {
         let error = submit(&manifest(address, None)).await.unwrap_err();
         assert!(
             error.to_string().contains("the response is not JSON"),
+            "{error:#}"
+        );
+    }
+
+    /// The validation of the Slack provider as its artifact declares it:
+    /// `auth.test` takes a bot token, whose answer names its `bot_id`, and
+    /// refuses a token of a user, whose answer has none. The answer is the
+    /// one of a local server at the URL of the declaration.
+    #[tokio::test]
+    async fn the_validation_of_slack_takes_the_token_of_a_bot_alone() {
+        let wasm = omnifs_engine::test_support::cargo_target_dir(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        )
+        .join("wasm32-wasip2/release/omnifs_provider_slack.wasm");
+        let bytes = std::fs::read(&wasm).expect("the Slack provider is built");
+        let (_, slack) =
+            omnifs_provider::Artifact::from_bytes_with_manifest("slack.wasm", bytes).unwrap();
+        let declared = |address: std::net::SocketAddr| {
+            let mut value = serde_json::to_value(&slack).unwrap();
+            let validation = &mut value["auth"]["schemes"][0]["staticToken"]["validation"];
+            assert_eq!(validation["url"], "https://slack.com/api/auth.test");
+            validation["url"] = format!("http://{address}/api/auth.test").into();
+            ProviderManifest::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap()
+        };
+        let (address, request) =
+            serve(json_answer(r#"{"ok":true,"user_id":"U1","bot_id":"B1"}"#)).await;
+        submit(&declared(address)).await.unwrap();
+        let request = request.await.unwrap();
+        assert!(
+            request.starts_with("post /api/auth.test http/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("\r\nauthorization: bearer xoxb-1\r\n"),
+            "{request}"
+        );
+        let (address, _) = serve(json_answer(r#"{"ok":true,"user_id":"U1"}"#)).await;
+        let error = submit(&declared(address)).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`/bot_id` of the response is absent"),
             "{error:#}"
         );
     }

@@ -985,8 +985,7 @@ struct RepoKey {
             "Fixture repositories whose trees host tests open."
         ),
     ),
-    limits(memory_mb(16, "Canned-data fixture needs only a small heap."),),
-    events(timer(60, Self::on_tick))
+    limits(memory_mb(16, "Canned-data fixture needs only a small heap."),)
 )]
 impl TestProvider {
     fn start(config: Config, r: &mut Router<State>) -> Result<State> {
@@ -1084,17 +1083,6 @@ impl TestProvider {
         r.dir("/dynamic/{name}").handler(dynamic)?;
 
         Ok(State::default())
-    }
-
-    /// Intent-tagged invalidation: evict the cached `/scoped/item` listing and
-    /// item 7's canonical object (and its facet-expanded view leaves).
-    fn on_tick(_cx: Cx<State>) -> impl core::future::Future<Output = Result<Invalidation>> {
-        core::future::ready(Ok(Invalidation::new()
-            .listing_path("/scoped/item")
-            .object::<Item>(&ItemKey {
-                filter: Facet::<StateFilter>(StateFilter::Open),
-                number: 7,
-            })))
     }
 }
 

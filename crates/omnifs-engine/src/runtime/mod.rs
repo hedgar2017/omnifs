@@ -377,14 +377,6 @@ impl Runtime {
         self.next_operation_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub async fn call_timer_tick(&self) -> Result<()> {
-        self.run_event(
-            wit_types::ProviderEvent::TimerTick,
-            self.resources.current_epoch(),
-        )
-        .await
-    }
-
     /// Resolve a host-issued Git tree handle for the private namespace facade.
     pub(crate) fn tree_ref(&self, tree_ref: u64) -> Option<crate::tree_refs::TreeRef> {
         self.trees.resolve(tree_ref)

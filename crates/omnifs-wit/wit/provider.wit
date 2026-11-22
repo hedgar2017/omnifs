@@ -517,13 +517,6 @@ interface types {
         warn,
         error,
     }
-
-    variant provider-event {
-        file-changed(string),
-        webhook-received(list<u8>),
-        timer-tick,
-        auth-refreshed,
-    }
 }
 
 // === Provider exports ===
@@ -565,13 +558,6 @@ interface namespace {
     /// serves them.
     feed: async func(id: correlation-id, path: string, token: option<feed-token>, start: option<feed-start>)
         -> tuple<result<feed-answer, provider-error>, effects, option<u64>>;
-}
-
-interface notify {
-    use types.{correlation-id, effects, provider-error, provider-event};
-
-    on-event: async func(id: correlation-id, event: provider-event)
-        -> tuple<result<_, provider-error>, effects>;
 }
 
 // === Host import ===
@@ -619,5 +605,4 @@ world provider {
     import projection;
     export lifecycle;
     export namespace;
-    export notify;
 }

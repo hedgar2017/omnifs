@@ -392,8 +392,7 @@ mod tests {
                 "displayName": "GitHub",
                 "provider": "github.wasm",
                 "defaultMount": "github",
-                "projection": 1,
-                "refreshIntervalSecs": 0
+                "projection": 1
             }"#,
         )
         .unwrap()

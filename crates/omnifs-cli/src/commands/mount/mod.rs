@@ -634,7 +634,6 @@ mod tests {
             "provider": "demo.wasm",
             "defaultMount": "demo",
             "projection": 1,
-            "refreshIntervalSecs": 0,
             "capabilities": [{
                 "kind": "domain",
                 "value": "api.demo.test",

@@ -365,13 +365,15 @@ async fn test_cache_isolated_by_mount_name() {
     let item_b = resolve_mount_namespace(ns, "mount-b", "/scoped/item").await;
     let mut events = ns.subscribe();
     let op_gen = runtime_a.resources.current_epoch();
-    let (tick_result, effects) = harness
-        .timer_tick()
-        .unwrap()
-        .into_result_and_effects()
-        .unwrap();
-    tick_result.unwrap();
-    publish_effects_for_test(&runtime_a, &effects, op_gen).expect("timer effects should publish");
+    let effects = omnifs_wit::host::types::Effects {
+        canonical: Vec::new(),
+        fs: Vec::new(),
+        invalidations: vec![omnifs_wit::host::types::Invalidation::Listing(
+            omnifs_wit::host::types::PathOrPrefix::Path("/scoped/item".to_owned()),
+        )],
+        removals: Vec::new(),
+    };
+    publish_effects_for_test(&runtime_a, &effects, op_gen).expect("invalidations should publish");
     let refreshed_a = ns.getattr(item_a.path.clone()).await.unwrap();
     assert_ne!(refreshed_a.change, item_a.attrs().unwrap().change);
     let refreshed_b = ns.getattr(item_b.path.clone()).await.unwrap();

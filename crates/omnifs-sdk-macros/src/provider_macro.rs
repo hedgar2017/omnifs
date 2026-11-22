@@ -1,26 +1,19 @@
 //! The `#[provider]` attribute macro.
 //!
-//! It backs `#[omnifs_sdk::provider(id = "..", capabilities(..), limits(..), auth = .., events(..))]`
+//! It backs `#[omnifs_sdk::provider(id = "..", capabilities(..), limits(..), auth = ..)]`
 //! on a provider impl block whose synchronous `start(..)` method defines the
 //! provider config, state, and routes.
 
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::{format_ident, quote, quote_spanned};
+use quote::{quote, quote_spanned};
 use serde_json::Value;
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{
-    FnArg, ImplItem, ImplItemFn, ItemImpl, LitInt, LitStr, Path, PathArguments, Token, Type,
-    parse_quote,
+    FnArg, ImplItem, ImplItemFn, ItemImpl, LitInt, LitStr, PathArguments, Token, Type, parse_quote,
 };
 
 use crate::util::{BytePiece, byte_array_tokens, generic_type_arg};
-
-/// A `timer(seconds, Self::method)` event declaration.
-struct TimerSpec {
-    interval_secs: u32,
-    handler: Path,
-}
 
 enum ParsedAccessNeed {
     Domain {
@@ -66,7 +59,6 @@ pub struct ProviderArgs {
     capabilities: Vec<ParsedAccessNeed>,
     limits: ParsedLimitDeclarations,
     auth: Option<LitStr>,
-    timer: Option<TimerSpec>,
 }
 
 impl Parse for ProviderArgs {
@@ -80,7 +72,6 @@ impl Parse for ProviderArgs {
             capabilities: Vec::new(),
             limits: ParsedLimitDeclarations::default(),
             auth: None,
-            timer: None,
         };
 
         while !input.is_empty() {
@@ -126,15 +117,10 @@ impl Parse for ProviderArgs {
                     let _: Token![=] = input.parse()?;
                     args.auth = Some(parse_auth_literal(input)?);
                 },
-                "events" => {
-                    let content;
-                    syn::parenthesized!(content in input);
-                    parse_events(&content, &mut args)?;
-                },
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "supported provider arguments are `id`/`display_name`/`description`/`mount`/`projection`, `capabilities(...)`, `limits(...)`, `auth = ...`, and `events(...)`",
+                        "supported provider arguments are `id`/`display_name`/`description`/`mount`/`projection`, `capabilities(...)`, `limits(...)`, and `auth = ...`",
                     ));
                 },
             }
@@ -308,35 +294,6 @@ fn parse_dynamic_why(inner: ParseStream<'_>, kind: &syn::Ident) -> syn::Result<S
     let _: Token![,] = inner.parse()?;
     let why: LitStr = inner.parse()?;
     Ok(why.value())
-}
-
-fn parse_events(content: ParseStream<'_>, args: &mut ProviderArgs) -> syn::Result<()> {
-    while !content.is_empty() {
-        let key: syn::Ident = content.parse()?;
-        match key.to_string().as_str() {
-            "timer" => {
-                let inner;
-                syn::parenthesized!(inner in content);
-                let interval: LitInt = inner.parse()?;
-                let _: Token![,] = inner.parse()?;
-                let handler: Path = inner.parse()?;
-                args.timer = Some(TimerSpec {
-                    interval_secs: interval.base10_parse()?,
-                    handler,
-                });
-            },
-            _ => {
-                return Err(syn::Error::new(
-                    key.span(),
-                    "supported events are `timer(<Duration>, Self::method)`",
-                ));
-            },
-        }
-        if content.peek(Token![,]) {
-            let _: Token![,] = content.parse()?;
-        }
-    }
-    Ok(())
 }
 
 fn parse_auth_literal(input: ParseStream<'_>) -> syn::Result<LitStr> {
@@ -530,7 +487,6 @@ impl ManifestFacts {
         capabilities: &[ParsedAccessNeed],
         limits: &ParsedLimitDeclarations,
         auth: Option<&LitStr>,
-        refresh_interval_secs: u32,
         has_config: bool,
     ) -> syn::Result<TokenStream2> {
         let mut fields = Vec::new();
@@ -547,7 +503,6 @@ impl ManifestFacts {
         fields.push(("witPackage", json_string(omnifs_wit::PROVIDER_WIT_PACKAGE)));
         fields.push(("sdkVersion", json_string(env!("CARGO_PKG_VERSION"))));
         fields.push(("projection", self.projection.to_string()));
-        fields.push(("refreshIntervalSecs", refresh_interval_secs.to_string()));
         if !capabilities.is_empty() {
             fields.push(("capabilities", capabilities_json(capabilities)));
         }
@@ -1067,93 +1022,6 @@ fn generate_namespace(type_name: &syn::Ident, state_type: &Type) -> TokenStream2
     }
 }
 
-fn generate_notify(
-    type_name: &syn::Ident,
-    state_type: &Type,
-    timer: Option<&TimerSpec>,
-) -> TokenStream2 {
-    let warn_ignored_event = quote! {
-        omnifs_sdk::omnifs::provider::log::log(&omnifs_sdk::omnifs::provider::types::LogEntry {
-            level: omnifs_sdk::omnifs::provider::types::LogLevel::Warn,
-            message: format!(
-                "ignored provider event `{}`: no handler registered",
-                event.name()
-            ),
-        });
-    };
-    let output = quote! {
-        (
-            core::result::Result<(), omnifs_sdk::omnifs::provider::types::ProviderError>,
-            omnifs_sdk::omnifs::provider::types::Effects,
-        )
-    };
-    let not_initialized = quote! {
-        (
-            Err(omnifs_sdk::error::ProviderError::internal(
-                "provider not initialized",
-            ).into()),
-            omnifs_sdk::prelude::Effects::new().into_wit(),
-        )
-    };
-    // Without a timer no event has a handler, so the answer is ready
-    // without a future of a handler to await.
-    let Some(timer) = timer else {
-        return quote! {
-            impl omnifs_sdk::exports::omnifs::provider::notify::Guest for #type_name {
-                fn on_event(
-                    _id: u64,
-                    event: omnifs_sdk::prelude::ProviderEvent,
-                ) -> impl core::future::Future<Output = #output> {
-                    core::future::ready(if state_handle().is_ok() {
-                        #warn_ignored_event
-                        (Ok(()), omnifs_sdk::prelude::Effects::new().into_wit())
-                    } else {
-                        #not_initialized
-                    })
-                }
-            }
-        };
-    };
-    let method = timer
-        .handler
-        .segments
-        .last()
-        .map(|segment| segment.ident.clone());
-    let method = method.unwrap_or_else(|| format_ident!("on_tick"));
-
-    quote! {
-        impl omnifs_sdk::exports::omnifs::provider::notify::Guest for #type_name {
-            async fn on_event(
-                id: u64,
-                event: omnifs_sdk::prelude::ProviderEvent,
-            ) -> #output {
-                let Ok(state) = state_handle() else {
-                    return #not_initialized;
-                };
-                let future_cx = omnifs_sdk::__internal::Cx::<#state_type>::new(id, state);
-                match &event {
-                    omnifs_sdk::omnifs::provider::types::ProviderEvent::TimerTick => {
-                        match #type_name::#method(future_cx).await {
-                            Ok(inv) => (
-                                Ok(()),
-                                inv.into_effects().into_wit(),
-                            ),
-                            Err(error) => (
-                                Err(error.into()),
-                                omnifs_sdk::prelude::Effects::new().into_wit(),
-                            ),
-                        }
-                    },
-                    _ => {
-                        #warn_ignored_event
-                        (Ok(()), omnifs_sdk::prelude::Effects::new().into_wit())
-                    },
-                }
-            }
-        }
-    }
-}
-
 pub(crate) fn provider_impl(args: &ProviderArgs, input: ItemImpl) -> syn::Result<TokenStream2> {
     let type_name = match &*input.self_ty {
         Type::Path(path) => path
@@ -1178,20 +1046,17 @@ pub(crate) fn provider_impl(args: &ProviderArgs, input: ItemImpl) -> syn::Result
         ));
     }
     let manifest = ManifestFacts::from_args(args)?;
-    let refresh_interval_secs = args.timer.as_ref().map_or(0, |timer| timer.interval_secs);
     let metadata = manifest.metadata_tokens(
         config_type,
         &args.capabilities,
         &args.limits,
         args.auth.as_ref(),
-        refresh_interval_secs,
         matches!(start_kind, StartKind::ConfigAndRouter),
     )?;
 
     let state_management = generate_state_management(state_type);
     let lifecycle = generate_lifecycle(&type_name, config_type, state_type, start_kind);
     let namespace = generate_namespace(&type_name, state_type);
-    let notify = generate_notify(&type_name, state_type, args.timer.as_ref());
 
     Ok(quote! {
         struct #type_name;
@@ -1207,7 +1072,6 @@ pub(crate) fn provider_impl(args: &ProviderArgs, input: ItemImpl) -> syn::Result
         #metadata
         #lifecycle
         #namespace
-        #notify
 
         #[cfg(target_arch = "wasm32")]
         omnifs_sdk::export!(#type_name with_types_in omnifs_sdk);
