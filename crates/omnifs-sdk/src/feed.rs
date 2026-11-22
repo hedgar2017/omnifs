@@ -38,7 +38,7 @@
 //!
 //! The host calls the feed `method` once per part of an answer with a
 //! [`FeedCx`]: the anchor path and the key of the object, the token the feed
-//! returned last, the declared starting path an operation without its fact
+//! returned last, as the type the feed gave it ([`FeedCx::token`]), the declared starting path an operation without its fact
 //! started the answer from ([`FeedCx::start`]), or of the operation of an
 //! answer past the deadline of the feed ([`FeedCx::due`]), the listings and
 //! the fed files of the projection, and the facts the part writes. The method
@@ -61,6 +61,16 @@ use crate::identity::IdentityCaptures;
 use crate::object::{Key, Object, ObjectKind};
 use omnifs_core::path::Path;
 use omnifs_wit::provider::types as wit_types;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+/// The string the host keeps for `token`: the one encoding of a token, which
+/// [`FeedCx::token`] reads. A token that does not encode is the `internal`
+/// error of the call.
+fn encode(token: &impl Serialize) -> Result<String> {
+    serde_json::to_string(token)
+        .map_err(|error| ProviderError::internal(format!("a feed token does not encode: {error}")))
+}
 
 /// The declared starting path of the operation that started an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,8 +123,29 @@ impl<K, S> FeedCx<K, S> {
     }
 
     /// The token of the last part the host published for this feed, or of
-    /// the inner state an outer feed gave it; `None` before its first part.
-    pub fn token(&self) -> Option<&str> {
+    /// the inner state an outer feed gave it, as the `T` that
+    /// [`Feed::part`], [`FeedPart::inner`], or [`Feed::restart`] took;
+    /// `None` before its first part. A token that is no `T` is the
+    /// `invalid-input` error of the call, which no retry answers: the host
+    /// keeps the state of the feed, and each operation that asks the feed
+    /// takes the error until the provider moves the number of its
+    /// projection, which a change of the meaning of its tokens asks for.
+    pub fn token<T: DeserializeOwned>(&self) -> Result<Option<T>> {
+        self.token
+            .as_deref()
+            .map(|token| {
+                serde_json::from_str(token).map_err(|error| {
+                    ProviderError::invalid_input(format!(
+                        "the token of the feed at {} is not of its type: {error}",
+                        self.path
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    /// The token as the string the host keeps.
+    pub fn raw_token(&self) -> Option<&str> {
         self.token.as_deref()
     }
 
@@ -267,9 +298,15 @@ impl Feed {
         Self::Unchanged
     }
 
-    /// One part of the answer, with the token after it. The answer ends with
-    /// it unless [`FeedPart::more`] says more parts follow.
-    pub fn part(token: impl Into<String>) -> FeedPart {
+    /// One part of the answer, with the token after it, which the next call
+    /// reads with [`FeedCx::token`]. The answer ends with it unless
+    /// [`FeedPart::more`] says more parts follow.
+    pub fn part(token: &impl Serialize) -> Result<FeedPart> {
+        encode(token).map(Self::raw_part)
+    }
+
+    /// [`Self::part`] with the token as the string the host keeps.
+    pub fn raw_part(token: impl Into<String>) -> FeedPart {
         FeedPart {
             token: token.into(),
             more: false,
@@ -283,7 +320,12 @@ impl Feed {
     /// feed, with the end of its first answer and its deadline as they were,
     /// and gives `error` to each operation that waits for the answer. The
     /// writes of the call are not facts.
-    pub fn restart(token: impl Into<String>, error: ProviderError) -> Self {
+    pub fn restart(token: &impl Serialize, error: ProviderError) -> Result<Self> {
+        encode(token).map(|token| Self::raw_restart(token, error))
+    }
+
+    /// [`Self::restart`] with the token as the string the host keeps.
+    pub fn raw_restart(token: impl Into<String>, error: ProviderError) -> Self {
         Self::Restart {
             token: token.into(),
             error,
@@ -314,9 +356,15 @@ impl FeedPart {
     }
 
     /// The token of the inner feed of the object of type `O` with `key`, as
-    /// an item of a page of rows: the host keeps it as that feed's state.
+    /// an item of a page of rows: the host keeps it as that feed's state,
+    /// which the feed of that object reads with [`FeedCx::token`].
+    pub fn inner<O: Object>(self, key: &O::Key, token: &impl Serialize) -> Result<Self> {
+        encode(token).map(|token| self.raw_inner::<O>(key, token))
+    }
+
+    /// [`Self::inner`] with the token as the string the host keeps.
     #[must_use]
-    pub fn inner<O: Object>(mut self, key: &O::Key, token: impl Into<String>) -> Self {
+    pub fn raw_inner<O: Object>(mut self, key: &O::Key, token: impl Into<String>) -> Self {
         self.inner.push(InnerState {
             kind: O::kind(),
             identity: key.identity_captures(),

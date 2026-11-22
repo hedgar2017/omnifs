@@ -190,12 +190,12 @@ enum Inner {
 /// A part with `token`, followed by more parts for `more`, with the inner
 /// states `inner`.
 fn feed_part(token: String, more: bool, inner: impl IntoIterator<Item = Inner>) -> Feed {
-    let mut part = Feed::part(token).more(more);
+    let mut part = Feed::raw_part(token).more(more);
     for inner in inner {
         part = match inner {
-            Inner::Message(key, token) => part.inner::<Message>(&key, token),
-            Inner::File(key, token) => part.inner::<File>(&key, token),
-            Inner::ReplyFile(key, token) => part.inner::<ReplyFile>(&key, token),
+            Inner::Message(key, token) => part.raw_inner::<Message>(&key, token),
+            Inner::File(key, token) => part.raw_inner::<File>(&key, token),
+            Inner::ReplyFile(key, token) => part.raw_inner::<ReplyFile>(&key, token),
         };
     }
     part.into()
@@ -438,7 +438,10 @@ impl Channels {
 /// page had. `invalid_cursor` restarts the feed with the token of the first
 /// page.
 async fn full_listing(cx: &FeedCx<WorkspaceKey>, listing: Listing) -> Result<Feed> {
-    let token = cx.token().map(decode_token::<ListingToken>).transpose()?;
+    let token = cx
+        .raw_token()
+        .map(decode_token::<ListingToken>)
+        .transpose()?;
     let (cursor, mut ids) = match token.flatten() {
         Some(ListingPage { cursor, ids }) => (Some(cursor), ids),
         None => (None, BTreeSet::new()),
@@ -453,7 +456,7 @@ async fn full_listing(cx: &FeedCx<WorkspaceKey>, listing: Listing) -> Result<Fee
             of: Refused::Cursor,
             error,
         }) if cursor.is_some() => {
-            return Ok(Feed::restart(encode(&ListingToken::None)?, error));
+            return Ok(Feed::raw_restart(encode(&ListingToken::None)?, error));
         },
         Err(refusal) => return Err(refusal.error),
     };
@@ -469,12 +472,12 @@ async fn full_listing(cx: &FeedCx<WorkspaceKey>, listing: Listing) -> Result<Fee
     }
     if let Some(cursor) = page.next {
         let token = Some(ListingPage { cursor, ids });
-        return Ok(Feed::part(encode(&token)?).more(true).into());
+        return Ok(Feed::raw_part(encode(&token)?).more(true).into());
     }
     for id in listed::<_, Id>(cx, folder.as_str())?.difference(&ids) {
         cx.remove(format!("{folder}/{id}"))?;
     }
-    Ok(Feed::part(encode(&ListingToken::None)?).into())
+    Ok(Feed::raw_part(encode(&ListingToken::None)?).into())
 }
 
 // ===========================================================================
@@ -488,7 +491,10 @@ impl History {
     /// projection lost, as after a removal of the channel by another feed;
     /// else a sweep down to the latest message of its token.
     pub(crate) async fn feed(cx: FeedCx<ChannelKey>) -> Result<Feed> {
-        let token = cx.token().map(decode_token::<HistoryToken>).transpose()?;
+        let token = cx
+            .raw_token()
+            .map(decode_token::<HistoryToken>)
+            .transpose()?;
         let (latest, stage) = match token {
             None => (None, Stage::first(Sweep::First)),
             Some(token) if lost(&cx, &token)? => {
@@ -570,7 +576,7 @@ async fn sweep(cx: &FeedCx<ChannelKey>, latest: Option<Ts>, stage: Stage) -> Res
                 latest: None,
                 stage: None,
             };
-            return Ok(Feed::part(encode(&token)?).into());
+            return Ok(Feed::raw_part(encode(&token)?).into());
         },
         Err(Refusal {
             of: Refused::Cursor,
@@ -580,7 +586,7 @@ async fn sweep(cx: &FeedCx<ChannelKey>, latest: Option<Ts>, stage: Stage) -> Res
                 latest,
                 stage: Some(Stage::first(sweep)),
             };
-            return Ok(Feed::restart(encode(&token)?, error));
+            return Ok(Feed::raw_restart(encode(&token)?, error));
         },
         Err(refusal) => return Err(refusal.error),
     };
@@ -662,7 +668,10 @@ impl Message {
     /// and after it, in the same answer, its replies for a due start, each in
     /// `replies`, of a message with another `latest_reply` or `reply_count`.
     pub(crate) async fn feed(cx: FeedCx<MessageKey>) -> Result<Feed> {
-        let token = cx.token().map(decode_token::<MessageToken>).transpose()?;
+        let token = cx
+            .raw_token()
+            .map(decode_token::<MessageToken>)
+            .transpose()?;
         let mut feed = MessageFeed {
             cx: &cx,
             messages: folder(cx.path())?,
@@ -800,7 +809,7 @@ impl MessageFeed<'_> {
                 error,
             }) if cursor.is_some() => {
                 let token = Some(Replies::default());
-                return Ok(Feed::restart(encode(&token)?, error));
+                return Ok(Feed::raw_restart(encode(&token)?, error));
             },
             Err(refusal) => return Err(refusal.error),
         };
@@ -881,7 +890,7 @@ impl ReplyFile {
 /// alone: each other answer is the error of its status, the rate-limited
 /// error with the seconds of its `Retry-After` for `429`.
 async fn content<K>(cx: &FeedCx<K>) -> Result<Feed> {
-    let token = cx.token().ok_or_else(|| {
+    let token = cx.raw_token().ok_or_else(|| {
         ProviderError::internal("the feed of a file has no token of the feed that took the file")
     })?;
     let file: FileToken = decode_token(token)?;
@@ -907,5 +916,5 @@ async fn content<K>(cx: &FeedCx<K>) -> Result<Feed> {
         size: blob.size,
     };
     cx.blob(format!("{}/content", cx.path()), &handle)?;
-    Ok(Feed::part(token).into())
+    Ok(Feed::raw_part(token).into())
 }

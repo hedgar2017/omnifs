@@ -1049,7 +1049,7 @@ impl Repo {
             comments,
             counts,
             stage,
-        }) = cx.token().map(decode).transpose()?
+        }) = cx.raw_token().map(decode).transpose()?
         else {
             let mut feed = RepoFeed {
                 cx: &cx,
@@ -1128,7 +1128,7 @@ impl RepoFeed<'_> {
             let token = encode(&row.token(None))?;
             let number = row.data.number;
             part = match row.item().kind {
-                ItemKind::Issues => part.inner::<Issue>(
+                ItemKind::Issues => part.raw_inner::<Issue>(
                     &IssueKey {
                         owner: key.owner.clone(),
                         repo: key.repo.clone(),
@@ -1137,7 +1137,7 @@ impl RepoFeed<'_> {
                     },
                     token,
                 ),
-                ItemKind::Pulls => part.inner::<PullRequest>(
+                ItemKind::Pulls => part.raw_inner::<PullRequest>(
                     &PullKey {
                         owner: key.owner.clone(),
                         repo: key.repo.clone(),
@@ -1592,7 +1592,7 @@ impl RepoFeed<'_> {
     /// while a stage remains.
     fn part(&self, stage: Option<Stage>) -> Result<FeedPart> {
         let more = stage.is_some();
-        Ok(Feed::part(encode(&RepoToken {
+        Ok(Feed::raw_part(encode(&RepoToken {
             rows: self.rows.clone(),
             comments: self.comments.clone(),
             counts: self.counts.clone(),
@@ -1645,7 +1645,7 @@ impl PullRequest {
 /// Each answer makes a part of each request.
 async fn item_feed<K>(cx: &FeedCx<K>, repo: &RepoId, item: ItemRef) -> Result<Feed> {
     let token = cx
-        .token()
+        .raw_token()
         .map(decode::<Option<ItemToken>>)
         .transpose()?
         .flatten();
@@ -1804,7 +1804,7 @@ async fn take_item_request<K>(
 /// A part of the feed of an item with `token`, followed by more parts while
 /// its answer has a next request.
 fn item_part(token: &ItemToken) -> Result<Feed> {
-    Ok(Feed::part(encode(&Some(token))?)
+    Ok(Feed::raw_part(encode(&Some(token))?)
         .more(token.next.is_some())
         .into())
 }
@@ -1825,5 +1825,5 @@ fn write_found<K>(cx: &FeedCx<K>, repo: &RepoId, item: ItemRef, row: &ItemRow) -
 /// item.
 fn removal<K>(cx: &FeedCx<K>, repo: &RepoId, item: ItemRef) -> Result<Feed> {
     remove_item(cx, repo, item)?;
-    Ok(Feed::part(encode(&None::<ItemToken>)?).into())
+    Ok(Feed::raw_part(encode(&None::<ItemToken>)?).into())
 }

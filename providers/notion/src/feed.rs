@@ -333,7 +333,10 @@ impl Workspace {
     /// listing for a read of `pages/` or `databases/`, its starting paths,
     /// and of the changes for another read.
     pub(crate) async fn feed(cx: FeedCx<WorkspaceKey>) -> Result<Feed> {
-        let token = cx.token().map(decode_token::<WorkspaceToken>).transpose()?;
+        let token = cx
+            .raw_token()
+            .map(decode_token::<WorkspaceToken>)
+            .transpose()?;
         let first = token.is_none();
         let (latest, stage) = token.map_or((None, None), |token| (token.latest, token.stage));
         let mut feed = WorkspaceFeed {
@@ -400,7 +403,7 @@ impl WorkspaceFeed<'_> {
     /// and none after it, so that the next read decides between a full
     /// listing and the changes.
     fn restart(&self, stage: Option<Stage>, error: ProviderError) -> Result<Feed> {
-        Ok(Feed::restart(
+        Ok(Feed::raw_restart(
             encode(&WorkspaceToken {
                 latest: self.latest,
                 stage,
@@ -608,16 +611,16 @@ impl WorkspaceFeed<'_> {
     /// parts while a stage remains, with the inner states of its results.
     fn part(&mut self, stage: Option<Stage>) -> Result<Feed> {
         let more = stage.is_some();
-        let mut part = Feed::part(encode(&WorkspaceToken {
+        let mut part = Feed::raw_part(encode(&WorkspaceToken {
             latest: self.latest,
             stage,
         })?)
         .more(more);
         for inner in self.inner.drain(..) {
             part = match inner {
-                Inner::Page(id, token) => part.inner::<Page>(&PageKey { id }, token),
+                Inner::Page(id, token) => part.raw_inner::<Page>(&PageKey { id }, token),
                 Inner::DataSource(id) => {
-                    part.inner::<DataSource>(&DataSourceKey { id }, DATA_SOURCE_TOKEN)
+                    part.raw_inner::<DataSource>(&DataSourceKey { id }, DATA_SOURCE_TOKEN)
                 },
             };
         }
@@ -682,7 +685,7 @@ impl Page {
             id: &cx.key().id,
         };
         let token = cx
-            .token()
+            .raw_token()
             .map(decode_token::<Option<PageToken>>)
             .transpose()?
             .flatten();
@@ -843,7 +846,7 @@ impl PageFeed<'_> {
         let none = match response.status() {
             200 => false,
             _ if cursor_refused(cursor.as_deref(), &response) => {
-                return Ok(Feed::restart(
+                return Ok(Feed::raw_restart(
                     encode(&Some(token))?,
                     status_error(&response),
                 ));
@@ -894,7 +897,7 @@ impl PageFeed<'_> {
     /// The removal of the page, with the token of a removed page.
     fn removal(&self) -> Result<Feed> {
         self.cx.remove(self.path())?;
-        Ok(Feed::part(encode(&None::<PageToken>)?).into())
+        Ok(Feed::raw_part(encode(&None::<PageToken>)?).into())
     }
 }
 
@@ -923,14 +926,14 @@ impl DataSource {
             return data_source_removal(&cx, id);
         }
         write_data_source(&cx, id, &object, ListingWrite::Join)?;
-        Ok(Feed::part(DATA_SOURCE_TOKEN).into())
+        Ok(Feed::raw_part(DATA_SOURCE_TOKEN).into())
     }
 }
 
 /// A part of the feed of a page with `token`, followed by `more` parts, its
 /// facts counting as lacking after `until`.
 fn page_part(token: &PageToken, more: bool, until: Option<OffsetDateTime>) -> Result<Feed> {
-    let part = Feed::part(encode(&Some(token))?).more(more);
+    let part = Feed::raw_part(encode(&Some(token))?).more(more);
     Ok(match until {
         Some(until) => part.until(SystemTime::from(until)),
         None => part,
@@ -941,5 +944,5 @@ fn page_part(token: &PageToken, more: bool, until: Option<OffsetDateTime>) -> Re
 /// The removal of a data source.
 fn data_source_removal(cx: &FeedCx<DataSourceKey>, id: &Id) -> Result<Feed> {
     cx.remove(data_source_path(id))?;
-    Ok(Feed::part(DATA_SOURCE_TOKEN).into())
+    Ok(Feed::raw_part(DATA_SOURCE_TOKEN).into())
 }

@@ -186,7 +186,7 @@ impl Drive {
             cx: &cx,
             inner: Vec::new(),
         };
-        match cx.token().map(decode_token::<DriveToken>).transpose()? {
+        match cx.raw_token().map(decode_token::<DriveToken>).transpose()? {
             None => feed.start(true).await,
             Some(DriveToken::Relisting) => feed.start(false).await,
             Some(DriveToken::Listing {
@@ -274,7 +274,7 @@ impl DriveFeed<'_> {
                 } else {
                     DriveToken::Relisting
                 };
-                return Ok(Feed::restart(
+                return Ok(Feed::raw_restart(
                     encode(&again)?,
                     ProviderError::from_http_status(400),
                 ));
@@ -335,7 +335,7 @@ impl DriveFeed<'_> {
         match response.status() {
             200 => {},
             400 => {
-                return Ok(Feed::restart(
+                return Ok(Feed::raw_restart(
                     encode(&DriveToken::Relisting)?,
                     ProviderError::from_http_status(400),
                 ));
@@ -422,13 +422,13 @@ impl DriveFeed<'_> {
     /// A part with `token`, followed by `more` parts, with the tokens of the
     /// own feeds of its items.
     fn part(&mut self, token: &DriveToken, more: bool) -> Result<Feed> {
-        let mut part = Feed::part(encode(token)?).more(more);
+        let mut part = Feed::raw_part(encode(token)?).more(more);
         for (kind, id, token) in self.inner.drain(..) {
             let key = ItemKey { id };
             part = match kind {
-                Kind::File => part.inner::<File>(&key, token),
-                Kind::Folder => part.inner::<Folder>(&key, token),
-                Kind::Other => part.inner::<Other>(&key, token),
+                Kind::File => part.raw_inner::<File>(&key, token),
+                Kind::Folder => part.raw_inner::<Folder>(&key, token),
+                Kind::Other => part.raw_inner::<Other>(&key, token),
             };
         }
         Ok(part.into())
@@ -453,7 +453,7 @@ async fn by_id(cx: &FeedCx<ItemKey>, id: &Id) -> Result<Option<Box<RawValue>>> {
 
 fn removal(cx: &FeedCx<ItemKey>, kind: Kind, id: &Id) -> Result<Feed> {
     cx.remove(path(kind, id))?;
-    Ok(Feed::part(REMOVED).into())
+    Ok(Feed::raw_part(REMOVED).into())
 }
 
 /// The own feed of an item of `kind`: the item by its ID, or its removal
@@ -469,7 +469,7 @@ fn removal(cx: &FeedCx<ItemKey>, kind: Kind, id: &Id) -> Result<Feed> {
 async fn own(cx: FeedCx<ItemKey>, kind: Kind) -> Result<Feed> {
     let id = &cx.key().id;
     let mut token = cx
-        .token()
+        .raw_token()
         .map(decode_token::<Option<ItemToken>>)
         .transpose()?
         .flatten();
@@ -502,7 +502,7 @@ async fn own(cx: FeedCx<ItemKey>, kind: Kind) -> Result<Feed> {
         }
     }
     let part = |object| -> Result<FeedPart> {
-        Ok(Feed::part(encode(&ItemToken {
+        Ok(Feed::raw_part(encode(&ItemToken {
             listed,
             revision: revision.map(str::to_owned),
             object,

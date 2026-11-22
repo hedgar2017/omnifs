@@ -826,24 +826,32 @@ fn file_object_anchor_reads_canonical() {
 // ---------------------------------------------------------------------------
 
 /// A part that writes the token and the starts of its call, until five
-/// seconds after the epoch; a restart from the token `t1`.
+/// seconds after the epoch, with the token `1` and the inner token `2` of
+/// the item `9`; a restart to the token `0` from the token `1`.
 #[allow(clippy::unused_async)]
 async fn demo_feed(cx: crate::feed::FeedCx<DemoKey, ()>) -> Result<crate::feed::Feed> {
+    let token = cx.token::<u32>()?;
     cx.file(
         format!("/items/{}/summary", cx.key().id),
-        format!("{:?} {:?} {:?}", cx.token(), cx.start(), cx.due()).into_bytes(),
+        format!("{token:?} {:?} {:?}", cx.start(), cx.due()).into_bytes(),
     )?;
     cx.dir(
         format!("/items/{}/parts", cx.key().id),
         crate::browse::ListingWrite::Complete,
     )?;
-    if cx.token() == Some("t1") {
-        return Ok(crate::feed::Feed::restart(
-            "t0",
+    if token == Some(1) {
+        return crate::feed::Feed::restart(
+            &0_u32,
             ProviderError::invalid_input("an expired cursor"),
-        ));
+        );
     }
-    Ok(crate::feed::Feed::part("t1")
+    Ok(crate::feed::Feed::part(&1_u32)?
+        .inner::<DemoObj>(
+            &DemoKey {
+                id: "9".to_string(),
+            },
+            &2_u32,
+        )?
         .until(std::time::UNIX_EPOCH + std::time::Duration::from_secs(5))
         .into())
 }
@@ -1144,7 +1152,10 @@ fn the_feed_export_runs_the_feed_of_the_object_at_its_path() {
     let wit_types::FeedAnswer::Part(part) = answer else {
         panic!("expected a part");
     };
-    assert_eq!(part.token, "t1");
+    assert_eq!(part.token, "1");
+    assert_eq!(part.inner.len(), 1);
+    assert_eq!(part.inner[0].id.captures[0].value, "9");
+    assert_eq!(part.inner[0].token, "2");
     assert!(!part.more);
     assert_eq!(until, Some(5_000), "the facts of the part count until then");
     let effects = effects.into_wit();
@@ -1165,14 +1176,20 @@ fn the_feed_export_runs_the_feed_of_the_object_at_its_path() {
     // A restart carries its token and its error, without the writes of its
     // call.
     let (answer, effects, until) =
-        poll_ready(router.feed(&cx, "/items/7", Some("t1".to_string()), None)).unwrap();
+        poll_ready(router.feed(&cx, "/items/7", Some("1".to_string()), None)).unwrap();
     let wit_types::FeedAnswer::Restart(restart) = answer else {
         panic!("expected a restart");
     };
-    assert_eq!(restart.token, "t0");
+    assert_eq!(restart.token, "0");
     assert_eq!(restart.error.kind, wit_types::ErrorKind::InvalidInput);
     assert!(effects.is_empty());
     assert_eq!(until, None);
+
+    // A token that is not of the type of the feed is the error of the call.
+    let error =
+        poll_ready(router.feed(&cx, "/items/7", Some("\"one\"".to_string()), None)).unwrap_err();
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidInput);
+    assert!(error.message().contains("is not of its type"), "{error}");
 
     let error =
         poll_ready(router.feed(&cx, "/items/7", None, lacks("/items/8/parts"))).unwrap_err();

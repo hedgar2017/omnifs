@@ -405,11 +405,11 @@ impl Shelf {
 
     fn answer(cx: &FeedCx<ShelfKey, State>) -> Result<Feed> {
         let shelf = cx.key().shelf.clone();
-        let token = cx.token().map(str::to_owned);
+        let token = cx.token::<ShelfToken>()?;
         let version = cx.state_mut(|state| {
             state.shelf_log.push(format!(
                 "{shelf} {} {}",
-                token.as_deref().unwrap_or("-"),
+                token.map_or_else(|| "-".to_owned(), |token| token.to_string()),
                 asked(cx.start(), cx.due())
             ));
             state.shelf_version
@@ -423,16 +423,16 @@ impl Shelf {
             shelf: shelf.clone(),
             book: number,
         };
-        match token.as_deref() {
+        match token {
             None => {
                 cx.dir(&books, ListingWrite::Partial)?;
                 book(1, "Book 1")?;
-                Ok(Feed::part("page-1")
+                Ok(Feed::part(&ShelfToken::Page(1))?
                     .more(true)
-                    .inner::<Book>(&key(1), "row-1")
+                    .inner::<Book>(&key(1), &BookToken::Row(1))?
                     .into())
             },
-            Some("page-1") => {
+            Some(ShelfToken::Page(1)) => {
                 if shelf == "flaky"
                     && !cx.state_mut(|state| std::mem::replace(&mut state.flaky_stopped, true))
                 {
@@ -440,17 +440,17 @@ impl Shelf {
                 }
                 cx.dir(&books, ListingWrite::Partial)?;
                 book(2, "Book 2")?;
-                Ok(Feed::part("page-2")
+                Ok(Feed::part(&ShelfToken::Page(2))?
                     .more(true)
-                    .inner::<Book>(&key(2), "row-2")
+                    .inner::<Book>(&key(2), &BookToken::Row(2))?
                     .into())
             },
-            Some("page-2") => {
+            Some(ShelfToken::Page(_)) => {
                 cx.dir(&books, ListingWrite::Complete)?;
-                Ok(Feed::part(format!("version-{version}")).into())
+                Ok(Feed::part(&ShelfToken::Version(version))?.into())
             },
-            Some(done) if done == format!("version-{version}") => Ok(Feed::unchanged()),
-            Some(change) if change == format!("change-{version}") => {
+            Some(ShelfToken::Version(done)) if done == version => Ok(Feed::unchanged()),
+            Some(ShelfToken::Change(change)) if change == version => {
                 if shelf == "wobbly"
                     && !cx.state_mut(|state| std::mem::replace(&mut state.wobbly_stopped, true))
                 {
@@ -459,9 +459,9 @@ impl Shelf {
                 }
                 cx.dir(&books, ListingWrite::Complete)?;
                 cx.remove(format!("{books}/2"))?;
-                Ok(Feed::part(format!("version-{version}")).into())
+                Ok(Feed::part(&ShelfToken::Version(version))?.into())
             },
-            Some(_) => {
+            Some(ShelfToken::Version(_) | ShelfToken::Change(_)) => {
                 let seen = match cx.listing(&books, ListingForm::Names)? {
                     Some(ListingFacts {
                         entries: ListingEntries::Names(names),
@@ -475,8 +475,45 @@ impl Shelf {
                 cx.dir(&books, ListingWrite::Complete)?;
                 book(1, &format!("Book 1 v{version}"))?;
                 book(3, "Book 3")?;
-                Ok(Feed::part(format!("change-{version}")).more(true).into())
+                Ok(Feed::part(&ShelfToken::Change(version))?.more(true).into())
             },
+        }
+    }
+}
+
+/// The token of the feed of a shelf: the page of its first answer that a
+/// part brought, the version of the shelves that an answer ended at, or the
+/// version that the first part of a change brought.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+enum ShelfToken {
+    Page(u8),
+    Version(u64),
+    Change(u64),
+}
+
+impl core::fmt::Display for ShelfToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Page(page) => write!(f, "page-{page}"),
+            Self::Version(version) => write!(f, "version-{version}"),
+            Self::Change(version) => write!(f, "change-{version}"),
+        }
+    }
+}
+
+/// The token of the feed of a book: the row of its shelf that brought it, or
+/// its own answer.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+enum BookToken {
+    Row(u64),
+    Own,
+}
+
+impl core::fmt::Display for BookToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Row(row) => write!(f, "row-{row}"),
+            Self::Own => f.write_str("own"),
         }
     }
 }
@@ -507,21 +544,24 @@ impl Book {
     /// The feed of one book, answering for its title before the first answer
     /// of its shelf ends: it rewrites the title from the book's own upstream.
     fn feed(cx: FeedCx<BookKey, State>) -> impl core::future::Future<Output = Result<Feed>> {
+        core::future::ready(Self::answer(&cx))
+    }
+
+    fn answer(cx: &FeedCx<BookKey, State>) -> Result<Feed> {
         let BookKey { shelf, book } = cx.key();
-        let token = cx.token().unwrap_or("-").to_owned();
+        let token = cx.token::<BookToken>()?;
         cx.state_mut(|state| {
             state.shelf_log.push(format!(
-                "{shelf}/{book} {token} {}",
+                "{shelf}/{book} {} {}",
+                token.map_or_else(|| "-".to_owned(), |token| token.to_string()),
                 asked(cx.start(), cx.due())
             ));
         });
-        core::future::ready(
-            cx.file(
-                format!("/shelves/{shelf}/books/{book}/title"),
-                format!("Book {book} (own)").into_bytes(),
-            )
-            .map(|()| Feed::from(Feed::part(format!("own-{book}")))),
-        )
+        cx.file(
+            format!("/shelves/{shelf}/books/{book}/title"),
+            format!("Book {book} (own)").into_bytes(),
+        )?;
+        Ok(Feed::part(&BookToken::Own)?.into())
     }
 }
 
