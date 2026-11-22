@@ -38,7 +38,7 @@
 //!
 //! The host calls the feed `method` once per part of an answer with a
 //! [`FeedCx`]: the anchor path and the key of the object, the token the feed
-//! returned last, as the type the feed gave it ([`FeedCx::token`]), the declared starting path an operation without its fact
+//! returned last, the declared starting path an operation without its fact
 //! started the answer from ([`FeedCx::start`]), or of the operation of an
 //! answer past the deadline of the feed ([`FeedCx::due`]), the listings and
 //! the fed files of the projection, and the facts the part writes. The method
@@ -48,6 +48,23 @@
 //! answer while the projection serves them, or [`Feed::restart`], which drops
 //! the kept parts of the answer, takes its token as the token of the feed,
 //! and gives its error to each operation that waits for the answer.
+//!
+//! A token is a value of a type of the feed, which this module alone encodes
+//! as the string the host keeps: [`Feed::part`], [`FeedPart::inner`], and
+//! [`Feed::restart`] take it, and [`FeedCx::token`] reads it as that type.
+//! `raw_token`, `raw_part`, `raw_inner`, and `raw_restart` are the same
+//! calls with the string itself.
+//!
+//! A feed reads the projection in the subtree of its object: a listing as
+//! its names, each parsed as a key ([`FeedCx::names`]), or as its count
+//! ([`FeedCx::count`]), and a fed file by a range of its bytes
+//! ([`FeedCx::read_range`]) or, for a file that is one record, whole within
+//! the bytes it names ([`FeedCx::read_record`]). Each read gives the time
+//! that the part that wrote the fact gave with [`FeedPart::until`].
+//!
+//! [`FeedCx::canonical`] writes the canonical bytes of an object, which the
+//! feed has from its own request: the faces of that object that serve
+//! canonical bytes render from them without a load of the object.
 
 use std::cell::RefCell;
 use std::ops::Deref;

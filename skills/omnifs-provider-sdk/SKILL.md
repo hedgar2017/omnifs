@@ -40,7 +40,9 @@ There is one route API. `file` and `dir` are the nouns; the *face* you put under
 | Does a directory list child objects (repos under an owner, issues, comments)? | yes | **Collection face** `o.dir(name).collection::<C>(method)` returning `Collection<C, Cur>`; `C` must be its own `r.object::<C>` |
 | Is the subtree a real tree the host can materialize wholesale (such as a git repo)? | yes | **Tree face** `o.dir(name).tree(method)` answering `Tree::at(tree_ref, commit)` or `Tree::unchanged()`, or raw `r.treeref(t).handler(..)` |
 | Is the same object reachable at a second path (by-name and by-id)? | yes | `let h = r.object::<O>(..)?; r.alias(other_template, &h)?;` |
-| Does the upstream report changes since a token, so one check can keep many paths current (GitHub issues `since`)? | yes | **Feed**: `o.feed(method).starts([..])` plus `.fed()` faces (`o.file(..).fed()`, `o.dir(..).fed()`, `o.fed()`); the method writes facts through `FeedCx` and answers `Feed::part(token)` or `Feed::unchanged()` |
+| Does the upstream report changes since a token, so one check can keep many paths current (GitHub issues `since`)? | yes | **Feed**: `o.feed(method).starts([..])` plus `.fed()` faces (`o.file(..).fed()`, `o.dir(..).fed()`, `o.fed()`); the method writes facts through `FeedCx` and answers `Feed::part(&token)?` or `Feed::unchanged()` |
+| Do the facts of an object come from feeds, or from direct, blob, or stream faces, alone, with no canonical payload? | yes | `#[omnifs_sdk::object(kind = "..", key = Key, no_load)]`: no `load`, and no canonical, representation, computed, or object face |
+| Does a feed already download the canonical payload of an object with `canonical`/`representation`/`computed` faces? | yes | `cx.canonical::<O>(anchor_path, Canonical::new(bytes, validator))` in the feed part: those faces render from the bytes without `Object::load` |
 | Tempted to add an object so something gets cached? | stop | An object earns canonical storage only with a `canonical` face. No canonical payload means a direct face or raw handler, not a fake object |
 
 Smell test from `providers/DESIGN.md`: repeated "load, derive field, build projection" handlers mean the route family wants an object face; a one-shot query wrapped in object machinery wants a direct face or raw handler.
@@ -106,7 +108,7 @@ Handlers are `async fn(Cx<S>) -> Result<..>`, `async fn(Cx<S>, Key) -> Result<..
 
 ## The object pattern, end to end
 
-`#[omnifs_sdk::object]` emits the whole `impl Object` (the `Key`/`State`/`Canonical` types, `decode`, `kind`) and forwards `load` to a provider-written inherent `async fn load`. `#[path_captures]` emits the `impl Key`. You write `load` (it has callouts) and any `derive` field fns; everything else is derived.
+`#[omnifs_sdk::object]` emits the whole `impl Object` (the `Key`/`State`/`Canonical` types, `decode`, `kind`) and forwards `load` to a provider-written inherent `async fn load`. `#[path_captures]` emits the `impl Key`. You write `load` (it has callouts) and any `derive` field fns; everything else is derived. An object without canonical bytes takes `no_load` in place of `load`.
 
 ```rust
 #[omnifs_sdk::path_captures]
@@ -172,7 +174,7 @@ async fn repos(self_key: OwnerKey, cx: ListCx<GhCursor, State>) -> Result<Collec
 
 A file-shaped object projects as a single file, not a directory: `r.file_object::<O>(template, |o| { o.dynamic(); o.canonical::<Json>()?; Ok(()) })?` declares exactly one canonical/representation/direct/blob face, and the path itself is the file.
 
-A feed method is `async fn feed(cx: FeedCx<K, State>) -> Result<Feed>`. `cx.path()` is the anchor path the host asked for; build the paths of facts from it, not from a key whose captures normalize. `cx.token()` is the token the host kept (`None` before the first part), `cx.start()` the declared starting path that started the answer, and `cx.listing(path, ListingForm::Count | Names)` the projection's listing of a path under the object. Write facts with `cx.file(path, bytes)`, `cx.dir(path, ListingWrite::Partial | Exhaustive | Complete)`, and `cx.remove(path)` at mount-absolute paths; answer `Feed::part(token).more(true).inner::<Issue>(&key, token).into()` while the answer continues, and `Feed::unchanged()` when the upstream reports no change since the token.
+A feed method is `async fn feed(cx: FeedCx<K, State>) -> Result<Feed>`. `cx.path()` is the anchor path the host asked for; build the paths of facts from it, not from a key whose captures normalize. `cx.token::<T>()?` is the token the host kept, as the type the feed gave it (`None` before the first part; never hand-roll its encoding), and `cx.start()` the declared starting path that started the answer. Read the projection under the object with `cx.names::<K>(path)?` (the names of a listing, parsed as keys), `cx.count(path)?`, `cx.read_range(path, offset, len)?` (a range of a fed file of any size, with its whole length), and `cx.read_record(path, max)?` (a whole record-sized file; `too-large` past `max`); each gives `until`, the time the part that wrote the fact gave with `FeedPart::until`, so a feed keeps no copy of that time in its token. Write facts with `cx.file(path, bytes)`, `cx.blob(path, &blob)`, `cx.dir(path, ListingWrite::Partial | Exhaustive | Complete | Join)`, `cx.canonical::<O>(anchor_path, canonical)`, and `cx.remove(path)` at mount-absolute paths; answer `Feed::part(&token)?.more(true).inner::<Issue>(&key, &item_token)?.into()` while the answer continues, `Feed::restart(&token, error)?` to begin again, and `Feed::unchanged()` when the upstream reports no change since the token.
 
 ## HTTP, batching, pagination, rate limits
 

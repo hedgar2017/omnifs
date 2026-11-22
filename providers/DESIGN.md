@@ -638,13 +638,30 @@ handler: lookup, listing, and read answer with the claims of the feeds of its
 ancestry, and the host serves the path from its projection once the answering
 feed has answered. The feed method gets a `FeedCx` with the anchor path the
 host asked for, which the paths of its facts extend even where the key
-normalizes a capture, the key, the token the
-host kept, the declared starting path that started the answer, the projection
-listings of its subtree (`FeedCx::listing`), and writers for the facts of the
-part: `file` for a stable inline file, `dir` with a `ListingWrite`, and
-`remove`. It answers `Feed::unchanged()` or `Feed::part(token)`, with `more`
-while its answer continues and `inner::<O>(key, token)` for the tokens of inner
-feeds, such as an item from a page of rows.
+normalizes a capture, the key, the token the host kept as the type the feed
+gave it (`FeedCx::token::<T>()`), the declared starting path that started the
+answer, the reads of the projection of its subtree, and writers for the facts
+of the part: `file` for a stable inline file, `blob` for a file of the bytes
+of a blob, `dir` with a `ListingWrite`, `canonical::<O>` for the canonical
+bytes of an object, and `remove`. It answers `Feed::unchanged()` or
+`Feed::part(&token)`, with `more` while its answer continues and
+`inner::<O>(&key, &token)` for the tokens of inner feeds, such as an item from
+a page of rows.
+
+The reads of the projection are typed by what they give: `names::<T>(path)`
+the names of a listing, each parsed as a key, `count(path)` their count,
+`read_range(path, offset, len)` a range of a fed file of any size with its
+whole length, and `read_record(path, max)` the whole of a file that is one
+record. Each gives the time that the part that wrote the fact gave with
+`FeedPart::until`.
+
+An object whose facts come from feeds alone has no canonical bytes and no
+load: `#[omnifs_sdk::object(kind = "...", key = Key, no_load)]`. An object
+with canonical faces whose payload a feed already downloads keeps its load for
+a read that no feed answered for, and the feed writes the payload with
+`FeedCx::canonical::<O>(anchor_path, canonical)`: the canonical,
+representation, and computed faces of the object render from those bytes
+without a load until a part writes other bytes.
 
 ## Object load prefetch and effects
 
@@ -750,6 +767,8 @@ Reject:
 - a paged collection whose cursor type cannot round-trip through opaque bytes;
 - an alias missing captures required by the target key;
 - a feed starting path that names no fed face of its object's subtree;
+- a canonical, representation, computed, or object face of an object declared
+  with `no_load`;
 - a fed face without a feed in its ancestry;
 - path captures unused by the key or by route facets;
 - an object implementation that tries to register hidden paths;

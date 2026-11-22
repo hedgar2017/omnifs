@@ -76,6 +76,13 @@ interface types {
     ///
     /// For `directory`, the `listing-write` says how the children written at
     /// `<path>/<name>` in the same batch join the listing of `path`.
+    ///
+    /// In the effects of a feed part, a file is a fed file: stable, with
+    /// inline bytes or a blob, or, with `deferred(full)` bytes and no size,
+    /// a view leaf of the canonical bytes that the same effects store for
+    /// its `id`, whose read the provider renders from those bytes. The host
+    /// keeps a view leaf as a fed fact of the version of those bytes,
+    /// without a deadline.
     record fs-write {
         id: option<logical-id>,
         path: string,
