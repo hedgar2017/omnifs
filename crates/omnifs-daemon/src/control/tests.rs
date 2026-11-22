@@ -604,6 +604,7 @@ async fn tonic_lists_and_deletes_credentials_without_returning_material() {
             client_secret: None,
             redirect_uri: None,
             scopes: None,
+            subject: None,
         },
     };
 
@@ -913,6 +914,7 @@ async fn two_op_batch_applies_atomically_and_reports_the_batch_id() {
             client_secret: None,
             redirect_uri: None,
             scopes: None,
+            subject: None,
         },
     };
     let definition = omnifs_api::MountDefinition {

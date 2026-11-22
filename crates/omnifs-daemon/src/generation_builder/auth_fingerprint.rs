@@ -20,13 +20,16 @@ struct FingerprintInput<'a> {
 
 /// The client overrides of a credential for its fingerprint, which statuses
 /// show: all but the client secret, in whose place every credential has
-/// none, as a credential without one.
+/// none, as a credential without one, and the subject of a credential with
+/// one alone.
 #[derive(Serialize)]
 struct FingerprintOverrides<'a> {
     client_id: &'a Option<String>,
     client_secret: Option<()>,
     redirect_uri: &'a Option<String>,
     scopes: &'a Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: &'a Option<String>,
 }
 
 pub(super) fn auth_fingerprint(
@@ -42,6 +45,7 @@ pub(super) fn auth_fingerprint(
             client_secret: None,
             redirect_uri: &overrides.redirect_uri,
             scopes: &overrides.scopes,
+            subject: &overrides.subject,
         },
     })
     .context("encode auth runtime fingerprint")?;
@@ -63,7 +67,28 @@ mod tests {
             client_secret: client_secret.map(|secret| SecretBytes::new(secret.to_vec())),
             redirect_uri: None,
             scopes: None,
+            subject: None,
         }
+    }
+
+    /// The subject of a credential is of its fingerprint, and a credential
+    /// without one has the fingerprint of the overrides without it.
+    #[test]
+    fn the_fingerprint_has_the_subject_of_a_credential_with_one() {
+        let provider = ProviderId::from_digest([7; 32]);
+        let of = |subject: Option<&str>| {
+            let overrides = CredentialClientOverrides {
+                subject: subject.map(str::to_owned),
+                ..overrides(None)
+            };
+            auth_fingerprint(provider, &AuthScheme::None, &overrides).unwrap()
+        };
+        assert_ne!(of(Some("ada@example.test")), of(None));
+        assert_ne!(of(Some("ada@example.test")), of(Some("bob@example.test")));
+        assert_eq!(
+            of(None),
+            auth_fingerprint(provider, &AuthScheme::None, &overrides(None)).unwrap()
+        );
     }
 
     #[test]

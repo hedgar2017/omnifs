@@ -49,10 +49,14 @@ pub(crate) enum DaemonProbe {
     Stopped,
     /// No daemon listens on the control socket and the profile records one,
     /// or its record is unreadable.
-    Unreachable { message: String },
+    Unreachable {
+        message: String,
+    },
     /// A daemon holds the control socket and its status request failed, as a
     /// daemon of another build of omnifs whose answer this one cannot read.
-    Unresponsive { message: String },
+    Unresponsive {
+        message: String,
+    },
 }
 
 impl DaemonProbe {

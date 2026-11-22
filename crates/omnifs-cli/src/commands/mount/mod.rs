@@ -96,6 +96,10 @@ pub struct ReauthArgs {
     /// private key of a service account.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["token", "token_env"])]
     pub client_secret_file: Option<String>,
+    /// Subject that an OAuth client without a sign-in asserts instead of
+    /// itself, as the user that a service account acts as.
+    #[arg(long, value_name = "SUBJECT", conflicts_with_all = ["token", "token_env"])]
+    pub subject: Option<String>,
 }
 
 fn effective_oauth_scopes(explicit: &[String], prior: &[String]) -> Vec<String> {
@@ -380,7 +384,11 @@ impl ReauthArgs {
             &auth.scheme,
             Some(auth.account_label.clone()),
         )?
-        .with_client(self.client_id.clone(), self.client_secret_file.clone())?;
+        .with_client(crate::auth::OAuthClientArgs {
+            client_id: self.client_id.clone(),
+            client_secret_file: self.client_secret_file.clone(),
+            subject: self.subject.clone(),
+        })?;
 
         // `--no-input` must never reach an OAuth browser handoff (it would hang
         // on the browser confirm or the manual-code paste). Mirror the add-side
@@ -451,6 +459,7 @@ impl ReauthArgs {
                     client_secret: None,
                     redirect_uri: None,
                     scopes: None,
+                    subject: None,
                 },
             }
         };

@@ -960,6 +960,7 @@ fn credential_overrides(v: &wire::CredentialClientOverrides) -> CredentialClient
             .map(|x| SecretBytes::new(x.to_vec())),
         redirect_uri: v.redirect_uri.clone(),
         scopes: v.scopes.as_ref().map(|x| x.values.clone()),
+        subject: v.subject.clone(),
     }
 }
 pub fn credential_submission(
@@ -1018,6 +1019,7 @@ fn to_credential_overrides(v: &CredentialClientOverrides) -> wire::CredentialCli
             .scopes
             .as_ref()
             .map(|x| wire::StringList { values: x.clone() }),
+        subject: v.subject.clone(),
     }
 }
 
@@ -1200,6 +1202,7 @@ mod tests {
                 client_secret: None,
                 redirect_uri: None,
                 scopes: None,
+                subject: None,
             },
         });
         match mutation_op(&to_mutation_op(&submit)).unwrap() {
@@ -1363,6 +1366,7 @@ mod tests {
                 client_secret: Some(SecretBytes::new(b"client-secret".to_vec())),
                 redirect_uri: None,
                 scopes: Some(vec![]),
+                subject: None,
             },
         };
         let debug = format!("{value:?}");
@@ -1379,6 +1383,7 @@ mod tests {
             client_secret: None,
             redirect_uri: None,
             scopes: Some(vec![]),
+            subject: None,
         };
         let wire = to_credential_overrides(&present);
         assert!(wire.scopes.is_some());
@@ -1403,6 +1408,7 @@ mod tests {
                 client_secret: Some(SecretBytes::new(b"client-secret".to_vec())),
                 redirect_uri: None,
                 scopes: Some(vec![]),
+                subject: None,
             },
         };
         let decoded = credential_submission(&to_credential_submission(&submission)).unwrap();

@@ -22,7 +22,7 @@ pub use resolve::SchemeResolveError;
 pub use scheme::{
     AmbientKind, AmbientSource, AuthManifest, AuthScheme, ClientSideTokenConfig, DeviceCodeConfig,
     DevicePollCompat, KeyValue, OAuthFlow, OauthScheme, PkceLoopbackConfig, PkceManualCodeConfig,
-    SchemeGuidance, StaticTokenScheme, TokenEndpointAuthMethod, TokenValidation,
+    SchemeGuidance, ScopeClaimConfig, StaticTokenScheme, TokenEndpointAuthMethod, TokenValidation,
 };
 pub use service::{
     AuthBinding, AuthUnavailable, CredentialHealth, CredentialService, DurableCredentialSnapshot,

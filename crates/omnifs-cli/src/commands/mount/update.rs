@@ -335,6 +335,7 @@ impl UpdateArgs {
                 client_secret: None,
                 redirect_uri: None,
                 scopes: None,
+                subject: None,
             },
         })
     }

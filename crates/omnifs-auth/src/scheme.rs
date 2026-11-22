@@ -136,6 +136,9 @@ pub enum AmbientKind {
 pub struct OauthScheme {
     pub key: String,
     pub display_name: String,
+    /// The authorization endpoint of a flow in which a user signs in; empty
+    /// for a flow without one, which has no authorization request.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,16 +174,31 @@ pub enum OAuthFlow {
     /// its own key and the token endpoint answers it with an access token.
     /// No user signs in and no refresh token exists; the client ID is the
     /// issuer of the assertion and the client secret is the PEM of its RSA
-    /// private key, as of a service account.
+    /// private key. The subject of the assertion is the one of the
+    /// credential, and the client itself for a credential without one. The
+    /// scopes are the `scope` parameter of the token request.
     JwtBearer,
+    /// The JWT bearer grant of an authorization server that takes the scopes
+    /// from a claim of the assertion, in place of the `scope` parameter of
+    /// the token request.
+    JwtBearerScopeClaim(ScopeClaimConfig),
 }
 
 impl OAuthFlow {
-    /// Whether a user signs in for the first access token of the flow.
+    /// Whether a user signs in for the first access token of the flow: not
+    /// for a JWT bearer grant, whose client asserts itself.
     #[must_use]
     pub fn needs_user(&self) -> bool {
-        !matches!(self, Self::JwtBearer)
+        !matches!(self, Self::JwtBearer | Self::JwtBearerScopeClaim(_))
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScopeClaimConfig {
+    /// The name of the claim of the assertion with the scopes, separated by
+    /// spaces.
+    pub claim: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

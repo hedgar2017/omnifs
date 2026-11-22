@@ -460,8 +460,7 @@ fn build_auth_binding(
             let request = OAuthRequest::from_runtime(
                 scheme.clone(),
                 runtime_overrides(&credential.overrides)?,
-            )?
-            .acting_as(credential.id.account());
+            )?;
             service.bind_oauth(
                 credential.id.clone(),
                 request,
@@ -568,6 +567,7 @@ fn runtime_overrides(
             .as_ref()
             .map(secret_string)
             .transpose()?,
+        subject: overrides.subject.clone(),
     })
 }
 
@@ -576,6 +576,7 @@ fn no_overrides(overrides: &CredentialClientOverrides) -> bool {
         && overrides.client_secret.is_none()
         && overrides.redirect_uri.is_none()
         && overrides.scopes.is_none()
+        && overrides.subject.is_none()
 }
 
 #[cfg(test)]
@@ -665,6 +666,7 @@ mod tests {
             client_secret: None,
             redirect_uri: None,
             scopes: None,
+            subject: None,
         };
         let scheme = provider
             .manifest

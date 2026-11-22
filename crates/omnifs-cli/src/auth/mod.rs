@@ -10,7 +10,7 @@ pub(crate) mod mount;
 
 pub(crate) use login::LoginInteractivity;
 pub(crate) use manifest_view::AuthManifestView;
-pub(crate) use model::{Auth, OAuth, StaticToken};
+pub(crate) use model::{Auth, OAuth, OAuthClientArgs, StaticToken};
 
 /// Keys any completed-auth receipt row may use:
 /// `oauth` (device-code flow, [`login::login_for_submission`]),

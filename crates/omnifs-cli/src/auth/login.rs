@@ -60,7 +60,7 @@ pub(crate) async fn login_for_submission(
         .resolve_oauth_scheme(Some(scheme_key))?
         .clone();
     let config = auth.as_oauth().map(super::OAuth::request_config);
-    let mut request = OAuthRequest::from_config(config.as_ref(), scheme)?.acting_as(account_label);
+    let mut request = OAuthRequest::from_config(config.as_ref(), scheme)?;
     if let Some(scopes) = interactivity.scopes {
         request.override_default_scopes(scopes.to_vec());
     }
@@ -108,6 +108,7 @@ pub(crate) async fn login_for_submission(
             client_secret,
             redirect_uri: auth.as_oauth().and_then(|oauth| oauth.redirect_uri.clone()),
             scopes: requested_scopes,
+            subject: auth.as_oauth().and_then(|oauth| oauth.subject.clone()),
         },
     })
 }

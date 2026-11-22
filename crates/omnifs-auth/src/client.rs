@@ -70,7 +70,7 @@ impl OAuthClient {
         }
 
         let token = exchange.request_async(&self.http).await?;
-        Ok(credential_entry_from_refresh_token(&token, current))
+        credential_entry_from_refresh_token(&token, current)
     }
 
     pub async fn revoke_access_token(

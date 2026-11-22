@@ -622,9 +622,22 @@
           ]
         },
         {
-          "description": "The JWT bearer grant of RFC 7523: the client signs an assertion with\nits own key and the token endpoint answers it with an access token.\nNo user signs in and no refresh token exists; the client ID is the\nissuer of the assertion and the client secret is the PEM of its RSA\nprivate key, as of a service account.",
+          "description": "The JWT bearer grant of RFC 7523: the client signs an assertion with\nits own key and the token endpoint answers it with an access token.\nNo user signs in and no refresh token exists; the client ID is the\nissuer of the assertion and the client secret is the PEM of its RSA\nprivate key. The subject of the assertion is the one of the\ncredential, and the client itself for a credential without one. The\nscopes are the `scope` parameter of the token request.",
           "type": "string",
           "const": "jwtBearer"
+        },
+        {
+          "description": "The JWT bearer grant of an authorization server that takes the scopes\nfrom a claim of the assertion, in place of the `scope` parameter of\nthe token request.",
+          "type": "object",
+          "properties": {
+            "jwtBearerScopeClaim": {
+              "$ref": "#/$defs/ScopeClaimConfig"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "jwtBearerScopeClaim"
+          ]
         }
       ]
     },
@@ -632,6 +645,7 @@
       "type": "object",
       "properties": {
         "authorizationEndpoint": {
+          "description": "The authorization endpoint of a flow in which a user signs in; empty\nfor a flow without one, which has no authorization request.",
           "type": "string"
         },
         "defaultClientId": {
@@ -703,7 +717,6 @@
       "required": [
         "key",
         "displayName",
-        "authorizationEndpoint",
         "tokenEndpoint",
         "flow",
         "injectDomains",
@@ -856,6 +869,19 @@
         }
       },
       "additionalProperties": false
+    },
+    "ScopeClaimConfig": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "description": "The name of the claim of the assertion with the scopes, separated by\nspaces.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "claim"
+      ]
     },
     "StaticTokenScheme": {
       "type": "object",

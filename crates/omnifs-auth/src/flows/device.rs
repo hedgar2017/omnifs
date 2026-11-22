@@ -62,7 +62,7 @@ impl OAuthClient {
                 Some(details.expires_in()),
             )
             .await?;
-        Ok(credential_entry_from_token(&token))
+        credential_entry_from_token(&token)
     }
 }
 

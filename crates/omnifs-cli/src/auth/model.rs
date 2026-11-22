@@ -44,6 +44,34 @@ pub(crate) struct OAuth {
     pub(crate) redirect_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scopes: Option<Vec<String>>,
+    /// The subject of the assertions of a JWT bearer grant, in place of the
+    /// client itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subject: Option<String>,
+}
+
+/// The OAuth client of an invocation: its ID, the file of its secret, and
+/// the subject that it asserts.
+pub(crate) struct OAuthClientArgs {
+    pub(crate) client_id: Option<String>,
+    pub(crate) client_secret_file: Option<String>,
+    pub(crate) subject: Option<String>,
+}
+
+impl OAuthClientArgs {
+    fn is_empty(&self) -> bool {
+        self.client_id.is_none() && self.client_secret_file.is_none() && self.subject.is_none()
+    }
+
+    /// Refuses a client of the invocation, which an OAuth scheme alone
+    /// takes.
+    pub(crate) fn refuse(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_empty(),
+            "`--client-id`, `--client-secret-file` and `--subject` need an OAuth auth scheme"
+        );
+        Ok(())
+    }
 }
 
 impl OAuth {
@@ -56,6 +84,7 @@ impl OAuth {
             client_id: self.client_id.clone(),
             client_secret_file: self.client_secret_file.clone(),
             client_secret_env: self.client_secret_env.clone(),
+            subject: self.subject.clone(),
         }
     }
 }
@@ -94,24 +123,21 @@ impl Auth {
         self
     }
 
-    /// This auth with the client ID and the file of the client secret of an
-    /// invocation, which an OAuth scheme alone takes.
-    pub(crate) fn with_client(
-        self,
-        client_id: Option<String>,
-        client_secret_file: Option<String>,
-    ) -> anyhow::Result<Self> {
-        if client_id.is_none() && client_secret_file.is_none() {
-            return Ok(self);
+    /// This auth with the client of an invocation, which an OAuth scheme
+    /// alone takes.
+    pub(crate) fn with_client(self, client: OAuthClientArgs) -> anyhow::Result<Self> {
+        match self {
+            Self::OAuth(oauth) => Ok(Self::OAuth(OAuth {
+                client_id: client.client_id,
+                client_secret_file: client.client_secret_file,
+                subject: client.subject,
+                ..oauth
+            })),
+            Self::StaticToken(_) => {
+                client.refuse()?;
+                Ok(self)
+            },
         }
-        let Self::OAuth(oauth) = self else {
-            anyhow::bail!("`--client-id` and `--client-secret-file` need an OAuth auth scheme");
-        };
-        Ok(Self::OAuth(OAuth {
-            client_id,
-            client_secret_file,
-            ..oauth
-        }))
     }
 
     pub(crate) fn as_oauth(&self) -> Option<&OAuth> {

@@ -3,7 +3,7 @@ use crate::client::BoxFuture;
 use crate::{AuthError, ManualCode, UrlOpener};
 use crate::{
     ClientSideTokenConfig, DeviceCodeConfig, DevicePollCompat, KeyValue, OAuthFlow, OauthScheme,
-    PkceLoopbackConfig, PkceManualCodeConfig, TokenEndpointAuthMethod,
+    PkceLoopbackConfig, PkceManualCodeConfig, ScopeClaimConfig, TokenEndpointAuthMethod,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +27,17 @@ pub(super) struct FakeBehavior {
     /// back as `200 OK` (with the same error body) instead of `400`.
     pub(super) device_pending_ok_body: bool,
     pub(super) refresh_delay_ms: u64,
+    pub(super) assertion_expires_in: AssertionExpiresIn,
+}
+
+/// `expires_in` of the answer to an assertion.
+#[derive(Clone, Copy, Default)]
+pub(super) enum AssertionExpiresIn {
+    /// 3599 seconds.
+    #[default]
+    Hour,
+    Seconds(u64),
+    Absent,
 }
 
 pub(super) struct FakeOpener(pub(super) FakeAuthServer);
@@ -119,6 +130,17 @@ impl FakeAuthServer {
     /// [`ASSERTION_KEY`] signs.
     pub(super) fn jwt_bearer_scheme(&self) -> OauthScheme {
         self.scheme(OAuthFlow::JwtBearer, None)
+    }
+
+    /// A scheme of the JWT bearer grant of a server that takes the scopes
+    /// from the claim `scope` of the assertion.
+    pub(super) fn jwt_bearer_scope_claim_scheme(&self) -> OauthScheme {
+        self.scheme(
+            OAuthFlow::JwtBearerScopeClaim(ScopeClaimConfig {
+                claim: "scope".to_owned(),
+            }),
+            None,
+        )
     }
 
     pub(super) fn device_scheme(
@@ -317,9 +339,12 @@ impl FakeAuthServer {
         write_fake_response(stream, "200 OK", "application/json", &body).await;
     }
 
-    /// An access token for an assertion of `client-id` with the scopes of
-    /// the scheme and this token endpoint as its audience, signed with the
-    /// key of [`ASSERTION_KEY`]; the error `invalid_grant` for another.
+    /// An access token for an assertion of `client-id` with a subject and
+    /// this token endpoint as its audience, signed with the key of
+    /// [`ASSERTION_KEY`], and with the scopes of the scheme either as the
+    /// parameter `scope` of the request or as the claim `scope` of the
+    /// assertion; the error `invalid_grant` for another. The token names the
+    /// subject, and the claim for scopes of one.
     async fn handle_assertion(
         &self,
         stream: &mut tokio::net::TcpStream,
@@ -327,14 +352,15 @@ impl FakeAuthServer {
     ) {
         #[derive(serde::Deserialize)]
         struct Claims {
-            sub: Option<String>,
-            scope: String,
+            sub: String,
+            scope: Option<String>,
             iat: i64,
             exp: i64,
         }
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
         validation.set_issuer(&["client-id"]);
         validation.set_audience(&[self.endpoint("/token")]);
+        validation.set_required_spec_claims(&["iss", "sub", "aud", "exp"]);
         let key = jsonwebtoken::DecodingKey::from_rsa_pem(ASSERTION_PUBLIC_KEY.as_bytes()).unwrap();
         let Ok(token) = jsonwebtoken::decode::<Claims>(&params["assertion"], &key, &validation)
         else {
@@ -346,20 +372,30 @@ impl FakeAuthServer {
             write_fake_response(stream, "400 Bad Request", "application/json", &body).await;
             return;
         };
-        assert_eq!(token.claims.scope, "read write");
+        let scopes = match (params.get("scope"), &token.claims.scope) {
+            (Some(scope), None) => {
+                assert_eq!(scope, "read write");
+                ""
+            },
+            (None, Some(scope)) => {
+                assert_eq!(scope, "read write");
+                "-with-scope-claim"
+            },
+            _ => panic!("the scopes are either a parameter or a claim"),
+        };
         assert_eq!(token.claims.exp - token.claims.iat, 3600);
         let id = self.state.next_token.fetch_add(1, Ordering::SeqCst);
-        let subject = token
-            .claims
-            .sub
-            .map_or_else(String::new, |subject| format!("-of-{subject}"));
-        let body = serde_json::json!({
-            "access_token": format!("assertion-access-{id}{subject}"),
-            "expires_in": 3599,
+        let subject = token.claims.sub;
+        let mut body = serde_json::json!({
+            "access_token": format!("assertion-access-{id}-of-{subject}{scopes}"),
             "token_type": "Bearer",
-        })
-        .to_string();
-        write_fake_response(stream, "200 OK", "application/json", &body).await;
+        });
+        match self.state.behavior.assertion_expires_in {
+            AssertionExpiresIn::Hour => body["expires_in"] = 3599.into(),
+            AssertionExpiresIn::Seconds(seconds) => body["expires_in"] = seconds.into(),
+            AssertionExpiresIn::Absent => {},
+        }
+        write_fake_response(stream, "200 OK", "application/json", &body.to_string()).await;
     }
 
     #[allow(clippy::too_many_lines)]

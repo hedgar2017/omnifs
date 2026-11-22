@@ -49,19 +49,38 @@ pub(crate) async fn exchange_code(
         exchange = exchange.add_extra_param(&param.key, &param.value);
     }
     let token = exchange.request_async(http).await?;
-    Ok(credential_entry_from_token(&token))
+    credential_entry_from_token(&token)
+}
+
+/// The expiry of a token that the token endpoint answered at `now`: none for
+/// an answer without `expires_in`, whose token has no known expiry, and an
+/// error for one past the last time.
+pub(crate) fn expiry(
+    token: &oauth2::basic::BasicTokenResponse,
+    now: OffsetDateTime,
+) -> Result<Option<OffsetDateTime>, AuthError> {
+    token
+        .expires_in()
+        .map(|expires_in| {
+            time::Duration::try_from(expires_in)
+                .ok()
+                .and_then(|expires_in| now.checked_add(expires_in))
+                .ok_or_else(|| {
+                    AuthError::TokenAnswer(format!(
+                        "expires_in of {} seconds is past the last time",
+                        expires_in.as_secs()
+                    ))
+                })
+        })
+        .transpose()
 }
 
 pub(crate) fn credential_entry_from_token(
-    token: &oauth2::StandardTokenResponse<
-        oauth2::EmptyExtraTokenFields,
-        oauth2::basic::BasicTokenType,
-    >,
-) -> CredentialEntry {
-    let now = OffsetDateTime::now_utc();
+    token: &oauth2::basic::BasicTokenResponse,
+) -> Result<CredentialEntry, AuthError> {
     // Stamp the real expiry; the credential service applies its freshness
     // margin at check time instead of baking it in here.
-    let expires_at = token.expires_in().map(|expires_in| now + expires_in);
+    let expires_at = expiry(token, OffsetDateTime::now_utc())?;
     let refresh_token = token
         .refresh_token()
         .map(|token| SecretString::from(token.secret().to_owned()));
@@ -70,24 +89,20 @@ pub(crate) fn credential_entry_from_token(
         .map(|s| s.iter().map(|sc| sc.as_ref().to_owned()).collect())
         .unwrap_or_default();
     let token_type = token.token_type().as_ref().to_owned();
-    CredentialEntry::oauth(
+    Ok(CredentialEntry::oauth(
         SecretString::from(token.access_token().secret().to_owned()),
         refresh_token,
         expires_at,
         token_type,
         scopes,
-    )
+    ))
 }
 
 pub(crate) fn credential_entry_from_refresh_token(
-    token: &oauth2::StandardTokenResponse<
-        oauth2::EmptyExtraTokenFields,
-        oauth2::basic::BasicTokenType,
-    >,
+    token: &oauth2::basic::BasicTokenResponse,
     current: &CredentialEntry,
-) -> CredentialEntry {
-    let now = OffsetDateTime::now_utc();
-    let expires_at = token.expires_in().map(|expires_in| now + expires_in);
+) -> Result<CredentialEntry, AuthError> {
+    let expires_at = expiry(token, OffsetDateTime::now_utc())?;
     let refresh_token = token
         .refresh_token()
         .map(|token| SecretString::from(token.secret().to_owned()));
@@ -98,11 +113,11 @@ pub(crate) fn credential_entry_from_refresh_token(
             .filter(|scope| !scope.is_empty())
             .collect()
     });
-    current.merge_oauth_refresh(
+    Ok(current.merge_oauth_refresh(
         SecretString::from(token.access_token().secret().to_owned()),
         refresh_token,
         expires_at,
         token.token_type().as_ref(),
         scopes,
-    )
+    ))
 }

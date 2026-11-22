@@ -9,7 +9,7 @@ Providers are sandboxed WASM components. They cannot read the credential store, 
 
 The host implements protocols, not vendors.
 
-The host can know OAuth authorization code with PKCE, OAuth device flow, the OAuth JWT bearer grant of a client that signs its own assertions (as a service account, with no user and no refresh token), static token injection, credential storage, refresh, retry, and capability enforcement. It must not know that a specific provider's authorization endpoint, scope shape, or API host belongs to GitHub, Linear, Slack, or another vendor.
+The host can know OAuth authorization code with PKCE, OAuth device flow, the OAuth JWT bearer grant of RFC 7523 of a client that signs its own assertions (as a service account, with no sign-in and no refresh token, for itself or for the subject of its credential), static token injection, credential storage, refresh, retry, and capability enforcement. It must not know that a specific provider's authorization endpoint, scope shape, or API host belongs to GitHub, Linear, Slack, or another vendor.
 
 Vendor knowledge lives in provider metadata and provider docs. A new service should require a provider change, not a host table entry, unless the service needs a new protocol family.
 
@@ -28,6 +28,12 @@ Provider metadata declares auth schemes, injection domains, header shape, flow t
 The daemon extracts that metadata and binds each mount's credential while building the startup namespace, before publishing any runtime. Each mount owns its injection facts and loaded entry, while a shared credential service owns only durable storage, OAuth transport, and refresh single-flight. Generic auth behavior remains provider-agnostic, and it does not branch on provider names.
 
 Provider-specific OAuth details belong next to the provider, usually in `providers/<name>/README.md`, when they help a user understand setup or scope consequences.
+
+Where an authorization server departs from the RFC of a grant, the provider declares the departure in its flow and the host follows the declaration: `devicePollCompat` of the device flow, and `jwtBearerScopeClaim` for a server that takes the scopes of a JWT bearer grant from a claim of the assertion. Without a declaration the host does what the RFC says.
+
+## Account and subject
+
+The account of a mount is the label of its stored credential: `provider:scheme:account` is the address of one credential, so two mounts of one provider with different tokens or OAuth clients have different accounts. It is never sent upstream. The subject is what a JWT bearer client asserts as `sub` in place of itself, as the user that a service account with delegation acts as; it is a fact of the credential, stored and fingerprinted with it, and given apart from the account.
 
 ## Grants and needs
 

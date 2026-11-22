@@ -12,17 +12,22 @@ use secrecy::{ExposeSecret, SecretString};
 
 pub(crate) type ConfiguredClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointMaybeSet, EndpointSet>;
+/// A client of the token and revocation endpoints alone, as of a flow
+/// without an authorization endpoint.
+pub(crate) type ConfiguredTokenClient =
+    BasicClient<EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointMaybeSet, EndpointSet>;
 pub(crate) type ConfiguredAuthorizationClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointNotSet>;
 pub(crate) type ConfiguredDeviceClient =
-    BasicClient<EndpointSet, EndpointSet, EndpointNotSet, EndpointMaybeSet, EndpointSet>;
+    BasicClient<EndpointNotSet, EndpointSet, EndpointNotSet, EndpointMaybeSet, EndpointSet>;
 
 #[derive(Clone, Debug)]
 pub struct OAuthRequest {
     pub(crate) scheme: OauthScheme,
     client_id: Option<String>,
     client_secret: Option<SecretString>,
-    /// The account that the client acts as, in place of its own.
+    /// The subject of the assertions of a JWT bearer grant, in place of the
+    /// client itself.
     subject: Option<String>,
 }
 
@@ -36,6 +41,7 @@ pub struct OAuthRequestConfig {
     pub client_id: Option<String>,
     pub client_secret_file: Option<String>,
     pub client_secret_env: Option<String>,
+    pub subject: Option<String>,
 }
 
 /// Daemon-validated OAuth overrides stored with submitted credential material.
@@ -45,6 +51,7 @@ pub struct OAuthRuntimeOverrides {
     pub redirect_uri: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<SecretString>,
+    pub subject: Option<String>,
 }
 
 impl std::fmt::Debug for OAuthRuntimeOverrides {
@@ -58,6 +65,7 @@ impl std::fmt::Debug for OAuthRuntimeOverrides {
                 "client_secret",
                 &self.client_secret.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("subject", &self.subject)
             .finish()
     }
 }
@@ -72,19 +80,21 @@ impl OAuthRequest {
         }
     }
 
-    /// The request of the client for the credential of `account`: its own
-    /// for the default account, and else that of the account that it acts
-    /// as, the subject of its assertions.
-    #[must_use]
-    pub fn acting_as(mut self, account: &str) -> Self {
-        self.subject =
-            (account != crate::AccountId::default_account().as_str()).then(|| account.to_owned());
-        self
-    }
-
-    /// The account that the client acts as, none for its own.
+    /// The subject of the assertions of a JWT bearer grant, none for the
+    /// client itself.
     pub(crate) fn subject(&self) -> Option<&str> {
         self.subject.as_deref()
+    }
+
+    /// Takes `subject`, which a JWT bearer grant alone asserts.
+    fn set_subject(&mut self, subject: &str, source: &str) -> Result<(), AuthError> {
+        if self.scheme.flow.needs_user() {
+            return Err(AuthError::RequestConfig(format!(
+                "{source} needs the flow of a JWT bearer grant, whose client asserts its subject"
+            )));
+        }
+        self.subject = Some(subject.to_owned());
+        Ok(())
     }
 
     #[must_use]
@@ -120,7 +130,11 @@ impl OAuthRequest {
     }
 
     pub(crate) fn client(&self, redirect_uri: RedirectUrl) -> Result<ConfiguredClient, AuthError> {
-        Ok(self.token_client()?.set_redirect_uri(redirect_uri))
+        let auth_uri = AuthUrl::new(self.scheme.authorization_endpoint.clone())?;
+        Ok(self
+            .token_client()?
+            .set_auth_uri(auth_uri)
+            .set_redirect_uri(redirect_uri))
     }
 
     pub(crate) fn authorization_client(
@@ -133,8 +147,7 @@ impl OAuthRequest {
             .set_redirect_uri(redirect_uri))
     }
 
-    pub(crate) fn token_client(&self) -> Result<ConfiguredClient, AuthError> {
-        let auth_uri = AuthUrl::new(self.scheme.authorization_endpoint.clone())?;
+    pub(crate) fn token_client(&self) -> Result<ConfiguredTokenClient, AuthError> {
         let token_uri = TokenUrl::new(self.scheme.token_endpoint.clone())?;
         let revocation_url = self
             .scheme
@@ -144,7 +157,6 @@ impl OAuthRequest {
             .transpose()?;
 
         let mut client = BasicClient::new(ClientId::new(self.effective_client_id()?))
-            .set_auth_uri(auth_uri)
             .set_token_uri(token_uri)
             .set_revocation_url_option(revocation_url);
 
@@ -186,23 +198,18 @@ impl OAuthRequest {
                 flow: flow.clone(),
                 oauth: self,
             }),
-            OAuthFlow::JwtBearer => LoginRequest::JwtBearer(JwtBearerLoginRequest { oauth: self }),
+            OAuthFlow::JwtBearer | OAuthFlow::JwtBearerScopeClaim(_) => {
+                LoginRequest::JwtBearer(JwtBearerLoginRequest { oauth: self })
+            },
         }
     }
 
     /// The client secret of the request, which the daemon needs with the
-    /// credential to ask the token endpoint again.
+    /// credential to ask the token endpoint again: for a JWT bearer grant,
+    /// the private key of the client.
     #[must_use]
     pub fn client_secret(&self) -> Option<&SecretString> {
         self.client_secret.as_ref()
-    }
-
-    /// The private key of the client for the assertions of the JWT bearer
-    /// grant.
-    pub(crate) fn assertion_key(&self) -> Result<&SecretString, AuthError> {
-        self.client_secret
-            .as_ref()
-            .ok_or(AuthError::MissingClientSecret)
     }
 
     pub(crate) fn effective_client_id(&self) -> Result<String, AuthError> {
@@ -260,7 +267,9 @@ impl OAuthRequest {
                 OAuthFlow::ClientSideToken(flow) => {
                     redirect_uri.clone_into(&mut flow.redirect_uri_template);
                 },
-                OAuthFlow::DeviceCode(_) | OAuthFlow::JwtBearer => {},
+                OAuthFlow::DeviceCode(_)
+                | OAuthFlow::JwtBearer
+                | OAuthFlow::JwtBearerScopeClaim(_) => {},
             }
         }
 
@@ -272,6 +281,9 @@ impl OAuthRequest {
         }
         if let Some(client_secret) = read_oauth_client_secret(config)? {
             request.client_secret = Some(client_secret);
+        }
+        if let Some(subject) = non_empty_config_value(config.subject.as_deref(), "auth.subject")? {
+            request.set_subject(subject, "auth.subject")?;
         }
         Ok(request)
     }
@@ -300,7 +312,9 @@ impl OAuthRequest {
                 OAuthFlow::ClientSideToken(flow) => {
                     redirect_uri.clone_into(&mut flow.redirect_uri_template);
                 },
-                OAuthFlow::DeviceCode(_) | OAuthFlow::JwtBearer => {},
+                OAuthFlow::DeviceCode(_)
+                | OAuthFlow::JwtBearer
+                | OAuthFlow::JwtBearerScopeClaim(_) => {},
             }
         }
 
@@ -313,6 +327,11 @@ impl OAuthRequest {
         if let Some(client_secret) = overrides.client_secret {
             validate_non_empty_secret(&client_secret)?;
             request.client_secret = Some(client_secret);
+        }
+        if let Some(subject) =
+            non_empty_config_value(overrides.subject.as_deref(), "oauth subject")?
+        {
+            request.set_subject(subject, "oauth subject")?;
         }
         Ok(request)
     }
@@ -450,6 +469,7 @@ mod tests {
                 redirect_uri: Some("https://localhost/callback".to_owned()),
                 client_id: Some("client".to_owned()),
                 client_secret: Some(secret),
+                subject: None,
             },
         )
         .unwrap();
@@ -463,6 +483,27 @@ mod tests {
         };
         assert_eq!(flow.redirect_uri, "https://localhost/callback");
         assert!(!format!("{request:?}").contains("client-secret"));
+    }
+
+    /// A flow in which a user signs in asserts no subject.
+    #[test]
+    fn a_subject_needs_the_flow_of_a_jwt_bearer_grant() {
+        let subject = || OAuthRuntimeOverrides {
+            subject: Some("ada@example.test".to_owned()),
+            ..OAuthRuntimeOverrides::default()
+        };
+        let result = OAuthRequest::from_runtime(scheme(), subject());
+        assert!(matches!(result, Err(AuthError::RequestConfig(_))));
+
+        let request = OAuthRequest::from_runtime(
+            OauthScheme {
+                flow: OAuthFlow::JwtBearer,
+                ..scheme()
+            },
+            subject(),
+        )
+        .unwrap();
+        assert_eq!(request.subject(), Some("ada@example.test"));
     }
 
     #[test]

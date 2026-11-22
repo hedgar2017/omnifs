@@ -93,6 +93,11 @@ pub struct CredentialClientOverrides {
     pub client_secret: Option<SecretBytes>,
     pub redirect_uri: Option<String>,
     pub scopes: Option<Vec<String>>,
+    /// The subject of the assertions of a JWT bearer grant, in place of the
+    /// client itself. Serde skips it: the daemon stores it after the payload
+    /// of a credential with one, apart from the payload itself.
+    #[serde(skip)]
+    pub subject: Option<String>,
 }
 
 impl std::fmt::Debug for CredentialClientOverrides {
@@ -106,6 +111,7 @@ impl std::fmt::Debug for CredentialClientOverrides {
             )
             .field("redirect_uri", &self.redirect_uri)
             .field("scopes", &self.scopes)
+            .field("subject", &self.subject)
             .finish()
     }
 }
@@ -185,6 +191,7 @@ mod tests {
                 client_secret: Some(SecretBytes::new(b"client-secret".to_vec())),
                 redirect_uri: None,
                 scopes: None,
+                subject: None,
             },
         };
         let debug = format!("{submission:?}");

@@ -4,7 +4,7 @@
 //! the embedded bundle or daemon metadata, submits credentials locally, and
 //! asks the daemon to create the mount.
 
-use crate::auth::Auth;
+use crate::auth::{Auth, OAuthClientArgs};
 use anyhow::Context as _;
 use clap::Args;
 use omnifs_api::{
@@ -51,16 +51,20 @@ pub struct AddArgs {
     /// private key of a service account.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["token", "token_env"])]
     pub client_secret_file: Option<String>,
-    /// Account that the credential is of, instead of the default one: for a
-    /// client that acts as a user, as a service account with domain-wide
-    /// delegation, the user.
+    /// Label of the stored credential of the mount, instead of the default
+    /// one: mounts of one provider with different credentials have
+    /// different accounts.
     #[arg(long, value_name = "ACCOUNT", conflicts_with = "no_auth")]
     pub account: Option<String>,
+    /// Subject that an OAuth client without a sign-in asserts instead of
+    /// itself, as the user that a service account acts as.
+    #[arg(long, value_name = "SUBJECT", conflicts_with_all = ["token", "token_env"])]
+    pub subject: Option<String>,
     /// Auth scheme to use instead of the provider default.
     #[arg(long, value_name = "SCHEME")]
     pub scheme: Option<String>,
     /// Do not write an auth block, even if the provider declares a default.
-    #[arg(long, conflicts_with_all = ["token", "token_env", "scheme", "client_id", "client_secret_file"])]
+    #[arg(long, conflicts_with_all = ["token", "token_env", "scheme", "client_id", "client_secret_file", "subject"])]
     pub no_auth: bool,
     /// Full provider config JSON object to write into the mount spec.
     #[arg(long = "config-json", value_name = "JSON")]
@@ -123,13 +127,14 @@ impl AddArgs {
         })
     }
 
-    /// Whether the invocation gives a credential of its own, a token or the
-    /// client credentials, which is submitted whatever credential is stored.
+    /// Whether the invocation gives a credential of its own, a token or an
+    /// OAuth client, which is submitted whatever credential is stored.
     pub(crate) fn gives_credential(&self) -> bool {
         self.token.is_some()
             || self.token_env.is_some()
             || self.client_id.is_some()
             || self.client_secret_file.is_some()
+            || self.subject.is_some()
     }
 
     /// This invocation's chosen auth, before any ambient-credential import
@@ -152,15 +157,16 @@ impl AddArgs {
             Some(scheme) => Some(Auth::from_scheme(auth_manifest, scheme, account)?),
             None => Auth::from_provider_default(manifest).map(|auth| auth.with_account(account)),
         };
-        match auth {
-            Some(auth) => auth
-                .with_client(self.client_id.clone(), self.client_secret_file.clone())
-                .map(Some),
-            None if self.client_id.is_none() && self.client_secret_file.is_none() => Ok(None),
-            None => {
-                anyhow::bail!("`--client-id` and `--client-secret-file` need an OAuth auth scheme")
-            },
-        }
+        let client = OAuthClientArgs {
+            client_id: self.client_id.clone(),
+            client_secret_file: self.client_secret_file.clone(),
+            subject: self.subject.clone(),
+        };
+        let Some(auth) = auth else {
+            client.refuse()?;
+            return Ok(None);
+        };
+        auth.with_client(client).map(Some)
     }
 
     /// Apply `--config-json`'s override onto an already-generated default
@@ -263,6 +269,7 @@ pub(crate) async fn run_static_token_init(
             client_secret: None,
             redirect_uri: None,
             scopes: None,
+            subject: None,
         },
     })
 }
@@ -302,6 +309,7 @@ mod tests {
             &["--token-env", "TOKEN"],
             &["--client-id", "client"],
             &["--client-secret-file", "key.pem"],
+            &["--subject", "ada@example.test"],
         ] {
             assert!(
                 add_args(&[&["github"], given].concat()).gives_credential(),

@@ -47,7 +47,11 @@ injects them after a callout crosses the WASM boundary.
 
 Credential material stays out of WIT payloads. It may cross the daemon control boundary only in request-side protobuf messages on the local Unix socket; it never crosses filesystem attach/TCP or appears in responses, status, inventory, logs, Debug, or Inspector output. Route provider auth declarations through provider metadata and mount auth/config resolution. Keep human auth UX in `omnifs-cli`.
 
-OAuth client ids in provider declarations are public application identifiers, not secrets. User access tokens, refresh tokens, and client secrets remain sensitive host-side values. `omnifs mount add` owns first-run OAuth mount generation; `omnifs mount reauth <mount>` owns repair and re-authentication; both submit the collected credential as one op in a lease-scoped mutation batch to the daemon. Credentials live only in the daemon credential store: a mount's auth declares identity (scheme, account) and never a sourcing mechanism, so there is no read-from-env or read-from-file path at serve time.
+OAuth client ids in provider declarations are public application identifiers, not secrets. User access tokens, refresh tokens, and client secrets remain sensitive host-side values. `omnifs mount add` owns first-run OAuth mount generation; `omnifs mount reauth <mount>` owns repair and re-authentication; both submit the collected credential as one op in a lease-scoped mutation batch to the daemon. Credentials live only in the daemon credential store: a mount's auth declares its stored credential (scheme, account) and never a sourcing mechanism, so there is no read-from-env or read-from-file path at serve time.
+
+The account of a mount is the label of its stored credential and nothing else: mounts of one provider with different credentials have different accounts, and the host asserts no account to an upstream. `omnifs mount add` stores a credential of its invocation, as a token or an OAuth client, for its account alone: it replaces the stored one, and refuses the account whose credential another mount holds, which `omnifs mount reauth` replaces.
+
+The OAuth JWT bearer grant is the one of RFC 7523. The host signs an assertion with the client ID as `iss`, the token endpoint as `aud`, `iat`, `exp`, and `sub`: the subject of the credential, from `--subject` of `omnifs mount add` and `omnifs mount reauth`, or the client itself for a credential without one. It sends the scopes as the `scope` parameter of the token request. The subject is stored with the credential, is part of its auth fingerprint, and is not a secret. What an authorization server takes otherwise is a declaration of the manifest of the provider, never a profile in the host: the flow `jwtBearerScopeClaim` names the claim of the assertion that has the scopes in place of that parameter. A JWT bearer scheme declares no authorization endpoint and no token endpoint auth. A token of an answer without `expires_in` has no known expiry and serves until the upstream refuses it; an `expires_in` past the last time is an error of the answer.
 
 Credential values must never appear in CLI output, errors, tracing, metrics, or structured envelopes. Source identifiers such as environment-variable names may appear when they make an error actionable.
 
@@ -66,6 +70,7 @@ The libkrun filesystem guest also receives no credentials or network device. Its
 - Transmit credentials through filesystem attach/TCP or expose them in daemon responses, status, inventory, logs, Debug, or Inspector output. Request-side submission on the local Unix control socket is the only allowed crossing.
 - Let providers read the credential store directly.
 - Build a provider-specific credential bypass in host runtime code.
+- Give the host the profile of a vendor for an OAuth grant, or take the subject of an assertion from the account of a mount.
 - Treat WIT async imports as provider-owned I/O.
 
 ## Code

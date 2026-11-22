@@ -1,7 +1,8 @@
 use crate::callback::{LoopbackCallback, LoopbackEndpoint, accept_callback_request};
 use crate::request::ClientSideTokenLoginRequest;
 use crate::test_support::{
-    ASSERTION_KEY, FakeAuthServer, FakeBehavior, FakeOpener, FakeRevocationServer,
+    ASSERTION_KEY, AssertionExpiresIn, FakeAuthServer, FakeBehavior, FakeOpener,
+    FakeRevocationServer,
 };
 use crate::{
     AuthBinding, AuthError, CredentialService, LoginRequest, OAuthClient, OAuthRequest,
@@ -365,10 +366,19 @@ async fn refresh_exchange_parses_rotated_refresh_token() {
 }
 
 fn jwt_bearer_login(scheme: OauthScheme, key: Option<&str>) -> crate::JwtBearerLoginRequest {
+    jwt_bearer_login_of(scheme, key, None)
+}
+
+fn jwt_bearer_login_of(
+    scheme: OauthScheme,
+    key: Option<&str>,
+    subject: Option<&str>,
+) -> crate::JwtBearerLoginRequest {
     let request = OAuthRequest::from_runtime(
         scheme,
         crate::OAuthRuntimeOverrides {
             client_secret: key.map(|key| SecretString::from(key.to_owned())),
+            subject: subject.map(str::to_owned),
             ..crate::OAuthRuntimeOverrides::default()
         },
     )
@@ -393,7 +403,12 @@ async fn jwt_bearer_login_takes_an_access_token_for_the_assertion_of_the_client(
         .await
         .unwrap();
 
-    assert_eq!(entry.access_token().expose_secret(), "assertion-access-1");
+    // The scopes are the parameter `scope` of the request, and the client
+    // itself is the subject of the assertion.
+    assert_eq!(
+        entry.access_token().expose_secret(),
+        "assertion-access-1-of-client-id"
+    );
     assert!(entry.refresh_token().is_none());
     assert_eq!(entry.scopes(), ["read", "write"]);
     let lifetime = entry.expires_at().unwrap() - before;
@@ -403,18 +418,71 @@ async fn jwt_bearer_login_takes_an_access_token_for_the_assertion_of_the_client(
     );
 }
 
+/// A flow that declares a claim for the scopes has them in that claim of the
+/// assertion, and no parameter `scope` in the request.
 #[tokio::test]
-async fn jwt_bearer_login_asserts_the_account_that_the_client_acts_as_as_the_subject() {
+async fn jwt_bearer_login_has_the_scopes_in_the_claim_that_the_flow_declares() {
+    let fake = FakeAuthServer::start(FakeBehavior::default()).await;
+    let entry = OAuthClient::new()
+        .unwrap()
+        .login_jwt_bearer(jwt_bearer_login(
+            fake.jwt_bearer_scope_claim_scheme(),
+            Some(ASSERTION_KEY),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        entry.access_token().expose_secret(),
+        "assertion-access-1-of-client-id-with-scope-claim"
+    );
+    assert_eq!(entry.scopes(), ["read", "write"]);
+}
+
+/// A token of an answer without `expires_in` has no known expiry, and an
+/// answer whose `expires_in` is past the last time is an error.
+#[tokio::test]
+async fn jwt_bearer_login_takes_no_expiry_of_an_answer_without_one_and_refuses_one_past_time() {
+    let login = |fake: &FakeAuthServer| {
+        let scheme = fake.jwt_bearer_scheme();
+        async move {
+            OAuthClient::new()
+                .unwrap()
+                .login_jwt_bearer(jwt_bearer_login(scheme, Some(ASSERTION_KEY)))
+                .await
+        }
+    };
+    let fake = FakeAuthServer::start(FakeBehavior {
+        assertion_expires_in: AssertionExpiresIn::Absent,
+        ..FakeBehavior::default()
+    })
+    .await;
+    assert_eq!(login(&fake).await.unwrap().expires_at(), None);
+
+    let fake = FakeAuthServer::start(FakeBehavior {
+        assertion_expires_in: AssertionExpiresIn::Seconds(i64::MAX.unsigned_abs()),
+        ..FakeBehavior::default()
+    })
+    .await;
+    let error = login(&fake).await.unwrap_err();
+    assert!(matches!(error, AuthError::TokenAnswer(_)), "{error}");
+}
+
+/// The subject of an assertion is the subject of the credential, and the
+/// client itself for a credential without one.
+#[tokio::test]
+async fn jwt_bearer_login_asserts_the_subject_of_the_credential_or_the_client_itself() {
     let fake = FakeAuthServer::start(FakeBehavior::default()).await;
     let client = OAuthClient::new().unwrap();
-    for (account, token) in [
-        ("default", "assertion-access-1"),
-        ("ada@example.test", "assertion-access-2-of-ada@example.test"),
+    for (subject, token) in [
+        (None, "assertion-access-1-of-client-id"),
+        (
+            Some("ada@example.test"),
+            "assertion-access-2-of-ada@example.test",
+        ),
     ] {
-        let mut login = jwt_bearer_login(fake.jwt_bearer_scheme(), Some(ASSERTION_KEY));
-        login.oauth = login.oauth.acting_as(account);
+        let login = jwt_bearer_login_of(fake.jwt_bearer_scheme(), Some(ASSERTION_KEY), subject);
         let entry = client.login_jwt_bearer(login).await.unwrap();
-        assert_eq!(entry.access_token().expose_secret(), token, "{account}");
+        assert_eq!(entry.access_token().expose_secret(), token, "{subject:?}");
     }
 }
 
@@ -496,7 +564,7 @@ async fn jwt_bearer_binding_renews_an_expired_token_without_a_refresh_token() {
         header,
         Some((
             "Authorization".to_owned(),
-            "Bearer assertion-access-1".to_owned()
+            "Bearer assertion-access-1-of-client-id".to_owned()
         ))
     );
     assert_eq!(binding.health(), crate::CredentialHealth::Ready);
@@ -592,7 +660,7 @@ fn refresh_merge_retains_omitted_refresh_token_scopes_and_identity() {
     }))
     .unwrap();
 
-    let entry = crate::flows::credential_entry_from_refresh_token(&token, &current);
+    let entry = crate::flows::credential_entry_from_refresh_token(&token, &current).unwrap();
 
     assert_eq!(entry.access_token().expose_secret(), "new-access");
     assert_eq!(entry.refresh_token().unwrap().expose_secret(), "refresh-1");
@@ -612,7 +680,7 @@ fn refresh_merge_honors_explicit_empty_scopes() {
     );
     token.set_scopes(Some(Vec::new()));
 
-    let entry = crate::flows::credential_entry_from_refresh_token(&token, &current);
+    let entry = crate::flows::credential_entry_from_refresh_token(&token, &current).unwrap();
 
     assert!(entry.scopes().is_empty());
 }
@@ -627,7 +695,7 @@ fn refresh_merge_normalizes_empty_wire_scope_to_explicit_empty_set() {
     }))
     .unwrap();
 
-    let entry = crate::flows::credential_entry_from_refresh_token(&token, &current);
+    let entry = crate::flows::credential_entry_from_refresh_token(&token, &current).unwrap();
 
     assert!(entry.scopes().is_empty());
 }

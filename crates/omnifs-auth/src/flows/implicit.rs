@@ -25,7 +25,7 @@ impl OAuthClient {
         if callback.state.secret() != csrf_token.secret() {
             return Err(AuthError::StateMismatch);
         }
-        Ok(credential_entry_from_token(&callback.token))
+        credential_entry_from_token(&callback.token)
     }
 }
 

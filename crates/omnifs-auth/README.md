@@ -3,7 +3,10 @@
 `omnifs-auth` is the host-side OAuth adapter for Omnifs. It does not implement
 OAuth itself; protocol construction, PKCE, device-code polling, token refresh,
 revocation, request signing, and response parsing are delegated to the `oauth2`
-crate.
+crate. The one exception is the JWT bearer grant of RFC 7523, which `oauth2`
+has no request for: `flows/jwt_bearer.rs` signs the assertion with
+`jsonwebtoken`, sends the token request itself, and reads the answer with the
+response types of `oauth2`.
 
 This crate owns the Omnifs-specific boundary around that protocol:
 
