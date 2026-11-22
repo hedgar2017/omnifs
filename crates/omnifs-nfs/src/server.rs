@@ -178,12 +178,7 @@ fn serve_connection(
     let writer = thread::Builder::new()
         .name("nfs-writer".to_string())
         .spawn(move || {
-            let mut write_stream = write_stream;
-            while let Ok(payload) = rx.recv() {
-                if write_rpc_record(&mut write_stream, &payload).is_err() {
-                    break;
-                }
-            }
+            let _ = write_replies(write_stream, &rx, omnifs_core::SILENT_PEER_TIMEOUT);
         })
         .expect("spawn nfs writer thread");
 
@@ -308,6 +303,26 @@ fn prune_finished_workers(workers: &Mutex<Vec<Connection>>) {
     }
 }
 
+/// Write each reply of `replies` to `stream` until the connection ends. A
+/// write that makes no progress for `silence`, to a client that reads none
+/// of it, ends the connection: its shutdown ends the reader of the
+/// connection too.
+fn write_replies(
+    mut stream: TcpStream,
+    replies: &mpsc::Receiver<Vec<u8>>,
+    silence: std::time::Duration,
+) -> io::Result<()> {
+    // The bound of each write, which a write that moves any byte renews.
+    stream.set_write_timeout(Some(silence))?;
+    while let Ok(payload) = replies.recv() {
+        if let Err(error) = write_rpc_record(&mut stream, &payload) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn join_workers(workers: &Mutex<Vec<Connection>>) {
     let workers = std::mem::take(&mut *workers.lock().expect("workers lock"));
     for connection in workers {
@@ -394,6 +409,23 @@ mod tests {
         let bind = "0.0.0.0:0".parse().expect("bind addr");
         let result = start_server(Arc::new(EmptyExport), bind, None);
         assert!(matches!(result, Err(NfsFilesystemError::Io(_))));
+    }
+
+    /// The replies to a client that reads none of them end the connection
+    /// once a write makes no progress for the silence of the writer.
+    #[test]
+    fn replies_to_a_client_that_reads_nothing_end_after_their_silence() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let (replies, rx) = mpsc::channel();
+        // More bytes than the buffers of the two sockets hold.
+        for _ in 0..64 {
+            replies.send(vec![0_u8; 1024 * 1024]).expect("reply");
+        }
+        drop(replies);
+        let written = write_replies(server, &rx, std::time::Duration::from_millis(100));
+        assert!(written.is_err(), "{written:?}");
     }
 
     #[test]
