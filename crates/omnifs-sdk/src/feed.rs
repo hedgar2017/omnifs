@@ -441,6 +441,8 @@ impl Feed {
             more: false,
             inner: Vec::new(),
             until: None,
+            unlisted: false,
+            anew: false,
         }
     }
 
@@ -474,9 +476,42 @@ pub struct FeedPart {
     more: bool,
     inner: Vec<InnerState>,
     until: Option<SystemTime>,
+    unlisted: bool,
+    anew: bool,
+}
+
+/// A [`FeedPart`] taken apart for the host.
+pub(crate) struct FeedPartParts {
+    pub(crate) token: String,
+    pub(crate) more: bool,
+    pub(crate) inner: Vec<InnerState>,
+    pub(crate) until: Option<SystemTime>,
+    pub(crate) unlisted: bool,
+    pub(crate) anew: bool,
 }
 
 impl FeedPart {
+    /// No inventory of a feed above this own feed has its object, as an
+    /// item that its upstream gives by its id alone: the host asks this feed
+    /// itself for its paths, past its own deadline with
+    /// [`FeedCx::due`], until a part of a feed above it brings its state
+    /// with [`FeedPart::inner`]. Each part of the feed says it again.
+    #[must_use]
+    pub fn unlisted(mut self) -> Self {
+        self.unlisted = true;
+        self
+    }
+
+    /// Decline to continue the kept parts of a later answer: the host drops
+    /// them, and the answer begins with this part. A call that continues an
+    /// answer has the start of its operation ([`FeedCx::start`],
+    /// [`FeedCx::due`]), by which the feed decides.
+    #[must_use]
+    pub fn anew(mut self) -> Self {
+        self.anew = true;
+        self
+    }
+
     /// Whether more parts follow in the same answer.
     #[must_use]
     pub fn more(mut self, more: bool) -> Self {
@@ -513,8 +548,15 @@ impl FeedPart {
         self
     }
 
-    pub(crate) fn into_parts(self) -> (String, bool, Vec<InnerState>, Option<SystemTime>) {
-        (self.token, self.more, self.inner, self.until)
+    pub(crate) fn into_parts(self) -> FeedPartParts {
+        FeedPartParts {
+            token: self.token,
+            more: self.more,
+            inner: self.inner,
+            until: self.until,
+            unlisted: self.unlisted,
+            anew: self.anew,
+        }
     }
 }
 

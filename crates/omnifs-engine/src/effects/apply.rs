@@ -830,7 +830,7 @@ fn feed_write(
             feed.answer = FeedAnswerWrite::Part(FeedPartWrite {
                 token: part.token,
                 more: part.more,
-                unlisted: false,
+                unlisted: part.unlisted,
             });
         },
         wit_types::FeedAnswer::Restart(restart) => {

@@ -476,7 +476,13 @@ impl Shelf {
                 }
                 cx.dir(&books, ListingWrite::Complete)?;
                 cx.remove(format!("{books}/2"))?;
-                Ok(Feed::part(&ShelfToken::Version(version))?.into())
+                let part = Feed::part(&ShelfToken::Version(version))?;
+                // The `fickle` shelf declines the part that the host kept.
+                Ok(if shelf == "fickle" {
+                    part.anew().into()
+                } else {
+                    part.into()
+                })
             },
             Some(ShelfToken::Version(_) | ShelfToken::Change(_)) => {
                 Self::listing_read(cx, &shelf, &books)?;

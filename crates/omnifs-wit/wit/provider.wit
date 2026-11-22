@@ -355,12 +355,18 @@ interface types {
     /// One part of an answer: the token after it, whether more parts follow
     /// in the same answer, the tokens of the objects of inner feeds it
     /// brought, as the items of a page of rows, and each anchor of another
-    /// facet of an object that it writes.
+    /// facet of an object that it writes. `unlisted` says that no inventory
+    /// of a feed above the feed has its object: the host asks the feed
+    /// itself for its paths, past its own deadline, until a part of a feed
+    /// above it brings its state. `anew` declines to continue the kept parts
+    /// of a later answer: they leave, and the answer begins with this part.
     record feed-part {
         token: feed-token,
         more: bool,
         inner: list<feed-state>,
         anchors: list<facet-anchor>,
+        unlisted: bool,
+        anew: bool,
     }
 
     /// An anchor of an object at another choice of a facet than the first,

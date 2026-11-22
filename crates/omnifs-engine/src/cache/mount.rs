@@ -433,6 +433,8 @@ pub(crate) struct KeptWrite {
     /// The count of [`MountResources::sequence`] when the call of the part
     /// began.
     pub began: u64,
+    /// The part declines the kept parts before it, which leave.
+    pub anew: bool,
 }
 
 /// The token after a part, and whether more parts follow in its answer.
@@ -2445,9 +2447,13 @@ fn keep_part(
     facts: &fjall::OptimisticTxKeyspace,
     kept: &KeptWrite,
 ) -> Result<(), ProjectionError> {
-    let previous = read_feed_state(tx, facts, &kept.object)?.ok_or_else(|| {
+    let mut previous = read_feed_state(tx, facts, &kept.object)?.ok_or_else(|| {
         ProjectionError::Inconsistent("a kept part of a feed without a state".into())
     })?;
+    if kept.anew {
+        drop_kept_parts(tx, facts, &kept.object)?;
+        previous.kept = 0;
+    }
     if previous.kept == 0 {
         tx.insert(
             facts,
@@ -3966,6 +3972,7 @@ mod tests {
                 part: part.as_bytes().to_vec(),
                 token: format!("after {part}"),
                 began: 0,
+                anew: false,
             }),
             ..ProjectionTransition::default()
         }

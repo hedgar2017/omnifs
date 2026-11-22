@@ -935,6 +935,8 @@ mod tests {
                 more: false,
                 inner: Vec::new(),
                 anchors: Vec::new(),
+                unlisted: false,
+                anew: false,
             }))
         };
         let large = "t".repeat(64 * 1024 * 1024 + 1);
@@ -954,6 +956,8 @@ mod tests {
             more: false,
             inner: Vec::new(),
             anchors: Vec::new(),
+            unlisted: false,
+            anew: false,
         }));
         let id = |value: &str| wit_types::LogicalId {
             kind: "test.print".to_string(),

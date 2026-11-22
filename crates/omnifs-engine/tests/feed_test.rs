@@ -448,6 +448,25 @@ async fn an_answer_that_writes_a_file_as_it_was_changes_nothing_for_a_filesystem
     }
 }
 
+/// A part that declines the kept parts of its answer begins the answer: the
+/// kept parts leave without their facts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_part_that_declines_the_kept_parts_of_its_answer_publishes_alone() {
+    let harness = make_initialized_runtime(CONFIG);
+    let segments = ["shelves", "fickle", "books"];
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
+    read(&harness, &["hello", "shelf-change"]).await;
+    tokio::time::sleep(PAST_DEADLINE).await;
+
+    // The first part of the later answer, which the host keeps, renames
+    // book 1 and adds book 3; the last part declines it and removes book 2.
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1"]);
+    assert_eq!(
+        read(&harness, &["shelves", "fickle", "books", "1", "title"]).await,
+        "Book 1"
+    );
+}
+
 // The tests below take the shared helpers of a provider test, by the path
 // of a node from the root of the namespace.
 use omnifs_itest::support;

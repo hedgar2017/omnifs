@@ -405,8 +405,55 @@ fn complete_listing(runtime: &Runtime, path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::under;
+    use super::{answering_claim, under};
+    use crate::cache::FeedState;
+    use crate::object_id::ObjectId;
+    use crate::ops::feed::{FeedClaim, FeedObject};
     use omnifs_core::path::Path;
+
+    #[test]
+    fn an_unlisted_own_feed_answers_for_its_paths_whatever_feed_above_it_ended() {
+        let claim = |path: &str, own: bool| FeedClaim {
+            object: FeedObject {
+                id: ObjectId::from_bytes(path.as_bytes().to_vec()),
+                path: Path::parse(path).unwrap(),
+            },
+            starts: true,
+            own,
+            full_listings: false,
+        };
+        let state = |ended: bool, unlisted: bool| {
+            Some(FeedState {
+                version: 1,
+                ended,
+                deadline: 0,
+                passed: 0,
+                token: [0; 32],
+                kept: 0,
+                unlisted,
+            })
+        };
+        let claims = [claim("/drive", false), claim("/drive/files/x", true)];
+        // The feed above ended: it answers for an item that its inventory
+        // has, and the own feed of an item that no inventory has answers
+        // itself.
+        assert_eq!(
+            answering_claim(&claims, &[state(true, false), state(true, false)]),
+            0
+        );
+        assert_eq!(
+            answering_claim(&claims, &[state(true, false), state(true, true)]),
+            1
+        );
+        // Before any feed above ended, the innermost claim answers.
+        assert_eq!(answering_claim(&claims, &[state(false, false), None]), 1);
+        // A feed that is not an own feed is never unlisted.
+        let plain = [claim("/shelf", false), claim("/shelf/books/1", false)];
+        assert_eq!(
+            answering_claim(&plain, &[state(true, false), state(true, true)]),
+            0
+        );
+    }
 
     #[test]
     fn a_path_below_an_anchor_of_another_facet_is_under_the_anchor_of_the_claim() {

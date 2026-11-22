@@ -853,6 +853,8 @@ async fn demo_feed(cx: crate::feed::FeedCx<DemoKey, ()>) -> Result<crate::feed::
             &2_u32,
         )?
         .until(std::time::UNIX_EPOCH + std::time::Duration::from_secs(5))
+        .unlisted()
+        .anew()
         .into())
 }
 
@@ -1157,6 +1159,8 @@ fn the_feed_export_runs_the_feed_of_the_object_at_its_path() {
     assert_eq!(part.inner[0].id.captures[0].value, "9");
     assert_eq!(part.inner[0].token, "2");
     assert!(!part.more);
+    assert!(part.unlisted, "no inventory above the feed has its object");
+    assert!(part.anew, "the part declines the kept parts of its answer");
     assert_eq!(until, Some(5_000), "the facts of the part count until then");
     let effects = effects.into_wit();
     assert_eq!(summary_of(&effects), b"None Some(\"parts\") None");

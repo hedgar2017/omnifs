@@ -94,7 +94,14 @@ impl<S> CompiledRouter<S> {
         match answer {
             Feed::Unchanged => Ok((wit_types::FeedAnswer::Unchanged, effects, None)),
             Feed::Part(part) => {
-                let (token, more, inner, until) = part.into_parts();
+                let crate::feed::FeedPartParts {
+                    token,
+                    more,
+                    inner,
+                    until,
+                    unlisted,
+                    anew,
+                } = part.into_parts();
                 let inner = inner
                     .into_iter()
                     .map(|state| wit_types::FeedState {
@@ -118,6 +125,8 @@ impl<S> CompiledRouter<S> {
                         more,
                         inner,
                         anchors,
+                        unlisted,
+                        anew,
                     }),
                     effects,
                     until,

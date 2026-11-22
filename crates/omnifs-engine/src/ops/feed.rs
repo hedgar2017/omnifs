@@ -528,6 +528,8 @@ impl Runtime {
                     more: false,
                     inner: Vec::new(),
                     anchors: Vec::new(),
+                    unlisted: false,
+                    anew: false,
                 },
                 effects,
                 bodies: Vec::new(),
@@ -560,7 +562,9 @@ impl Runtime {
                         "a feed answered unchanged after the kept parts of its answer".into(),
                     ));
                 },
-                wit_types::FeedAnswer::Part(mut part) if kept => {
+                // A part that declines the kept parts begins the answer:
+                // its publication drops them.
+                wit_types::FeedAnswer::Part(mut part) if kept && !part.anew => {
                     let mut parts = self
                         .resources
                         .kept_parts(object.id.as_bytes())
@@ -699,6 +703,7 @@ impl Runtime {
                 from: origin.from,
                 token: kept.part.token.clone(),
                 began: kept.began,
+                anew: kept.part.anew,
                 part: kept.encode(&self.resources)?,
             }),
             ..ProjectionTransition::default()
