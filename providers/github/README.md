@@ -5,26 +5,38 @@
 ## Mount layout
 
 ```
+/github/{owner}/
+  owner.json
+  profile.md
 /github/{owner}/{repo}/
+  repo.json
   issues/
     open|all/
       {number}/
+        item.json
+        item.md
         title
         body
         state
         user
         comments/{id}/
+          comment.json
+          comment.md
           author
           body.md
   pulls/
     open|all/
       {number}/
+        item.json
+        item.md
         title
         body
         state
         user
         diff.patch
         comments/{id}/
+          comment.json
+          comment.md
           author
           body.md
         files/{percent-encoded-path}/
@@ -38,7 +50,20 @@
 /github/notifications/thread-{id}/
 ```
 
-The feed of a repository keeps its issues, pull requests, and comments. The first read of `issues/all/`, `issues/open/`, `pulls/all/`, or `pulls/open/` takes the first full listing a page at a time: every issue and pull request by `updated_at`, then every comment, then the GitHub GraphQL counts of the comments of each item; a stopped listing continues from its next page at the next read of those folders. After it, a read 3 seconds or more after the last answer checks the changes since the last `updated_at` with `If-None-Match`, the comments since then, and the GraphQL counts, a part of the answer for each request, which the host publishes together with the last part. Before the first full listing ends, an item answers from its own `GET /repos/{owner}/{repo}/issues/{number}`, and its comments download at the first read of its `comments/` or of a comment in it, for a count other than `0`. The facts of an issue or a pull request live under `all/`, which `open/` shares while it is open. GitHub GraphQL answers only an authenticated mount.
+The feed of a repository keeps its issues, pull requests, and comments. The first read of `issues/all/`, `issues/open/`, `pulls/all/`, or `pulls/open/` takes the first full listing a page at a time: every issue and pull request by `updated_at`, then every comment by `updated_at`, then the GitHub GraphQL counts of the comments of each item; a stopped listing continues from its next page at the next read of those folders. A page after one that moved the time of its list asks for the rows since that time, so that a row that changes between two pages moves no other row past a page.
+
+After it, a read 3 seconds or more after the last answer is a check, a part of the answer for each request, which the host publishes together with the last part:
+
+- the issues and pull requests since the last `updated_at` of one, with `If-None-Match`;
+- the comments since the last `updated_at` of one, with `If-None-Match`, so that an edit of a comment comes without a change of its item;
+- one GitHub GraphQL `POST` with the counts of the issues and of the pull requests, the IDs of the comments of each changed item, and one page of the counts of the comments of the items, the page after that of the check before it. An item with another count than its `comments/` takes the IDs of its comments, so that a comment that left an item without a change of that item leaves within as many checks as the repository has hundreds of items;
+- for another count of the issues or of the pull requests, the numbers of that kind, which remove the items that left.
+
+Before the first full listing ends, an item answers from its own `GET /repos/{owner}/{repo}/issues/{number}`, and its comments download at the first read of its `comments/` or of a comment in it, for a count other than `0`. The facts of an issue or a pull request live under `all/`, which `open/` shares while it is open. GitHub GraphQL answers only an authenticated mount.
+
+The owner and the repository are named as the path spells them: another spelling of the same name is another folder with its own downloads.
+
+`diff.patch` is the diff between the base and the head of the pull request, which each read asks `GET /repos/{owner}/{repo}/pulls/{number}` for; the host downloads the diff of a pair of commits once. `actions/runs/{id}/log` fails while GitHub answers the archive of the logs with a redirect, which the host does not follow.
 
 ## Capabilities
 

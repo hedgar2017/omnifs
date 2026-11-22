@@ -782,16 +782,33 @@ The feed of the repository keeps its issues, pull requests, and comments: the
 entry in `{kind}/open/` shares while it is open, and the `author` and `body.md`
 of each comment. Its first full listing takes the rows of
 `GET /repos/{owner}/{repo}/issues` by `updated_at`, then the comments of the
-repository, then the GitHub GraphQL counts of the comments of each item, where
-an item with another count takes the ids of its comments. After it, each answer
-past the deadline is a check of each page of the rows since the time of the last
-row, the first with the `ETag` of that time, and of the counts, at most 100
-items a `POST`, where another count of a kind takes the numbers of its items,
-and an item that GitHub GraphQL cannot resolve leaves; each request is a part,
-and the host keeps the parts until the last one. Before the first
-full listing ends, the feed of an item answers for it from
-`GET /repos/{owner}/{repo}/issues/{number}` and takes its comments at the first
-read of its `comments/`.
+repository by `updated_at`, then each page of the GitHub GraphQL counts of the
+comments of each item, where an item with another count takes the ids of its
+comments, and each comment of those that the projection lacks by its id. A page
+of the rows or of the comments after one that moved the time of its list asks
+for the rows since that time, and by its link `next` only after a page whose
+rows end at the time they were asked since: a row that changes between two
+pages moves no other row past a page. After the first full listing, each answer
+past the deadline is a check: each page of the rows since the time of the last
+row, the first with the `ETag` of that time; each page of the comments since
+the time of the last comment, the first with the `ETag` of that time, so that an
+edit of a comment comes without a change of its item; and the counts, at most
+100 items a `POST`, the first with the page of the counts of the comments of
+the items after that of the check before it. A changed item, and an item of
+that page with another count than its `comments/`, takes the ids of its
+comments, which remove a comment that left it and bring by its id a comment
+that the comments of the check lack; an item that GitHub GraphQL cannot
+resolve leaves. Another count of a kind takes the numbers of its items once:
+an item of the projection that they lack leaves, and an item that the
+projection lacks comes from `GET /repos/{owner}/{repo}/issues/{number}`, unless
+that answers without it. Each request is a part, and the host keeps the parts
+until the last one. Before the first full listing ends, the feed of an item
+answers for it from `GET /repos/{owner}/{repo}/issues/{number}` and takes its
+comments at the first read of its `comments/`, each page after the first by the
+link `next` of the one before it.
+
+The owner and the repository of a key are the segments of its path as they are
+spelled, so that the facts of a feed live under the path of its object.
 
 A collection stores child canonical bytes only when the list payload satisfies
 the child object's canonical contract. Shallow fields can be eager computed
@@ -804,22 +821,29 @@ Comments are `Comment` objects projected as `comments/{comment_id}` directories
 (one object keyed by the comment id, whose fed faces the feeds keep), not
 indexed `comments/{idx}` files.
 
-The pull diff is a blob face, not a direct file. The exact return type can move,
-but the behavior must preserve host-resident bytes:
+The pull diff is a blob face, not a direct file. It is `Dynamic`, with the
+base and the head of the pull request as its version and as the version of
+its blob request, so that the host holds the diff of each pair of commits and
+a push to the pull request brings another diff:
 
 ```rust
 async fn diff(cx: Cx<GitHub>, key: PullRequestKey) -> Result<BlobFile<Diff>> {
+    let path = format!("/repos/{}/pulls/{}", key.repo(), key.number());
+    let pull: PullCommits = cx.endpoint(GitHubApi).get(path.as_str()).json().await?;
+    let version = format!("{}..{}", pull.base.sha, pull.head.sha);
     let blob = cx
         .endpoint(GitHubApi)
-        .get(format!("/repos/{}/pulls/{}", key.repo(), key.number()))
+        .get(path)
         .header("Accept", "application/vnd.github.diff")
         .into_blob()
+        .version(version.as_str())
         .fetch()
         .await?;
 
     Ok(BlobFile::new(blob.id)
         .size(FileSize::Exact(blob.size))
-        .content_type("text/x-diff"))
+        .stability(Stability::Dynamic)
+        .version(version))
 }
 ```
 
@@ -827,6 +851,7 @@ GitHub action logs are different in the current provider: the endpoint returns a
 zip and the provider flattens it into text in guest memory. That can remain a
 direct transformed file. If the log surface becomes a raw downloadable archive
 or an extracted tree, model it as a blob or tree face instead of a direct file.
+An answer without the archive is an error of the read, never a file.
 
 ### arXiv
 
