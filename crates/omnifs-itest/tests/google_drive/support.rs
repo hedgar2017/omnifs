@@ -198,7 +198,7 @@ pub fn expect_first_byte(request: &Request, id: &str) {
         request,
         &format!("/files/{id}"),
         &[("alt", "media"), ("supportsAllDrives", "true")],
-        true,
+        false,
     );
     let Request::Fetch(request) = request else {
         panic!("the request of a first byte is inline: {request:?}");
@@ -232,7 +232,7 @@ pub fn expect_export_refusal(request: &Request, id: &str, mime_type: &str) {
         request,
         &format!("/files/{id}/export"),
         &[("mimeType", mime_type)],
-        true,
+        false,
     );
 }
 

@@ -11,7 +11,7 @@ use omnifs_itest::RuntimeHarness;
 use omnifs_itest::support::{
     Answer, Request, answering, lookup, names, next_callout, read, served,
 };
-use omnifs_wit::host::types::Callout;
+use omnifs_wit::host::types::{Callout, CalloutError, CalloutResult, ErrorKind};
 use serde_json::{Value, json};
 use support::{
     Corpus, at, blob, bytes, changed, changes, drive_harness, drives, expect_bytes, expect_changes,
@@ -96,7 +96,9 @@ async fn reading(
 /// listing. A page that Google Drive refuses with `400` for its token begins
 /// the listing again with the token of the changes of its start. A request
 /// of a listing that fails for now leaves the check of each item that the
-/// listing brought to its own feed past its deadline.
+/// listing brought to its own feed in a sync. An object without an ID, a
+/// MIME type, or `trashed` is the error of the listing, whose other items
+/// are in the mount.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_first_full_listing_takes_the_items_of_the_user_and_of_each_shared_drive() {
@@ -128,6 +130,8 @@ async fn the_first_full_listing_takes_the_items_of_the_user_and_of_each_shared_d
             bare.clone(),
             headless.clone(),
             uploaded("x-1", "survey.csv", "kept"),
+            without(uploaded("anon-1", "anon.md", "old"), "id"),
+            without(google("blank-1", "form", "Blank", EDITED), "mimeType"),
         ],
         Some("page-2"),
     );
@@ -163,8 +167,8 @@ async fn the_first_full_listing_takes_the_items_of_the_user_and_of_each_shared_d
     )
     .await;
     assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
-    // Past its deadline, an operation on an item that the listing brought
-    // checks it by its ID while the listing has not ended.
+    // In a sync, an operation on an item that the listing brought checks it
+    // by its ID while the listing has not ended.
     harness.begin_sync();
     let (old, requests) = answering(
         &harness,
@@ -222,8 +226,11 @@ async fn the_first_full_listing_takes_the_items_of_the_user_and_of_each_shared_d
         ],
     )
     .await;
+    // The objects without what names them are the error of the listing,
+    // after the facts of the other items.
+    assert!(matches!(listing, Err(NsError::Invalid)), "{listing:?}");
     assert_eq!(
-        listing.unwrap(),
+        listed(&harness, "files").await,
         sorted(&[
             "file-1",
             "broken-1",
@@ -429,16 +436,34 @@ async fn the_content_takes_the_bytes_and_the_export_of_a_file_at_the_revision_of
     // MD5 take the file by its ID, and its bytes of its MD5, which stay at
     // the change of that MD5.
     let uploaded_again = uploaded("file-2", "draft.md", "new");
-    let (content, requests) = reading(
-        &harness,
-        "files/file-2/content",
-        [blob(200, b"new"), ok(&uploaded_again), blob(200, b"new")],
-    )
-    .await;
+    let content_path = at("files/file-2/content");
+    let (content, ()) = tokio::join!(read(&harness, &content_path), async {
+        let first = next_callout(&harness).await;
+        let Callout::FetchBlob(asked) = first.callout().clone() else {
+            panic!("the bytes are a blob fetch: {:?}", first.callout());
+        };
+        assert_eq!(asked.md5.as_deref(), Some(md5("old")));
+        harness.runtime.answer_test_blob(first, 200, b"new").await;
+        let by_id = next_callout(&harness).await;
+        let Callout::Fetch(request) = by_id.callout().clone() else {
+            panic!("the item by its ID: {:?}", by_id.callout());
+        };
+        expect_item(&Request::Fetch(request), "file-2");
+        let Answer::Fetch(answer) = ok(&uploaded_again) else {
+            unreachable!()
+        };
+        by_id.answer(answer);
+        // The host keeps the bytes of the first answer under their own MD5,
+        // so the request of that MD5 downloads nothing.
+        let again = next_callout(&harness).await;
+        let Callout::FetchBlob(asked) = again.callout().clone() else {
+            panic!("the bytes are a blob fetch: {:?}", again.callout());
+        };
+        assert_eq!(asked.md5.as_deref(), Some(md5("new")));
+        assert!(harness.runtime.keeps_test_blob(&asked));
+        harness.runtime.answer_test_blob(again, 200, b"new").await;
+    });
     assert_eq!(content.unwrap(), "new");
-    expect_bytes(&requests[0], "file-2", md5("old"));
-    expect_item(&requests[1], "file-2");
-    expect_bytes(&requests[2], "file-2", md5("new"));
     harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
@@ -454,7 +479,7 @@ async fn the_content_takes_the_bytes_and_the_export_of_a_file_at_the_revision_of
     assert_eq!(read, uploaded_again);
 }
 
-/// The changes at a read of `files/` past the deadline of the feed, from the
+/// The changes at a read of `files/` once in a sync, from the
 /// token of the answer before: a new file, a file with other content, whose
 /// content the next read takes again, a file with another name alone, whose
 /// content stays, the removal of an item that the account no longer has, of
@@ -506,7 +531,7 @@ async fn the_changes_take_the_items_after_the_token_of_the_answer_before() {
     let plan_edited = google("doc-1", "document", "Plan", EDITED_LATER);
     let headless = without(uploaded("file-5", "raw.bin", "busy"), "md5Checksum");
     let found = uploaded("file-9", "found again.md", "new");
-    harness.begin_sync();
+    let sync = harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("files")),
@@ -514,7 +539,9 @@ async fn the_changes_take_the_items_after_the_token_of_the_answer_before() {
             ok(&json!({
                 "changes": [
                     changed(&edited),
+                    json!({ "changeType": "file", "removed": false }),
                     changed(&uploaded("file-2", "renamed.md", "kept")),
+                    changed(&without(uploaded("file-10", "odd.md", "new"), "trashed")),
                     removed("file-3"),
                 ],
                 "nextPageToken": "changes-1b",
@@ -542,16 +569,20 @@ async fn the_changes_take_the_items_after_the_token_of_the_answer_before() {
         ],
     )
     .await;
-    assert_eq!(
-        listing.unwrap(),
-        sorted(&[
-            "file-1", "file-2", "file-5", "file-6", "file-8", "file-9", "team-3", "doc-1"
-        ])
-    );
+    // A change without what names it is the error of the answer, after the
+    // facts of the other changes.
+    assert!(matches!(listing, Err(NsError::Invalid)), "{listing:?}");
     expect_changes(&requests[0], "changes-1");
     expect_changes(&requests[1], "changes-1b");
     expect_item(&requests[2], "file-7");
     expect_item(&requests[3], "file-9");
+    // The changes are asked once in a sync, and not outside one.
+    let files_now = sorted(&[
+        "file-1", "file-2", "file-5", "file-6", "file-8", "file-9", "team-3", "doc-1",
+    ]);
+    assert_eq!(listed(&harness, "files").await, files_now);
+    harness.end_sync(sync);
+    assert_eq!(listed(&harness, "files").await, files_now);
     assert_eq!(listed(&harness, "folders").await, ["folder-2"]);
     assert_eq!(listed(&harness, "others").await, ["form-2"]);
 
@@ -749,6 +780,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
                         uploaded("file-4", "draft.md", "new"),
                         uploaded("file-5", "later.md", "kept"),
                         uploaded("form-3", "form.csv", "kept"),
+                        without(google("anon-2", "form", "Anon", EDITED), "id"),
                         google("folder-1", "folder", "Work", EDITED),
                         google("form-2", "form", "Poll", EDITED),
                     ],
@@ -763,8 +795,9 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
                 };
                 drives_page.answer(answer);
             });
+            assert!(matches!(listing, Err(NsError::Invalid)), "{listing:?}");
             assert_eq!(
-                listing.unwrap(),
+                listed(&harness, "files").await,
                 sorted(&["file-1", "file-3", "file-4", "file-5", "form-3"])
             );
         }
@@ -787,7 +820,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
     assert_eq!(content.unwrap(), "new");
     expect_bytes(&requests[0], "file-4", md5("new"));
 
-    // The export by its ID comes back at its next lookup past its deadline,
+    // The export by its ID comes back at its next lookup in a sync,
     // and the host keeps the answer of its request of its content.
     harness.begin_sync();
     let (content, requests) = reading(
@@ -812,8 +845,8 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
 }
 
 /// A file, a folder, and another item by their IDs: found with their facts,
-/// and missing for `404`, in the trash, or of another kind. Past its
-/// deadline, each operation on such an item, which no listing has, takes it
+/// and missing for `404`, in the trash, or of another kind. In a sync,
+/// each operation on such an item, which no listing has, takes it
 /// again by its ID: its lookup, the listing of its folder, the read of its
 /// name, of its object, and of its content, which comes again for another
 /// revision alone, and the item leaves for `404` or in the trash. A full
@@ -896,7 +929,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
         expect_item(&requests[0], id);
     }
 
-    // Past its deadline, each operation on the file takes it by its ID.
+    // In a sync, an operation on the file takes it by its ID, once.
     let edited = uploaded("file-1", "edited.md", "notes!");
     harness.begin_sync();
     let (found, requests) = answering(
@@ -907,6 +940,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
     .await;
     assert!(!found.unwrap().is_missing());
     expect_item(&requests[0], "file-1");
+    assert_eq!(text(&harness, "files/file-1/name").await, "notes.md");
     harness.begin_sync();
     let (listing, requests) =
         answering(&harness, names(&harness, &at("files/file-1")), [ok(&notes)]).await;
@@ -971,7 +1005,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
     assert_eq!(listed(&harness, "others").await, ["form-1"]);
 
     // After the listing, the changes bring nothing of an item by its ID
-    // alone: an operation past its deadline takes it again, with its other
+    // alone: an operation in a sync takes it again, with its other
     // name, or its removal.
     harness.begin_sync();
     let (_, requests) = reading(
@@ -1153,6 +1187,9 @@ async fn a_refused_content_is_the_error_of_its_read_and_a_missing_one_removes_it
         "{limited:?}"
     );
     expect_first_byte(&requests[1], "file-3");
+    // The refused content is asked again at the next sync alone.
+    let held = served(&harness, read(&harness, &at("files/file-3/content"))).await;
+    assert!(matches!(held, Err(NsError::RateLimited { .. })), "{held:?}");
     let (asked, requests) = reading(
         &harness,
         "files/sheet-1/content",
@@ -1161,6 +1198,45 @@ async fn a_refused_content_is_the_error_of_its_read_and_a_missing_one_removes_it
     .await;
     assert!(matches!(asked, Err(NsError::Permission)), "{asked:?}");
     expect_export(&requests[0], "sheet-1", "text/csv", EDITED);
+    harness.begin_sync();
+    let (content, requests) = reading(
+        &harness,
+        "files/file-3/content",
+        [ok(&changes(&[], "changes-2")), blob(200, b"busy")],
+    )
+    .await;
+    assert_eq!(content.unwrap(), "busy");
+    expect_changes(&requests[0], "changes-1");
+    expect_bytes(&requests[1], "file-3", md5("busy"));
+
+    // A download that Google Drive redirects to a host of no domain of the
+    // mount: the read has the refusal of the host, after one request of the
+    // first byte, which Google Drive answers with the redirect.
+    let harness = drive_harness();
+    first_full_listing(&harness, &[uploaded("far-1", "far.bin", "new")]).await;
+    let content_path = at("files/far-1/content");
+    let (refused, ()) = tokio::join!(read(&harness, &content_path), async {
+        let download = next_callout(&harness).await;
+        let Callout::FetchBlob(asked) = download.callout().clone() else {
+            panic!("the bytes are a blob fetch: {:?}", download.callout());
+        };
+        expect_bytes(&Request::Blob(asked), "far-1", md5("new"));
+        download.answer(CalloutResult::CalloutError(CalloutError {
+            kind: ErrorKind::Denied,
+            message: "the redirect to far.example.com is to no domain of the mount".to_owned(),
+            retryable: false,
+        }));
+        let probe = next_callout(&harness).await;
+        let Callout::Fetch(request) = probe.callout().clone() else {
+            panic!("the first byte is an inline request: {:?}", probe.callout());
+        };
+        expect_first_byte(&Request::Fetch(request), "far-1");
+        let Answer::Fetch(answer) = bytes(302, b"") else {
+            unreachable!()
+        };
+        probe.answer(answer);
+    });
+    assert!(matches!(refused, Err(NsError::Permission)), "{refused:?}");
 
     // A credential that Google Drive refuses.
     let harness = drive_harness();
