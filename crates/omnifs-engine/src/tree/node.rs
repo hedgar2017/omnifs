@@ -122,7 +122,7 @@ impl Node {
     }
 
     /// This node with its facts from feeds.
-    pub(crate) fn as_fed(self) -> Self {
+    pub(crate) fn fed_fact(self) -> Self {
         Self { fed: true, ..self }
     }
 

@@ -229,7 +229,7 @@ impl EngineNamespace {
                 ));
             }
             if let Some(node) = cached_child_node(entry, &mount, parent, name, &rel)? {
-                return Ok(if fed_fact { node.as_fed() } else { node });
+                return Ok(if fed_fact { node.fed_fact() } else { node });
             }
         }
 
