@@ -1124,3 +1124,35 @@ async fn mount_add_refuses_each_credential_for_the_account_that_another_mount_ho
     assert_eq!(mount_names(&fixture), ["demo", "second"]);
     daemon.stop().await;
 }
+
+/// A command with `--require-daemon` in a profile where no daemon listens
+/// fails at once with the exit of an unavailable daemon, and neither starts
+/// one nor waits for one.
+#[test]
+fn require_daemon_fails_at_once_without_a_daemon() {
+    let parent = tempfile::tempdir().expect("parent of the profile");
+    let profile = parent.path().join("profile");
+    let output = std::process::Command::new(omnifs_bin())
+        .args([
+            "--require-daemon",
+            "--output",
+            "json",
+            "mount",
+            "rm",
+            "absent",
+            "--dry-run",
+        ])
+        .env("OMNIFS_HOME", &profile)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("run omnifs with --require-daemon");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("no omnifs daemon listens"), "{stdout}");
+    let endpoint = Bootstrap::<Client>::under_root(&profile);
+    assert!(
+        !endpoint.control_socket().exists(),
+        "the command starts no daemon"
+    );
+}

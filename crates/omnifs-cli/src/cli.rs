@@ -55,6 +55,15 @@ pub struct Cli {
     #[arg(long, global = true, help_heading = "Global options")]
     pub wait_for_daemon: bool,
 
+    /// Fail at once when no daemon listens, without starting or waiting for one.
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        conflicts_with = "wait_for_daemon"
+    )]
+    pub require_daemon: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

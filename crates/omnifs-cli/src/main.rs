@@ -103,7 +103,8 @@ async fn cli_main(cli: Cli) {
         .with_command(command_path)
         .with_no_input(cli.no_input)
         .with_yes(cli.yes)
-        .with_wait_for_daemon(cli.wait_for_daemon);
+        .with_wait_for_daemon(cli.wait_for_daemon)
+        .with_require_daemon(cli.require_daemon);
     // Capture the usage label before `run` consumes `cli`. `None` for the
     // internal `daemon` subcommand, which records its own usage stream.
     let usage_label = cli.usage_label();
