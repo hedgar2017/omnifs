@@ -203,7 +203,8 @@ enum ReadKey {
 pub(crate) struct NamespaceFlights {
     lookup: ExactFlights<Path, LookupOutcome>,
     list: ExactFlights<Path, ListOutcome>,
-    read: ExactFlights<ReadKey, ReadReply>,
+    /// Each read with the path that its flight read.
+    read: ExactFlights<ReadKey, (Path, ReadReply)>,
     /// One answer per feed object id.
     pub(super) feed: ExactFlights<ObjectId, ()>,
 }
@@ -438,10 +439,13 @@ impl Runtime {
         .is_some_and(|s| s == Stability::Live);
 
         // Warm-but-not-live reads share by object identity, so concurrent user
-        // reads of distinct paths that alias the same object share one provider
-        // operation. Access-driven revalidation uses a distinct object key
-        // because a normal warm read may serve pushed bytes without reloading.
-        // Cold reads have no known id yet, so they key on the path.
+        // reads of the paths of one object share one load of it: a read of
+        // the path that the flight read takes its answer, and a read of
+        // another path of the object, another representation of it, then
+        // serves its own path from the object that the flight loaded.
+        // Access-driven revalidation uses a distinct object key because a
+        // normal warm read may serve pushed bytes without reloading. Cold
+        // reads have no known id yet, so they key on the path.
         let read_key = match &warm_id {
             Some(host_id) => match mode {
                 ReadMode::Serve => ReadKey::Object(host_id.clone()),
@@ -457,26 +461,48 @@ impl Runtime {
             None => PublicationKey::Path(path.clone()),
         };
         let runtime = self;
-        let reserve = move || runtime.resources.reserve(publication_key);
-        let work = move || async move {
-            let result = runtime
-                .run_read_file(path, content_type, cached_canonical, captured_epoch)
-                .await
-                .map_err(SharedError::from)?;
-            Ok(result)
+        let reserve = || runtime.resources.reserve(publication_key.clone());
+        let work = |cached_canonical| {
+            let content_type = content_type.clone();
+            async move {
+                let result = runtime
+                    .run_read_file(path, content_type, cached_canonical, captured_epoch)
+                    .await
+                    .map_err(SharedError::from)?;
+                Ok((path.clone(), result))
+            }
         };
-        let result = if live {
+        if live {
             let _permit = reserve().await;
-            work().await
-        } else {
-            self.namespace_flights
-                .read
-                .run(read_key, reserve, work)
+            let (_, reply) = work(cached_canonical)
                 .await
+                .map_err(SharedError::into_engine)?;
+            return Ok(reply);
         }
-        .map_err(SharedError::into_engine)?;
-
-        Ok(result)
+        let (read, reply) = self
+            .namespace_flights
+            .read
+            .run(read_key, reserve, || work(cached_canonical))
+            .await
+            .map_err(SharedError::into_engine)?;
+        if read == *path {
+            return Ok(reply);
+        }
+        let _permit = reserve().await;
+        let loaded = self
+            .resources
+            .cached_canonical_for(path)
+            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?
+            .and_then(|canonical| {
+                Some(wit_types::CanonicalInput {
+                    id: ObjectId::from_bytes(canonical.id).to_wit()?,
+                    validator: canonical.validator,
+                    bytes: canonical.bytes,
+                    revalidate: false,
+                })
+            });
+        let (_, reply) = work(loaded).await.map_err(SharedError::into_engine)?;
+        Ok(reply)
     }
 
     pub(crate) async fn open_file(&self, path: &Path, captured_epoch: u64) -> Result<OpenOutcome> {

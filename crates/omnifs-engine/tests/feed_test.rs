@@ -307,3 +307,26 @@ async fn the_attributes_of_a_listed_fed_directory_change_once_past_the_deadline_
     assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "3"]);
     assert_ne!(stat().await, again);
 }
+
+/// The size of a file past its deadline is of the bytes that a read takes
+/// then, at a getattr without a read before it: a reader takes as many bytes
+/// as the attributes say.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_size_of_a_file_past_its_deadline_is_of_the_bytes_of_its_next_read() {
+    let harness = make_initialized_runtime(CONFIG);
+    let file = path(&harness, &["hello", "shelf-log"]).await;
+    let read = || async {
+        let read = harness.namespace.read(file.clone(), 0, u32::MAX).await;
+        read.unwrap().bytes.len() as u64
+    };
+    let size = || async { harness.namespace.getattr(file.clone()).await.unwrap().size };
+    let learned = read().await;
+    assert_eq!(size().await, learned);
+
+    // The file grows upstream by the calls of the shelf feed.
+    names(&harness, &["shelves", "oak", "books"]).await.unwrap();
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let grown = size().await;
+    assert!(grown > learned, "{grown} > {learned}");
+    assert_eq!(read().await, grown);
+}

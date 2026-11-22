@@ -95,3 +95,21 @@ async fn canonical_read_repeats_with_stable_bytes() {
     assert_eq!(first.bytes, second.bytes);
     assert_eq!(first.attrs.size, second.attrs.size);
 }
+
+/// Concurrent reads of two representations of one object each take the bytes
+/// of their own path.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_reads_of_two_representations_take_the_bytes_of_their_own_paths() {
+    let harness = make_runtime();
+    let namespace = harness.namespace.as_ref();
+    let markdown = resolve(namespace, "/test/items/all/7/item.md").await;
+    let json = resolve(namespace, "/test/items/all/7/item.json").await;
+    let read = |node: &LookupAnswer| {
+        let path = node.path.clone();
+        async move { namespace.read(path, 0, u32::MAX).await.unwrap().bytes }
+    };
+    let (first, second) = tokio::join!(read(&markdown), read(&json));
+    assert_eq!(first, b"# Item 7\n\nBody 7\n");
+    assert_eq!(second, read(&json).await);
+    assert_ne!(first, second);
+}

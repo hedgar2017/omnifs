@@ -1164,6 +1164,23 @@ impl EngineNamespace {
             }
             let refreshed = self.refresh_record(&id, &node);
 
+            // A learned size is of the bytes of the read that learned it.
+            // Past the deadline of the file a read takes its bytes again, so
+            // the size of an answer is of the bytes of that read: a reader
+            // takes as many bytes as the attributes say.
+            if refreshed
+                .as_ref()
+                .is_some_and(|attrs| attrs.has_exact_size() && !attrs.is_deferred_ranged())
+                && !node.is_dir()
+                && !node.is_fed()
+                && node.synthetic_kind().is_none()
+                && self.view_expired(&node)?
+            {
+                self.read_full(&id, &node, 0, 1).await?;
+                let learned = self.ids.get(&id).and_then(|record| record.attrs.clone());
+                return Ok(self.attrs_from_parts(&id, &node, learned.as_ref()));
+            }
+
             // The exact-size flavor probes provider I/O for a deferred ranged
             // file so the NFS renderer can flatten a directory with real child
             // sizes.
@@ -1186,6 +1203,21 @@ impl EngineNamespace {
         .await;
         Self::record_outcome(&span, &result);
         result
+    }
+
+    /// Whether the file of `node` is past its deadline in a mount with its
+    /// provider, where a read takes its bytes again.
+    fn view_expired(&self, node: &crate::Node) -> Result<bool, NsError> {
+        let entry = self.entry_for(node.mount())?;
+        if entry.runtime().is_none() {
+            return Ok(false);
+        }
+        entry
+            .resources()?
+            .view_expired(node.path(), crate::clock::now_millis())
+            .map_err(|error| NsError::Internal {
+                message: error.to_string(),
+            })
     }
 
     /// Refresh a record's stored attrs from a fresh resolve, preserving a learned
