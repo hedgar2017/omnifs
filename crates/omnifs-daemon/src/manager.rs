@@ -31,7 +31,6 @@ use tokio::time::Instant;
 
 const MUTATION_QUEUE_CAPACITY: usize = 16;
 const GENERATION_DRAIN_GRACE: Duration = Duration::from_secs(10);
-const CREDENTIAL_REVOCATION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Fixed lease length: no renewal, and an expired lease is stealable by the
 /// next `begin`. This only gates the `BeginMutation` → `ApplyMutation` gap;
 /// the single-writer task serializes everything else.
@@ -679,19 +678,12 @@ impl ManagerState {
         revocation: PreparedCredentialRevocation,
         scopes: Vec<String>,
     ) -> anyhow::Result<()> {
-        let remote = tokio::time::timeout(CREDENTIAL_REVOCATION_TIMEOUT, revocation.revoke()).await;
-        let finish = match remote {
-            Ok(Ok(())) => CredentialRevocationFinish::Deleted,
-            Ok(Err(error)) => {
+        // The answer of the revocation endpoint, or the end of its
+        // connection, ends the revocation, without a time of the host.
+        let finish = match revocation.revoke().await {
+            Ok(()) => CredentialRevocationFinish::Deleted,
+            Err(error) => {
                 tracing::warn!(credential = %id, %error, "credential revocation call failed");
-                CredentialRevocationFinish::Unknown
-            },
-            Err(_) => {
-                tracing::warn!(
-                    credential = %id,
-                    seconds = CREDENTIAL_REVOCATION_TIMEOUT.as_secs(),
-                    "credential revocation did not finish within the timeout"
-                );
                 CredentialRevocationFinish::Unknown
             },
         };

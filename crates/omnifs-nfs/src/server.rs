@@ -12,10 +12,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 const MAX_CONNECTIONS: usize = 64;
-const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound on concurrently-dispatched RPC handler threads across all
 /// connections. A provider-backed `readdir`/`lookup`/`read` can block on cold
@@ -100,12 +98,6 @@ pub fn start_server(
                         continue;
                     };
                     if let Err(error) = stream.set_nonblocking(false) {
-                        trace.line(&format!(
-                            "connection_config_error peer={peer:?} err={error}"
-                        ));
-                        continue;
-                    }
-                    if let Err(error) = stream.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT)) {
                         trace.line(&format!(
                             "connection_config_error peer={peer:?} err={error}"
                         ));

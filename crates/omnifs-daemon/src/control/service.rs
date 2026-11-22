@@ -6,7 +6,6 @@ use super::mapping::{
 };
 use super::*;
 
-const PROVIDER_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 pub(crate) struct GrpcControlService {
     control: Arc<ControlServer>,
 }
@@ -389,12 +388,9 @@ impl wire::control_server::Control for GrpcControlService {
         request: Request<tonic::Streaming<wire::ImportProviderRequest>>,
     ) -> Result<Response<wire::ImportProviderResponse>, Status> {
         let daemon = self.daemon()?;
-        let upload = tokio::time::timeout(
-            PROVIDER_UPLOAD_TIMEOUT,
-            import_provider_inner(&daemon, request),
-        )
-        .await
-        .map_err(|_| grpc_invalid("provider upload timed out"))??;
+        // The end of the stream of the client ends the upload, its last
+        // chunk or the close of its connection, without a time of its own.
+        let upload = import_provider_inner(&daemon, request).await?;
         let outcome = daemon
             .state
             .import_provider(upload)
