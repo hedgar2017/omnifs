@@ -120,13 +120,11 @@ impl GenerationDraft {
     /// A provider store failure fails preparation outright: it is
     /// indistinguishable in principle from any other durable-state failure
     /// and must not be reported as "this mount's provider is unretained".
-    /// Likewise, a credential whose auth runtime fingerprint no longer
-    /// matches its pinned provider, or any other `build_auth_binding`
-    /// failure, fails preparation rather than degrading the mount to
-    /// `AuthRequired`. Only a mount whose credential lookup finds nothing (or
-    /// finds one bound to a different provider) degrades to
-    /// `MountBuildState::AuthRequired`: that is the one case that is
-    /// genuinely a missing/stale credential rather than a defect.
+    /// Likewise, a `build_auth_binding` failure fails preparation rather
+    /// than degrading the mount to `AuthRequired`. A mount whose credential
+    /// lookup finds nothing, or finds one whose auth runtime fingerprint is
+    /// not the one of the auth scheme of its provider, degrades alone to
+    /// `MountBuildState::AuthRequired`: a missing or stale credential.
     pub(crate) async fn prepare(
         self,
         state: &Arc<StateStore>,
@@ -318,7 +316,6 @@ impl CredentialRuntime {
 }
 
 struct LoadedProvider {
-    reference: omnifs_core::ProviderRef,
     manifest: omnifs_provider::ProviderManifest,
     bytes: Arc<[u8]>,
 }
@@ -329,7 +326,6 @@ impl TryFrom<StoredProvider> for LoadedProvider {
     /// The provider of a valid manifest; the error of an invalid one.
     fn try_from(provider: StoredProvider) -> Result<Self, String> {
         Ok(Self {
-            reference: provider.reference,
             manifest: provider
                 .manifest
                 .map_err(|error| format!("its provider manifest is invalid: {error}"))?,
@@ -391,15 +387,12 @@ fn build_mount_input(
             credential_generation: None,
         },
         Some(id) => {
-            // A credential stays bound to a mount that moves to another
-            // artifact of its provider with the auth scheme of its issue.
+            // A credential is bound to a mount with the auth scheme of its
+            // issue alone: it stays bound on another artifact of its
+            // provider with that scheme, and is stale without it, as one
+            // whose fingerprint an earlier omnifs took otherwise.
             let bound = match credentials.get(id) {
-                Some(credential)
-                    if credential.provider == provider.reference.id
-                        || issued_scheme(provider, credential)? =>
-                {
-                    Some(credential)
-                },
+                Some(credential) if issued_scheme(provider, credential)? => Some(credential),
                 _ => None,
             };
             match bound {
@@ -453,11 +446,6 @@ fn build_auth_binding(
         .as_ref()
         .and_then(|manifest| manifest.scheme(credential.id.scheme()))
         .context("credential scheme is absent from the pinned provider")?;
-    anyhow::ensure!(
-        auth_fingerprint(credential.provider, scheme, &credential.overrides)?
-            == credential.fingerprint,
-        "credential auth runtime no longer matches the pinned provider"
-    );
     let binding = match (scheme, credential.kind) {
         (AuthScheme::StaticToken(scheme), AuthKind::StaticToken) => service.bind_static(
             credential.id.clone(),
@@ -588,4 +576,144 @@ fn no_overrides(overrides: &CredentialClientOverrides) -> bool {
         && overrides.client_secret.is_none()
         && overrides.redirect_uri.is_none()
         && overrides.scopes.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omnifs_auth::{RefreshCandidate, RefreshPersistError, RefreshPersistence};
+    use omnifs_core::{MountName, MountVersion, MutationId, ProviderMeta, ProviderName};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct NoRefresh;
+
+    impl RefreshSink for NoRefresh {
+        fn persist<'a>(
+            &'a self,
+            _candidate: RefreshCandidate,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<RefreshPersistence, RefreshPersistError>> + Send + 'a>,
+        > {
+            unreachable!("a static token has no refresh")
+        }
+    }
+
+    fn provider() -> LoadedProvider {
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "id": "demo",
+            "displayName": "Demo",
+            "provider": "demo.wasm",
+            "defaultMount": "demo",
+            "projection": 1,
+            "refreshIntervalSecs": 0,
+            "capabilities": [{
+                "kind": "domain",
+                "value": "api.demo.test",
+                "why": "Test credential injection."
+            }],
+            "auth": {
+                "default": "pat",
+                "schemes": [{
+                    "staticToken": {
+                        "key": "pat",
+                        "valuePrefix": "Bearer ",
+                        "description": "Demo token",
+                        "injectDomains": ["api.demo.test"]
+                    }
+                }]
+            }
+        }))
+        .unwrap();
+        LoadedProvider {
+            manifest: omnifs_provider::ProviderManifest::from_bytes(&manifest).unwrap(),
+            bytes: Arc::from(Vec::new().into_boxed_slice()),
+        }
+    }
+
+    fn mount(credential: &CredentialId) -> StoredMount {
+        StoredMount {
+            document: omnifs_state::MountDocument {
+                name: MountName::new("demo").unwrap(),
+                provider: omnifs_core::ProviderRef {
+                    id: ProviderId::from_digest([7; 32]),
+                    meta: ProviderMeta {
+                        name: ProviderName::new("demo").unwrap(),
+                        version: None,
+                    },
+                },
+                credential: Some(credential.clone()),
+                limits: None,
+                config: serde_json::json!({}),
+            },
+            canonical: Vec::new(),
+            version: MountVersion::from_digest([1; 32]),
+            revision: MountRevision::new(1),
+            last_mutation_id: MutationId::from_bytes([1; 16]),
+        }
+    }
+
+    /// The state of a mount of `provider()` with a stored token whose
+    /// fingerprint is `fingerprint`, or the one of the scheme for none.
+    fn state_with_fingerprint(fingerprint: Option<AuthRuntimeFingerprint>) -> MountBuildState {
+        let provider = provider();
+        let mount = mount(&CredentialId::new("demo", "pat", "default").unwrap());
+        let id = mount.document.credential.clone().unwrap();
+        let provider_id = mount.document.provider.id;
+        let overrides = CredentialClientOverrides {
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
+            scopes: None,
+        };
+        let scheme = provider
+            .manifest
+            .auth
+            .as_ref()
+            .unwrap()
+            .scheme("pat")
+            .unwrap();
+        let issued = auth_fingerprint(provider_id, scheme, &overrides).unwrap();
+        let entry = CredentialEntry::static_token(SecretString::from("token".to_owned()));
+        let runtime = CredentialRuntime {
+            id: id.clone(),
+            provider: provider_id,
+            kind: AuthKind::StaticToken,
+            fingerprint: fingerprint.unwrap_or(issued),
+            version: CredentialVersion::initial(),
+            generation: CredentialGeneration::initial(),
+            entry: entry.clone(),
+            overrides: Arc::new(overrides),
+        };
+        let service = Arc::new(CredentialService::new(
+            [(
+                id.clone(),
+                DurableCredentialSnapshot {
+                    entry,
+                    version: runtime.version,
+                },
+            )],
+            OAuthClient::new().unwrap(),
+            Arc::new(NoRefresh),
+        ));
+        let credentials = HashMap::from([(id.clone(), runtime)]);
+        build_mount_input(mount, Ok(&provider), &credentials, &service)
+            .unwrap()
+            .state
+    }
+
+    /// A credential whose fingerprint is not the one of the auth scheme of
+    /// the provider of its mount, as one that an earlier omnifs stored,
+    /// leaves that mount alone without a credential.
+    #[test]
+    fn a_credential_of_another_fingerprint_leaves_its_mount_alone_without_one() {
+        assert!(matches!(
+            state_with_fingerprint(None),
+            MountBuildState::Active { auth: Some(_), .. }
+        ));
+        assert!(matches!(
+            state_with_fingerprint(Some(AuthRuntimeFingerprint::from_digest([9; 32]))),
+            MountBuildState::AuthRequired
+        ));
+    }
 }
