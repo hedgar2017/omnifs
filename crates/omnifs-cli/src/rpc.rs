@@ -10,12 +10,10 @@ use omnifs_api::{
     CredentialKey, CredentialStatus, DaemonInventory, MountRecord, MutationOp, MutationOpResult,
     PhaseEvent, ProviderImportReceipt, ProviderMetadata, ServingOutcome,
 };
-use omnifs_bootstrap::{Bootstrap, Client, FolderChange};
+use omnifs_bootstrap::{Bootstrap, Client};
 use omnifs_core::{MountName, MutationId, ProviderId};
 use prost::Message as _;
 use std::time::Duration;
-use tokio::io::Interest;
-use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
 use tokio::sync::OnceCell;
 use tokio_stream::StreamExt as _;
@@ -26,7 +24,7 @@ use crate::error::{ExitCode, WithExitCode, WithHint};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(CONTROL_REQUEST_TIMEOUT_SECS);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(CONTROL_MUTATION_TIMEOUT_SECS);
-pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(CONTROL_SHUTDOWN_TIMEOUT_SECS);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(CONTROL_SHUTDOWN_TIMEOUT_SECS);
 const PROVIDER_IMPORT_TIMEOUT: Duration = Duration::from_mins(3);
 
 fn unary<T>(message: T, timeout: Duration) -> Request<T> {
@@ -113,8 +111,7 @@ impl RpcClient {
     }
 
     /// Refuses a daemon of another control protocol than the one of this
-    /// command, to which a request would lose what the daemon does not know,
-    /// as the subject of a credential.
+    /// command, to which a request would lose what the daemon does not know.
     pub(crate) async fn require_protocol(&self) -> anyhow::Result<()> {
         let daemon = self.daemon_info().await?.protocol;
         if daemon == CONTROL_PROTOCOL {
@@ -123,45 +120,6 @@ impl RpcClient {
         Err(anyhow::anyhow!(protocol_mismatch(daemon)))
             .with_hint("stop the daemon with `omnifs down --keep-filesystems`, and start it with this omnifs")
             .with_exit_code(ExitCode::DaemonUnavailable)
-    }
-
-    /// Whether the daemon ends within `bound`: its control socket is missing
-    /// or refuses a connection. It watches the folder of the profile, and
-    /// connects at each change of it and once more at the bound.
-    pub(crate) async fn ended_within(&self, bound: Duration) -> anyhow::Result<bool> {
-        let folder = self.endpoint.bootstrap_dir();
-        let socket = self.endpoint.control_socket();
-        let bound = tokio::time::sleep(bound);
-        tokio::pin!(bound);
-        let mut elapsed = false;
-        loop {
-            let change = match FolderChange::watch(folder) {
-                Ok(change) => change,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-                Err(error) => {
-                    return Err(error).with_context(|| format!("watch {}", folder.display()));
-                },
-            };
-            match UnixStream::connect(&socket).await {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    return Ok(true);
-                },
-                Ok(_) | Err(_) => {},
-            }
-            if elapsed {
-                return Ok(false);
-            }
-            let change = AsyncFd::with_interest(change, Interest::READABLE)?;
-            tokio::select! {
-                readable = change.readable() => drop(readable?),
-                () = &mut bound => elapsed = true,
-            }
-        }
     }
 
     pub(crate) async fn inventory(&self) -> anyhow::Result<DaemonInventory> {
@@ -592,16 +550,6 @@ pub(crate) fn without_daemon(error: &anyhow::Error) -> bool {
 pub(crate) struct DaemonAnswer {
     pub(crate) code: omnifs_api::ControlErrorCode,
     message: String,
-}
-
-/// The code of the error of the control protocol that the daemon answered
-/// the request of `error` with; none for a request without an answer of the
-/// daemon.
-pub(crate) fn answered(error: &anyhow::Error) -> Option<omnifs_api::ControlErrorCode> {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<DaemonAnswer>())
-        .map(|answer| answer.code)
 }
 
 /// The sentence of a daemon of the control protocol `daemon`, another than

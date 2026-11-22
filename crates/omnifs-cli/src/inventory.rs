@@ -36,67 +36,16 @@ pub(crate) struct DaemonFacts {
     pub(crate) status: Option<DaemonInventory>,
     pub(crate) probe: DaemonProbe,
     /// Whether the daemon runs the program of this command; none without the
-    /// status of a daemon, as of a daemon that the probe gives as
-    /// unresponsive.
+    /// status of a daemon.
     pub(crate) current_program: Option<bool>,
 }
 
-/// The state of the daemon of a profile as a status request finds it.
-/// `docs/contracts/50-control-plane.md` owns which failure of the request is
-/// which state.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum DaemonProbe {
-    /// A daemon of the control protocol of this command gave its status.
     Responding,
-    /// No daemon listens on the control socket and the profile records none.
     Stopped,
-    /// No daemon listens on the control socket and the profile records one
-    /// or has an unreadable record, or the command cannot reach the control
-    /// socket, as one that it has no permission for.
     Unreachable { message: String },
-    /// A daemon holds the control socket and gives the command no status: it
-    /// does not answer, it speaks another control protocol, or it is still
-    /// shutting down after the time of a shutdown.
-    Unresponsive { message: String },
-}
-
-/// The messages of `error` and of its causes, each once.
-fn sentence(error: &anyhow::Error) -> String {
-    crate::error::message_chain(error).join(": ")
-}
-
-impl DaemonProbe {
-    /// The probe of a request for the info of the daemon that failed with
-    /// `error`, in a profile with the record of a daemon, with none, or with
-    /// an unreadable one.
-    fn of_failure<T>(error: &anyhow::Error, identity: std::io::Result<Option<T>>) -> Self {
-        match crate::rpc::connection_failure(error) {
-            // A request that failed past its connection, or a connection
-            // that a listener does not take in time.
-            None => Self::Unresponsive {
-                message: sentence(error),
-            },
-            Some(std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
-                match identity {
-                    Ok(Some(_)) => Self::Unreachable {
-                        message: sentence(error),
-                    },
-                    Ok(None) => Self::Stopped,
-                    Err(identity_error) => Self::Unreachable {
-                        message: format!(
-                            "{}; cannot read process identity: {identity_error}",
-                            sentence(error)
-                        ),
-                    },
-                }
-            },
-            // The control socket itself is out of the reach of the command.
-            Some(_) => Self::Unreachable {
-                message: sentence(error),
-            },
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -135,8 +84,9 @@ impl DaemonFacts {
     pub(crate) fn health(&self) -> DaemonHealth {
         match (&self.probe, self.status.as_ref()) {
             (DaemonProbe::Stopped, _) => DaemonHealth::Stopped,
-            (DaemonProbe::Unreachable { .. } | DaemonProbe::Unresponsive { .. }, _)
-            | (DaemonProbe::Responding, None) => DaemonHealth::Unreachable,
+            (DaemonProbe::Unreachable { .. }, _) | (DaemonProbe::Responding, None) => {
+                DaemonHealth::Unreachable
+            },
             (DaemonProbe::Responding, Some(status)) => match status.health.overall_state() {
                 HealthState::Healthy => DaemonHealth::Running,
                 HealthState::Starting => DaemonHealth::Starting,
@@ -207,59 +157,27 @@ impl DaemonFacts {
 
 impl DaemonFacts {
     /// The probe of the daemon of the profile of `endpoint`, with its
-    /// status from a daemon that responds: the info of the daemon, which it
-    /// answers in each phase, and then its inventory. A daemon that answers
-    /// that it is shutting down is probed once more after its end, within
-    /// `shutdown`, the time of a shutdown. Each other error that a daemon of
-    /// the control protocol of this command answers is the error of the
-    /// command: that daemon responds, and no state names its error.
-    async fn probe(
-        endpoint: &Bootstrap<Client>,
-        shutdown: std::time::Duration,
-    ) -> Result<(DaemonProbe, Option<DaemonInventory>)> {
-        let mut after_shutdown = false;
-        loop {
-            let rpc = crate::rpc::RpcClient::from_endpoint(endpoint.clone());
-            let info = match rpc.daemon_info().await {
-                Ok(info) => info,
-                Err(error) => {
-                    let probe = DaemonProbe::of_failure(&error, endpoint.read_process_identity());
-                    return Ok((probe, None));
-                },
-            };
-            if info.protocol != omnifs_api::CONTROL_PROTOCOL {
-                let probe = DaemonProbe::Unresponsive {
-                    message: crate::rpc::protocol_mismatch(info.protocol),
-                };
-                return Ok((probe, None));
-            }
-            let error = match rpc.inventory().await {
-                Ok(inventory) => return Ok((DaemonProbe::Responding, Some(inventory))),
-                Err(error) => error,
-            };
-            match crate::rpc::answered(&error) {
-                Some(omnifs_api::ControlErrorCode::ShuttingDown)
-                    if !after_shutdown && rpc.ended_within(shutdown).await? =>
-                {
-                    after_shutdown = true;
-                },
-                Some(omnifs_api::ControlErrorCode::ShuttingDown) => {
-                    let probe = DaemonProbe::Unresponsive {
+    /// inventory from a daemon that responds. A failed request is stopped
+    /// without the record of a daemon, and unreachable with one or with an
+    /// unreadable one.
+    async fn probe(endpoint: &Bootstrap<Client>) -> (DaemonProbe, Option<DaemonInventory>) {
+        let rpc = crate::rpc::RpcClient::from_endpoint(endpoint.clone());
+        match rpc.inventory().await {
+            Ok(inventory) => (DaemonProbe::Responding, Some(inventory)),
+            Err(error) => {
+                let probe = match endpoint.read_process_identity() {
+                    Ok(Some(_)) => DaemonProbe::Unreachable {
+                        message: format!("{error:#}"),
+                    },
+                    Ok(None) => DaemonProbe::Stopped,
+                    Err(identity_error) => DaemonProbe::Unreachable {
                         message: format!(
-                            "the daemon is shutting down for more than {} s",
-                            shutdown.as_secs()
+                            "{error:#}; cannot read process identity: {identity_error}"
                         ),
-                    };
-                    return Ok((probe, None));
-                },
-                Some(_) => return Err(error.context("the daemon answered its status request")),
-                None => {
-                    let probe = DaemonProbe::Unresponsive {
-                        message: sentence(&error),
-                    };
-                    return Ok((probe, None));
-                },
-            }
+                    },
+                };
+                (probe, None)
+            },
         }
     }
 }
@@ -673,8 +591,7 @@ impl Inventory {
         let configured_filesystems = client_state.registry().list()?;
         let program = omnifs_core::executable_program().context("read the executable of omnifs")?;
         let instances = host_instance_programs(&client_state, &configured_filesystems, &program)?;
-        let (probe, daemon_status) =
-            DaemonFacts::probe(&endpoint, crate::rpc::SHUTDOWN_TIMEOUT).await?;
+        let (probe, daemon_status) = DaemonFacts::probe(&endpoint).await;
         let daemon_known = daemon_status.is_some() || probe == DaemonProbe::Stopped;
         let mounts = daemon_status
             .as_ref()
@@ -957,23 +874,14 @@ mod tests {
         (dir, endpoint)
     }
 
-    /// The state of the probe of `endpoint`, with the time `shutdown` of a
-    /// shutdown, and its message.
-    async fn probed(
-        endpoint: &Bootstrap<Client>,
-        shutdown: std::time::Duration,
-    ) -> (String, String) {
-        let (probe, status) = DaemonFacts::probe(endpoint, shutdown).await.unwrap();
-        assert_eq!(status.is_some(), probe == DaemonProbe::Responding);
-        let probe = serde_json::to_value(probe).unwrap();
-        (
-            probe["state"].as_str().unwrap().to_owned(),
-            probe["message"].as_str().unwrap_or_default().to_owned(),
-        )
-    }
-
+    /// The state of the probe of `endpoint`.
     async fn state(endpoint: &Bootstrap<Client>) -> String {
-        probed(endpoint, std::time::Duration::from_secs(5)).await.0
+        let (probe, status) = DaemonFacts::probe(endpoint).await;
+        assert_eq!(status.is_some(), probe == DaemonProbe::Responding);
+        serde_json::to_value(probe).unwrap()["state"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     fn record_daemon(endpoint: &Bootstrap<Client>) {
@@ -984,21 +892,24 @@ mod tests {
         .unwrap();
     }
 
-    fn answers(
-        protocol: u32,
-        inventory: Result<DaemonInventory, omnifs_api::ControlError>,
-    ) -> crate::fake_daemon::Answers {
-        crate::fake_daemon::Answers {
-            info: crate::fake_daemon::info(protocol),
-            inventory,
-        }
-    }
-
-    fn shutting_down() -> omnifs_api::ControlError {
-        omnifs_api::ControlError::new(
-            omnifs_api::ControlErrorCode::ShuttingDown,
-            "daemon is shutting down",
-        )
+    /// A daemon that answers its status request with an error is stopped
+    /// without the record of a daemon, and unreachable with one.
+    #[tokio::test]
+    async fn a_daemon_that_gives_no_status_is_stopped_or_unreachable_by_its_record() {
+        let (_dir, endpoint) = profile();
+        let _daemon = crate::fake_daemon::FakeDaemon::start(
+            &endpoint,
+            crate::fake_daemon::Answers {
+                info: crate::fake_daemon::info(omnifs_api::CONTROL_PROTOCOL),
+                inventory: Err(omnifs_api::ControlError::new(
+                    omnifs_api::ControlErrorCode::ShuttingDown,
+                    "daemon is shutting down",
+                )),
+            },
+        );
+        assert_eq!(state(&endpoint).await, "stopped");
+        record_daemon(&endpoint);
+        assert_eq!(state(&endpoint).await, "unreachable");
     }
 
     /// A profile without a daemon on its control socket, one that is missing
@@ -1019,113 +930,6 @@ mod tests {
             std::fs::write(endpoint.process_identity_path(), b"no record").unwrap();
             assert_eq!(state(&endpoint).await, "unreachable", "refuses: {refuses}");
         }
-    }
-
-    /// A control socket that the command has no permission for is
-    /// unreachable: the command cannot tell whether a daemon holds it.
-    #[tokio::test]
-    async fn a_control_socket_without_permission_is_unreachable() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let (_dir, endpoint) = profile();
-        let _listener = tokio::net::UnixListener::bind(endpoint.control_socket()).unwrap();
-        std::fs::set_permissions(
-            endpoint.control_socket(),
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
-        let (state, message) = probed(&endpoint, std::time::Duration::from_secs(5)).await;
-        assert_eq!(state, "unreachable");
-        assert!(message.contains("ermission denied"), "{message}");
-    }
-
-    /// A daemon that gives its status responds, and a daemon of another
-    /// control protocol, whose answers the command does not read, is
-    /// unresponsive.
-    #[tokio::test]
-    async fn a_daemon_responds_with_the_control_protocol_of_the_command_alone() {
-        let status = DaemonFacts::test(DaemonHealth::Running).status.unwrap();
-        let (_dir, endpoint) = profile();
-        let daemon = crate::fake_daemon::FakeDaemon::start(
-            &endpoint,
-            answers(omnifs_api::CONTROL_PROTOCOL, Ok(status.clone())),
-        );
-        assert_eq!(state(&endpoint).await, "responding");
-        daemon.end().await;
-
-        let (_dir, endpoint) = profile();
-        let _daemon =
-            crate::fake_daemon::FakeDaemon::start(&endpoint, answers(0, Ok(status.clone())));
-        let (state, message) = probed(&endpoint, std::time::Duration::from_secs(5)).await;
-        assert_eq!(state, "unresponsive");
-        assert_eq!(message, crate::rpc::protocol_mismatch(0));
-    }
-
-    /// A daemon that answers that it is shutting down is stopped after its
-    /// end, and unresponsive when it holds its control socket past the time
-    /// of a shutdown.
-    #[tokio::test]
-    async fn a_daemon_that_shuts_down_is_stopped_after_its_end() {
-        let (_dir, endpoint) = profile();
-        let daemon = crate::fake_daemon::FakeDaemon::start(
-            &endpoint,
-            answers(omnifs_api::CONTROL_PROTOCOL, Err(shutting_down())),
-        );
-        let end = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            daemon.end().await;
-        });
-        assert_eq!(state(&endpoint).await, "stopped");
-        end.await.unwrap();
-
-        let (_dir, endpoint) = profile();
-        let _daemon = crate::fake_daemon::FakeDaemon::start(
-            &endpoint,
-            answers(omnifs_api::CONTROL_PROTOCOL, Err(shutting_down())),
-        );
-        let (state, message) = probed(&endpoint, std::time::Duration::from_millis(100)).await;
-        assert_eq!(state, "unresponsive");
-        assert_eq!(message, "the daemon is shutting down for more than 0 s");
-    }
-
-    /// A daemon that holds its control socket and does not answer is
-    /// unresponsive.
-    #[tokio::test(start_paused = true)]
-    async fn a_daemon_that_does_not_answer_is_unresponsive() {
-        let (_dir, endpoint) = profile();
-        let listener = tokio::net::UnixListener::bind(endpoint.control_socket()).unwrap();
-        tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
-        });
-        let (state, message) = probed(&endpoint, std::time::Duration::from_secs(5)).await;
-        assert_eq!(state, "unresponsive");
-        assert!(message.contains("timed out"), "{message}");
-    }
-
-    /// An error that a daemon of the control protocol of the command answers
-    /// its status request with, other than that it is shutting down, is the
-    /// error of the command: that daemon responds, and no state names its
-    /// error.
-    #[tokio::test]
-    async fn an_error_of_a_daemon_that_answers_is_the_error_of_the_command() {
-        let (_dir, endpoint) = profile();
-        let _daemon = crate::fake_daemon::FakeDaemon::start(
-            &endpoint,
-            answers(
-                omnifs_api::CONTROL_PROTOCOL,
-                Err(omnifs_api::ControlError::new(
-                    omnifs_api::ControlErrorCode::Internal,
-                    "the answer of the daemon has 1048588 bytes, over the 1048576 bytes of a control message",
-                )),
-            ),
-        );
-        let error = DaemonFacts::probe(&endpoint, std::time::Duration::from_secs(5))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            sentence(&error),
-            "the daemon answered its status request: the answer of the daemon has 1048588 bytes, over the 1048576 bytes of a control message"
-        );
     }
 
     #[test]

@@ -22,7 +22,6 @@ pub(crate) struct Answers {
 pub(crate) struct FakeDaemon {
     begun: Arc<AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
-    socket: std::path::PathBuf,
 }
 
 impl FakeDaemon {
@@ -42,23 +41,18 @@ impl FakeDaemon {
                 .await
                 .expect("serve the control socket");
         });
-        Self {
-            begun,
-            server,
-            socket,
-        }
+        Self { begun, server }
     }
 
     /// The number of mutations that began.
     pub(crate) fn begun(&self) -> usize {
         self.begun.load(Ordering::SeqCst)
     }
+}
 
-    /// Ends the daemon, as one that removes its control socket at its end.
-    pub(crate) async fn end(self) {
+impl Drop for FakeDaemon {
+    fn drop(&mut self) {
         self.server.abort();
-        let _ = self.server.await;
-        std::fs::remove_file(&self.socket).expect("remove the control socket");
     }
 }
 
