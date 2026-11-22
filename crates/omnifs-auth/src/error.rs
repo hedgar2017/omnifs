@@ -45,8 +45,16 @@ pub enum AuthError {
         error: String,
         description: Option<String>,
     },
+    #[error(
+        "oauth assertion has no key: the flow of a JWT bearer grant needs the PEM of the RSA private key of its client as the client secret"
+    )]
+    MissingAssertionKey,
     #[error("oauth assertion key is not the PEM of an RSA private key: {0}")]
     AssertionKey(String),
+    #[error("oauth assertion was not signed: {0}")]
+    AssertionSignature(String),
+    #[error("oauth token endpoint answered HTTP {0} without an OAuth error")]
+    TokenEndpointStatus(u16),
     #[error("oauth token endpoint answer is invalid: {0}")]
     TokenAnswer(String),
     #[error("oauth revocation endpoint error: {0}")]

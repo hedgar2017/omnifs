@@ -512,7 +512,10 @@ async fn jwt_bearer_login_surfaces_the_error_of_the_token_endpoint_and_of_the_ke
         .login_jwt_bearer(jwt_bearer_login(fake.jwt_bearer_scheme(), None))
         .await
         .unwrap_err();
-    assert!(matches!(error, AuthError::MissingClientSecret), "{error}");
+    assert_eq!(
+        error.to_string(),
+        "oauth assertion has no key: the flow of a JWT bearer grant needs the PEM of the RSA private key of its client as the client secret"
+    );
 }
 
 #[tokio::test]
