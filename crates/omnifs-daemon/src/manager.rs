@@ -678,19 +678,38 @@ impl ManagerState {
         revocation: PreparedCredentialRevocation,
         scopes: Vec<String>,
     ) -> anyhow::Result<()> {
-        // The answer of the revocation endpoint, or the end of its
-        // connection, ends the revocation, without a time of the host.
-        let finish = match revocation.revoke().await {
-            Ok(()) => CredentialRevocationFinish::Deleted,
-            Err(error) => {
-                tracing::warn!(credential = %id, %error, "credential revocation call failed");
-                CredentialRevocationFinish::Unknown
-            },
-        };
+        let finish =
+            revocation_finish(&id, revocation.revoke(), omnifs_core::SILENT_PEER_TIMEOUT).await;
         self.state
             .finish_credential_revocation(id, mutation, finish, scopes)
             .await?;
         Ok(())
+    }
+}
+
+/// The finish of the revocation `revoke` of the credential `id`: deleted at
+/// the answer of its endpoint, and unknown at its failure, at the end of its
+/// connection, or after `silence` without an answer of an endpoint that
+/// holds its connection.
+async fn revocation_finish(
+    id: &CredentialId,
+    revoke: impl std::future::Future<Output = anyhow::Result<()>>,
+    silence: Duration,
+) -> CredentialRevocationFinish {
+    match tokio::time::timeout(silence, revoke).await {
+        Ok(Ok(())) => CredentialRevocationFinish::Deleted,
+        Ok(Err(error)) => {
+            tracing::warn!(credential = %id, %error, "credential revocation call failed");
+            CredentialRevocationFinish::Unknown
+        },
+        Err(_) => {
+            tracing::warn!(
+                credential = %id,
+                seconds = silence.as_secs(),
+                "the revocation endpoint holds its connection and did not answer"
+            );
+            CredentialRevocationFinish::Unknown
+        },
     }
 }
 
@@ -801,6 +820,23 @@ mod tests {
     use omnifs_bootstrap::{Bootstrap, Daemon};
     use omnifs_state::StateStoreOptions;
     use std::time::Duration;
+
+    /// A revocation whose endpoint holds its connection without an answer
+    /// finishes as unknown after its silence, and one that answers as
+    /// deleted.
+    #[tokio::test]
+    async fn a_revocation_without_an_answer_finishes_unknown_after_its_silence() {
+        let id = CredentialId::new("demo", "oauth", "default").unwrap();
+        let silence = Duration::from_millis(20);
+        assert!(matches!(
+            revocation_finish(&id, std::future::pending(), silence).await,
+            CredentialRevocationFinish::Unknown
+        ));
+        assert!(matches!(
+            revocation_finish(&id, async { Ok(()) }, silence).await,
+            CredentialRevocationFinish::Deleted
+        ));
+    }
 
     async fn test_manager(lease: Duration) -> (Arc<MutationManager>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
