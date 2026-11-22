@@ -178,7 +178,7 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
     expect_search(&requests[0], 100, Some("cursor-2"));
 
     // The answer of another page to the request of a page that the listing
-    // lacks is the error of the read, and the next read asks for it again.
+    // lacks is the error of the read, and the next sync asks for it again.
     harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
@@ -278,8 +278,9 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
 /// taken after its last part, with the removal of what it lacks after its
 /// `GET`, the stopped content of a removed page too, and from its first
 /// request after a `400` to its `start_cursor`; a page that Notion refuses to
-/// its `GET` stays, the sweep goes on, and the next sync takes it by its own
-/// feed, whose error a read of its paths gets.
+/// its `GET` stays, the sweep goes on, and a read of a fact of it that the
+/// projection lacks has the error of Notion for the rest of the sync without
+/// a request.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_full_listing_again_in_a_sync_is_taken_after_its_last_part() {
@@ -425,7 +426,10 @@ async fn a_full_listing_again_in_a_sync_is_taken_after_its_last_part() {
     expect(&requests[0], "GET", &markdown_of(&id(2)), None);
 
     // A page that Notion refuses to the sweep stays as the projection has
-    // it, and the sweep goes on.
+    // it, and the sweep goes on: for the rest of the sync, a read of its
+    // paths is served what the projection has, and a read of a fact of it
+    // that the projection lacks has the error of Notion, each without a
+    // request.
     harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
@@ -442,21 +446,28 @@ async fn a_full_listing_again_in_a_sync_is_taken_after_its_last_part() {
     expect(&requests[1], "GET", &format!("/v1/pages/{}", id(1)), None);
     expect(&requests[2], "GET", &format!("/v1/pages/{}", id(2)), None);
     let title = format!("/notion/pages/{}/title", id(1));
-    assert_eq!(
-        served(&harness, read(&harness, &title)).await.unwrap(),
-        "One again"
-    );
-    // The next sync takes it by its own feed, and a read of its paths gets
-    // the error of Notion.
+    let body = format!("/notion/pages/{}/body.md", id(1));
+    for _ in 0..2 {
+        assert_eq!(
+            served(&harness, read(&harness, &title)).await.unwrap(),
+            "One again"
+        );
+        let refused = served(&harness, read(&harness, &body)).await;
+        assert!(matches!(refused, Err(NsError::Permission)), "{refused:?}");
+    }
+    // The next sync asks for it once, by its full listing.
     harness.begin_sync();
-    let (refused, requests) = answering(
+    let (listing, requests) = answering(
         &harness,
-        read(&harness, &title),
-        vec![failure(403, "restricted_resource")],
+        names(&harness, "/notion/pages"),
+        vec![ok(&list(&[], None)), failure(403, "restricted_resource")],
     )
     .await;
+    assert_eq!(listing.unwrap(), names_of(&[1]));
+    expect_search(&requests[0], 100, None);
+    expect(&requests[1], "GET", &format!("/v1/pages/{}", id(1)), None);
+    let refused = served(&harness, read(&harness, &body)).await;
     assert!(matches!(refused, Err(NsError::Permission)), "{refused:?}");
-    expect(&requests[0], "GET", &format!("/v1/pages/{}", id(1)), None);
 }
 
 /// The changes at a read of a file of a page in a sync: the `page_size` of
@@ -1257,7 +1268,8 @@ async fn the_comments_take_their_answers_by_next_cursor() {
 
 /// A `529` gives a read the error of a rate limit and Notion no request in
 /// the seconds of its `Retry-After`; a `429` of a blocked connection gives a
-/// read its error at once and asks again at the next read.
+/// read its error at once, for the rest of the sync, and the next sync asks
+/// again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_529_waits_its_retry_after_and_a_blocked_connection_does_not() {
     let harness = notion_harness();
