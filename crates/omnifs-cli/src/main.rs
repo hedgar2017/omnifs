@@ -19,6 +19,8 @@ mod commands;
 mod daemon_teardown;
 mod docker;
 mod error;
+#[cfg(test)]
+mod fake_daemon;
 mod filesystem_driver;
 mod guest_image_pull;
 mod host_fs;

@@ -233,6 +233,9 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = anyhow::Result<Vec<PlannedOp>>>,
 {
+    // A mutation goes to a daemon of the control protocol of this command
+    // alone: another one drops what it does not know of a request.
+    rpc.require_protocol().await?;
     settle(rpc, state, output).await?;
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).context("generate mutation id")?;
@@ -276,6 +279,56 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mutation begins on a daemon of the control protocol of the command
+    /// alone: a daemon of another one, which would drop what it does not
+    /// know of a request, as the subject of a credential, gets none.
+    #[tokio::test]
+    async fn a_mutation_begins_on_a_daemon_of_the_control_protocol_of_the_command_alone() {
+        use crate::fake_daemon::{Answers, FakeDaemon, info};
+        let begun_on = |protocol: u32| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let endpoint =
+                omnifs_bootstrap::Bootstrap::<omnifs_bootstrap::Client>::under_root(dir.path());
+            let daemon = FakeDaemon::start(
+                &endpoint,
+                Answers {
+                    info: info(protocol),
+                    inventory: Err(omnifs_api::ControlError::new(
+                        omnifs_api::ControlErrorCode::Internal,
+                        "no inventory",
+                    )),
+                },
+            );
+            let error = run(
+                &RpcClient::from_endpoint(endpoint),
+                &ClientState::under(dir.path().join("client")),
+                &Output::new(crate::ui::output::OutputMode::Json, true),
+                || async { Ok(Vec::new()) },
+            )
+            .await
+            .err()
+            .unwrap();
+            (daemon.begun(), error)
+        };
+
+        let (begun, error) = begun_on(0).await;
+        assert_eq!(begun, 0);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the daemon speaks the control protocol 0, and this command speaks {}",
+                omnifs_api::CONTROL_PROTOCOL
+            )
+        );
+        assert_eq!(
+            crate::error::exit_code(&error),
+            crate::error::ExitCode::DaemonUnavailable
+        );
+
+        let (begun, _) = begun_on(omnifs_api::CONTROL_PROTOCOL).await;
+        assert_eq!(begun, 1);
+    }
 
     #[test]
     fn command_summary_translates_every_journaled_kind_into_command_vocabulary() {

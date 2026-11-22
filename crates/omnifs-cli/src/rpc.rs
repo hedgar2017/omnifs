@@ -5,15 +5,17 @@ use bytes::Bytes;
 use hyper_util::rt::TokioIo;
 use omnifs_api::grpc::{self, wire};
 use omnifs_api::{
-    CONTROL_LOG_TAIL_MAX_LINES, CONTROL_MUTATION_TIMEOUT_SECS, CONTROL_REQUEST_TIMEOUT_SECS,
-    CONTROL_SHUTDOWN_TIMEOUT_SECS, CONTROL_STREAM_PAYLOAD_MAX_BYTES, CredentialKey,
-    CredentialStatus, DaemonInventory, MountRecord, MutationOp, MutationOpResult, PhaseEvent,
-    ProviderImportReceipt, ProviderMetadata, ServingOutcome,
+    CONTROL_LOG_TAIL_MAX_LINES, CONTROL_MUTATION_TIMEOUT_SECS, CONTROL_PROTOCOL,
+    CONTROL_REQUEST_TIMEOUT_SECS, CONTROL_SHUTDOWN_TIMEOUT_SECS, CONTROL_STREAM_PAYLOAD_MAX_BYTES,
+    CredentialKey, CredentialStatus, DaemonInventory, MountRecord, MutationOp, MutationOpResult,
+    PhaseEvent, ProviderImportReceipt, ProviderMetadata, ServingOutcome,
 };
-use omnifs_bootstrap::{Bootstrap, Client};
+use omnifs_bootstrap::{Bootstrap, Client, FolderChange};
 use omnifs_core::{MountName, MutationId, ProviderId};
 use prost::Message as _;
 use std::time::Duration;
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
 use tokio::sync::OnceCell;
 use tokio_stream::StreamExt as _;
@@ -24,7 +26,7 @@ use crate::error::{ExitCode, WithExitCode, WithHint};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(CONTROL_REQUEST_TIMEOUT_SECS);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(CONTROL_MUTATION_TIMEOUT_SECS);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(CONTROL_SHUTDOWN_TIMEOUT_SECS);
+pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(CONTROL_SHUTDOWN_TIMEOUT_SECS);
 const PROVIDER_IMPORT_TIMEOUT: Duration = Duration::from_mins(3);
 
 fn unary<T>(message: T, timeout: Duration) -> Request<T> {
@@ -101,6 +103,65 @@ impl RpcClient {
             .map(grpc::mount_record)
             .transpose()
             .map_err(Into::into)
+    }
+
+    /// The info of the daemon, which it answers in each of its phases.
+    pub(crate) async fn daemon_info(&self) -> anyhow::Result<omnifs_api::DaemonInfo> {
+        let response = bounded_unary!(self, get_daemon_info, wire::Empty {}).into_inner();
+        grpc::daemon_info(response.info.as_ref().context("missing daemon info")?)
+            .map_err(Into::into)
+    }
+
+    /// Refuses a daemon of another control protocol than the one of this
+    /// command, to which a request would lose what the daemon does not know,
+    /// as the subject of a credential.
+    pub(crate) async fn require_protocol(&self) -> anyhow::Result<()> {
+        let daemon = self.daemon_info().await?.protocol;
+        if daemon == CONTROL_PROTOCOL {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(protocol_mismatch(daemon)))
+            .with_hint("stop the daemon with `omnifs down --keep-filesystems`, and start it with this omnifs")
+            .with_exit_code(ExitCode::DaemonUnavailable)
+    }
+
+    /// Whether the daemon ends within `bound`: its control socket is missing
+    /// or refuses a connection. It watches the folder of the profile, and
+    /// connects at each change of it and once more at the bound.
+    pub(crate) async fn ended_within(&self, bound: Duration) -> anyhow::Result<bool> {
+        let folder = self.endpoint.bootstrap_dir();
+        let socket = self.endpoint.control_socket();
+        let bound = tokio::time::sleep(bound);
+        tokio::pin!(bound);
+        let mut elapsed = false;
+        loop {
+            let change = match FolderChange::watch(folder) {
+                Ok(change) => change,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("watch {}", folder.display()));
+                },
+            };
+            match UnixStream::connect(&socket).await {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    return Ok(true);
+                },
+                Ok(_) | Err(_) => {},
+            }
+            if elapsed {
+                return Ok(false);
+            }
+            let change = AsyncFd::with_interest(change, Interest::READABLE)?;
+            tokio::select! {
+                readable = change.readable() => drop(readable?),
+                () = &mut bound => elapsed = true,
+            }
+        }
     }
 
     pub(crate) async fn inventory(&self) -> anyhow::Result<DaemonInventory> {
@@ -506,17 +567,49 @@ fn connect_error(error: &tonic::transport::Error) -> anyhow::Error {
     }
 }
 
+/// The kind of the I/O error of a connection to the control socket that
+/// failed; none for another failure of a request, as a time-out or an answer
+/// of the daemon.
+pub(crate) fn connection_failure(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind)
+}
+
 /// Whether the connection to the control socket found no daemon: the socket
 /// is missing or refuses the connection.
 pub(crate) fn without_daemon(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            )
-        })
-    })
+    matches!(
+        connection_failure(error),
+        Some(std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)
+    )
+}
+
+/// An error of the control protocol that the daemon answers a request with.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct DaemonAnswer {
+    pub(crate) code: omnifs_api::ControlErrorCode,
+    message: String,
+}
+
+/// The code of the error of the control protocol that the daemon answered
+/// the request of `error` with; none for a request without an answer of the
+/// daemon.
+pub(crate) fn answered(error: &anyhow::Error) -> Option<omnifs_api::ControlErrorCode> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DaemonAnswer>())
+        .map(|answer| answer.code)
+}
+
+/// The sentence of a daemon of the control protocol `daemon`, another than
+/// the one of this command.
+pub(crate) fn protocol_mismatch(daemon: u32) -> String {
+    format!(
+        "the daemon speaks the control protocol {daemon}, and this command speaks {CONTROL_PROTOCOL}"
+    )
 }
 
 fn retained_provider_metadata(
@@ -598,16 +691,19 @@ fn status_error(status: &tonic::Status) -> anyhow::Error {
             omnifs_api::ControlErrorCode::Busy
             | omnifs_api::ControlErrorCode::NotReady
             | omnifs_api::ControlErrorCode::RecoveryRequired
+            | omnifs_api::ControlErrorCode::ShuttingDown
             | omnifs_api::ControlErrorCode::MutationInProgress
             | omnifs_api::ControlErrorCode::LeaseExpired
             | omnifs_api::ControlErrorCode::LeaseNotHeld => ExitCode::DaemonUnavailable,
             _ => ExitCode::GenericFailure,
         };
+        let answer = anyhow::Error::new(DaemonAnswer {
+            code: error.code,
+            message: error.message,
+        });
         let result: anyhow::Result<()> = match lease_conflict_sentence(error.code) {
-            Some(sentence) => {
-                Err(anyhow::anyhow!(error.message).context(sentence)).with_hint("omnifs status")
-            },
-            None => Err(anyhow::anyhow!(error.message)),
+            Some(sentence) => Err(answer.context(sentence)).with_hint("omnifs status"),
+            None => Err(answer),
         };
         return WithExitCode::<()>::with_exit_code(result, code)
             .expect_err("status error starts from Err");

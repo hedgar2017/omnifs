@@ -64,6 +64,8 @@ tabled = { version = "0.20", features = ["ansi"] }
 [dev-dependencies]
 blake3 = { workspace = true }
 tempfile = { workspace = true }
+# The paused clock of a test of a time-out of the control client.
+tokio = { workspace = true, features = ["test-util"] }
 insta = "1"
 # Shares the cross-process NFS serialization lock (one port owner) with the
 # filesystem conformance matrix. No cycle: omnifs-itest does not depend on

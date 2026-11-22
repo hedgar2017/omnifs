@@ -97,10 +97,12 @@ pub trait WithExitCode<T> {
 fn ensure_hinted(err: anyhow::Error, mutate: impl FnOnce(&mut HintedError)) -> anyhow::Error {
     let mut hinted = match err.downcast::<HintedError>() {
         Ok(hinted) => hinted,
+        // The boxed error keeps its own type, so that a cause chain finds an
+        // error by its type under the wrapper as it does without it.
         Err(err) => HintedError {
             hints: Vec::new(),
             exit_code: ExitCode::GenericFailure,
-            source: err.into(),
+            source: err.reallocate_into_boxed_dyn_error_without_backtrace(),
         },
     };
     mutate(&mut hinted);

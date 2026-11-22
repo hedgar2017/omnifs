@@ -41,6 +41,12 @@ impl ClientState {
         })
     }
 
+    /// The client state under `root`, for a test.
+    #[cfg(test)]
+    pub(crate) fn under(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub(crate) fn owner_id(&self) -> anyhow::Result<ClientOwnerId> {
         self.prepare()?;
         let lock_path = self.root.join(OWNER_LOCK);
@@ -140,9 +146,7 @@ mod tests {
     #[test]
     fn owner_identity_is_stable_and_private() {
         let temp = tempfile::tempdir().unwrap();
-        let state = ClientState {
-            root: temp.path().join("client"),
-        };
+        let state = ClientState::under(temp.path().join("client"));
         let first = state.owner_id().unwrap();
         assert_eq!(state.owner_id().unwrap(), first);
         assert_eq!(
@@ -170,9 +174,7 @@ mod tests {
     #[test]
     fn no_journal_file_means_no_pending_mutation() {
         let temp = tempfile::tempdir().unwrap();
-        let state = ClientState {
-            root: temp.path().join("client"),
-        };
+        let state = ClientState::under(temp.path().join("client"));
         assert!(state.pending().unwrap().is_none());
         assert!(!state.root.join(MUTATION_FILE).exists());
     }
@@ -180,9 +182,7 @@ mod tests {
     #[test]
     fn pending_round_trips_and_clears() {
         let temp = tempfile::tempdir().unwrap();
-        let state = ClientState {
-            root: temp.path().join("client"),
-        };
+        let state = ClientState::under(temp.path().join("client"));
         let record = PendingMutation {
             id: MutationId::from_bytes([7; 16]),
             ops: vec![PendingOp {
@@ -213,9 +213,7 @@ mod tests {
     #[test]
     fn clearing_an_already_absent_journal_is_not_an_error() {
         let temp = tempfile::tempdir().unwrap();
-        let state = ClientState {
-            root: temp.path().join("client"),
-        };
+        let state = ClientState::under(temp.path().join("client"));
         state.clear_pending().unwrap();
         state.clear_pending().unwrap();
     }
@@ -223,9 +221,7 @@ mod tests {
     #[test]
     fn setting_pending_replaces_any_prior_record() {
         let temp = tempfile::tempdir().unwrap();
-        let state = ClientState {
-            root: temp.path().join("client"),
-        };
+        let state = ClientState::under(temp.path().join("client"));
         state
             .set_pending(&PendingMutation {
                 id: MutationId::from_bytes([1; 16]),
