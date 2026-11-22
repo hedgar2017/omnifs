@@ -12,10 +12,11 @@
 //! the new messages after the `ts` of the latest message of the channel. Its
 //! first full listing gives the feed of each message its state, so that the
 //! feed of a message takes it by its `ts` past its deadline before the end
-//! of that listing. The own feed of a message takes it by its `ts` and its
-//! replies from the pages of `conversations.replies`, kept in its token until
-//! the last page, and the own feed of a file of a message or a reply takes
-//! its content from the URL that the feed that took the file gives it.
+//! of that listing. The own feed of a message takes it by its `ts`, and its
+//! replies with the message itself from the pages of
+//! `conversations.replies`, kept in its token until the last page, and the
+//! own feed of a file of a message or a reply takes its content from the URL
+//! that the feed that took the file gives it.
 //!
 //! The take of a message or a reply writes its files against its
 //! `message.json` in the projection, with the removal of the `content` of a
@@ -98,7 +99,6 @@ enum HistoryStage {
 }
 
 /// The token of the feed of a message: the replies of an unfinished answer.
-/// The token of a removed message is `null`.
 #[derive(Serialize, Deserialize)]
 struct MessageToken {
     replies: Option<Replies>,
@@ -479,8 +479,9 @@ struct HistoryFeed<'a> {
 impl History {
     /// The feed of the history of a channel: the next request of its token;
     /// else a full listing for a call without a token, for the start or the
-    /// due start `""`, and for a channel without a message; else the new
-    /// messages after its latest message.
+    /// due start `""`, and for a channel without a message in its token or
+    /// in the projection, as after a removal of the channel by another feed;
+    /// else the new messages after the latest message of its token.
     pub(crate) async fn feed(cx: FeedCx<ChannelKey>) -> Result<Feed> {
         let token = cx.token().map(decode_token::<HistoryToken>).transpose()?;
         let first = token.is_none();
@@ -491,10 +492,12 @@ impl History {
         let listing = [cx.start(), cx.due()].contains(&Some(""));
         let stage = match stage {
             Some(stage) => stage,
-            None if first || listing || latest.is_none() => HistoryStage::Listing {
-                first,
-                cursor: None,
-                messages: BTreeSet::new(),
+            None if first || listing || latest.is_none() || !has_messages(&cx)? => {
+                HistoryStage::Listing {
+                    first,
+                    cursor: None,
+                    messages: BTreeSet::new(),
+                }
             },
             None => HistoryStage::New {
                 cursor: None,
@@ -509,6 +512,12 @@ impl History {
         };
         feed.page(stage).await
     }
+}
+
+/// Whether the projection has a message of the channel of `cx`.
+fn has_messages(cx: &FeedCx<ChannelKey>) -> Result<bool> {
+    let facts = cx.listing(messages_path(&cx.key().id), ListingForm::Count)?;
+    Ok(facts.is_some_and(|facts| !matches!(facts.entries, ListingEntries::Count(0))))
 }
 
 impl HistoryFeed<'_> {
@@ -574,7 +583,7 @@ impl HistoryFeed<'_> {
                             id: self.channel.clone(),
                             ts: ts.clone(),
                         };
-                        let token = encode(&Some(MessageToken { replies: None }))?;
+                        let token = encode(&MessageToken { replies: None })?;
                         self.inner.push(Inner::Message(key, token));
                     }
                     messages.insert(ts);
@@ -683,11 +692,7 @@ impl Message {
     /// in `replies` of a message with another `latest_reply` or
     /// `reply_count`.
     pub(crate) async fn feed(cx: FeedCx<MessageKey>) -> Result<Feed> {
-        let token = cx
-            .token()
-            .map(decode_token::<Option<MessageToken>>)
-            .transpose()?
-            .flatten();
+        let token = cx.token().map(decode_token::<MessageToken>).transpose()?;
         let key = cx.key();
         let mut feed = MessageFeed {
             cx: &cx,
@@ -819,7 +824,7 @@ impl MessageFeed<'_> {
                         messages: Vec::new(),
                     }),
                 };
-                return Ok(Feed::restart(encode(&Some(token))?, failure(&error)));
+                return Ok(Feed::restart(encode(&token)?, failure(&error)));
             },
             Answer::Error(error) => return Err(failure(&error)),
         };
@@ -833,20 +838,36 @@ impl MessageFeed<'_> {
         self.replies_end(&messages)
     }
 
-    /// The last part of the replies: `replies/` complete with each message of
-    /// `messages` whose `thread_ts` is the `ts` of the message, other than
-    /// the message itself, and the removal of each other reply.
+    /// The last part of the replies: the message of `messages` with the `ts`
+    /// of the message as the message, its folder joining `messages/`, and
+    /// `replies/` complete with each other message whose `thread_ts` is that
+    /// `ts`, with the removal of each other reply.
     fn replies_end(&mut self, messages: &[Box<RawValue>]) -> Result<Feed> {
-        let of = Of::Thread(self.channel, self.ts);
+        let thread = Of::Thread(self.channel, self.ts);
         let mut replies = BTreeSet::new();
         for object in messages {
-            let reply: MessageObject = decode(object.get().as_bytes())?;
-            if reply.ts != *self.ts && reply.thread_ts.as_ref() == Some(self.ts) {
-                let reply = take(self.cx, of, object, ListingWrite::Complete, &mut self.inner)?;
+            let message: MessageObject = decode(object.get().as_bytes())?;
+            if message.ts == *self.ts {
+                let channel = Of::Channel(self.channel);
+                take(
+                    self.cx,
+                    channel,
+                    object,
+                    ListingWrite::Join,
+                    &mut self.inner,
+                )?;
+            } else if message.thread_ts.as_ref() == Some(self.ts) {
+                let reply = take(
+                    self.cx,
+                    thread,
+                    object,
+                    ListingWrite::Complete,
+                    &mut self.inner,
+                )?;
                 replies.insert(reply.message.ts);
             }
         }
-        let at = of.listing();
+        let at = thread.listing();
         self.cx.dir(&at, ListingWrite::Complete)?;
         for reply in listed::<_, Ts>(self.cx, &at)?.difference(&replies) {
             self.cx.remove(format!("{at}/{reply}"))?;
@@ -854,18 +875,16 @@ impl MessageFeed<'_> {
         self.part(None)
     }
 
-    /// The removal of the message, with its replies, and the token of a
-    /// removed message.
-    fn removal(&self) -> Result<Feed> {
+    /// The removal of the message, with its replies.
+    fn removal(&mut self) -> Result<Feed> {
         self.cx.remove(self.path())?;
-        Ok(Feed::part(encode(&None::<MessageToken>)?).into())
+        self.part(None)
     }
 
-    /// The removal of the channel of the message, with the token of a
-    /// removed message.
-    fn channel_removal(&self) -> Result<Feed> {
+    /// The removal of the channel of the message.
+    fn channel_removal(&mut self) -> Result<Feed> {
         self.cx.remove(channel_path(self.channel))?;
-        Ok(Feed::part(encode(&None::<MessageToken>)?).into())
+        self.part(None)
     }
 
     /// A part with the replies of an unfinished answer, followed by more
@@ -873,7 +892,7 @@ impl MessageFeed<'_> {
     /// replies.
     fn part(&mut self, replies: Option<Replies>) -> Result<Feed> {
         let more = replies.is_some();
-        let token = encode(&Some(MessageToken { replies }))?;
+        let token = encode(&MessageToken { replies })?;
         Ok(feed_part(token, more, self.inner.drain(..)))
     }
 }
