@@ -52,7 +52,8 @@
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::str::FromStr;
+use std::time::{Duration, SystemTime};
 
 use crate::browse::{Effects, ListingWrite};
 use crate::cx::Cx;
@@ -60,7 +61,6 @@ use crate::error::{ProviderError, Result};
 use crate::identity::IdentityCaptures;
 use crate::object::{Key, Object, ObjectKind};
 use omnifs_core::path::Path;
-use omnifs_wit::provider::types as wit_types;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -170,18 +170,47 @@ impl<K, S> FeedCx<K, S> {
         }
     }
 
-    /// The listing of the mount-absolute `path` in the host projection, as a
-    /// count of its entries or their names, with its completeness; `None`
-    /// for a path the projection has no listing of. The host answers only
-    /// for a path in the subtree of the feed's object.
-    pub fn listing(
-        &self,
-        path: impl AsRef<str>,
-        form: ListingForm,
-    ) -> Result<Option<ListingFacts>> {
-        let facts =
-            crate::omnifs::provider::projection::listing(self.cx.id(), path.as_ref(), form.into())?;
-        Ok(facts.map(ListingFacts::from))
+    /// The names of the listing of the mount-absolute `path` in the host
+    /// projection, each parsed as a `T`, as a `String` or as the key of an
+    /// entry; `None` for a path the projection has no listing of. A name
+    /// that is no `T` is the `internal` error of the call: the feed wrote
+    /// it. The host answers only for a path in the subtree of the feed's
+    /// object.
+    pub fn names<T: FromStr>(&self, path: impl AsRef<str>) -> Result<Option<ListedNames<T>>> {
+        let path = path.as_ref();
+        crate::omnifs::provider::projection::names(self.cx.id(), path)?
+            .map(|listed| {
+                Ok(ListedNames {
+                    names: listed
+                        .names
+                        .iter()
+                        .map(|name| {
+                            name.parse().map_err(|_| {
+                                ProviderError::internal(format!("{path} lists {name}"))
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                    complete: listed.complete,
+                    until: listed.until.map(time),
+                })
+            })
+            .transpose()
+    }
+
+    /// The count of the names of the listing of the mount-absolute `path`
+    /// in the host projection; `None` for a path the projection has no
+    /// listing of. The host answers only for a path in the subtree of the
+    /// feed's object.
+    pub fn count(&self, path: impl AsRef<str>) -> Result<Option<ListedCount>> {
+        Ok(
+            crate::omnifs::provider::projection::count(self.cx.id(), path.as_ref())?.map(
+                |listed| ListedCount {
+                    count: listed.count,
+                    complete: listed.complete,
+                    until: listed.until.map(time),
+                },
+            ),
+        )
     }
 
     /// The bytes of the fed file at the mount-absolute `path` in the host
@@ -240,45 +269,32 @@ impl<K, S> Deref for FeedCx<K, S> {
     }
 }
 
-/// What [`FeedCx::listing`] returns of a listing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ListingForm {
-    Count,
-    Names,
-}
-
-impl From<ListingForm> for wit_types::ListingForm {
-    fn from(form: ListingForm) -> Self {
-        match form {
-            ListingForm::Count => Self::Count,
-            ListingForm::Names => Self::Names,
-        }
-    }
-}
-
-/// A listing of the host projection with its completeness.
+/// The names of a listing of the host projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListingFacts {
+pub struct ListedNames<T> {
+    pub names: Vec<T>,
+    /// Whether the listing is complete.
     pub complete: bool,
-    pub entries: ListingEntries,
+    /// The time after which the listing counts as lacking for the start of
+    /// an answer, which the part that wrote it gave with
+    /// [`FeedPart::until`]; `None` for a listing without one.
+    pub until: Option<SystemTime>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ListingEntries {
-    Count(u64),
-    Names(Vec<String>),
+/// The count of the names of a listing of the host projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListedCount {
+    pub count: u64,
+    /// Whether the listing is complete.
+    pub complete: bool,
+    /// The time after which the listing counts as lacking, as of
+    /// [`ListedNames::until`].
+    pub until: Option<SystemTime>,
 }
 
-impl From<wit_types::ListingFacts> for ListingFacts {
-    fn from(facts: wit_types::ListingFacts) -> Self {
-        Self {
-            complete: facts.complete,
-            entries: match facts.entries {
-                wit_types::ListingEntries::Count(count) => ListingEntries::Count(count),
-                wit_types::ListingEntries::Names(names) => ListingEntries::Names(names),
-            },
-        }
-    }
+/// The time of `millis` milliseconds of the Unix epoch.
+fn time(millis: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(millis)
 }
 
 /// The answer of one feed call.

@@ -189,8 +189,8 @@ pub(crate) struct FeedChanges {
 }
 
 /// The feed operations in flight, by correlation id, with the anchor path of
-/// their object: `projection.listing` and `projection.file` answer only for
-/// them and only under that path.
+/// their object: the reads of the `projection` import answer only for them
+/// and only under that path.
 #[derive(Default)]
 pub(crate) struct FeedOperations {
     paths: dashmap::DashMap<u64, Path>,
@@ -267,9 +267,6 @@ impl ProjectionReads {
         path: &str,
     ) -> std::result::Result<Option<Vec<u8>>, wit_types::ProviderError> {
         let path = self.feed_path(id, path)?;
-        let internal = |error: crate::cache::ProjectionError| {
-            refusal(wit_types::ErrorKind::Internal, error.to_string())
-        };
         if !self.resources.is_fed(&path).map_err(internal)? {
             return Ok(None);
         }
@@ -289,38 +286,76 @@ impl ProjectionReads {
         Ok(Some(file.content))
     }
 
-    /// The listing of `path` in the projection, for the feed operation `id`
-    /// and a path in the subtree of its object; none for a path without one.
-    pub(crate) fn listing(
+    /// The names of the listing of `path` in the projection, for the feed
+    /// operation `id` and a path in the subtree of its object; none for a
+    /// path without a listing.
+    pub(crate) fn names(
         &self,
         id: u64,
         path: &str,
-        form: wit_types::ListingForm,
-    ) -> std::result::Result<Option<wit_types::ListingFacts>, wit_types::ProviderError> {
+    ) -> std::result::Result<Option<wit_types::ListingNames>, wit_types::ProviderError> {
+        Ok(self
+            .listing(id, path)?
+            .map(|listing| wit_types::ListingNames {
+                names: listing.names,
+                complete: listing.complete,
+                until: listing.until,
+            }))
+    }
+
+    /// The count of the names of the listing of `path` in the projection,
+    /// for the paths of [`Self::names`].
+    pub(crate) fn count(
+        &self,
+        id: u64,
+        path: &str,
+    ) -> std::result::Result<Option<wit_types::ListingCount>, wit_types::ProviderError> {
+        self.listing(id, path)?
+            .map(|listing| {
+                Ok(wit_types::ListingCount {
+                    count: u64::try_from(listing.names.len()).map_err(internal)?,
+                    complete: listing.complete,
+                    until: listing.until,
+                })
+            })
+            .transpose()
+    }
+
+    /// The listing of `path` in the projection, for the feed operation `id`
+    /// and a path in the subtree of its object: its names, whether it is
+    /// complete, and the time of its fed mark, after which it counts as
+    /// lacking; none for a path without a listing.
+    fn listing(
+        &self,
+        id: u64,
+        path: &str,
+    ) -> std::result::Result<Option<Listing>, wit_types::ProviderError> {
         let path = self.feed_path(id, path)?;
-        let Some(listing) = self
-            .resources
-            .dirents_payload(&path)
-            .map_err(|error| refusal(wit_types::ErrorKind::Internal, error.to_string()))?
-        else {
+        let Some(listing) = self.resources.dirents_payload(&path).map_err(internal)? else {
             return Ok(None);
         };
-        let names = listing
-            .entries()
-            .filter(|entry| !crate::tree::synthetic::is_reserved_provider_leaf(&entry.name))
-            .map(|entry| entry.name.clone());
-        let entries = match form {
-            wit_types::ListingForm::Count => wit_types::ListingEntries::Count(
-                u64::try_from(names.count())
-                    .map_err(|error| refusal(wit_types::ErrorKind::Internal, error.to_string()))?,
-            ),
-            wit_types::ListingForm::Names => wit_types::ListingEntries::Names(names.collect()),
-        };
-        Ok(Some(wit_types::ListingFacts {
+        Ok(Some(Listing {
+            names: listing
+                .entries()
+                .filter(|entry| !crate::tree::synthetic::is_reserved_provider_leaf(&entry.name))
+                .map(|entry| entry.name.clone())
+                .collect(),
             complete: listing.is_complete_offline(),
-            entries,
+            until: self.resources.fed_until(&path).map_err(internal)?,
         }))
     }
+}
+
+/// A listing of the projection as [`ProjectionReads`] gives it.
+struct Listing {
+    names: Vec<String>,
+    complete: bool,
+    until: Option<u64>,
+}
+
+/// The refusal of a read of the projection that failed in the host.
+fn internal(error: impl std::fmt::Display) -> wit_types::ProviderError {
+    refusal(wit_types::ErrorKind::Internal, error.to_string())
 }
 
 fn refusal(kind: wit_types::ErrorKind, message: impl Into<String>) -> wit_types::ProviderError {

@@ -444,6 +444,29 @@ async fn an_answer_that_writes_a_file_as_it_was_changes_nothing_for_a_filesystem
         assert!(
             !matches!(&event, omnifs_engine::NsEvent::AttrsChanged { path, .. } if *path == title),
             "{event:?}"
+/// A feed reads a listing of the projection as its names, each parsed as a
+/// key, or as its count, each with whether the listing is complete and with
+/// the time that the part that wrote the listing gave its facts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_feed_reads_the_names_and_the_count_of_a_listing_with_its_completeness_and_its_time() {
+    let harness = make_initialized_runtime(CONFIG);
+    for shelf in ["oak", "dated"] {
+        assert_eq!(
+            names(&harness, &["shelves", shelf, "books"]).await.unwrap(),
+            ["1", "2"]
+        );
+    }
+    read(&harness, &["hello", "shelf-change"]).await;
+    tokio::time::sleep(PAST_DEADLINE).await;
+    for (shelf, until) in [("oak", "None"), ("dated", "Some(4102444800)")] {
+        assert_eq!(
+            names(&harness, &["shelves", shelf, "books"]).await.unwrap(),
+            ["1", "3"]
+        );
+        assert_eq!(read(&harness, &["shelves", shelf, "seen"]).await, "1,2");
+        assert_eq!(
+            read(&harness, &["shelves", shelf, "listed"]).await,
+            format!("names true {until}, count 2 true {until}")
         );
     }
 }

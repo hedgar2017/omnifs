@@ -104,13 +104,20 @@ impl HostState {
 }
 
 impl ProjectionHost for HostState {
-    fn listing(
+    fn names(
         &mut self,
         id: u64,
         path: String,
-        form: wit_types::ListingForm,
-    ) -> Result<Option<wit_types::ListingFacts>, wit_types::ProviderError> {
-        self.projection()?.listing(id, &path, form)
+    ) -> Result<Option<wit_types::ListingNames>, wit_types::ProviderError> {
+        self.projection()?.names(id, &path)
+    }
+
+    fn count(
+        &mut self,
+        id: u64,
+        path: String,
+    ) -> Result<Option<wit_types::ListingCount>, wit_types::ProviderError> {
+        self.projection()?.count(id, &path)
     }
 
     fn file(&mut self, id: u64, path: String) -> Result<Option<Vec<u8>>, wit_types::ProviderError> {

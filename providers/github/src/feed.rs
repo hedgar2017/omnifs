@@ -993,36 +993,20 @@ fn remove_item<K>(cx: &FeedCx<K>, repo: &RepoId, item: ItemRef) -> Result<()> {
 /// The count of the entries the projection lists at `path`, none without a
 /// listing.
 fn count<K>(cx: &FeedCx<K>, path: &str) -> Result<Option<usize>> {
-    let Some(facts) = cx.listing(path, ListingForm::Count)? else {
+    let Some(listed) = cx.count(path)? else {
         return Ok(None);
     };
-    let ListingEntries::Count(count) = facts.entries else {
-        return Err(ProviderError::internal(format!(
-            "the listing of {path} has no count"
-        )));
-    };
-    usize::try_from(count)
+    usize::try_from(listed.count)
         .map(Some)
         .map_err(|error| ProviderError::internal(format!("the listing of {path}: {error}")))
 }
 
 /// The numbers the projection lists at `path`, none without a listing.
 fn listed<K>(cx: &FeedCx<K>, path: &str) -> Result<BTreeSet<u64>> {
-    let Some(facts) = cx.listing(path, ListingForm::Names)? else {
-        return Ok(BTreeSet::new());
-    };
-    let ListingEntries::Names(names) = facts.entries else {
-        return Err(ProviderError::internal(format!(
-            "the listing of {path} has no names"
-        )));
-    };
-    names
-        .iter()
-        .map(|name| {
-            name.parse()
-                .map_err(|_| ProviderError::internal(format!("{path} lists {name}")))
-        })
-        .collect()
+    Ok(cx
+        .names(path)?
+        .map(|listed| listed.names.into_iter().collect())
+        .unwrap_or_default())
 }
 
 // ===========================================================================
@@ -1663,8 +1647,8 @@ async fn item_feed<K>(cx: &FeedCx<K>, repo: &RepoId, item: ItemRef) -> Result<Fe
                 write_found(cx, repo, item, &row)?;
                 let mut next = row.token(etag);
                 let complete = cx
-                    .listing(comments_path(repo, item), ListingForm::Count)?
-                    .is_some_and(|facts| facts.complete);
+                    .count(comments_path(repo, item))?
+                    .is_some_and(|listed| listed.complete);
                 if row.comments != 0 && complete {
                     next.next = Some(ItemRequest::Since {
                         since: token.updated_at,

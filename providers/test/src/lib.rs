@@ -396,7 +396,8 @@ impl Shelf {
     /// completes `books`; the `flaky` shelf stops once before its second
     /// part. After the first answer, an answer is `unchanged` until the
     /// shelf version moves, and then renames book 1, adds book 3, and records
-    /// in `seen` the names the host listed for `books` in a part, and removes
+    /// in `seen` the names the host listed for `books` and in `listed` the
+    /// completeness, the time and the count of that listing in a part, and removes
     /// book 2 in its last part; the `wobbly` shelf stops once at a rate limit
     /// of a second before that last part.
     fn feed(cx: FeedCx<ShelfKey, State>) -> impl core::future::Future<Output = Result<Feed>> {
@@ -447,7 +448,13 @@ impl Shelf {
             },
             Some(ShelfToken::Page(_)) => {
                 cx.dir(&books, ListingWrite::Complete)?;
-                Ok(Feed::part(&ShelfToken::Version(version))?.into())
+                let part = Feed::part(&ShelfToken::Version(version))?;
+                Ok(if shelf == "dated" {
+                    part.until(dated_until())
+                } else {
+                    part
+                }
+                .into())
             },
             Some(ShelfToken::Version(done)) if done == version => Ok(Feed::unchanged()),
             Some(ShelfToken::Change(change)) if change == version => {
@@ -462,16 +469,29 @@ impl Shelf {
                 Ok(Feed::part(&ShelfToken::Version(version))?.into())
             },
             Some(ShelfToken::Version(_) | ShelfToken::Change(_)) => {
-                let seen = match cx.listing(&books, ListingForm::Names)? {
-                    Some(ListingFacts {
-                        entries: ListingEntries::Names(names),
-                        ..
-                    }) => names.join(","),
-                    other => {
-                        return Err(ProviderError::internal(format!("books listing {other:?}")));
-                    },
+                let (Some(seen), Some(listed)) = (cx.names::<u64>(&books)?, cx.count(&books)?)
+                else {
+                    return Err(ProviderError::internal(format!("no listing of {books}")));
                 };
-                cx.file(format!("/shelves/{shelf}/seen"), seen.into_bytes())?;
+                let names = seen
+                    .names
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                cx.file(format!("/shelves/{shelf}/seen"), names.into_bytes())?;
+                cx.file(
+                    format!("/shelves/{shelf}/listed"),
+                    format!(
+                        "names {} {:?}, count {} {} {:?}",
+                        seen.complete,
+                        seen.until.map(epoch_seconds),
+                        listed.count,
+                        listed.complete,
+                        listed.until.map(epoch_seconds),
+                    )
+                    .into_bytes(),
+                )?;
                 cx.dir(&books, ListingWrite::Complete)?;
                 book(1, &format!("Book 1 v{version}"))?;
                 book(3, "Book 3")?;
@@ -479,6 +499,18 @@ impl Shelf {
             },
         }
     }
+}
+
+/// The time until which the listing of the books of the `dated` shelf
+/// counts: the first second of the year 2100.
+fn dated_until() -> std::time::SystemTime {
+    std::time::SystemTime::UNIX_EPOCH + Duration::from_hours(1_139_568)
+}
+
+/// The seconds of `time` after the Unix epoch.
+fn epoch_seconds(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// The token of the feed of a shelf: the page of its first answer that a
@@ -759,6 +791,7 @@ impl TestProvider {
             o.stable();
             o.file("shelf.json").canonical::<Json>()?;
             o.file("seen").fed()?;
+            o.file("listed").fed()?;
             o.dir("books").fed()?;
             o.feed(Shelf::feed).starts(["books"])?;
             Ok(())

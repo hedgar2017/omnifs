@@ -162,21 +162,10 @@ fn folder(path: &Path) -> Result<Path> {
 /// The entries of the listing of `path` in the projection, none without a
 /// listing.
 fn listed<K, T: FromStr<Err = ()> + Ord>(cx: &FeedCx<K>, path: &str) -> Result<BTreeSet<T>> {
-    let Some(facts) = cx.listing(path, ListingForm::Names)? else {
-        return Ok(BTreeSet::new());
-    };
-    let ListingEntries::Names(names) = facts.entries else {
-        return Err(ProviderError::internal(format!(
-            "the listing of {path} has no names"
-        )));
-    };
-    names
-        .iter()
-        .map(|name| {
-            name.parse()
-                .map_err(|()| ProviderError::internal(format!("{path} lists {name}")))
-        })
-        .collect()
+    Ok(cx
+        .names(path)?
+        .map(|listed| listed.names.into_iter().collect())
+        .unwrap_or_default())
 }
 
 /// The token of the feed of an object that a feed took, as an inner state
@@ -534,8 +523,7 @@ fn lost(cx: &FeedCx<ChannelKey>, token: &HistoryToken) -> Result<bool> {
     if !has {
         return Ok(false);
     }
-    let facts = cx.listing(cx.path(), ListingForm::Count)?;
-    Ok(facts.is_none_or(|facts| matches!(facts.entries, ListingEntries::Count(0))))
+    Ok(cx.count(cx.path())?.is_none_or(|listed| listed.count == 0))
 }
 
 /// A request of the next page of `stage`, a sweep of the history after the
@@ -700,8 +688,8 @@ impl MessageFeed<'_> {
     /// projection; else their first request.
     async fn thread(&mut self) -> Result<Feed> {
         let at = self.replies_path();
-        let replies = self.cx.listing(&at, ListingForm::Count)?;
-        if replies.is_some_and(|facts| facts.complete) {
+        let replies = self.cx.count(&at)?;
+        if replies.is_some_and(|listed| listed.complete) {
             return self.part(None);
         }
         let projected = self

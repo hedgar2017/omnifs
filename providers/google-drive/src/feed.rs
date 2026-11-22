@@ -155,22 +155,12 @@ fn projected_revision<K>(cx: &FeedCx<K>, id: &Id) -> Result<Option<String>> {
 /// The IDs of the items of `kind` of the projection, by their listing.
 fn listing<K>(cx: &FeedCx<K>, kind: Kind) -> Result<Vec<Id>> {
     let at = dir(kind);
-    let Some(ListingFacts {
-        entries: ListingEntries::Names(names),
-        ..
-    }) = cx.listing(at, ListingForm::Names)?
-    else {
+    let Some(listed) = cx.names(at)? else {
         return Err(ProviderError::internal(format!(
             "the projection has no names of {at}"
         )));
     };
-    names
-        .iter()
-        .map(|name| {
-            name.parse()
-                .map_err(|()| ProviderError::internal(format!("{at} lists {name}")))
-        })
-        .collect()
+    Ok(listed.names)
 }
 
 /// One call of the feed of the Drive: its context and the tokens of the own

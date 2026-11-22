@@ -257,21 +257,10 @@ fn remove_content<K>(cx: &FeedCx<K>, id: &Id) -> Result<()> {
 /// The IDs of the entries of the listing of `path` in the projection, none
 /// without a listing.
 fn listed<K>(cx: &FeedCx<K>, path: &str) -> Result<BTreeSet<Id>> {
-    let Some(facts) = cx.listing(path, ListingForm::Names)? else {
-        return Ok(BTreeSet::new());
-    };
-    let ListingEntries::Names(names) = facts.entries else {
-        return Err(ProviderError::internal(format!(
-            "the listing of {path} has no names"
-        )));
-    };
-    names
-        .iter()
-        .map(|name| {
-            name.parse()
-                .map_err(|()| ProviderError::internal(format!("{path} lists {name}")))
-        })
-        .collect()
+    Ok(cx
+        .names(path)?
+        .map(|listed| listed.names.into_iter().collect())
+        .unwrap_or_default())
 }
 
 /// A request of Notion with a `start_cursor` whose answer has a status from
@@ -816,7 +805,7 @@ impl PageFeed<'_> {
             .is_none_or(|until| OffsetDateTime::now_utc() < until)
             && self
                 .cx
-                .listing(format!("{}/comments", self.path()), ListingForm::Count)?
+                .count(format!("{}/comments", self.path()))?
                 .is_some_and(|comments| comments.complete))
     }
 

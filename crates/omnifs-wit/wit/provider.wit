@@ -370,21 +370,23 @@ interface types {
         token: feed-token,
     }
 
-    /// What `projection.listing` returns of a listing.
-    enum listing-form {
-        count,
-        names,
-    }
-
-    /// A listing of the projection with its completeness.
-    record listing-facts {
+    /// The names of a listing of the projection, whether the listing is
+    /// complete, and the time, in milliseconds of the Unix epoch, after which
+    /// it counts as lacking for the start of an answer, from the part that
+    /// wrote it.
+    record listing-names {
+        names: list<string>,
         complete: bool,
-        entries: listing-entries,
+        until: option<u64>,
     }
 
-    variant listing-entries {
-        count(u64),
-        names(list<string>),
+    /// The count of the names of a listing of the projection, whether the
+    /// listing is complete, and the time after which it counts as lacking,
+    /// as of `listing-names`.
+    record listing-count {
+        count: u64,
+        complete: bool,
+        until: option<u64>,
     }
 
     /// Opened ranged-read handle. `open-file` is only valid for files
@@ -550,12 +552,17 @@ interface log {
 
 /// Reads of the projection the host keeps, for a feed operation.
 interface projection {
-    use types.{correlation-id, listing-facts, listing-form, provider-error};
+    use types.{correlation-id, listing-count, listing-names, provider-error};
 
-    /// The listing of `path` in the projection, for a path in the subtree of
-    /// the object of the feed operation `id`; none for a path without one.
-    listing: func(id: correlation-id, path: string, form: listing-form)
-        -> result<option<listing-facts>, provider-error>;
+    /// The names of the listing of `path` in the projection, for a path in
+    /// the subtree of the object of the feed operation `id`; none for a path
+    /// without a listing.
+    names: func(id: correlation-id, path: string)
+        -> result<option<listing-names>, provider-error>;
+    /// The count of the names of the listing of `path` in the projection,
+    /// for the paths of `names`.
+    count: func(id: correlation-id, path: string)
+        -> result<option<listing-count>, provider-error>;
     /// The bytes of the fed file at `path` in the projection, for a path in
     /// the subtree of the object of the feed operation `id`; none for a path
     /// without one.
