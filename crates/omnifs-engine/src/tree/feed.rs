@@ -8,6 +8,7 @@ use crate::ops::feed::{FeedClaim, FeedStart};
 use crate::ops::namespace::{ListOutcome, PageRequest};
 use crate::view::LookupPayload;
 use omnifs_core::path::Path;
+use omnifs_wit::host::types as wit_types;
 
 use super::error::{Result, TreeError};
 
@@ -74,16 +75,14 @@ pub(crate) async fn answer_claims(
     let anchor = &claims[claims.len() - 1].object.path;
     let under_anchor = &under(anchor, path)?;
     let at = fact_path(path, fact, anchor, under_anchor);
+    let internal = |error: crate::cache::ProjectionError| TreeError::internal(error.to_string());
     let answering = loop {
         let states = claims
             .iter()
             .map(|claim| runtime.resources.feed_state(claim.object.id.as_bytes()))
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| TreeError::internal(error.to_string()))?;
-        let answering = states
-            .iter()
-            .position(|state| state.as_ref().is_some_and(|state| state.ended))
-            .unwrap_or(claims.len() - 1);
+            .map_err(internal)?;
+        let answering = answering_claim(claims, &states);
         let (claim, state) = (&claims[answering], &states[answering]);
         if matches!(fact, FedFact::Lookup)
             && let Some(listing) = incomplete_listing(runtime, at, &claim.object.path)?
@@ -92,14 +91,10 @@ pub(crate) async fn answer_claims(
             Box::pin(answer_claims(runtime, &listing, FedFact::Listing, &claims)).await?;
             return Ok((at.clone(), under_anchor.clone()));
         }
-        let kept = runtime
-            .resources
-            .has_kept_parts(claim.object.id.as_bytes())
-            .map_err(|error| TreeError::internal(error.to_string()))?;
+        let kept = state.as_ref().is_some_and(|state| state.kept > 0);
         let first_answer = state.as_ref().is_none_or(|state| !state.ended);
         let below_own = claim.own && path.segments().count() > claim.object.path.segments().count();
-        let limited = runtime.rate_limited_until().is_some();
-        let due = !limited && past_deadline(state.as_ref());
+        let due = past_deadline(state.as_ref());
         let start = if claim.full_listings && !first_answer {
             (due && asks_listing(runtime, path, fact, at, claim)?)
                 .then(|| claim.starts.then(|| FeedStart::Due(under_anchor.clone())))
@@ -113,29 +108,61 @@ pub(crate) async fn answer_claims(
         } else {
             None
         };
-        let Some(start) = start.or((kept && !limited).then_some(None)) else {
+        let Some(start) = start.or((kept && due).then_some(None)) else {
             break answering;
         };
-        if runtime
-            .feed(&claim.object, start.as_ref(), state.as_ref())
-            .await?
-        {
+        let lacks = matches!(start, Some(FeedStart::Lacks(_)));
+        // The projection serves what it has of a feed whose first answer
+        // ended, or of a path that is no listing: the operation that lacks
+        // its fact, and the listing of a first answer that has not ended,
+        // have nothing to be served.
+        let served =
+            !lacks && state.is_some() && !(first_answer && matches!(fact, FedFact::Listing));
+        if let Some((remaining, error)) = runtime.window() {
+            if !served {
+                return Err(crate::EngineError::ProviderError(wit_types::ProviderError {
+                    retry_after: Some(
+                        u32::try_from(remaining.as_secs().max(1)).unwrap_or(u32::MAX),
+                    ),
+                    ..error
+                })
+                .into());
+            }
+            // The check waits for the end of the window.
+            let now = now_millis();
+            let wait = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+            runtime
+                .resources
+                .defer_feed(claim.object.id.as_bytes(), now.saturating_add(wait), now)
+                .map_err(internal)?;
             break answering;
+        }
+        match runtime
+            .feed(
+                &claim.object,
+                start.as_ref(),
+                state.as_ref(),
+                lacks.then_some(at),
+            )
+            .await
+        {
+            Ok(true) => break answering,
+            Ok(false) => {},
+            Err(crate::EngineError::ProviderError(error)) if failed_for_now(&error) => {
+                // The next check waits, as after a rate limit, so that no
+                // retry of an operation is a request of its own.
+                if error.kind != wit_types::ErrorKind::RateLimited {
+                    runtime.note_failed_for_now(&error);
+                }
+                if !served {
+                    return Err(crate::EngineError::ProviderError(error).into());
+                }
+            },
+            Err(error) => return Err(error.into()),
         }
     };
     if matches!(fact, FedFact::Listing) {
-        let claim = &claims[answering];
-        let ended = runtime
-            .resources
-            .feed_state(claim.object.id.as_bytes())
-            .map_err(|error| TreeError::internal(error.to_string()))?
-            .is_some_and(|state| state.ended);
-        let asked = !(claim.full_listings && ended)
-            || under(&claim.object.path, path)? == claim.object.path;
-        runtime
-            .resources
-            .record_listing_feed(at, asked.then_some(claim.object.id.as_bytes()))
-            .map_err(|error| TreeError::internal(error.to_string()))?;
+        record_listing(runtime, path, at, &claims[answering])?;
     }
     answer_own(runtime, path, fact, &claims[answering + 1..]).await?;
     Ok((at.clone(), under_anchor.clone()))
@@ -173,18 +200,83 @@ async fn answer_own(
             .map_err(|error| TreeError::internal(error.to_string()))?;
         if matches!(fact, FedFact::Lookup)
             && under_anchor == claim.object.path
-            && !(runtime.rate_limited_until().is_none() && past_deadline(state.as_ref()))
+            && !past_deadline(state.as_ref())
         {
             return Ok(());
         }
+        // The fact lacks: within the window of the mount the operation has
+        // the error of the window, without a request.
+        if let Some((remaining, error)) = runtime.window() {
+            return Err(crate::EngineError::ProviderError(wit_types::ProviderError {
+                retry_after: Some(u32::try_from(remaining.as_secs().max(1)).unwrap_or(u32::MAX)),
+                ..error
+            })
+            .into());
+        }
+        let at = fact_path(path, fact, &claim.object.path, &under_anchor).clone();
         let start = FeedStart::Lacks(under_anchor);
-        if runtime
-            .feed(&claim.object, Some(&start), state.as_ref())
-            .await?
+        match runtime
+            .feed(&claim.object, Some(&start), state.as_ref(), Some(&at))
+            .await
         {
-            return Ok(());
+            Ok(true) => return Ok(()),
+            Ok(false) => {},
+            Err(crate::EngineError::ProviderError(error)) if failed_for_now(&error) => {
+                if error.kind != wit_types::ErrorKind::RateLimited {
+                    runtime.note_failed_for_now(&error);
+                }
+                return Err(crate::EngineError::ProviderError(error).into());
+            },
+            Err(error) => return Err(error.into()),
         }
     }
+}
+
+/// Record the feed of `claim`, the answering feed of the listing of `path`
+/// with its fact at `at`, as the feed of that listing. A feed of full
+/// listings after the end of its first answer answers the listing of its
+/// anchor alone.
+fn record_listing(runtime: &Runtime, path: &Path, at: &Path, claim: &FeedClaim) -> Result<()> {
+    let internal = |error: crate::cache::ProjectionError| TreeError::internal(error.to_string());
+    let ended = runtime
+        .resources
+        .feed_state(claim.object.id.as_bytes())
+        .map_err(internal)?
+        .is_some_and(|state| state.ended);
+    if !(claim.full_listings && ended) || under(&claim.object.path, path)? == claim.object.path {
+        runtime
+            .resources
+            .record_listing_feed(at, claim.object.id.as_bytes(), now_millis())
+            .map_err(internal)?;
+    }
+    Ok(())
+}
+
+/// The answering claim among `claims` with their `states`: the innermost own
+/// claim whose feed is unlisted, an object that no inventory of a feed above
+/// it has; else the outer claim whose first answer ended; else the innermost
+/// one.
+fn answering_claim(claims: &[FeedClaim], states: &[Option<FeedState>]) -> usize {
+    let unlisted = |index: &usize| {
+        claims[*index].own && states[*index].as_ref().is_some_and(|state| state.unlisted)
+    };
+    (0..claims.len()).rev().find(unlisted).unwrap_or_else(|| {
+        states
+            .iter()
+            .position(|state| state.as_ref().is_some_and(|state| state.ended))
+            .unwrap_or(claims.len() - 1)
+    })
+}
+
+/// Whether `error` is of a check that failed for now: at a rate limit, the
+/// network, a timeout, or the upstream, which the SDK gives as the network.
+fn failed_for_now(error: &wit_types::ProviderError) -> bool {
+    matches!(
+        error.kind,
+        wit_types::ErrorKind::RateLimited
+            | wit_types::ErrorKind::Network
+            | wit_types::ErrorKind::Timeout
+    )
 }
 
 /// Whether a feed has no state or is past its deadline.

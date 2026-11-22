@@ -4,12 +4,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::cache::identity::GitId;
 use crate::cache::{
-    DirentsMutation, FactPayload, FeedAnswerWrite, FeedPartWrite, FeedWrite, Freshness, GitWrite,
-    Invalidation, MountResources, ObjectMutation, ProjectionTransition, RecordWrite,
+    CallSpan, DirentsMutation, FactPayload, FeedAnswerWrite, FeedPartWrite, FeedWrite, Freshness,
+    GitWrite, Invalidation, MountResources, ObjectMutation, ProjectionTransition, RecordWrite,
 };
 use crate::clock::{DYNAMIC_TTL_MILLIS, freshness_expiry, page_deadline};
 use crate::object_id::ObjectId;
-use crate::ops::feed::{FeedChanges, FeedClaim, FeedObject, FeedOrigin};
+use crate::ops::feed::{CallFacts, FeedChanges, FeedClaim, FeedObject, FeedOrigin};
 use crate::ops::namespace::{
     DirEntry, DirListing, ListOutcome, PageRequest, ReadBytes, ReadOutcome,
 };
@@ -446,37 +446,58 @@ impl<'a> EffectApplier<'a> {
         Ok((outcome, transition))
     }
 
-    /// Lower one answer of the feed of `object`: the facts of a part are fed,
-    /// those at the paths of `until` counting as lacking for the start of an
-    /// answer after their time, and the feed states it brought publish with
-    /// them; a restart moves the token of the feed. Returns the outcome and
-    /// what the answer changes.
+    /// Lower one answer of the feed of `object`, of the `calls` of its parts
+    /// in their order: the facts of a part are fed, those at the paths of
+    /// `until` counting as lacking for the start of an answer after their
+    /// time, and the feed states it brought publish with them; a restart
+    /// moves the token of the feed. A later call writes over an earlier one,
+    /// and keeps the path that an earlier one removes, or a path above it.
+    /// Returns the outcome and what the answer names as changed.
     pub(crate) fn lower_feed(
         &self,
         object: &FeedObject,
         answer: wit_types::FeedAnswer,
-        effects: &wit_types::Effects,
+        calls: &[CallFacts<'_>],
         until: HashMap<Path, u64>,
         origin: FeedOrigin,
         now_millis: u64,
     ) -> anyhow::Result<(ProjectionTransition, FeedChanges)> {
-        let mut transition = self.lower_writes(effects, now_millis, true)?;
         let mut changes = FeedChanges::default();
-        for write in &effects.fs {
-            let path = Path::parse(&write.path).map_err(anyhow::Error::from)?;
-            if let Some((parent, _)) = path.parent_and_name() {
-                changes.listings.push(parent);
+        let mut lowered = Vec::with_capacity(calls.len());
+        // The paths that the calls after each call write.
+        let mut later = std::collections::BTreeSet::<String>::new();
+        for call in calls.iter().rev() {
+            let mut part = self.lower_writes(call.effects, now_millis, true)?;
+            part.removals.retain(|removed| {
+                let below = if removed.is_root() {
+                    "/".to_owned()
+                } else {
+                    format!("{}/", removed.as_str())
+                };
+                !later.contains(removed.as_str())
+                    && !later
+                        .range(below.clone()..)
+                        .next()
+                        .is_some_and(|path| path.starts_with(&below))
+            });
+            for write in &call.effects.fs {
+                let path = Path::parse(&write.path).map_err(anyhow::Error::from)?;
+                if let Some((parent, _)) = path.parent_and_name() {
+                    changes.listings.push(parent);
+                }
+                later.insert(path.as_str().to_owned());
+                match write.kind {
+                    wit_types::FsKind::Directory(_) => changes.listings.push(path),
+                    wit_types::FsKind::File(_) => changes.files.push(path),
+                }
             }
-            match write.kind {
-                wit_types::FsKind::Directory(_) => changes.listings.push(path),
-                wit_types::FsKind::File(_) => changes.files.push(path),
+            for path in &part.removals {
+                if let Some((parent, _)) = path.parent_and_name() {
+                    changes.listings.push(parent);
+                }
+                changes.removals.push(path.clone());
             }
-        }
-        for path in &transition.removals {
-            if let Some((parent, _)) = path.parent_and_name() {
-                changes.listings.push(parent);
-            }
-            changes.removals.push(path.clone());
+            lowered.push(part);
         }
         for paths in [
             &mut changes.listings,
@@ -486,48 +507,25 @@ impl<'a> EffectApplier<'a> {
             paths.sort_by(|left, right| left.as_str().cmp(right.as_str()));
             paths.dedup();
         }
-        let deadline = now_millis.saturating_add(DYNAMIC_TTL_MILLIS);
-        let mut feed = FeedWrite {
-            object: object.id.as_bytes().to_vec(),
-            from: origin.from,
-            kept_from: origin.kept_from,
-            since: origin.since,
-            answer: FeedAnswerWrite::Unchanged,
-            inner: Vec::new(),
-            anchors: Vec::new(),
-            deadline,
-            now: now_millis,
-            until,
-        };
-        match answer {
-            wit_types::FeedAnswer::Unchanged => {},
-            wit_types::FeedAnswer::Part(part) => {
-                feed.inner = part
-                    .inner
-                    .iter()
-                    .map(|state| {
-                        (
-                            ObjectId::from_wit(&state.id).as_bytes().to_vec(),
-                            state.token.clone(),
-                        )
-                    })
-                    .collect();
-                feed.anchors = part
-                    .anchors
-                    .iter()
-                    .map(|anchor| Ok((Path::parse(&anchor.path)?, Path::parse(&anchor.anchor)?)))
-                    .collect::<Result<_, omnifs_core::path::ParseError>>()
-                    .map_err(anyhow::Error::from)?;
-                feed.answer = FeedAnswerWrite::Part(FeedPartWrite {
-                    token: part.token,
-                    more: part.more,
-                });
-            },
-            wit_types::FeedAnswer::Restart(restart) => {
-                feed.answer = FeedAnswerWrite::Restart(restart.token);
-            },
+        let mut transition = ProjectionTransition::default();
+        let mut spans = Vec::with_capacity(calls.len());
+        for (call, mut part) in calls.iter().zip(lowered.into_iter().rev()) {
+            transition.records.append(&mut part.records);
+            transition.dirents.append(&mut part.dirents);
+            transition.objects.append(&mut part.objects);
+            transition.freshness.append(&mut part.freshness);
+            transition.invalidations.append(&mut part.invalidations);
+            transition.removals.append(&mut part.removals);
+            spans.push(CallSpan {
+                records: transition.records.len(),
+                removals: transition.removals.len(),
+                began: call.began,
+                ended: call.ended,
+            });
         }
-        transition.feed = Some(feed);
+        transition.feed = Some(feed_write(
+            object, answer, spans, until, origin, now_millis,
+        )?);
         Ok((transition, changes))
     }
 
@@ -738,4 +736,59 @@ fn listing_write_from_wit(write: wit_types::ListingWrite) -> ListingWrite {
 
 fn feed_claims(claims: &[wit_types::FeedClaim]) -> anyhow::Result<Vec<FeedClaim>> {
     claims.iter().map(FeedClaim::from_wit).collect()
+}
+
+/// The states that one answer of the feed of `object` publishes, of the
+/// calls of `spans`.
+fn feed_write(
+    object: &FeedObject,
+    answer: wit_types::FeedAnswer,
+    spans: Vec<CallSpan>,
+    until: HashMap<Path, u64>,
+    origin: FeedOrigin,
+    now_millis: u64,
+) -> anyhow::Result<FeedWrite> {
+    let deadline = now_millis.saturating_add(DYNAMIC_TTL_MILLIS);
+    let mut feed = FeedWrite {
+        object: object.id.as_bytes().to_vec(),
+        from: origin.from,
+        spans,
+        lacked: origin.lacked,
+        answer: FeedAnswerWrite::Unchanged,
+        inner: Vec::new(),
+        anchors: Vec::new(),
+        deadline,
+        now: now_millis,
+        until,
+    };
+    match answer {
+        wit_types::FeedAnswer::Unchanged => {},
+        wit_types::FeedAnswer::Part(part) => {
+            feed.inner = part
+                .inner
+                .iter()
+                .map(|state| {
+                    (
+                        ObjectId::from_wit(&state.id).as_bytes().to_vec(),
+                        state.token.clone(),
+                    )
+                })
+                .collect();
+            feed.anchors = part
+                .anchors
+                .iter()
+                .map(|anchor| Ok((Path::parse(&anchor.path)?, Path::parse(&anchor.anchor)?)))
+                .collect::<Result<_, omnifs_core::path::ParseError>>()
+                .map_err(anyhow::Error::from)?;
+            feed.answer = FeedAnswerWrite::Part(FeedPartWrite {
+                token: part.token,
+                more: part.more,
+                unlisted: false,
+            });
+        },
+        wit_types::FeedAnswer::Restart(restart) => {
+            feed.answer = FeedAnswerWrite::Restart(restart.token);
+        },
+    }
+    Ok(feed)
 }

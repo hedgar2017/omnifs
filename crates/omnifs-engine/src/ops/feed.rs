@@ -78,45 +78,57 @@ impl FeedStart {
     }
 }
 
-/// One call of a feed: the token it continues from, and in a `later` answer,
-/// after the end of the first answer of the feed, the origin of its answer.
+/// One call of a feed: the token it continues from, the version of the
+/// state of its feed, in a `later` answer, after the end of the first answer
+/// of the feed, with `kept` parts, and the count of the publications of the
+/// mount when it began.
 struct FeedCall {
     token: Option<String>,
-    from: Option<String>,
-    kept_from: Option<String>,
-    since: u64,
+    from: Option<u64>,
     later: bool,
+    kept: bool,
+    began: u64,
 }
 
-/// Where the answer of a call of a feed began: the token of the state of its
-/// feed, the token after the last kept part that it continued from, and the
-/// count of [`MountResources::begin_feed_answer`].
+/// Where the answer of a call of a feed began: the version of the state of
+/// its feed, and the path of the fact that its operation lacked.
 #[derive(Debug, Clone)]
 pub(crate) struct FeedOrigin {
-    pub(crate) from: Option<String>,
-    pub(crate) kept_from: Option<String>,
-    pub(crate) since: u64,
+    pub(crate) from: Option<u64>,
+    pub(crate) lacked: Option<Path>,
+}
+
+/// The effects of one call of an answer, with the counts of the publications
+/// of the mount when the call began and when it ended.
+pub(crate) struct CallFacts<'a> {
+    pub(crate) effects: &'a wit_types::Effects,
+    pub(crate) began: u64,
+    pub(crate) ended: u64,
 }
 
 /// What one call of a feed did: the facts of the feed stand, a part,
-/// published or kept, with the token after it, or nothing, for a call whose
-/// feed another answer moved the state of.
+/// published or kept, and whether more parts follow it, or nothing, for a
+/// call whose feed another answer moved the state of.
 enum FeedStep {
     Unchanged,
-    Part { more: bool, token: String },
+    Part { more: bool },
     Moved,
 }
 
 /// A part of a later answer of a feed, which the projection keeps until the
-/// last part of the answer: the part and the effects of its call. In the
-/// projection a kept part is without its token, which the projection has of
-/// the last kept part alone, and each blob of its effects is the index of
-/// its body in `bodies`: a blob handle is of the process that fetched it.
+/// last part of the answer: the part and the effects of its call, with the
+/// counts of the publications of the mount when the call began and when it
+/// ended. In the projection a kept part is without its token, which the
+/// projection has of the last kept part alone, and each blob of its effects
+/// is the index of its body in `bodies`: a blob handle is of the process
+/// that fetched it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct KeptPart {
     part: wit_types::FeedPart,
     effects: wit_types::Effects,
     bodies: Vec<([u8; 32], u64)>,
+    began: u64,
+    ended: u64,
 }
 
 impl KeptPart {
@@ -322,16 +334,17 @@ fn refusal(kind: wit_types::ErrorKind, message: impl Into<String>) -> wit_types:
 
 impl Runtime {
     /// Run one answer of the feed of `object`, started by the operation at
-    /// `start`, in one flight per object id, while the state of the feed is
-    /// still `seen`, the state the caller decided on. Returns whether this
-    /// caller ran the answer; a caller that waited on another answer of the
-    /// same feed, or whose state another answer moved before its flight, gets
-    /// that answer and decides again.
+    /// `start`, which lacks its fact at `lacked`, in one flight per object
+    /// id, while the state of the feed is still `seen`, the state the caller
+    /// decided on. Returns whether this caller ran the answer; a caller that
+    /// waited on another answer of the same feed, or whose state another
+    /// answer moved before its flight, gets that answer and decides again.
     pub(crate) async fn feed(
         &self,
         object: &FeedObject,
         start: Option<&FeedStart>,
         seen: Option<&FeedState>,
+        lacked: Option<&Path>,
     ) -> Result<bool> {
         let led = AtomicBool::new(false);
         let runtime = self;
@@ -352,7 +365,7 @@ impl Runtime {
                     // operation decides again, as after another answer
                     // before its flight.
                     let answered = runtime
-                        .run_feed_answer(object, start)
+                        .run_feed_answer(object, start, lacked)
                         .await
                         .map_err(SharedError::from)?;
                     led.store(answered, Ordering::Relaxed);
@@ -376,58 +389,44 @@ impl Runtime {
         &self,
         object: &FeedObject,
         start: Option<&FeedStart>,
+        lacked: Option<&Path>,
     ) -> Result<bool> {
-        let state = self
-            .resources
-            .feed_state(object.id.as_bytes())
-            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-        let later = state.as_ref().is_some_and(|state| state.ended);
-        let kept = self
-            .resources
-            .kept_token(object.id.as_bytes())
-            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-        // The token of the state of the feed, which a published part moves
-        // and a kept part does not, and the token after the last kept part.
-        let mut from = state.map(|state| state.token);
-        let mut kept = kept;
-        // A published part ends the flight of its call; the kept parts of a
-        // later answer are of one flight with its last part.
-        let mut flight = self.resources.begin_feed_answer();
+        let stored =
+            |error: crate::cache::ProjectionError| EngineError::ProviderProtocol(error.to_string());
         loop {
+            let id = object.id.as_bytes();
+            let state = self.resources.feed_state(id).map_err(stored)?;
+            let kept = state.as_ref().is_some_and(|state| state.kept > 0);
+            let flight = self.resources.begin_feed_call().map_err(stored)?;
             let call = FeedCall {
-                token: kept.clone().or_else(|| from.clone()),
-                from: from.clone(),
-                kept_from: kept.clone(),
-                since: flight.since,
-                later,
-            };
-            match self.run_feed_call(object, call, start).await? {
-                FeedStep::Unchanged | FeedStep::Part { more: false, .. } => return Ok(true),
-                FeedStep::Moved => return Ok(false),
-                FeedStep::Part {
-                    more: true,
-                    token: next,
-                } => {
-                    if later {
-                        kept = Some(next);
-                    } else {
-                        from = Some(next);
-                        flight = self.resources.begin_feed_answer();
-                    }
+                token: if kept {
+                    self.resources.kept_token(id).map_err(stored)?
+                } else {
+                    self.resources.feed_token(id).map_err(stored)?
                 },
+                from: state.as_ref().map(|state| state.version),
+                later: state.as_ref().is_some_and(|state| state.ended),
+                kept,
+                began: flight.began,
+            };
+            match self.run_feed_call(object, call, start, lacked).await? {
+                FeedStep::Unchanged | FeedStep::Part { more: false } => return Ok(true),
+                FeedStep::Moved => return Ok(false),
+                FeedStep::Part { more: true } => {},
             }
         }
     }
 
     /// One call of the feed of `object`. The `until` of a part is the time
-    /// of the facts of the part, a part of a later answer with `more` having
-    /// none.
+    /// of the facts of the part under the anchor of the object, a part of a
+    /// later answer with `more` having none.
     #[allow(clippy::too_many_lines)]
     async fn run_feed_call(
         &self,
         object: &FeedObject,
         call: FeedCall,
         start: Option<&FeedStart>,
+        lacked: Option<&Path>,
     ) -> Result<FeedStep> {
         let id = self.next_operation_id();
         let span = inspector::provider_span(
@@ -443,10 +442,14 @@ impl Runtime {
         let FeedCall {
             token,
             from,
-            kept_from,
-            since,
             later,
+            kept,
+            began,
         } = call;
+        let origin = FeedOrigin {
+            from,
+            lacked: lacked.cloned(),
+        };
         async {
             let operation = self.feed_operations.begin(id, object.path.clone());
             let (wire_result, effects, until) = self
@@ -459,6 +462,10 @@ impl Runtime {
                 )
                 .await?;
             drop(operation);
+            let ended = self
+                .resources
+                .sequence()
+                .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             crate::op_validate::validate_feed(&wire_result, &effects, until, tokened, |tree| {
                 self.tree_ref(tree).is_some()
             })
@@ -466,90 +473,103 @@ impl Runtime {
             super::lifecycle::inspect_result(&span, &wire_result);
             let pending_blobs = blob_guard.take();
             let answer = self.provider_result(wire_result)?;
-            // The facts of the part of this call, whose time is its `until`.
-            let deadlined = until
-                .map(|until| {
-                    effects
-                        .fs
-                        .iter()
-                        .map(|write| Ok((Path::parse(&write.path)?, until)))
-                        .collect::<std::result::Result<HashMap<_, _>, omnifs_core::path::ParseError>>()
-                })
-                .transpose()
-                .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?
-                .unwrap_or_default();
-            let (answer, effects) = match answer {
+            // The facts of the part of this call under the anchor of its
+            // object, whose time is its `until`: a fact that the part writes
+            // elsewhere, as the listing that its object joins, is of another
+            // feed.
+            let mut deadlined = HashMap::new();
+            if let Some(until) = until {
+                for write in &effects.fs {
+                    let path = Path::parse(&write.path)
+                        .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+                    if path.has_prefix(&object.path) {
+                        deadlined.insert(path, until);
+                    }
+                }
+            }
+            let last = KeptPart {
+                part: wit_types::FeedPart {
+                    token: String::new(),
+                    more: false,
+                    inner: Vec::new(),
+                    anchors: Vec::new(),
+                },
+                effects,
+                bodies: Vec::new(),
+                began,
+                ended,
+            };
+            let (answer, parts) = match answer {
                 wit_types::FeedAnswer::Part(part) if later && part.more => {
                     if until.is_some() {
                         return Err(EngineError::ProviderProtocol(
                             "a part of a later feed answer with more parts has no until".into(),
                         ));
                     }
-                    let token = part.token.clone();
                     let kept = self.keep_feed_part(
                         object,
-                        KeptPart {
-                            part,
-                            effects,
-                            bodies: Vec::new(),
-                        },
-                        FeedOrigin {
-                            from,
-                            kept_from,
-                            since,
-                        },
+                        KeptPart { part, ..last },
+                        &origin,
                         pending_blobs,
                         captured_epoch,
                     )?;
                     inspector::record_outcome(&span, InspectorOutcome::Ok);
                     return Ok(if kept {
-                        FeedStep::Part { more: true, token }
+                        FeedStep::Part { more: true }
                     } else {
                         FeedStep::Moved
                     });
                 },
-                wit_types::FeedAnswer::Unchanged if kept_from.is_some() => {
+                wit_types::FeedAnswer::Unchanged if kept => {
                     return Err(EngineError::ProviderProtocol(
                         "a feed answered unchanged after the kept parts of its answer".into(),
                     ));
                 },
-                wit_types::FeedAnswer::Part(part) if kept_from.is_some() => {
-                    let parts = self
+                wit_types::FeedAnswer::Part(mut part) if kept => {
+                    let mut parts = self
                         .resources
                         .kept_parts(object.id.as_bytes())
                         .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?
                         .iter()
                         .map(|bytes| KeptPart::decode(bytes, &self.resources, id))
                         .collect::<Result<Vec<_>>>()?;
-                    let last = KeptPart {
-                        part,
-                        effects,
-                        bodies: Vec::new(),
-                    };
-                    let (part, effects) = compose(parts, last)?;
-                    (wit_types::FeedAnswer::Part(part), effects)
+                    // The inner states and the facet anchors of each part in
+                    // their order, with the token of the last.
+                    let (inner, anchors) = (
+                        std::mem::take(&mut part.inner),
+                        std::mem::take(&mut part.anchors),
+                    );
+                    for kept in &mut parts {
+                        part.inner.append(&mut kept.part.inner);
+                        part.anchors.append(&mut kept.part.anchors);
+                    }
+                    part.inner.extend(inner);
+                    part.anchors.extend(anchors);
+                    parts.push(last);
+                    (wit_types::FeedAnswer::Part(part), parts)
                 },
-                answer => (answer, effects),
+                answer => (answer, vec![last]),
             };
             let step = match &answer {
-                wit_types::FeedAnswer::Part(part) => Ok(FeedStep::Part {
-                    more: part.more,
-                    token: part.token.clone(),
-                }),
+                wit_types::FeedAnswer::Part(part) => Ok(FeedStep::Part { more: part.more }),
                 wit_types::FeedAnswer::Unchanged => Ok(FeedStep::Unchanged),
                 wit_types::FeedAnswer::Restart(restart) => Err(restart.error.clone()),
             };
+            let calls = parts
+                .iter()
+                .map(|part| CallFacts {
+                    effects: &part.effects,
+                    began: part.began,
+                    ended: part.ended,
+                })
+                .collect::<Vec<_>>();
             let (mut transition, changes) = EffectApplier::new(&self.resources)
                 .lower_feed(
                     object,
                     answer,
-                    &effects,
+                    &calls,
                     deadlined,
-                    FeedOrigin {
-                        from,
-                        kept_from,
-                        since,
-                    },
+                    origin,
                     clock::now_millis(),
                 )
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
@@ -575,7 +595,7 @@ impl Runtime {
     }
 
     /// Record what the answer of a feed changed, of the `changes` that its
-    /// part names: a filesystem drops its answers for the paths whose facts
+    /// parts name: a filesystem drops its answers for the paths whose facts
     /// the publication changed alone, and the facts that an answer writes as
     /// they were stand.
     fn record_feed_changes(
@@ -619,7 +639,7 @@ impl Runtime {
         &self,
         object: &FeedObject,
         kept: KeptPart,
-        origin: FeedOrigin,
+        origin: &FeedOrigin,
         blobs: Vec<crate::cache::BlobWrite>,
         captured_epoch: u64,
     ) -> Result<bool> {
@@ -627,7 +647,11 @@ impl Runtime {
             .lower_feed(
                 object,
                 wit_types::FeedAnswer::Part(kept.part.clone()),
-                &kept.effects,
+                &[CallFacts {
+                    effects: &kept.effects,
+                    began: kept.began,
+                    ended: kept.ended,
+                }],
                 HashMap::new(),
                 origin.clone(),
                 clock::now_millis(),
@@ -638,8 +662,8 @@ impl Runtime {
             kept: Some(KeptWrite {
                 object: object.id.as_bytes().to_vec(),
                 from: origin.from,
-                kept_from: origin.kept_from,
                 token: kept.part.token.clone(),
+                began: kept.began,
                 part: kept.encode(&self.resources)?,
             }),
             ..ProjectionTransition::default()
@@ -648,60 +672,4 @@ impl Runtime {
             .publish_feed_transition(transition, captured_epoch)?
             .is_some())
     }
-}
-
-/// The kept parts of a later answer and its last part as one part: the token
-/// of the last, the inner states and the facet anchors of each in their
-/// order, and the effects of each in their order, where a write of a later
-/// part keeps the path that an earlier part removes, or a path above it.
-fn compose(
-    kept: Vec<KeptPart>,
-    last: KeptPart,
-) -> Result<(wit_types::FeedPart, wit_types::Effects)> {
-    let mut inner = Vec::new();
-    let mut anchors = Vec::new();
-    let mut effects = wit_types::Effects {
-        canonical: Vec::new(),
-        fs: Vec::new(),
-        invalidations: Vec::new(),
-        removals: Vec::new(),
-    };
-    let token = last.part.token.clone();
-    for KeptPart {
-        part,
-        effects: part_effects,
-        ..
-    } in kept.into_iter().chain([last])
-    {
-        let written = part_effects
-            .fs
-            .iter()
-            .map(|write| Path::parse(&write.path))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-        let mut removals = Vec::with_capacity(effects.removals.len());
-        for removal in effects.removals {
-            let removed = Path::parse(&removal)
-                .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-            if !written.iter().any(|path| path.has_prefix(&removed)) {
-                removals.push(removal);
-            }
-        }
-        effects.removals = removals;
-        inner.extend(part.inner);
-        anchors.extend(part.anchors);
-        effects.canonical.extend(part_effects.canonical);
-        effects.fs.extend(part_effects.fs);
-        effects.invalidations.extend(part_effects.invalidations);
-        effects.removals.extend(part_effects.removals);
-    }
-    Ok((
-        wit_types::FeedPart {
-            token,
-            more: false,
-            inner,
-            anchors,
-        },
-        effects,
-    ))
 }

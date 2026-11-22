@@ -168,12 +168,32 @@ impl ProjectionStore {
         self.db.inner().seqno()
     }
 
-    pub(crate) fn transact<F, T>(&self, mut plan: F) -> Result<T, ProjectionStoreError>
+    pub(crate) fn transact<F, T>(&self, plan: F) -> Result<T, ProjectionStoreError>
+    where
+        F: FnMut(&mut OptimisticWriteTx, &OptimisticTxKeyspace) -> Result<T, ProjectionStoreError>,
+    {
+        self.transact_as(Some(PersistMode::SyncAll), plan)
+    }
+
+    /// A transaction whose commit waits for no write to the disk: of a
+    /// record that its writer writes again after a stop.
+    pub(crate) fn transact_unsynced<F, T>(&self, plan: F) -> Result<T, ProjectionStoreError>
+    where
+        F: FnMut(&mut OptimisticWriteTx, &OptimisticTxKeyspace) -> Result<T, ProjectionStoreError>,
+    {
+        self.transact_as(None, plan)
+    }
+
+    fn transact_as<F, T>(
+        &self,
+        durability: Option<PersistMode>,
+        mut plan: F,
+    ) -> Result<T, ProjectionStoreError>
     where
         F: FnMut(&mut OptimisticWriteTx, &OptimisticTxKeyspace) -> Result<T, ProjectionStoreError>,
     {
         for _ in 0..8 {
-            let mut tx = self.db.write_tx()?.durability(Some(PersistMode::SyncAll));
+            let mut tx = self.db.write_tx()?.durability(durability);
             let result = plan(&mut tx, &self.facts)?;
             if let Ok(()) = tx.commit()? {
                 return Ok(result);

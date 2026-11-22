@@ -299,14 +299,59 @@ impl ProjectionTransition {
     }
 }
 
-/// The state of a feed: the token of its last part, whether its first
-/// answer ended, and its deadline, after which an operation that does not
-/// start it asks it for an answer.
+/// The state of a feed, without its token, which is apart and which only a
+/// call of the feed reads: whether its first answer ended, and its deadline,
+/// after which an operation that does not start it asks it for an answer.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FeedState {
-    pub token: String,
+    /// The count of the changes of the token of the feed and of its kept
+    /// parts: an answer publishes only from the version that its call began
+    /// from.
+    pub version: u64,
     pub ended: bool,
     pub deadline: u64,
+    /// The last deadline of the feed that a check of it came past.
+    pub passed: u64,
+    /// The BLAKE3 digest of the token.
+    pub token: [u8; 32],
+    /// The count of the kept parts of a later answer.
+    pub kept: u32,
+    /// The last part of the feed said that no inventory of a feed above it
+    /// has its object, and no part of a feed above it brought its state
+    /// since: the feed answers for its paths itself.
+    pub unlisted: bool,
+}
+
+impl FeedState {
+    /// The part of the change of the attributes of a directory that moves
+    /// with the deadline of this feed, the feed of its listing: the deadline
+    /// once `now` is past it, and until then the last deadline that a check
+    /// came past. A check renews the deadline, so the change moves once for
+    /// each deadline and never back.
+    pub(crate) fn change(&self, now: u64) -> u64 {
+        if self.deadline <= now {
+            self.deadline
+        } else {
+            self.passed
+        }
+    }
+
+    /// The last deadline that a check at `now` came past.
+    fn passed_at(previous: Option<&Self>, now: u64) -> u64 {
+        previous.map_or(0, |previous| previous.change(now))
+    }
+}
+
+/// The facts of one call of a feed in a publication: its records before
+/// `records` and its removals before `removals`, after those of the call
+/// before it, with the counts of [`MountResources::sequence`] when the call
+/// began and when it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallSpan {
+    pub records: usize,
+    pub removals: usize,
+    pub began: u64,
+    pub ended: u64,
 }
 
 /// The feed states one answer of a feed publishes: its own, renewed by an
@@ -314,28 +359,26 @@ pub(crate) struct FeedState {
 /// restart, a part and a restart dropping its kept parts, and the inner
 /// states the part brought, each a token whose first answer ended, which
 /// drops the kept parts of its feed unless it is the token that the feed
-/// has. Every state but that of a restart gets `deadline`. `anchors` pairs each anchor
-/// of another facet that the part writes with the anchor of the claim of its
-/// object, and `until` gives each path of the facts of the part with a time
-/// after which they count as lacking for the start of an answer that time.
+/// has. Every state but that of a restart gets `deadline`. `anchors` pairs
+/// each anchor of another facet that the part writes with the anchor of the
+/// claim of its object, and `until` gives each path of the facts of the part
+/// with a time after which they count as lacking for the start of an answer.
 #[derive(Debug, Clone)]
 pub(crate) struct FeedWrite {
     pub object: Vec<u8>,
-    /// The token of the state of the feed that the call of the answer began
-    /// from, none for a feed without a state: the answer of a call that
-    /// another answer moved the state of, as an inner state of an outer
-    /// feed, is no publication.
-    pub from: Option<String>,
-    /// The token after the last kept part that the call of the answer
-    /// continued from, none for a call without a kept part: the answer of a
-    /// call whose kept parts another answer dropped or moved is no
+    /// The version of the state of the feed that the call of the answer
+    /// began from, none for a feed without a state: the answer of a call
+    /// that another answer moved the token or the kept parts of is no
     /// publication.
-    pub kept_from: Option<String>,
-    /// The count of the answers of feeds that changed the projection when
-    /// the answer began ([`MountResources::fed_changes`]): the answer of a
-    /// feed that writes a path that the answer of another feed changed since
-    /// is no publication, and its kept parts leave.
-    pub since: u64,
+    pub from: Option<u64>,
+    /// The calls of the answer in their order, the kept parts of a later
+    /// answer before its last part: a record or a removal of a call writes
+    /// over no change that the answer of another feed made after the call
+    /// began.
+    pub spans: Vec<CallSpan>,
+    /// The path of the fact that the operation of the answer lacked, whose
+    /// expired `until` an answer that ends without a write of it clears.
+    pub lacked: Option<Path>,
     pub answer: FeedAnswerWrite,
     pub inner: Vec<(Vec<u8>, String)>,
     pub anchors: Vec<(Path, Path)>,
@@ -343,6 +386,23 @@ pub(crate) struct FeedWrite {
     /// The time of the answer.
     pub now: u64,
     pub until: HashMap<Path, u64>,
+}
+
+impl FeedWrite {
+    /// The span of the call of record `index`, or of removal `index`.
+    fn span(
+        &self,
+        index: usize,
+        of: impl Fn(&CallSpan) -> usize,
+    ) -> Result<CallSpan, ProjectionError> {
+        self.spans
+            .iter()
+            .find(|span| index < of(span))
+            .copied()
+            .ok_or_else(|| {
+                ProjectionError::Inconsistent("a fact of a feed answer has no call".into())
+            })
+    }
 }
 
 /// What one answer of a feed does to its state.
@@ -363,16 +423,16 @@ pub(crate) enum FeedAnswerWrite {
 #[derive(Debug, Clone)]
 pub(crate) struct KeptWrite {
     pub object: Vec<u8>,
-    /// The token of the state of the feed that the call of the part began
+    /// The version of the state of the feed that the call of the part began
     /// from, as [`FeedWrite::from`].
-    pub from: Option<String>,
-    /// The token after the kept part before this one, as
-    /// [`FeedWrite::kept_from`].
-    pub kept_from: Option<String>,
+    pub from: Option<u64>,
     pub part: Vec<u8>,
     /// The token after the part, from which the answer continues: the
     /// projection has the token after the last kept part alone.
     pub token: String,
+    /// The count of [`MountResources::sequence`] when the call of the part
+    /// began.
+    pub began: u64,
 }
 
 /// The token after a part, and whether more parts follow in its answer.
@@ -380,6 +440,9 @@ pub(crate) struct KeptWrite {
 pub(crate) struct FeedPartWrite {
     pub token: String,
     pub more: bool,
+    /// No inventory of a feed above the feed has its object
+    /// ([`FeedState::unlisted`]).
+    pub unlisted: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -460,82 +523,49 @@ pub(crate) struct Changed {
     pub listings: HashSet<Path>,
 }
 
-/// The answers of feeds that changed the projection while an answer of a
-/// feed is in flight, by which the answer of a feed that writes over the
-/// change of another is no publication: its call began before that change.
-#[derive(Default)]
-pub(crate) struct FedChanges {
-    /// The count of the answers recorded so far.
-    count: u64,
-    /// The answers in flight, by the count at their begin.
-    in_flight: BTreeMap<u64, usize>,
-    /// Each recorded answer after the oldest answer in flight: its count,
-    /// the object of its feed, and the paths whose records it changed.
-    log: Vec<(u64, Vec<u8>, HashSet<Path>)>,
+/// The fed mark of a path: its facts come from feeds alone.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FedMark {
+    /// The time after which the facts count as lacking for the start of an
+    /// answer, from the part that wrote them.
+    until: Option<u64>,
 }
 
-impl FedChanges {
-    fn begin(&mut self) -> u64 {
-        *self.in_flight.entry(self.count).or_default() += 1;
-        self.count
-    }
+/// The last change of the facts of a path: the count of
+/// [`MountResources::sequence`] of the publication that made it, and the
+/// count when the call that fetched it began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ChangeRow {
+    sequence: u64,
+    began: u64,
+}
 
-    fn end(&mut self, since: u64) {
-        if let Some(answers) = self.in_flight.get_mut(&since) {
-            *answers -= 1;
-            if *answers == 0 {
-                self.in_flight.remove(&since);
+/// What the answer of another feed did to a path after a call began.
+enum Newer {
+    /// Nothing: the call writes.
+    No,
+    /// A change of a call that began after the call ended: it stands.
+    Later,
+    /// A change of a call that overlaps the call: it stands, and the path
+    /// counts as lacking, so that the next operation on it asks its feed.
+    Overlapping,
+}
+
+/// A call of a feed in flight, from its begin to its end.
+pub(crate) struct FeedCallFlight<'a> {
+    resources: &'a MountResources,
+    pub(crate) began: u64,
+}
+
+impl Drop for FeedCallFlight<'_> {
+    fn drop(&mut self) {
+        let mut calls = self.resources.feed_calls.lock();
+        if let Some(count) = calls.get_mut(&self.began) {
+            *count -= 1;
+            if *count == 0 {
+                calls.remove(&self.began);
             }
         }
-        let oldest = self.in_flight.keys().next().copied();
-        self.log
-            .retain(|(count, _, _)| oldest.is_some_and(|oldest| *count > oldest));
-    }
-
-    fn record(&mut self, object: &[u8], changed: &HashSet<Path>) {
-        if changed.is_empty() || self.in_flight.is_empty() {
-            return;
-        }
-        self.count += 1;
-        self.log
-            .push((self.count, object.to_vec(), changed.clone()));
-    }
-
-    /// Whether the answer of the feed of `object` that began at `since`,
-    /// with records at `written` and the removals `removed`, writes a path
-    /// whose record the answer of another feed changed since.
-    fn moved<'a>(
-        &self,
-        object: &[u8],
-        since: u64,
-        mut written: impl Iterator<Item = &'a Path>,
-        removed: &[Path],
-    ) -> bool {
-        let others: Vec<&HashSet<Path>> = self
-            .log
-            .iter()
-            .filter(|(count, by, _)| *count > since && by != object)
-            .map(|(_, _, changed)| changed)
-            .collect();
-        !others.is_empty()
-            && (written.any(|path| others.iter().any(|changed| changed.contains(path)))
-                || removed.iter().any(|removed| {
-                    others
-                        .iter()
-                        .any(|changed| changed.iter().any(|path| path.has_prefix(removed)))
-                }))
-    }
-}
-
-/// An answer of a feed in flight, from its begin to its end.
-pub(crate) struct FeedAnswerFlight<'a> {
-    resources: &'a MountResources,
-    pub(crate) since: u64,
-}
-
-impl Drop for FeedAnswerFlight<'_> {
-    fn drop(&mut self) {
-        self.resources.fed_changes.lock().end(self.since);
     }
 }
 
@@ -643,7 +673,9 @@ pub struct MountResources {
     /// that it staged.
     operation_blobs: dashmap::DashMap<u64, Vec<(u64, Option<BlobRequestId>)>>,
     pub(crate) next_blob_id: AtomicU64,
-    fed_changes: Mutex<FedChanges>,
+    /// The calls of feeds in flight, by the count of [`Self::sequence`] at
+    /// their begin.
+    feed_calls: Mutex<BTreeMap<u64, usize>>,
     publication: PublicationReservations,
     fence: Arc<ResourceFence>,
     generation: ResourceGeneration,
@@ -815,7 +847,7 @@ impl MountResources {
             blob_handles: dashmap::DashMap::new(),
             operation_blobs: dashmap::DashMap::new(),
             next_blob_id: AtomicU64::new(1),
-            fed_changes: Mutex::new(FedChanges::default()),
+            feed_calls: Mutex::new(BTreeMap::new()),
             publication: PublicationReservations {
                 active: Mutex::new(HashSet::new()),
                 wake: Notify::new(),
@@ -863,12 +895,22 @@ impl MountResources {
         }
     }
 
-    /// Begin an answer of a feed, for [`FeedWrite::since`].
-    pub(crate) fn begin_feed_answer(&self) -> FeedAnswerFlight<'_> {
-        FeedAnswerFlight {
+    /// The count of the publications that changed a fact of the projection.
+    pub(crate) fn sequence(&self) -> Result<u64, ProjectionError> {
+        self.projection
+            .get(SEQUENCE_KEY)?
+            .map_or(Ok(0), |bytes| Ok(postcard::from_bytes(&bytes)?))
+    }
+
+    /// Begin a call of a feed, for [`CallSpan::began`].
+    pub(crate) fn begin_feed_call(&self) -> Result<FeedCallFlight<'_>, ProjectionError> {
+        let mut calls = self.feed_calls.lock();
+        let began = self.sequence()?;
+        *calls.entry(began).or_default() += 1;
+        Ok(FeedCallFlight {
             resources: self,
-            since: self.fed_changes.lock().begin(),
-        }
+            began,
+        })
     }
 
     /// Current per-projection invalidation epoch used by publication fences.
@@ -1170,33 +1212,16 @@ impl MountResources {
         if captured_epoch != coherence.invalidation_epoch {
             return Ok(PublicationOutcome::Fenced);
         }
-        for (object, from, kept_from) in feed
+        for (object, from) in feed
             .iter()
-            .map(|feed| (&feed.object, &feed.from, &feed.kept_from))
-            .chain(
-                kept.iter()
-                    .map(|kept| (&kept.object, &kept.from, &kept.kept_from)),
-            )
+            .map(|feed| (&feed.object, feed.from))
+            .chain(kept.iter().map(|kept| (&kept.object, kept.from)))
         {
-            let state = self.feed_state(object)?;
-            if state.map(|state| state.token) != *from || self.kept_token(object)? != *kept_from {
+            if self.feed_state(object)?.map(|state| state.version) != from {
                 return Ok(PublicationOutcome::Moved);
             }
         }
-        if let Some(feed) = &feed {
-            let written = records.iter().map(|record| &record.path);
-            if self
-                .fed_changes
-                .lock()
-                .moved(&feed.object, feed.since, written, &removed_paths)
-            {
-                self.projection.transact(|tx, facts| {
-                    drop_kept_parts(tx, facts, &feed.object)?;
-                    Ok(())
-                })?;
-                return Ok(PublicationOutcome::Moved);
-            }
-        }
+        let floor = self.feed_calls.lock().keys().next().copied();
         let mut retired = HashSet::new();
         let mut memory_paths = HashSet::new();
         let mut memory_prefixes = Vec::new();
@@ -1239,6 +1264,24 @@ impl MountResources {
         let (reconciled_paths, changed) = self.projection.transact(|tx, facts| {
             let mut removals = Vec::<Vec<u8>>::new();
             let mut changed = Changed::default();
+            let sequence = read_sequence(tx, facts)?;
+            // Each path that the publication changes, with the count when
+            // the call that fetched its change began, and each path that
+            // one of its removals takes.
+            let mut fetched = HashMap::<Path, u64>::new();
+            let mut removed = Vec::<Path>::new();
+            let removed_since = match &feed {
+                Some(feed) => removed_after(
+                    tx,
+                    facts,
+                    feed.spans
+                        .iter()
+                        .map(|span| span.began)
+                        .min()
+                        .unwrap_or(sequence),
+                )?,
+                None => Vec::new(),
+            };
 
             let mut claims = HashMap::<String, Vec<u8>>::new();
             for object in &objects {
@@ -1270,20 +1313,40 @@ impl MountResources {
                 }
             }
 
-            // A feed answer writes fed facts, its fed mark with the time
-            // after which they count as lacking; any other transition leaves
-            // the fed facts of a path to its feeds.
-            let fed_answer = feed.is_some();
-            let fed_mark = |path: &Path| -> Result<Vec<u8>, ProjectionError> {
-                match feed.as_ref().and_then(|feed| feed.until.get(path)) {
-                    Some(until) => Ok(postcard::to_allocvec(until)?),
-                    None => Ok(Vec::new()),
-                }
-            };
+            // A feed answer writes fed facts, each with its fed mark; any
+            // other transition leaves the fed facts of a path to its feeds.
+            // A fact of a call of a feed writes over no change that the
+            // answer of another feed made after the call began: that change
+            // stands, as one that the call did not see.
             let mut written = Vec::with_capacity(prepared_records.len());
-            for record in &prepared_records {
-                if fed_answer {
-                    put(tx, facts, fed_key(&record.path), fed_mark(&record.path)?)?;
+            for (index, record) in prepared_records.iter().enumerate() {
+                let key = fact_key(
+                    record.path.as_str(),
+                    record.fact.kind(),
+                    record.aux.as_deref(),
+                );
+                let value = postcard::to_allocvec(&record.fact).map_err(ProjectionError::from)?;
+                let mut began = sequence;
+                if let Some(feed) = &feed {
+                    let span = feed.span(index, |span| span.records)?;
+                    began = span.began;
+                    let newer = if tx.get(facts, &key)?.as_deref() == Some(value.as_slice()) {
+                        Newer::No
+                    } else {
+                        newer(tx, facts, &record.path, span, &removed_since)?
+                    };
+                    let mark = read_fed_mark(tx, facts, &record.path)?;
+                    let until = match newer {
+                        Newer::No => feed.until.get(&record.path).copied(),
+                        Newer::Later => mark.and_then(|mark| mark.until),
+                        Newer::Overlapping => Some(0),
+                    };
+                    if matches!(newer, Newer::No) || mark.is_some() {
+                        put_fed_mark(tx, facts, &record.path, until)?;
+                    }
+                    if !matches!(newer, Newer::No) {
+                        continue;
+                    }
                 } else if tx.get(facts, fed_key(&record.path))?.is_some() {
                     continue;
                 }
@@ -1294,14 +1357,9 @@ impl MountResources {
                 {
                     delete(tx, facts, git_key(&record.path))?;
                 }
-                let key = fact_key(
-                    record.path.as_str(),
-                    record.fact.kind(),
-                    record.aux.as_deref(),
-                );
-                let value = postcard::to_allocvec(&record.fact).map_err(ProjectionError::from)?;
                 if put(tx, facts, key, value)? {
                     changed.records.insert(record.path.clone());
+                    fetched.insert(record.path.clone(), began);
                 }
                 if let DurableFact::Lookup(lookup) = &record.fact
                     && let LookupPayload::Negative { id: Some(id) } = lookup
@@ -1331,15 +1389,11 @@ impl MountResources {
                 )?;
             }
             for mutation in &dirents {
-                if fed_answer {
-                    put(
-                        tx,
-                        facts,
-                        fed_key(mutation.path()),
-                        fed_mark(mutation.path())?,
-                    )?;
+                if let Some(feed) = &feed {
+                    let path = mutation.path();
+                    put_fed_mark(tx, facts, path, feed.until.get(path).copied())?;
                     if apply_dirents(tx, facts, mutation)? {
-                        changed.listings.insert(mutation.path().clone());
+                        changed.listings.insert(path.clone());
                     }
                 } else {
                     let mutation = with_fed_entries(tx, facts, mutation)?;
@@ -1349,31 +1403,27 @@ impl MountResources {
                 }
             }
             if let Some(feed) = &feed {
-                write_feed_states(tx, facts, feed)?;
+                let state = write_feed_states(tx, facts, feed)?;
+                // The feed of a listing that it writes first is the feed of
+                // that listing, from the change of the feed as it is, so
+                // that the change of the directory begins where it was.
+                for mutation in &dirents {
+                    let key = listing_feed_key(mutation.path());
+                    if tx.get(facts, &key)?.is_none() {
+                        tx.insert(
+                            facts,
+                            &key,
+                            postcard::to_allocvec(&(&feed.object, state.change(feed.now)))
+                                .map_err(ProjectionError::from)?,
+                        );
+                    }
+                }
             }
             if let Some(kept) = &kept {
-                // The kept parts of an answer have the token after the last
-                // of them: parts without it are of no answer.
-                if tx.get(facts, kept_token_key(&kept.object))?.is_none() {
-                    drop_kept_parts(tx, facts, &kept.object)?;
-                }
-                let prefix = kept_prefix(&kept.object);
-                let next = tx.prefix(facts, prefix.as_slice()).count();
-                put(
-                    tx,
-                    facts,
-                    kept_key(&kept.object, next),
-                    kept.part.as_slice(),
-                )?;
-                put(
-                    tx,
-                    facts,
-                    kept_token_key(&kept.object),
-                    kept.token.as_bytes(),
-                )?;
+                keep_part(tx, facts, kept)?;
             }
             for freshness in &freshness {
-                if !fed_answer && tx.get(facts, fed_key(&freshness.path))?.is_some() {
+                if feed.is_none() && tx.get(facts, fed_key(&freshness.path))?.is_some() {
                     continue;
                 }
                 let mut expiry = b"x:".to_vec();
@@ -1418,8 +1468,23 @@ impl MountResources {
                     Invalidation::Object(_) => {},
                 }
             }
-            for path in &removed_paths {
+            for (index, path) in removed_paths.iter().enumerate() {
+                // A removal of a call of a feed takes no path that the
+                // answer of another feed changed after the call began.
+                if let Some(feed) = &feed
+                    && changed_after(
+                        tx,
+                        facts,
+                        path,
+                        feed.span(index, |span| span.removals)?.began,
+                    )?
+                {
+                    continue;
+                }
                 let left = remove_subtree_facts(tx, facts, path, &mut removals)?;
+                if !left.is_empty() {
+                    removed.push(path.clone());
+                }
                 changed.records.extend(left.iter().cloned());
                 reconciled_paths.extend(left);
                 if let Some(parent) = remove_from_parent_listing(tx, facts, path)? {
@@ -1430,13 +1495,18 @@ impl MountResources {
             for key in removals {
                 delete(tx, facts, key)?;
             }
+            if let Some(feed) = &feed
+                && let Some(lacked) = &feed.lacked
+                && !matches!(&feed.answer, FeedAnswerWrite::Part(part) if part.more)
+                && let Some(mark) = read_fed_mark(tx, facts, lacked)?
+                && mark.until.is_some_and(|until| until <= feed.now)
+            {
+                // The feed let the fact that the operation lacked stand.
+                put_fed_mark(tx, facts, lacked, None)?;
+            }
+            record_changes(tx, facts, sequence, &changed, &fetched, &removed, floor)?;
             Ok((reconciled_paths, changed))
         })?;
-        if let Some(feed) = &feed {
-            self.fed_changes
-                .lock()
-                .record(&feed.object, &changed.records);
-        }
 
         if let Some(next_epoch) = next_epoch {
             coherence.invalidation_epoch = next_epoch;
@@ -1724,78 +1794,157 @@ impl MountResources {
             .transpose()
     }
 
+    /// The token of the feed of the object `id`, for a call of the feed.
+    pub(crate) fn feed_token(&self, id: &[u8]) -> Result<Option<String>, ProjectionError> {
+        self.projection
+            .get(&token_key(id))?
+            .map(token_text)
+            .transpose()
+    }
+
     /// Whether the facts of `path` are fed: they come from feeds alone.
     pub(crate) fn is_fed(&self, path: &Path) -> Result<bool, ProjectionError> {
         Ok(self.projection.get(&fed_key(path))?.is_some())
+    }
+
+    fn fed_mark(&self, path: &Path) -> Result<Option<FedMark>, ProjectionError> {
+        self.projection
+            .get(&fed_key(path))?
+            .map(|bytes| postcard::from_bytes(&bytes).map_err(ProjectionError::from))
+            .transpose()
     }
 
     /// The time after which the fed facts of `path` count as lacking for the
     /// start of an answer, from the part that wrote them; none for facts
     /// without one.
     pub(crate) fn fed_until(&self, path: &Path) -> Result<Option<u64>, ProjectionError> {
-        match self.projection.get(&fed_key(path))? {
-            Some(mark) if !mark.is_empty() => Ok(Some(postcard::from_bytes(&mark)?)),
-            Some(_) | None => Ok(None),
+        Ok(self.fed_mark(path)?.and_then(|mark| mark.until))
+    }
+
+    /// The count of [`Self::sequence`] of the last change of the facts of
+    /// `path`, in the change of its attributes in each answer: `0` for a
+    /// path without one.
+    pub(crate) fn changed_at(&self, path: &Path) -> Result<u64, ProjectionError> {
+        self.projection
+            .get(&change_key(path))?
+            .map_or(Ok(0), |bytes| {
+                Ok(postcard::from_bytes::<ChangeRow>(&bytes)?.sequence)
+            })
+    }
+
+    /// Record a change of the facts of each of `paths` that no publication
+    /// made, as the pages that a pagination control adds to a listing.
+    pub(crate) fn record_changed(&self, paths: &[Path]) -> Result<(), ProjectionError> {
+        if paths.is_empty() || *self.fence.active.lock() != self.generation.0 {
+            return Ok(());
         }
+        let _coherence = self.coherence.lock();
+        self.projection.transact(|tx, facts| {
+            let sequence = read_sequence(tx, facts)?;
+            let fetched = paths.iter().map(|path| (path.clone(), sequence)).collect();
+            let changed = Changed {
+                records: paths.iter().cloned().collect(),
+                listings: HashSet::new(),
+            };
+            record_changes(tx, facts, sequence, &changed, &fetched, &[], None)?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
-    /// The feed that the last listing of the fed directory `path` asked, by
-    /// the id of its object: none for a directory that no operation listed.
+    /// The feed of the listing of the fed directory `path`, by the id of its
+    /// object: the feed that wrote the listing first, until a listing asks
+    /// another ([`Self::record_listing_feed`]).
     pub(crate) fn listing_feed(&self, path: &Path) -> Result<Option<Vec<u8>>, ProjectionError> {
-        Ok(self.projection.get(&listing_feed_key(path))?)
+        Ok(self.listing_row(path)?.map(|(feed, _)| feed))
     }
 
-    /// Record `feed` as [`Self::listing_feed`] of `path`.
+    fn listing_row(&self, path: &Path) -> Result<Option<(Vec<u8>, u64)>, ProjectionError> {
+        self.projection
+            .get(&listing_feed_key(path))?
+            .map(|bytes| postcard::from_bytes(&bytes).map_err(ProjectionError::from))
+            .transpose()
+    }
+
+    /// Record `feed`, the feed that a listing of the fed directory `path`
+    /// asks, as the feed of that listing in place of another, with the
+    /// change of the directory as it is at `now`.
     pub(crate) fn record_listing_feed(
         &self,
         path: &Path,
-        feed: Option<&[u8]>,
+        feed: &[u8],
+        now: u64,
     ) -> Result<(), ProjectionError> {
-        let key = listing_feed_key(path);
-        if self.projection.get(&key)?.as_deref() == feed {
+        if self.listing_feed(path)?.as_deref() == Some(feed)
+            || *self.fence.active.lock() != self.generation.0
+        {
             return Ok(());
         }
-        self.projection.transact(|tx, facts| {
-            match feed {
-                Some(feed) => tx.insert(facts, &key, feed),
-                None => tx.remove(facts, &key),
-            }
+        let _coherence = self.coherence.lock();
+        // The record leaves with the facts of the directory.
+        if !self.is_fed(path)? {
+            return Ok(());
+        }
+        let change = self.feed_state(feed)?.map_or(0, |state| state.change(now));
+        let base = change.wrapping_sub(self.listing_due(path, now)?);
+        let key = listing_feed_key(path);
+        let value = postcard::to_allocvec(&(feed, base))?;
+        // The record is of the listing that asks: the next one records it
+        // again after a stop before the write reaches the disk.
+        self.projection.transact_unsynced(|tx, facts| {
+            tx.insert(facts, &key, &value);
             Ok(())
         })?;
         Ok(())
     }
 
     /// The part of the change of the attributes of the fed directory `path`
-    /// that moves with the deadline of the feed of its listing: a filesystem
-    /// lists a directory again only after a change of its attributes, and
-    /// past that deadline a listing asks the feed, when the feed `answers`,
-    /// outside the rate-limit window of a mount with its provider. It is the
-    /// deadline of the feed once `now` is past it, and until then the last
-    /// deadline that an answer of the feed came past, so that it moves once
-    /// for a deadline and stands over the answer that renews the deadline.
-    pub(crate) fn listing_due(
-        &self,
-        path: &Path,
-        answers: bool,
-        now: u64,
-    ) -> Result<u64, ProjectionError> {
-        let Some(feed) = self.listing_feed(path)? else {
+    /// that moves with the deadline of the feed of its listing
+    /// ([`FeedState::change`]), from where it was when the feed became the
+    /// feed of the listing: a filesystem lists a directory again only after
+    /// a change of its attributes, and past that deadline a listing asks the
+    /// feed. `0` for a directory without a listing of a feed.
+    pub(crate) fn listing_due(&self, path: &Path, now: u64) -> Result<u64, ProjectionError> {
+        let Some((feed, base)) = self.listing_row(path)? else {
             return Ok(0);
         };
-        if let Some(state) = self.feed_state(&feed)?
-            && answers
-            && state.deadline <= now
-        {
-            return Ok(state.deadline);
-        }
-        self.projection
-            .get(&passed_key(&feed))?
-            .map_or(Ok(0), |bytes| Ok(postcard::from_bytes(&bytes)?))
+        Ok(self
+            .feed_state(&feed)?
+            .map_or(0, |state| state.change(now))
+            .wrapping_sub(base))
     }
 
-    /// Whether the feed of the object `id` has kept parts of a later answer.
-    pub(crate) fn has_kept_parts(&self, id: &[u8]) -> Result<bool, ProjectionError> {
-        Ok(!self.projection.read_prefix(&kept_prefix(id))?.is_empty())
+    /// Give the feed of the object `id` the `deadline` after a check that
+    /// gave no answer at `now`, at a failure for now or in the rate-limit
+    /// window of the mount: the next check waits for it, and the deadline
+    /// before it is one that a check came past.
+    pub(crate) fn defer_feed(
+        &self,
+        id: &[u8],
+        deadline: u64,
+        now: u64,
+    ) -> Result<(), ProjectionError> {
+        if *self.fence.active.lock() != self.generation.0 {
+            return Ok(());
+        }
+        let _coherence = self.coherence.lock();
+        self.projection.transact(|tx, facts| {
+            if let Some(previous) = read_feed_state(tx, facts, id)? {
+                let state = FeedState {
+                    deadline,
+                    passed: FeedState::passed_at(Some(&previous), now),
+                    ..previous
+                };
+                put(
+                    tx,
+                    facts,
+                    feed_key(id),
+                    postcard::to_allocvec(&state).map_err(ProjectionError::from)?,
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// The token after the last kept part of the later answer of the feed of
@@ -1803,11 +1952,7 @@ impl MountResources {
     pub(crate) fn kept_token(&self, id: &[u8]) -> Result<Option<String>, ProjectionError> {
         self.projection
             .get(&kept_token_key(id))?
-            .map(|token| {
-                String::from_utf8(token).map_err(|error| {
-                    ProjectionError::Inconsistent(format!("the token of a kept part: {error}"))
-                })
-            })
+            .map(token_text)
             .transpose()
     }
 
@@ -2026,10 +2171,25 @@ fn normalize_meta(meta: &EntryMeta, body: &BodyStore) -> Result<EntryMeta, Proje
     Ok(EntryMeta::file(attrs))
 }
 
+/// The key of [`MountResources::sequence`].
+const SEQUENCE_KEY: &[u8] = b"q:";
+
 fn feed_key(id: &[u8]) -> Vec<u8> {
     let mut key = b"e:".to_vec();
     key.extend_from_slice(hex::encode(id).as_bytes());
     key
+}
+
+/// The key of the token of the feed of the object `id`.
+fn token_key(id: &[u8]) -> Vec<u8> {
+    let mut key = b"t:".to_vec();
+    key.extend_from_slice(hex::encode(id).as_bytes());
+    key
+}
+
+fn token_text(bytes: Vec<u8>) -> Result<String, ProjectionError> {
+    String::from_utf8(bytes)
+        .map_err(|error| ProjectionError::Inconsistent(format!("the token of a feed: {error}")))
 }
 
 fn fed_key(path: &Path) -> Vec<u8> {
@@ -2038,38 +2198,19 @@ fn fed_key(path: &Path) -> Vec<u8> {
     key
 }
 
-/// The key of the last deadline of the feed of the object `id` that an
-/// answer of the feed came past.
-fn passed_key(id: &[u8]) -> Vec<u8> {
-    let mut key = b"p:".to_vec();
-    key.extend_from_slice(hex::encode(id).as_bytes());
+/// The key of the [`ChangeRow`] of `path`.
+fn change_key(path: &Path) -> Vec<u8> {
+    let mut key = b"c:".to_vec();
+    key.extend_from_slice(path.as_str().as_bytes());
     key
 }
 
-/// Give the feed with `key` the `state`, and record the deadline of the
-/// state before it as the last that an answer came past when `now` is past
-/// it ([`MountResources::listing_due`]).
-fn put_feed_state(
-    tx: &mut fjall::OptimisticWriteTx,
-    facts: &fjall::OptimisticTxKeyspace,
-    id: &[u8],
-    previous: Option<&FeedState>,
-    state: &FeedState,
-    now: u64,
-) -> Result<(), ProjectionError> {
-    if let Some(previous) = previous
-        && previous.deadline <= now
-        && previous.deadline != state.deadline
-    {
-        put(
-            tx,
-            facts,
-            passed_key(id),
-            postcard::to_allocvec(&previous.deadline)?,
-        )?;
-    }
-    put(tx, facts, feed_key(id), postcard::to_allocvec(state)?)?;
-    Ok(())
+/// The prefix of the keys of the removals at the count `sequence` and after
+/// it, in the order of their counts: each names the path that a removal took
+/// with the facts below it, until no call that began before it is in flight
+/// or kept.
+fn removed_key(sequence: u64) -> Vec<u8> {
+    format!("d:{sequence:016x}:").into_bytes()
 }
 
 /// The key of [`MountResources::listing_feed`] of `path`.
@@ -2097,7 +2238,7 @@ fn kept_prefix(id: &[u8]) -> Vec<u8> {
 
 /// The key of the kept part `index` of the feed of the object `id`, which
 /// sorts in the order of the parts.
-fn kept_key(id: &[u8], index: usize) -> Vec<u8> {
+fn kept_key(id: &[u8], index: u32) -> Vec<u8> {
     let mut key = kept_prefix(id);
     key.extend_from_slice(format!("{index:08x}").as_bytes());
     key
@@ -2111,28 +2252,262 @@ fn kept_token_key(id: &[u8]) -> Vec<u8> {
     key
 }
 
+/// The prefix of the keys of the counts at which the first kept part of each
+/// feed began.
+const KEPT_BEGAN_PREFIX: &[u8] = b"kb:";
+
+fn kept_began_key(id: &[u8]) -> Vec<u8> {
+    let mut key = KEPT_BEGAN_PREFIX.to_vec();
+    key.extend_from_slice(hex::encode(id).as_bytes());
+    key
+}
+
+fn read_sequence(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+) -> Result<u64, ProjectionError> {
+    tx.get(facts, SEQUENCE_KEY)?
+        .map_or(Ok(0), |bytes| Ok(postcard::from_bytes(&bytes)?))
+}
+
+fn read_feed_state(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    id: &[u8],
+) -> Result<Option<FeedState>, ProjectionError> {
+    tx.get(facts, feed_key(id))?
+        .map(|bytes| postcard::from_bytes(&bytes).map_err(ProjectionError::from))
+        .transpose()
+}
+
+fn read_fed_mark(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    path: &Path,
+) -> Result<Option<FedMark>, ProjectionError> {
+    tx.get(facts, fed_key(path))?
+        .map(|bytes| postcard::from_bytes(&bytes).map_err(ProjectionError::from))
+        .transpose()
+}
+
+/// Give `path` its fed mark with `until`.
+fn put_fed_mark(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    path: &Path,
+    until: Option<u64>,
+) -> Result<(), ProjectionError> {
+    put(
+        tx,
+        facts,
+        fed_key(path),
+        postcard::to_allocvec(&FedMark { until })?,
+    )?;
+    Ok(())
+}
+
+/// The paths that removals took after the count `began`.
+fn removed_after(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    began: u64,
+) -> Result<Vec<(u64, Path)>, ProjectionError> {
+    let start = removed_key(began.saturating_add(1));
+    tx.range(facts, start.as_slice()..b"d;".as_slice())
+        .map(|guard| {
+            let key = guard.key()?;
+            let text = std::str::from_utf8(&key)
+                .map_err(|_| ProjectionError::Inconsistent("a removal key is not UTF-8".into()))?;
+            let sequence = u64::from_str_radix(&text[2..18], 16)
+                .map_err(|error| ProjectionError::Inconsistent(error.to_string()))?;
+            let path = Path::parse(&text[19..])
+                .map_err(|error| ProjectionError::Inconsistent(error.to_string()))?;
+            Ok((sequence, path))
+        })
+        .collect()
+}
+
+/// What the answer of another feed did to `path` after the call of `span`
+/// began, with the removals `removed` since the first call of the answer.
+fn newer(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    path: &Path,
+    span: CallSpan,
+    removed: &[(u64, Path)],
+) -> Result<Newer, ProjectionError> {
+    if removed
+        .iter()
+        .any(|(sequence, root)| *sequence > span.began && path.has_prefix(root))
+    {
+        return Ok(Newer::Later);
+    }
+    let Some(bytes) = tx.get(facts, change_key(path))? else {
+        return Ok(Newer::No);
+    };
+    let row: ChangeRow = postcard::from_bytes(&bytes)?;
+    Ok(if row.sequence <= span.began {
+        Newer::No
+    } else if row.began > span.ended {
+        Newer::Later
+    } else {
+        Newer::Overlapping
+    })
+}
+
+/// Whether a publication changed `root` or a path below it after the count
+/// `began`.
+fn changed_after(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    root: &Path,
+    began: u64,
+) -> Result<bool, ProjectionError> {
+    let prefix = change_key(root);
+    for guard in tx.prefix(facts, prefix.as_slice()) {
+        let (key, value) = guard.into_inner()?;
+        let below = Path::parse(
+            std::str::from_utf8(&key[2..])
+                .map_err(|_| ProjectionError::Inconsistent("a change key is not UTF-8".into()))?,
+        )
+        .map_err(|error| ProjectionError::Inconsistent(error.to_string()))?;
+        if below.has_prefix(root) && postcard::from_bytes::<ChangeRow>(&value)?.sequence > began {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Record what a publication changed at the count after `sequence`: the
+/// [`ChangeRow`] of each path of `changed`, with the count of `fetched` when
+/// the call that fetched its change began, and each of the removals
+/// `removed`. The removals that every call in flight, from `floor`, and
+/// every kept part began after leave.
+fn record_changes(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    sequence: u64,
+    changed: &Changed,
+    fetched: &HashMap<Path, u64>,
+    removed: &[Path],
+    floor: Option<u64>,
+) -> Result<(), ProjectionError> {
+    if changed.records.is_empty() && changed.listings.is_empty() {
+        return Ok(());
+    }
+    let next = sequence.checked_add(1).ok_or_else(|| {
+        ProjectionError::Inconsistent("the count of the publications overflows".into())
+    })?;
+    tx.insert(facts, SEQUENCE_KEY, postcard::to_allocvec(&next)?);
+    for path in changed.records.iter().chain(&changed.listings) {
+        // The facts of a path that left have no change: its removal has.
+        if tx
+            .get(facts, fact_key(path.as_str(), RecordKind::Lookup, None))?
+            .is_none()
+            && tx
+                .get(facts, fact_key(path.as_str(), RecordKind::Dirents, None))?
+                .is_none()
+            && tx.get(facts, fed_key(path))?.is_none()
+        {
+            continue;
+        }
+        let row = ChangeRow {
+            sequence: next,
+            began: fetched.get(path).copied().unwrap_or(sequence),
+        };
+        tx.insert(facts, change_key(path), postcard::to_allocvec(&row)?);
+    }
+    for path in removed {
+        let mut key = removed_key(next);
+        key.extend_from_slice(path.as_str().as_bytes());
+        tx.insert(facts, key, []);
+    }
+    let mut oldest = floor.unwrap_or(next);
+    for guard in tx.prefix(facts, KEPT_BEGAN_PREFIX) {
+        oldest = oldest.min(postcard::from_bytes(&guard.value()?)?);
+    }
+    let passed = tx
+        .range(
+            facts,
+            removed_key(0).as_slice()..removed_key(oldest.saturating_add(1)).as_slice(),
+        )
+        .map(|guard| Ok(guard.key()?.to_vec()))
+        .collect::<Result<Vec<_>, ProjectionError>>()?;
+    for key in passed {
+        tx.remove(facts, key);
+    }
+    Ok(())
+}
+
+/// Keep the part `kept` of a later answer of its feed after its kept parts.
+fn keep_part(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    kept: &KeptWrite,
+) -> Result<(), ProjectionError> {
+    let previous = read_feed_state(tx, facts, &kept.object)?.ok_or_else(|| {
+        ProjectionError::Inconsistent("a kept part of a feed without a state".into())
+    })?;
+    if previous.kept == 0 {
+        tx.insert(
+            facts,
+            kept_began_key(&kept.object),
+            postcard::to_allocvec(&kept.began)?,
+        );
+    }
+    tx.insert(
+        facts,
+        kept_key(&kept.object, previous.kept),
+        kept.part.as_slice(),
+    );
+    tx.insert(facts, kept_token_key(&kept.object), kept.token.as_bytes());
+    let state = FeedState {
+        version: previous.version + 1,
+        kept: previous.kept + 1,
+        ..previous
+    };
+    tx.insert(
+        facts,
+        feed_key(&kept.object),
+        postcard::to_allocvec(&state)?,
+    );
+    Ok(())
+}
+
+/// Write the states of the answer `feed`, and return the state of its feed.
 fn write_feed_states(
     tx: &mut fjall::OptimisticWriteTx,
     facts: &fjall::OptimisticTxKeyspace,
     feed: &FeedWrite,
-) -> Result<(), ProjectionError> {
-    let previous = tx
-        .get(facts, feed_key(&feed.object))?
-        .map(|bytes| postcard::from_bytes::<FeedState>(&bytes))
-        .transpose()?;
+) -> Result<FeedState, ProjectionError> {
+    let previous = read_feed_state(tx, facts, &feed.object)?;
+    let passed = FeedState::passed_at(previous.as_ref(), feed.now);
+    let moved = |token: &str, previous: Option<&FeedState>| FeedState {
+        version: previous.map_or(1, |previous| previous.version + 1),
+        ended: true,
+        deadline: feed.deadline,
+        passed: FeedState::passed_at(previous, feed.now),
+        token: *blake3::hash(token.as_bytes()).as_bytes(),
+        kept: 0,
+        unlisted: false,
+    };
     let state = match (&feed.answer, &previous) {
         (FeedAnswerWrite::Part(part), previous) => FeedState {
-            token: part.token.clone(),
             ended: previous.as_ref().is_some_and(|state| state.ended) || !part.more,
-            deadline: feed.deadline,
+            unlisted: part.unlisted,
+            ..moved(&part.token, previous.as_ref())
         },
         (FeedAnswerWrite::Unchanged, Some(previous)) => FeedState {
             deadline: feed.deadline,
+            passed,
             ..previous.clone()
         },
         (FeedAnswerWrite::Restart(token), Some(previous)) => FeedState {
-            token: token.clone(),
-            ..previous.clone()
+            ended: previous.ended,
+            deadline: previous.deadline,
+            passed: previous.passed,
+            unlisted: previous.unlisted,
+            ..moved(token, Some(previous))
         },
         (FeedAnswerWrite::Unchanged | FeedAnswerWrite::Restart(_), None) => {
             return Err(ProjectionError::Inconsistent(
@@ -2140,8 +2515,16 @@ fn write_feed_states(
             ));
         },
     };
-    put_feed_state(tx, facts, &feed.object, previous.as_ref(), &state, feed.now)?;
-    if !matches!(feed.answer, FeedAnswerWrite::Unchanged) {
+    put(
+        tx,
+        facts,
+        feed_key(&feed.object),
+        postcard::to_allocvec(&state)?,
+    )?;
+    if let FeedAnswerWrite::Part(FeedPartWrite { token, .. }) | FeedAnswerWrite::Restart(token) =
+        &feed.answer
+    {
+        put(tx, facts, token_key(&feed.object), token.as_bytes())?;
         drop_kept_parts(tx, facts, &feed.object)?;
     }
     for (path, anchor) in &feed.anchors {
@@ -2156,21 +2539,25 @@ fn write_feed_states(
     // of an answer from another token leave with it; the kept parts of an
     // answer from that token continue it.
     for (id, token) in &feed.inner {
-        let previous = tx
-            .get(facts, feed_key(id))?
-            .map(|bytes| postcard::from_bytes::<FeedState>(&bytes))
-            .transpose()?;
-        let state = FeedState {
-            token: token.clone(),
-            ended: true,
-            deadline: feed.deadline,
+        let previous = read_feed_state(tx, facts, id)?;
+        let brought = moved(token, previous.as_ref());
+        let state = match previous {
+            Some(previous) if previous.token == brought.token => FeedState {
+                ended: true,
+                deadline: brought.deadline,
+                passed: brought.passed,
+                unlisted: false,
+                ..previous
+            },
+            Some(_) | None => {
+                put(tx, facts, token_key(id), token.as_bytes())?;
+                drop_kept_parts(tx, facts, id)?;
+                brought
+            },
         };
-        put_feed_state(tx, facts, id, previous.as_ref(), &state, feed.now)?;
-        if previous.is_none_or(|previous| previous.token != *token) {
-            drop_kept_parts(tx, facts, id)?;
-        }
+        put(tx, facts, feed_key(id), postcard::to_allocvec(&state)?)?;
     }
-    Ok(())
+    Ok(state)
 }
 
 /// Remove the kept parts of the later answer of the feed of the object `id`.
@@ -2188,6 +2575,7 @@ fn drop_kept_parts(
         delete(tx, facts, key)?;
     }
     delete(tx, facts, kept_token_key(id))?;
+    delete(tx, facts, kept_began_key(id))?;
     Ok(())
 }
 
@@ -2476,6 +2864,7 @@ fn remove_path_facts(
     removals.push(expiry);
     removals.push(git_key(path));
     removals.push(fed_key(path));
+    removals.push(change_key(path));
     removals.push(listing_feed_key(path));
     removals.push(anchor_key(path));
     Ok(())
@@ -3529,252 +3918,53 @@ mod tests {
         assert!(store.git_for_path(&stale_git).unwrap().is_none());
     }
 
-    /// Publish `transition` as the answer of a call that began from the
-    /// state of its feed in `store`.
-    fn publish_from_state(store: &MountResources, mut transition: ProjectionTransition) {
-        if let Some(feed) = &mut transition.feed {
-            feed.from = store
-                .feed_state(&feed.object)
-                .unwrap()
-                .map(|state| state.token);
-            feed.kept_from = store.kept_token(&feed.object).unwrap();
+    /// Publish `transition` as the answer of one call that began from the
+    /// state of its feed in `store`, and ended, at the count of the store.
+    fn publish_from_state(store: &MountResources, transition: ProjectionTransition) -> Changed {
+        let sequence = store.sequence().unwrap();
+        match publish_fetched(store, transition, sequence, sequence) {
+            PublicationOutcome::Committed { changed, .. } => changed,
+            other => panic!("{other:?}"),
         }
-        if let Some(kept) = &mut transition.kept {
-            kept.from = store
-                .feed_state(&kept.object)
-                .unwrap()
-                .map(|state| state.token);
-            kept.kept_from = store.kept_token(&kept.object).unwrap();
-        }
-        assert!(matches!(
-            store.publish(transition, store.current_epoch()).unwrap(),
-            PublicationOutcome::Committed { .. }
-        ));
     }
 
-    /// The kept part `part` of the feed `object`, of a call from the token
-    /// `from` after the kept part with the token `kept_from`.
-    fn kept_part(
-        object: &[u8],
-        from: &str,
-        kept_from: Option<&str>,
-        part: &str,
-    ) -> ProjectionTransition {
+    /// Publish `transition` as the answer of one call that began from the
+    /// state of its feed in `store`, at the count `began`, and ended at
+    /// `ended`.
+    fn publish_fetched(
+        store: &MountResources,
+        mut transition: ProjectionTransition,
+        began: u64,
+        ended: u64,
+    ) -> PublicationOutcome {
+        let version = |object: &[u8]| store.feed_state(object).unwrap().map(|state| state.version);
+        if let Some(feed) = &mut transition.feed {
+            feed.from = version(&feed.object);
+            feed.spans = vec![CallSpan {
+                records: transition.records.len(),
+                removals: transition.removals.len(),
+                began,
+                ended,
+            }];
+        }
+        if let Some(kept) = &mut transition.kept {
+            kept.from = version(&kept.object);
+        }
+        store.publish(transition, store.current_epoch()).unwrap()
+    }
+
+    /// The kept part `part` of the feed `object`.
+    fn kept_part(object: &[u8], part: &str) -> ProjectionTransition {
         ProjectionTransition {
             kept: Some(KeptWrite {
                 object: object.to_vec(),
-                from: Some(from.into()),
-                kept_from: kept_from.map(Into::into),
+                from: None,
                 part: part.as_bytes().to_vec(),
                 token: format!("after {part}"),
+                began: 0,
             }),
             ..ProjectionTransition::default()
         }
-    }
-
-    #[test]
-    fn an_inner_state_of_the_token_of_its_feed_keeps_the_kept_parts_and_a_part_continues_its_kept_parts_alone()
-     {
-        let (_dir, _caches, store) = open_store("kept");
-        let inner = |token: &str| {
-            let mut outer = fed_part("outer", HashMap::new());
-            outer.object = b"outer".to_vec();
-            outer.inner = vec![(b"feed".to_vec(), token.into())];
-            ProjectionTransition {
-                feed: Some(outer),
-                ..ProjectionTransition::default()
-            }
-        };
-        publish_from_state(&store, inner("token"));
-        publish_from_state(&store, kept_part(b"feed", "token", None, "P1"));
-
-        // The outer feed brings the token that the feed has: the kept part
-        // stays, and the next part continues it.
-        publish_from_state(&store, inner("token"));
-        assert_eq!(store.kept_parts(b"feed").unwrap(), [b"P1".to_vec()]);
-        publish_from_state(&store, kept_part(b"feed", "token", Some("after P1"), "P2"));
-        assert_eq!(
-            store.kept_parts(b"feed").unwrap(),
-            [b"P1".to_vec(), b"P2".to_vec()]
-        );
-
-        // A part of a call that continued other kept parts than the
-        // projection has is no publication: a first part after another
-        // answer kept one, and a part after kept parts that left with
-        // another token of its feed, which came back.
-        let moved = |transition| {
-            matches!(
-                store.publish(transition, store.current_epoch()),
-                Ok(PublicationOutcome::Moved)
-            )
-        };
-        assert!(moved(kept_part(b"feed", "token", None, "P1 again")));
-        publish_from_state(&store, inner("other"));
-        assert!(!store.has_kept_parts(b"feed").unwrap());
-        publish_from_state(&store, inner("token"));
-        assert!(moved(kept_part(b"feed", "token", Some("after P2"), "P3")));
-        let mut last = fed_part("last", HashMap::new());
-        last.from = Some("token".into());
-        last.kept_from = Some("after P2".into());
-        assert!(moved(ProjectionTransition {
-            feed: Some(last),
-            ..ProjectionTransition::default()
-        }));
-        assert!(!store.has_kept_parts(b"feed").unwrap());
-    }
-
-    #[test]
-    fn an_answer_over_the_change_of_another_feed_since_its_begin_is_no_publication() {
-        let (_dir, _caches, store) = open_store("conflict");
-        let title = p("/shelf/books/1/title");
-        let write = |object: &[u8], content: &str, since: u64| {
-            let mut feed = fed_part("token", HashMap::new());
-            feed.object = object.to_vec();
-            feed.from = store.feed_state(object).unwrap().map(|state| state.token);
-            feed.kept_from = store.kept_token(object).unwrap();
-            feed.since = since;
-            ProjectionTransition {
-                records: vec![RecordWrite {
-                    path: title.clone(),
-                    aux: None,
-                    fact: FactPayload::File(FilePayload::new(None, content.as_bytes().to_vec())),
-                }],
-                feed: Some(feed),
-                ..ProjectionTransition::default()
-            }
-        };
-        let content = || {
-            FilePayload::deserialize(
-                &store
-                    .cache_get(&title, RecordKind::File, None)
-                    .unwrap()
-                    .unwrap()
-                    .payload,
-            )
-            .unwrap()
-            .content
-        };
-        let publish = |transition| store.publish(transition, store.current_epoch()).unwrap();
-
-        // The answer of the book began, with a kept part, before the answer
-        // of the shelf changed the title: it is no publication, and its kept
-        // part leaves.
-        let book = store.begin_feed_answer();
-        assert!(matches!(
-            publish(write(b"book", "old", book.since)),
-            PublicationOutcome::Committed { .. }
-        ));
-        publish(kept_part(b"book", "token", None, "P1"));
-        let shelf = store.begin_feed_answer();
-        assert!(matches!(
-            publish(write(b"shelf", "new", shelf.since)),
-            PublicationOutcome::Committed { .. }
-        ));
-        drop(shelf);
-        let mut stale = write(b"book", "old", book.since);
-        stale.feed.as_mut().unwrap().kept_from = Some("after P1".into());
-        assert!(matches!(publish(stale), PublicationOutcome::Moved));
-        assert_eq!(content(), b"new");
-        assert!(!store.has_kept_parts(b"book").unwrap());
-        drop(book);
-
-        // An answer that began after the change publishes, and so does the
-        // answer over a write that changed nothing.
-        let book = store.begin_feed_answer();
-        let shelf = store.begin_feed_answer();
-        publish(write(b"shelf", "new", shelf.since));
-        assert!(matches!(
-            publish(write(b"book", "newer", book.since)),
-            PublicationOutcome::Committed { .. }
-        ));
-        assert_eq!(content(), b"newer");
-        drop((book, shelf));
-        assert!(store.fed_changes.lock().log.is_empty());
-    }
-
-    #[test]
-    fn a_publication_names_the_paths_that_it_changed_alone() {
-        let (_dir, _caches, store) = open_store("changed");
-        let books = p("/shelf/books");
-        let changed = |transition: ProjectionTransition| {
-            let mut transition = transition;
-            transition.feed.as_mut().unwrap().from =
-                store.feed_state(b"feed").unwrap().map(|state| state.token);
-            match store.publish(transition, store.current_epoch()).unwrap() {
-                PublicationOutcome::Committed { changed, .. } => changed,
-                other => panic!("{other:?}"),
-            }
-        };
-        let first = changed(fed_dir(&books, &["1"], ListingWrite::Complete));
-        assert!(first.listings.contains(&books));
-        assert!(first.records.contains(&p("/shelf/books/1")));
-
-        // The same listing again changes nothing.
-        let again = changed(fed_dir(&books, &["1"], ListingWrite::Complete));
-        assert!(again.listings.is_empty() && again.records.is_empty());
-
-        // Another child changes the listing and its own lookup alone, and a
-        // removal the path that left and the listing that had it.
-        let more = changed(fed_dir(&books, &["1", "2"], ListingWrite::Complete));
-        assert_eq!(more.listings, HashSet::from([books.clone()]));
-        assert_eq!(more.records, HashSet::from([p("/shelf/books/2")]));
-        let mut removal = fed_dir(&books, &["1"], ListingWrite::Join);
-        removal.removals = vec![p("/shelf/books/2"), p("/shelf/books/9")];
-        let removed = changed(removal);
-        assert_eq!(removed.listings, HashSet::from([books.clone()]));
-        assert_eq!(removed.records, HashSet::from([p("/shelf/books/2")]));
-    }
-
-    #[test]
-    fn the_change_of_a_listed_directory_moves_once_past_the_deadline_of_the_feed_of_its_listing() {
-        let (_dir, _caches, store) = open_store("due");
-        let books = p("/shelf/books");
-        publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Complete));
-        // No listing asked the feed: nothing lists the directory again.
-        assert_eq!(store.listing_due(&books, true, 5_000).unwrap(), 0);
-
-        // After a listing within the deadline, the change moves once the
-        // deadline passes, to the deadline, for a feed that answers.
-        store.record_listing_feed(&books, Some(b"feed")).unwrap();
-        assert_eq!(store.listing_due(&books, true, 999).unwrap(), 0);
-        assert_eq!(store.listing_due(&books, true, 1_000).unwrap(), 1_000);
-        assert_eq!(store.listing_due(&books, true, 5_000).unwrap(), 1_000);
-        assert_eq!(store.listing_due(&books, false, 5_000).unwrap(), 0);
-
-        // The answer past the deadline, of any operation, renews the
-        // deadline and leaves the change where it was, until the next
-        // deadline passes; an answer within the deadline leaves it too.
-        let answer = |now: u64, deadline: u64| {
-            let mut unchanged = fed_part("token", HashMap::new());
-            unchanged.answer = FeedAnswerWrite::Unchanged;
-            unchanged.now = now;
-            unchanged.deadline = deadline;
-            publish_from_state(
-                &store,
-                ProjectionTransition {
-                    feed: Some(unchanged),
-                    ..ProjectionTransition::default()
-                },
-            );
-        };
-        answer(5_000, 8_000);
-        assert_eq!(store.listing_due(&books, true, 5_000).unwrap(), 1_000);
-        answer(6_000, 9_000);
-        assert_eq!(store.listing_due(&books, true, 8_999).unwrap(), 1_000);
-        assert_eq!(store.listing_due(&books, true, 9_000).unwrap(), 9_000);
-
-        // The record leaves with the directory.
-        let mut removal = fed_part("token", HashMap::new());
-        removal.answer = FeedAnswerWrite::Unchanged;
-        publish_from_state(
-            &store,
-            ProjectionTransition {
-                removals: vec![books.clone()],
-                feed: Some(removal),
-                ..ProjectionTransition::default()
-            },
-        );
-        assert_eq!(store.listing_feed(&books).unwrap(), None);
     }
 
     fn fed_dir(path: &Path, children: &[&str], write: ListingWrite) -> ProjectionTransition {
@@ -3809,17 +3999,18 @@ mod tests {
         }
     }
 
-    /// The last part of an answer of the feed `feed` with `token`, its facts
-    /// at the paths of `until` counting until their time.
+    /// The last part of an answer of the feed `feed` with `token`, its facts at the paths of `until` counting
+    /// until their time.
     fn fed_part(token: &str, until: HashMap<Path, u64>) -> FeedWrite {
         FeedWrite {
             object: b"feed".to_vec(),
             from: None,
-            kept_from: None,
-            since: 0,
+            spans: Vec::new(),
+            lacked: None,
             answer: FeedAnswerWrite::Part(FeedPartWrite {
                 token: token.into(),
                 more: false,
+                unlisted: false,
             }),
             inner: Vec::new(),
             anchors: Vec::new(),
@@ -3827,6 +4018,375 @@ mod tests {
             now: 0,
             until,
         }
+    }
+
+    /// An answer of the feed `object` that writes
+    /// `content` as the file at `path`.
+    fn fed_file(object: &[u8], path: &Path, content: &str) -> ProjectionTransition {
+        let mut feed = fed_part("token", HashMap::new());
+        feed.object = object.to_vec();
+        ProjectionTransition {
+            records: vec![RecordWrite {
+                path: path.clone(),
+                aux: None,
+                fact: FactPayload::File(FilePayload::new(None, content.as_bytes().to_vec())),
+            }],
+            feed: Some(feed),
+            ..ProjectionTransition::default()
+        }
+    }
+
+    fn file_content(store: &MountResources, path: &Path) -> Vec<u8> {
+        let record = store.cache_get(path, RecordKind::File, None).unwrap();
+        FilePayload::deserialize(&record.unwrap().payload)
+            .unwrap()
+            .content
+    }
+
+    /// A part of the feed `outer` that brings `token` as the state of `feed`.
+    fn inner_state(token: &str) -> ProjectionTransition {
+        let mut outer = fed_part("outer", HashMap::new());
+        outer.object = b"outer".to_vec();
+        outer.inner = vec![(b"feed".to_vec(), token.into())];
+        ProjectionTransition {
+            feed: Some(outer),
+            ..ProjectionTransition::default()
+        }
+    }
+
+    #[test]
+    fn an_inner_state_of_the_token_of_its_feed_keeps_the_kept_parts_and_a_part_continues_its_kept_parts_alone()
+     {
+        let (_dir, _caches, store) = open_store("kept");
+        publish_from_state(&store, inner_state("token"));
+        publish_from_state(&store, kept_part(b"feed", "P1"));
+        let version = store.feed_state(b"feed").unwrap().unwrap().version;
+
+        // The outer feed brings the token that the feed has: the kept part
+        // stays, the version of the feed with it, and the next part
+        // continues it.
+        publish_from_state(&store, inner_state("token"));
+        assert_eq!(store.kept_parts(b"feed").unwrap(), [b"P1".to_vec()]);
+        assert_eq!(store.feed_state(b"feed").unwrap().unwrap().version, version);
+        publish_from_state(&store, kept_part(b"feed", "P2"));
+        assert_eq!(
+            store.kept_parts(b"feed").unwrap(),
+            [b"P1".to_vec(), b"P2".to_vec()]
+        );
+        assert_eq!(store.kept_token(b"feed").unwrap(), Some("after P2".into()));
+        assert_eq!(store.feed_token(b"feed").unwrap(), Some("token".into()));
+
+        // A part of a call that began from another version of the feed, as
+        // before another kept part or before another token that left again,
+        // is no publication.
+        let moved = |mut transition: ProjectionTransition, from: u64| {
+            if let Some(kept) = &mut transition.kept {
+                kept.from = Some(from);
+            }
+            if let Some(feed) = &mut transition.feed {
+                feed.from = Some(from);
+            }
+            matches!(
+                store.publish(transition, store.current_epoch()),
+                Ok(PublicationOutcome::Moved)
+            )
+        };
+        assert!(moved(kept_part(b"feed", "P2 again"), version));
+        let kept = store.feed_state(b"feed").unwrap().unwrap().version;
+        publish_from_state(&store, inner_state("other"));
+        assert_eq!(store.feed_state(b"feed").unwrap().unwrap().kept, 0);
+        assert!(store.kept_parts(b"feed").unwrap().is_empty());
+        publish_from_state(&store, inner_state("token"));
+        assert!(moved(kept_part(b"feed", "P3"), kept));
+        assert!(moved(
+            ProjectionTransition {
+                feed: Some(fed_part("last", HashMap::new())),
+                ..ProjectionTransition::default()
+            },
+            kept
+        ));
+        assert_eq!(store.feed_token(b"feed").unwrap(), Some("token".into()));
+    }
+
+    #[test]
+    fn a_call_writes_over_no_change_that_another_feed_made_after_it_began() {
+        let (_dir, _caches, store) = open_store("newer");
+        let title = p("/shelf/books/1/title");
+        publish_from_state(&store, fed_file(b"book", &title, "first"));
+        let began = store.sequence().unwrap();
+
+        // The shelf changes the title after the call of the book began, in a
+        // call that overlaps it: the change stands, the answer of the book
+        // publishes the rest of its facts, and the title counts as lacking,
+        // so that the next operation on it asks its feed. No answer is in
+        // flight meanwhile: the call is of a kept part that a later
+        // operation continues.
+        publish_from_state(&store, fed_file(b"shelf", &title, "new"));
+        let other = p("/shelf/books/1/author");
+        let mut resumed = fed_file(b"book", &title, "old");
+        resumed.records.push(RecordWrite {
+            path: other.clone(),
+            aux: None,
+            fact: FactPayload::File(FilePayload::new(None, b"author".to_vec())),
+        });
+        let ended = store.sequence().unwrap();
+        assert!(matches!(
+            publish_fetched(&store, resumed, began, ended),
+            PublicationOutcome::Committed { .. }
+        ));
+        assert_eq!(file_content(&store, &title), b"new");
+        assert_eq!(file_content(&store, &other), b"author");
+        assert_eq!(store.fed_until(&title).unwrap(), Some(0));
+
+        // A change of a call that began after the call ended stands without
+        // a mark, the bytes that stand are no change to write over, and a
+        // call that began after the change writes over it.
+        let mut answered = fed_file(b"shelf", &title, "newer");
+        answered.feed.as_mut().unwrap().until = HashMap::from([(title.clone(), 9)]);
+        publish_fetched(&store, answered, ended + 1, ended + 1);
+        assert_eq!(store.fed_until(&title).unwrap(), Some(9));
+        let stale = |content| fed_file(b"book", &title, content);
+        publish_fetched(&store, stale("old"), began, began);
+        assert_eq!(file_content(&store, &title), b"newer");
+        assert_eq!(store.fed_until(&title).unwrap(), Some(9));
+        let changed = publish_from_state(&store, stale("newer"));
+        assert!(changed.records.is_empty());
+        publish_from_state(&store, stale("newest"));
+        assert_eq!(file_content(&store, &title), b"newest");
+    }
+
+    #[test]
+    fn a_call_takes_and_writes_no_path_that_another_feed_changed_or_removed_after_it_began() {
+        let (_dir, _caches, store) = open_store("removed");
+        let book = p("/shelf/books/1");
+        let title = p("/shelf/books/1/title");
+        publish_from_state(&store, fed_file(b"book", &title, "first"));
+        let began = store.sequence().unwrap();
+
+        // A sweep that began before the book changed takes it not.
+        publish_from_state(&store, fed_file(b"book", &title, "second"));
+        let mut sweep = fed_part("token", HashMap::new());
+        sweep.object = b"shelf".to_vec();
+        let sweep = || ProjectionTransition {
+            removals: vec![book.clone()],
+            feed: Some(sweep.clone()),
+            ..ProjectionTransition::default()
+        };
+        let ended = store.sequence().unwrap();
+        publish_fetched(&store, sweep(), began, ended);
+        assert_eq!(file_content(&store, &title), b"second");
+
+        // A sweep that began after it takes it, and a call of the book that
+        // began before the removal writes nothing below it.
+        let flight = store.begin_feed_call().unwrap();
+        let before = flight.began;
+        publish_from_state(&store, sweep());
+        assert!(
+            store
+                .cache_get(&title, RecordKind::File, None)
+                .unwrap()
+                .is_none()
+        );
+        let stale = fed_file(b"book", &title, "second");
+        publish_fetched(&store, stale, before, before);
+        assert!(
+            store
+                .cache_get(&title, RecordKind::File, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.projection.read_prefix(b"d:").unwrap().len(), 1);
+        drop(flight);
+
+        // The removal leaves once no call that began before it is in flight
+        // or kept, and a call that began after it writes the path again.
+        publish_from_state(&store, fed_file(b"book", &title, "third"));
+        assert_eq!(file_content(&store, &title), b"third");
+        assert!(store.projection.read_prefix(b"d:").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_publication_names_the_paths_that_it_changed_alone_and_counts_their_changes() {
+        let (_dir, _caches, store) = open_store("changed");
+        let books = p("/shelf/books");
+        let first = publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Complete));
+        assert!(first.listings.contains(&books));
+        assert!(first.records.contains(&p("/shelf/books/1")));
+        let listed = store.changed_at(&books).unwrap();
+        assert_eq!(listed, store.sequence().unwrap());
+        assert_eq!(store.changed_at(&p("/shelf/books/1")).unwrap(), listed);
+
+        // The same listing again changes nothing, and counts nothing.
+        let again = publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Complete));
+        assert!(again.listings.is_empty() && again.records.is_empty());
+        assert_eq!(store.sequence().unwrap(), listed);
+
+        // Another child changes the listing and its own lookup alone, and a
+        // removal the path that left and the listing that had it.
+        let more = publish_from_state(&store, fed_dir(&books, &["1", "2"], ListingWrite::Complete));
+        assert_eq!(more.listings, HashSet::from([books.clone()]));
+        assert_eq!(more.records, HashSet::from([p("/shelf/books/2")]));
+        assert!(store.changed_at(&books).unwrap() > listed);
+        assert_eq!(store.changed_at(&p("/shelf/books/1")).unwrap(), listed);
+        let mut removal = fed_dir(&books, &["1"], ListingWrite::Join);
+        removal.removals = vec![p("/shelf/books/2"), p("/shelf/books/9")];
+        let removed = publish_from_state(&store, removal);
+        assert_eq!(removed.listings, HashSet::from([books.clone()]));
+        assert_eq!(removed.records, HashSet::from([p("/shelf/books/2")]));
+        assert_eq!(store.changed_at(&p("/shelf/books/2")).unwrap(), 0);
+
+        // A change that no publication made counts too.
+        let counted = store.changed_at(&books).unwrap();
+        store.record_changed(std::slice::from_ref(&books)).unwrap();
+        assert!(store.changed_at(&books).unwrap() > counted);
+    }
+
+    #[test]
+    fn the_change_of_a_fed_directory_moves_once_past_each_deadline_of_the_feed_of_its_listing() {
+        let (_dir, _caches, store) = open_store("due");
+        let books = p("/shelf/books");
+        let answer = |object: &[u8], now: u64, deadline: u64| {
+            let mut unchanged = fed_part("token", HashMap::new());
+            unchanged.object = object.to_vec();
+            unchanged.answer = FeedAnswerWrite::Unchanged;
+            unchanged.now = now;
+            unchanged.deadline = deadline;
+            publish_from_state(
+                &store,
+                ProjectionTransition {
+                    feed: Some(unchanged),
+                    ..ProjectionTransition::default()
+                },
+            );
+        };
+
+        // The feed that writes the listing first is the feed of the listing,
+        // whose change the first listing leaves where it was: a directory
+        // without a listing of a feed has none.
+        assert_eq!(store.listing_due(&books, 5_000).unwrap(), 0);
+        answer_first(&store, &books);
+        assert_eq!(store.listing_feed(&books).unwrap(), Some(b"feed".to_vec()));
+        assert_eq!(store.listing_due(&books, 999).unwrap(), 0);
+
+        // The change moves once the deadline passes, and stands over the
+        // answer that renews the deadline, of any operation, and over an
+        // answer within the deadline, until the next deadline passes.
+        let passed = store.listing_due(&books, 1_000).unwrap();
+        assert_ne!(passed, 0);
+        assert_eq!(store.listing_due(&books, 5_000).unwrap(), passed);
+        answer(b"feed", 5_000, 8_000);
+        assert_eq!(store.listing_due(&books, 5_000).unwrap(), passed);
+        answer(b"feed", 6_000, 9_000);
+        assert_eq!(store.listing_due(&books, 8_999).unwrap(), passed);
+        let again = store.listing_due(&books, 9_000).unwrap();
+        assert_ne!(again, passed);
+
+        // A check that gives no answer, in the window of the mount or at a
+        // failure for now, defers the feed: the change stands until the
+        // deadline that it gave passes, and never moves back.
+        store.defer_feed(b"feed", 12_000, 9_500).unwrap();
+        assert_eq!(store.listing_due(&books, 9_500).unwrap(), again);
+        assert_eq!(store.listing_due(&books, 11_999).unwrap(), again);
+        let deferred = store.listing_due(&books, 12_000).unwrap();
+        assert!(deferred != again && deferred != passed);
+
+        // Another feed that a listing asks is the feed of the listing from
+        // the change as it is, and moves it past its own deadline.
+        answer_other(&store);
+        store.record_listing_feed(&books, b"other", 12_500).unwrap();
+        assert_eq!(store.listing_feed(&books).unwrap(), Some(b"other".to_vec()));
+        assert_eq!(store.listing_due(&books, 12_500).unwrap(), deferred);
+        assert_ne!(store.listing_due(&books, 20_000).unwrap(), deferred);
+
+        // The record leaves with the directory.
+        let mut removal = fed_part("token", HashMap::new());
+        removal.answer = FeedAnswerWrite::Unchanged;
+        publish_from_state(
+            &store,
+            ProjectionTransition {
+                removals: vec![books.clone()],
+                feed: Some(removal),
+                ..ProjectionTransition::default()
+            },
+        );
+        assert_eq!(store.listing_feed(&books).unwrap(), None);
+        store.record_listing_feed(&books, b"other", 13_000).unwrap();
+        assert_eq!(store.listing_feed(&books).unwrap(), None);
+    }
+
+    fn answer_first(store: &MountResources, books: &Path) {
+        publish_from_state(store, fed_dir(books, &["1"], ListingWrite::Complete));
+    }
+
+    /// The first answer of the feed `other`, with the deadline `20_000`.
+    fn answer_other(store: &MountResources) {
+        let mut other = fed_part("token", HashMap::new());
+        other.object = b"other".to_vec();
+        other.now = 12_400;
+        other.deadline = 20_000;
+        publish_from_state(
+            store,
+            ProjectionTransition {
+                feed: Some(other),
+                ..ProjectionTransition::default()
+            },
+        );
+    }
+
+    #[test]
+    fn an_answer_that_ends_clears_the_expired_until_of_the_fact_that_lacked_and_a_feed_above_lists_an_unlisted_feed()
+     {
+        let (_dir, _caches, store) = open_store("marks");
+        let title = p("/shelf/books/1/title");
+        let mut own = fed_file(b"book", &title, "first");
+        own.records.push(RecordWrite {
+            path: p("/shelf/books/1"),
+            aux: None,
+            fact: FactPayload::Lookup(LookupPayload::Positive(EntryMeta::directory())),
+        });
+        own.feed.as_mut().unwrap().until = HashMap::from([(title.clone(), 5)]);
+        publish_from_state(&store, own);
+        assert_eq!(store.fed_until(&title).unwrap(), Some(5));
+
+        // An answer that the operation that lacked the title started, and
+        // that ends with the facts as they were, lets the title stand.
+        let unchanged = |lacked: Option<&Path>, now: u64| {
+            let mut feed = fed_part("token", HashMap::new());
+            feed.object = b"book".to_vec();
+            feed.answer = FeedAnswerWrite::Unchanged;
+            feed.now = now;
+            feed.lacked = lacked.cloned();
+            ProjectionTransition {
+                feed: Some(feed),
+                ..ProjectionTransition::default()
+            }
+        };
+        publish_from_state(&store, unchanged(None, 9));
+        assert_eq!(store.fed_until(&title).unwrap(), Some(5));
+        publish_from_state(&store, unchanged(Some(&title), 4));
+        assert_eq!(store.fed_until(&title).unwrap(), Some(5));
+        publish_from_state(&store, unchanged(Some(&title), 9));
+        assert_eq!(store.fed_until(&title).unwrap(), None);
+
+        // A part that says that no inventory above its feed has its object
+        // makes its feed unlisted, until a feed above it brings its state.
+        let state = || store.feed_state(b"feed").unwrap().unwrap();
+        let mut alone = fed_part("token", HashMap::new());
+        alone.answer = FeedAnswerWrite::Part(FeedPartWrite {
+            token: "token".into(),
+            more: false,
+            unlisted: true,
+        });
+        publish_from_state(
+            &store,
+            ProjectionTransition {
+                feed: Some(alone),
+                ..ProjectionTransition::default()
+            },
+        );
+        assert!(state().unlisted);
+        publish_from_state(&store, inner_state("token"));
+        assert!(!state().unlisted);
     }
 
     #[test]
@@ -3854,23 +4414,11 @@ mod tests {
 
         // A restart takes its token with the end of the first answer and the
         // deadline as they were, and drops the kept parts.
-        publish_from_state(
-            &store,
-            ProjectionTransition {
-                kept: Some(KeptWrite {
-                    object: b"feed".to_vec(),
-                    from: None,
-                    kept_from: None,
-                    part: b"kept".to_vec(),
-                    token: "kept token".into(),
-                }),
-                ..ProjectionTransition::default()
-            },
-        );
-        assert!(store.has_kept_parts(b"feed").unwrap());
+        publish_from_state(&store, kept_part(b"feed", "kept"));
+        assert_eq!(store.feed_state(b"feed").unwrap().unwrap().kept, 1);
         assert_eq!(
             store.kept_token(b"feed").unwrap(),
-            Some("kept token".into())
+            Some("after kept".into())
         );
         let mut restart = fed_part("restart", HashMap::new());
         restart.answer = FeedAnswerWrite::Restart("restart".into());
@@ -3882,43 +4430,18 @@ mod tests {
                 ..ProjectionTransition::default()
             },
         );
-        assert!(!store.has_kept_parts(b"feed").unwrap());
+        assert!(store.kept_parts(b"feed").unwrap().is_empty());
         assert_eq!(store.kept_token(b"feed").unwrap(), None);
-        assert_eq!(
-            store.feed_state(b"feed").unwrap(),
-            Some(FeedState {
-                token: "restart".into(),
-                ended: true,
-                deadline: 1_000,
-            })
-        );
+        let state = store.feed_state(b"feed").unwrap().unwrap();
+        assert_eq!((state.ended, state.deadline, state.kept), (true, 1_000, 0));
+        assert_eq!(store.feed_token(b"feed").unwrap(), Some("restart".into()));
 
-        // An inner state drops the kept parts of its feed.
-        publish_from_state(
-            &store,
-            ProjectionTransition {
-                kept: Some(KeptWrite {
-                    object: b"inner".to_vec(),
-                    from: None,
-                    kept_from: None,
-                    part: b"kept".to_vec(),
-                    token: "kept token".into(),
-                }),
-                ..ProjectionTransition::default()
-            },
-        );
-        let mut part = fed_part("token", HashMap::new());
-        part.inner = vec![(b"inner".to_vec(), "inner token".into())];
-        publish_from_state(
-            &store,
-            ProjectionTransition {
-                feed: Some(part),
-                ..ProjectionTransition::default()
-            },
-        );
-        assert!(!store.has_kept_parts(b"inner").unwrap());
+        // An inner state of another token drops the kept parts of its feed.
+        publish_from_state(&store, kept_part(b"feed", "kept"));
+        publish_from_state(&store, inner_state("inner token"));
+        assert!(store.kept_parts(b"feed").unwrap().is_empty());
         assert_eq!(
-            store.feed_state(b"inner").unwrap().map(|state| state.token),
+            store.feed_token(b"feed").unwrap(),
             Some("inner token".into())
         );
     }
@@ -3928,41 +4451,26 @@ mod tests {
         let (_dir, _caches, store) = open_store("moved");
         let books = p("/shelf/books");
         publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Complete));
+        let from = store
+            .feed_state(b"feed")
+            .unwrap()
+            .map(|state| state.version);
 
         // An outer feed gives the feed another state, as an inner state.
-        let mut outer = fed_part("outer", HashMap::new());
-        outer.object = b"outer".to_vec();
-        outer.inner = vec![(b"feed".to_vec(), "moved".into())];
-        publish_from_state(
-            &store,
-            ProjectionTransition {
-                feed: Some(outer),
-                ..ProjectionTransition::default()
-            },
-        );
+        publish_from_state(&store, inner_state("moved"));
 
         // The answer and the kept part of a call that began from the state
         // before write nothing.
         let mut stale = fed_dir(&books, &["2"], ListingWrite::Complete);
-        stale.feed.as_mut().unwrap().from = Some("token".into());
+        stale.feed.as_mut().unwrap().from = from;
         assert!(matches!(
             store.publish(stale, store.current_epoch()),
             Ok(PublicationOutcome::Moved)
         ));
+        let mut kept = kept_part(b"feed", "kept");
+        kept.kept.as_mut().unwrap().from = from;
         assert!(matches!(
-            store.publish(
-                ProjectionTransition {
-                    kept: Some(KeptWrite {
-                        object: b"feed".to_vec(),
-                        from: Some("token".into()),
-                        kept_from: None,
-                        part: b"kept".to_vec(),
-                        token: "kept token".into(),
-                    }),
-                    ..ProjectionTransition::default()
-                },
-                store.current_epoch(),
-            ),
+            store.publish(kept, store.current_epoch()),
             Ok(PublicationOutcome::Moved)
         ));
         assert_eq!(
@@ -3974,11 +4482,8 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!store.has_kept_parts(b"feed").unwrap());
-        assert_eq!(
-            store.feed_state(b"feed").unwrap().map(|state| state.token),
-            Some("moved".into())
-        );
+        assert!(store.kept_parts(b"feed").unwrap().is_empty());
+        assert_eq!(store.feed_token(b"feed").unwrap(), Some("moved".into()));
     }
 
     #[test]
@@ -4099,14 +4604,9 @@ mod tests {
         assert!(listing.is_complete_offline());
         assert_eq!(listing.entries().count(), 2);
         assert!(store.is_fed(&books).unwrap());
-        assert_eq!(
-            store.feed_state(b"feed").unwrap(),
-            Some(FeedState {
-                token: "token".into(),
-                ended: true,
-                deadline: 1_000,
-            })
-        );
+        let state = store.feed_state(b"feed").unwrap().unwrap();
+        assert_eq!((state.ended, state.deadline), (true, 1_000));
+        assert_eq!(store.feed_token(b"feed").unwrap(), Some("token".into()));
 
         // A removal retracts the child and its subtree and leaves the
         // listing as complete as it was.

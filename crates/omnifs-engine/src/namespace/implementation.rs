@@ -219,6 +219,18 @@ struct NodeRecord {
     /// refreshes (the engine-internal learned-size writeback).
     attrs: Option<FileAttrsCache>,
     host: Option<HostRecord>,
+    /// The version of the file that the last answer with its attributes
+    /// told: a read gives the bytes of the size that its reader has.
+    told: Option<Told>,
+}
+
+/// The body of a file in the projection, of `length` bytes, with the
+/// attributes that an answer gave for it.
+#[derive(Clone)]
+struct Told {
+    body: crate::view::BodyId,
+    length: u64,
+    attrs: Option<FileAttrsCache>,
 }
 
 /// A node of a tree: its path under the root of the tree and its kind. The
@@ -253,9 +265,6 @@ pub struct EngineNamespace {
     registry: Arc<MountTable>,
     rt: Handle,
     ids: DashMap<Path, NodeRecord>,
-    epoch: AtomicU64,
-    /// id -> the epoch of its last invalidation, folded into `Attrs::change`.
-    node_epochs: DashMap<Path, u64>,
     events: broadcast::Sender<NsEvent>,
     handles: DashMap<Path, HandleRecord>,
     /// Count of ranged opens that yielded a handle; a test hook for asserting
@@ -290,8 +299,6 @@ impl EngineNamespace {
             registry,
             rt,
             ids: DashMap::new(),
-            epoch: AtomicU64::new(0),
-            node_epochs: DashMap::new(),
             events,
             handles: DashMap::new(),
             open_count: AtomicU64::new(0),
@@ -376,6 +383,7 @@ impl EngineNamespace {
         let root = NodeRecord {
             attrs: None,
             host: None,
+            told: None,
         };
         self.ids.insert(Path::root(), root);
     }
@@ -500,11 +508,13 @@ impl EngineNamespace {
             kind,
         });
         let host = incoming_host;
+        let told = self.ids.get(&id).and_then(|record| record.told.clone());
         self.ids.insert(
             id.clone(),
             NodeRecord {
                 attrs: merged,
                 host,
+                told,
             },
         );
         id
@@ -658,7 +668,7 @@ impl EngineNamespace {
         let mut unique = HashSet::new();
         affected.retain(|path| unique.insert(path.clone()));
 
-        let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.record_unpublished(mount, &report);
         let invalidation_paths: Vec<Path> = exact_paths
             .iter()
             .chain(prefix_paths.iter())
@@ -677,10 +687,8 @@ impl EngineNamespace {
             .collect();
         for path in handles {
             self.handles.remove(&path);
-            self.node_epochs.insert(path, epoch);
         }
         for id in affected {
-            self.node_epochs.insert(id.clone(), epoch);
             // Drop the learned attrs so the next answer re-resolves; keep the
             // identity so a filesystem's cached id stays resolvable.
             if let Some(mut record) = self.ids.get_mut(&id) {
@@ -699,7 +707,7 @@ impl EngineNamespace {
             if !unique.insert(dir.clone()) {
                 continue;
             }
-            self.node_epochs.insert(dir.clone(), epoch);
+            let epoch = self.changed_at(mount, rel);
             let due = if *fed {
                 self.listing_due(mount, rel)
             } else {
@@ -724,7 +732,7 @@ impl EngineNamespace {
                 continue;
             }
             self.handles.remove(&file);
-            self.node_epochs.insert(file.clone(), epoch);
+            let epoch = self.changed_at(mount, rel);
             if let Some(mut record) = self.ids.get_mut(&file) {
                 record.attrs = None;
                 record.host = None;
@@ -738,6 +746,32 @@ impl EngineNamespace {
             let _ = self
                 .events
                 .send(NsEvent::AttrsChanged { path: file, attrs });
+        }
+    }
+
+    /// Record the changes of `report` that no publication made: the change
+    /// of the attributes of each path is of the projection, so that it
+    /// stands over a restart.
+    fn record_unpublished(&self, mount: &str, report: &crate::tree::InvalidationReport) {
+        let unrecorded: Vec<Path> = report
+            .paths
+            .iter()
+            .chain(&report.prefixes)
+            .chain(
+                report
+                    .changed_dirs
+                    .iter()
+                    .filter(|(_, fed)| !fed)
+                    .map(|(dir, _)| dir),
+            )
+            .cloned()
+            .collect();
+        if let Some(Err(error)) = self
+            .configured_entry(mount)
+            .and_then(|entry| entry.resources().ok())
+            .map(|resources| resources.record_changed(&unrecorded))
+        {
+            tracing::warn!(mount, %error, "a change of the projection was not recorded");
         }
     }
 
@@ -772,7 +806,7 @@ impl EngineNamespace {
         node: &crate::Node,
         attrs: Option<&FileAttrsCache>,
     ) -> Attrs {
-        let epoch = self.node_epoch(id, node);
+        let epoch = self.node_epoch(node);
         let due = if node.is_fed() && node.is_dir() {
             self.listing_due(node.mount(), node.fact())
         } else {
@@ -789,39 +823,54 @@ impl EngineNamespace {
     /// [`MountResources::listing_due`] of the fed directory whose facts are
     /// at `fact` in `mount`: a part of its change counter in each answer.
     fn listing_due(&self, mount: &str, fact: &Path) -> u64 {
+        self.projection_count(mount, fact, |resources| {
+            resources.listing_due(fact, crate::clock::now_millis())
+        })
+    }
+
+    /// [`MountResources::changed_at`] of the facts at `fact` in `mount`: the
+    /// epoch of the changes of a node in each answer.
+    fn changed_at(&self, mount: &str, fact: &Path) -> u64 {
+        self.projection_count(mount, fact, |resources| resources.changed_at(fact))
+    }
+
+    fn projection_count(
+        &self,
+        mount: &str,
+        fact: &Path,
+        count: impl Fn(&crate::cache::MountResources) -> Result<u64, crate::cache::ProjectionError>,
+    ) -> u64 {
         let Some(entry) = self.configured_entry(mount) else {
             return 0;
         };
-        let answers = entry
-            .runtime()
-            .is_some_and(|runtime| runtime.rate_limited_until().is_none());
         match entry
             .resources()
             .map_err(|error| error.to_string())
-            .and_then(|resources| {
-                resources
-                    .listing_due(fact, answers, crate::clock::now_millis())
-                    .map_err(|error| error.to_string())
-            }) {
-            Ok(due) => due,
+            .and_then(|resources| count(resources).map_err(|error| error.to_string()))
+        {
+            Ok(count) => count,
             Err(error) => {
-                tracing::warn!(mount, path = fact.as_str(), %error, "no feed of the listing");
+                tracing::warn!(mount, path = fact.as_str(), %error, "no change of the facts");
                 0
             },
         }
     }
 
-    /// The epoch of the changes of `node` at `id`: that of its facts, which a
-    /// node under an anchor of another facet of an object shares with the
-    /// node under the anchor of its claim.
-    fn node_epoch(&self, id: &Path, node: &crate::Node) -> u64 {
-        let fact = mount_full_path(node.mount(), node.fact());
-        let at = if node.fact() == node.path() {
-            id
-        } else {
-            &fact
-        };
-        self.node_epochs.get(at).map_or(0, |epoch| *epoch)
+    /// The epoch of the changes of `node`: that of its facts, which a node
+    /// under an anchor of another facet of an object shares with the node
+    /// under the anchor of its claim.
+    fn node_epoch(&self, node: &crate::Node) -> u64 {
+        self.changed_at(node.mount(), node.fact())
+    }
+
+    /// The epoch of the changes of the node at `id`, whose facts are at its
+    /// own path.
+    fn epoch_of(&self, id: &Path) -> u64 {
+        let (_, mount) = Self::record(id);
+        if self.configured_entry(&mount).is_none() {
+            return 0;
+        }
+        self.changed_at(&mount, &mount_relative_path(&mount, id))
     }
 
     /// The change counter for a node, folding the served-mount set into the
@@ -911,7 +960,7 @@ impl EngineNamespace {
             .learned_attrs
             .unwrap_or_else(|| handle.attrs().clone());
         self.store_learned(id, learned.clone());
-        let epoch = self.node_epochs.get(id).map_or(0, |e| *e);
+        let epoch = self.epoch_of(id);
         let attrs = read_attrs(id, EntryKind::File, Some(&learned), false, epoch);
         Ok(ReadAnswer {
             bytes: chunk.bytes,
@@ -927,16 +976,54 @@ impl EngineNamespace {
         offset: u64,
         len: u32,
     ) -> Result<ReadAnswer, NsError> {
+        let told = self.ids.get(id).and_then(|record| record.told.clone());
         let ReadRange { bytes, eof, attrs } = self.read(node, offset, len, &RequestCtx).await?;
         if let Some(attrs) = &attrs {
             self.store_learned(id, attrs.clone());
+        }
+        // The read may have taken another version of the file than the one
+        // whose size its reader has, as at the deadline of the file. A
+        // reader takes as many bytes as the attributes that it has say, so
+        // a version of another length, and the rest of a version that the
+        // reader began, are the bytes of the version that it was told,
+        // whole; the next answer with the attributes of the file tells the
+        // version that the projection has now. A version of the same length
+        // from its first byte is the version that the reader takes.
+        let current = self.file_version(node, attrs.as_ref());
+        if let (Some(told), Some(current)) = (&told, &current)
+            && current.body != told.body
+            && offset == 0
+            && current.length == told.length
+            && let Some(mut record) = self.ids.get_mut(id)
+        {
+            record.told = Some(current.clone());
+        }
+        if let (Some(told), Some(current)) = (told, current)
+            && current.body != told.body
+            && (offset != 0 || current.length != told.length)
+        {
+            let resources = self.entry_for(node.mount())?.resources()?;
+            let bytes = resources
+                .read_body_range(told.body, told.length, offset, len)
+                .map_err(|error| NsError::Internal {
+                    message: error.to_string(),
+                })?;
+            let eof = offset.saturating_add(bytes.len() as u64) >= told.length;
+            let attrs = read_attrs(
+                id,
+                entry_kind_from_node(node),
+                told.attrs.as_ref(),
+                node.is_fed(),
+                self.node_epoch(node),
+            );
+            return Ok(ReadAnswer { bytes, eof, attrs });
         }
         let attrs = read_attrs(
             id,
             entry_kind_from_node(node),
             attrs.as_ref(),
             node.is_fed(),
-            self.node_epoch(id, node),
+            self.node_epoch(node),
         );
         Ok(ReadAnswer { bytes, eof, attrs })
     }
@@ -989,7 +1076,7 @@ impl EngineNamespace {
         let mount = node.mount().to_string();
         let base = handle.attrs().clone();
         let events = self.events.clone();
-        let node_epoch = self.node_epochs.get(id).map_or(0, |e| *e);
+        let node_epoch = self.epoch_of(id);
         // The pump is a detached task; it reports growth by cloning the shared
         // pieces it needs (no back-reference to `self`).
         let id = id.clone();
@@ -1118,20 +1205,26 @@ impl EngineNamespace {
             attrs,
         );
         let host = None;
+        let told = self.ids.get(&id).and_then(|record| record.told.clone());
         self.ids.insert(
             id.clone(),
             NodeRecord {
                 attrs: merged.clone(),
                 host,
+                told,
             },
         );
-        let epoch = self.node_epochs.get(&id).map_or(0, |e| *e);
         let kind = entry_kind_from_meta(meta);
-        let due = match parent.fact().join(name) {
-            Ok(fact) if fed && kind == EntryKind::Directory => {
-                self.listing_due(parent.mount(), &fact)
-            },
-            Ok(_) | Err(_) => 0,
+        let (epoch, due) = match parent.fact().join(name) {
+            Ok(fact) => (
+                self.changed_at(parent.mount(), &fact),
+                if fed && kind == EntryKind::Directory {
+                    self.listing_due(parent.mount(), &fact)
+                } else {
+                    0
+                },
+            ),
+            Err(_) => (0, 0),
         };
         let attrs = attrs_from_cache(
             kind.clone(),
@@ -1164,23 +1257,6 @@ impl EngineNamespace {
             }
             let refreshed = self.refresh_record(&id, &node);
 
-            // A learned size is of the bytes of the read that learned it.
-            // Past the deadline of the file a read takes its bytes again, so
-            // the size of an answer is of the bytes of that read: a reader
-            // takes as many bytes as the attributes say.
-            if refreshed
-                .as_ref()
-                .is_some_and(|attrs| attrs.has_exact_size() && !attrs.is_deferred_ranged())
-                && !node.is_dir()
-                && !node.is_fed()
-                && node.synthetic_kind().is_none()
-                && self.view_expired(&node)?
-            {
-                self.read_full(&id, &node, 0, 1).await?;
-                let learned = self.ids.get(&id).and_then(|record| record.attrs.clone());
-                return Ok(self.attrs_from_parts(&id, &node, learned.as_ref()));
-            }
-
             // The exact-size flavor probes provider I/O for a deferred ranged
             // file so the NFS renderer can flatten a directory with real child
             // sizes.
@@ -1197,6 +1273,7 @@ impl EngineNamespace {
                 return Ok(self.attrs_from_parts(&id, &node, Some(&probed)));
             }
 
+            self.tell(&id, &node, refreshed.as_ref());
             Ok(self.attrs_from_parts(&id, &node, refreshed.as_ref()))
         }
         .instrument(span.clone())
@@ -1205,19 +1282,32 @@ impl EngineNamespace {
         result
     }
 
-    /// Whether the file of `node` is past its deadline in a mount with its
-    /// provider, where a read takes its bytes again.
-    fn view_expired(&self, node: &crate::Node) -> Result<bool, NsError> {
-        let entry = self.entry_for(node.mount())?;
-        if entry.runtime().is_none() {
-            return Ok(false);
+    /// The body of the file of `node` in the projection, with `attrs`.
+    fn file_version(&self, node: &crate::Node, attrs: Option<&FileAttrsCache>) -> Option<Told> {
+        let resources = self.configured_entry(node.mount())?.resources().ok()?;
+        let aux = if node.is_fed() {
+            None
+        } else {
+            attrs?.durable_observation_cache_aux()?
+        };
+        let (body, length) = resources.file_body(node.fact(), aux.as_deref()).ok()??;
+        Some(Told {
+            body,
+            length,
+            attrs: attrs.cloned(),
+        })
+    }
+
+    /// Record the version of the file of `node` that an answer with `attrs`
+    /// tells its reader.
+    fn tell(&self, id: &Path, node: &crate::Node, attrs: Option<&FileAttrsCache>) {
+        if node.is_dir() || node.host().is_some() || node.synthetic_kind().is_some() {
+            return;
         }
-        entry
-            .resources()?
-            .view_expired(node.path(), crate::clock::now_millis())
-            .map_err(|error| NsError::Internal {
-                message: error.to_string(),
-            })
+        let told = self.file_version(node, attrs);
+        if let Some(mut record) = self.ids.get_mut(id) {
+            record.told = told;
+        }
     }
 
     /// Refresh a record's stored attrs from a fresh resolve, preserving a learned
@@ -1396,8 +1486,14 @@ impl EngineNamespace {
             relative,
             kind: host_kind(&metadata.kind),
         });
-        self.ids
-            .insert(id.clone(), NodeRecord { attrs: None, host });
+        self.ids.insert(
+            id.clone(),
+            NodeRecord {
+                attrs: None,
+                host,
+                told: None,
+            },
+        );
         let _ = metadata;
         id
     }
@@ -1588,6 +1684,12 @@ impl Namespace for EngineNamespace {
                     let metadata = self.host_stat(tree_ref, relative).await?;
                     metadata.attrs(Self::host_change(&metadata))
                 } else {
+                    let known = self
+                        .ids
+                        .get(&id)
+                        .and_then(|record| record.attrs.clone())
+                        .or_else(|| node.attrs().cloned());
+                    self.tell(&id, &node, known.as_ref());
                     self.attrs_for(&id, &node)
                 };
                 Ok(LookupAnswer::found(id, attrs))

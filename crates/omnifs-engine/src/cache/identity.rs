@@ -20,7 +20,7 @@ impl ProjectionId {
     #[must_use]
     pub(crate) fn new(spec_source: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new();
-        frame(&mut hasher, b"omnifs/projection/v2");
+        frame(&mut hasher, b"omnifs/projection/v3");
         frame(&mut hasher, spec_source);
         Self(*hasher.finalize().as_bytes())
     }

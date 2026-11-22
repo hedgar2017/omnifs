@@ -39,6 +39,7 @@ pub(crate) mod synthetic;
 
 pub(crate) use self::error::{TreeError, TreeErrorKind};
 pub(crate) use self::handle::{RangedHandle, spawn_live_follow_pump};
+pub(crate) use self::invalidate::InvalidationReport;
 pub(crate) use self::list::{Cursor, ListOutcome};
 pub(crate) use self::node::HostKind;
 pub(crate) use self::node::{Entry, Node, NodeBody};

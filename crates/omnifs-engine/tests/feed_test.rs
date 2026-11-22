@@ -41,7 +41,11 @@ async fn read(harness: &RuntimeHarness, segments: &[&str]) -> String {
     String::from_utf8(read.bytes).unwrap()
 }
 
+/// The calls of the feeds of the test provider so far. A read gives the
+/// version of the log whose size the lookup before it told, so the second
+/// read gives the log as the first one took it.
 async fn log(harness: &RuntimeHarness) -> Vec<String> {
+    read(harness, &["hello", "shelf-log"]).await;
     read(harness, &["hello", "shelf-log"])
         .await
         .lines()
@@ -185,45 +189,44 @@ async fn a_stopped_feed_keeps_its_token_and_its_inner_states_answer_meanwhile() 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_later_answer_publishes_its_parts_with_its_last_part_and_continues_after_a_stop() {
     let harness = make_initialized_runtime(CONFIG);
-    assert_eq!(
-        names(&harness, &["shelves", "wobbly", "books"])
-            .await
-            .unwrap(),
-        ["1", "2"]
-    );
+    let segments = ["shelves", "wobbly", "books"];
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
+    let shelf = path(&harness, &["shelves", "wobbly"]).await;
+    let change = || async {
+        let lookup = harness.namespace.lookup(shelf.clone(), "books").await;
+        lookup.unwrap().attrs().unwrap().change
+    };
+    let listed = change().await;
 
     // A later answer keeps its first part and stops at a rate limit before
-    // its last part: the operation takes the error of the stop.
+    // its last part: the check failed for now, so the operation is served
+    // what the projection has, without the kept part.
     read(&harness, &["hello", "shelf-change"]).await;
     tokio::time::sleep(PAST_DEADLINE).await;
-    assert!(matches!(
-        names(&harness, &["shelves", "wobbly", "books"]).await,
-        Err(NsError::RateLimited { .. })
-    ));
+    let due = change().await;
+    assert_ne!(due, listed);
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
+    let calls = log(&harness).await.len();
 
-    // While the rate-limit window is open, the projection serves without the
-    // kept part.
-    assert_eq!(
-        names(&harness, &["shelves", "wobbly", "books"])
-            .await
-            .unwrap(),
-        ["1", "2"]
-    );
+    // While the window of the mount is open, each operation is served from
+    // the projection without a call, and the attributes of the directory
+    // stand where the deadline moved them.
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
     assert_eq!(
         read(&harness, &["shelves", "wobbly", "books", "1", "title"]).await,
         "Book 1"
     );
+    assert_eq!(change().await, due);
+    assert_eq!(log(&harness).await.len(), calls);
 
-    // After the window, the next operation continues the answer from the
-    // token of its kept part, whatever the deadline, with what it asks, and
-    // its last part publishes both parts.
+    // The check waits for the end of the window: the attributes of the
+    // directory move once more then, and the listing that they bring
+    // continues the answer from the token of its kept part, with what it
+    // asks, and its last part publishes both parts.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
-    assert_eq!(
-        names(&harness, &["shelves", "wobbly", "books"])
-            .await
-            .unwrap(),
-        ["1", "3"]
-    );
+    let waited = change().await;
+    assert!(waited != due && waited != listed);
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "3"]);
     assert_eq!(
         read(&harness, &["shelves", "wobbly", "books", "1", "title"]).await,
         "Book 1 v1"
@@ -237,6 +240,40 @@ async fn a_later_answer_publishes_its_parts_with_its_last_part_and_continues_aft
             "wobbly change-1 ~books"
         ]
     );
+}
+
+/// A check of a feed that fails for now at the network fails no operation
+/// whose fact the projection has, and the next check waits as long as after
+/// an answer; the operation that lacks its fact, and the listing of a first
+/// answer that has not ended, have the error, within the wait without a call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_that_fails_for_now_serves_the_projection_and_the_next_check_waits() {
+    let harness = make_initialized_runtime(CONFIG);
+    let segments = ["shelves", "flaky", "books"];
+
+    // The first answer stops after its first part: the listing that started
+    // it has the error, and again within the wait, without a call.
+    assert!(matches!(
+        names(&harness, &segments).await,
+        Err(NsError::Network)
+    ));
+    let calls = log(&harness).await.len();
+    assert!(matches!(
+        names(&harness, &segments).await,
+        Err(NsError::Network)
+    ));
+    assert_eq!(log(&harness).await.len(), calls);
+
+    // The book of the published part serves from the projection.
+    assert_eq!(
+        read(&harness, &["shelves", "flaky", "books", "1", "title"]).await,
+        "Book 1"
+    );
+    assert_eq!(log(&harness).await.len(), calls);
+
+    // After the wait the listing continues the first answer.
+    tokio::time::sleep(PAST_DEADLINE).await;
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
 }
 
 /// The change of the attributes of a fed directory, which makes a filesystem
@@ -308,27 +345,35 @@ async fn the_attributes_of_a_listed_fed_directory_change_once_past_the_deadline_
     assert_ne!(stat().await, again);
 }
 
-/// The size of a file past its deadline is of the bytes that a read takes
-/// then, at a getattr without a read before it: a reader takes as many bytes
-/// as the attributes say.
+/// A getattr of a file past its deadline reads nothing, and a read gives the
+/// bytes of the size that the last attributes told, whole, whatever version
+/// the read takes then: the next attributes tell the size of that version.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_size_of_a_file_past_its_deadline_is_of_the_bytes_of_its_next_read() {
+async fn a_read_gives_the_bytes_of_the_size_that_the_attributes_told() {
     let harness = make_initialized_runtime(CONFIG);
-    let file = path(&harness, &["hello", "shelf-log"]).await;
+    let file = path(&harness, &["hello", "fresh-full"]).await;
     let read = || async {
         let read = harness.namespace.read(file.clone(), 0, u32::MAX).await;
-        read.unwrap().bytes.len() as u64
+        String::from_utf8(read.unwrap().bytes).unwrap()
     };
     let size = || async { harness.namespace.getattr(file.clone()).await.unwrap().size };
-    let learned = read().await;
-    assert_eq!(size().await, learned);
+    // Each read of the provider gives another count, of another length from
+    // the tenth on.
+    while read().await != "fresh-full-9\n" {}
+    let told = size().await;
+    assert_eq!(told, 13);
 
-    // The file grows upstream by the calls of the shelf feed.
-    names(&harness, &["shelves", "oak", "books"]).await.unwrap();
+    // Past the deadline no getattr reads the file.
     tokio::time::sleep(PAST_DEADLINE).await;
-    let grown = size().await;
-    assert!(grown > learned, "{grown} > {learned}");
-    assert_eq!(read().await, grown);
+    for _ in 0..3 {
+        assert_eq!(size().await, told);
+    }
+    // The read takes the tenth version, and gives the ninth, whose size its
+    // reader has; the attributes after it tell the tenth, and the next read
+    // gives the version of that size that it takes.
+    assert_eq!(read().await, "fresh-full-9\n");
+    assert_eq!(size().await, 14);
+    assert_eq!(read().await, "fresh-full-11\n");
 }
 
 /// A mount without its provider serves a fed file as with it: by the ranges

@@ -60,11 +60,12 @@ pub struct Runtime {
     pub(crate) invalidation: InvalidationState,
     pub(crate) namespace_flights: crate::ops::namespace::NamespaceFlights,
     pub(crate) feed_operations: Arc<crate::ops::feed::FeedOperations>,
-    // Per-mount rate-limit window. `Some(open_until)` while the mount's
-    // provider is throttled (set from a 429's Retry-After); reads serve stale
-    // cache instead of EAGAIN until it clears. std Mutex: the critical section
-    // is a single set/get with no await held across it.
-    rate_limit_until: std::sync::Mutex<Option<std::time::Instant>>,
+    // Per-mount window, open until its instant with the error that opened
+    // it, while the upstream of the mount limits its rate (from a 429's
+    // Retry-After) or failed for now: an operation is served from what the
+    // projection has until it closes. std Mutex: the critical section is a
+    // single set/get with no await held across it.
+    window: std::sync::Mutex<Option<(std::time::Instant, wit_types::ProviderError)>>,
     pub(crate) test_callouts: Option<std::sync::Mutex<mpsc::Receiver<TestSignal>>>,
 }
 
@@ -286,7 +287,7 @@ impl Runtime {
             invalidation: InvalidationState::default(),
             namespace_flights: crate::ops::namespace::NamespaceFlights::new(),
             feed_operations,
-            rate_limit_until: std::sync::Mutex::new(None),
+            window: std::sync::Mutex::new(None),
             test_callouts: test_rx.map(std::sync::Mutex::new),
         };
         let transition = crate::effect_apply::EffectApplier::new(&runtime.resources)
@@ -318,22 +319,54 @@ impl Runtime {
         let cooldown = retry_after
             .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
             .min(RATE_LIMIT_MAX_COOLDOWN);
-        let until = std::time::Instant::now() + cooldown;
-        *self.rate_limit_until.lock().unwrap() = Some(until);
+        self.open_window(
+            cooldown,
+            wit_types::ProviderError {
+                kind: wit_types::ErrorKind::RateLimited,
+                message: "the upstream limits the rate of the mount".into(),
+                retryable: true,
+                retry_after: None,
+            },
+        );
     }
 
-    /// The instant the mount's rate-limit window closes, if currently open.
-    /// Lazily clears an expired window.
-    pub fn rate_limited_until(&self) -> Option<std::time::Instant> {
-        let mut guard = self.rate_limit_until.lock().unwrap();
-        match *guard {
-            Some(until) if until > std::time::Instant::now() => Some(until),
+    /// Arm the window of the mount after a check of a feed that failed for
+    /// now with `error`, at the network, a timeout, or the upstream: the next
+    /// check waits as long as after an answer.
+    pub(crate) fn note_failed_for_now(&self, error: &wit_types::ProviderError) {
+        self.open_window(
+            std::time::Duration::from_millis(crate::clock::DYNAMIC_TTL_MILLIS),
+            error.clone(),
+        );
+    }
+
+    fn open_window(&self, cooldown: std::time::Duration, error: wit_types::ProviderError) {
+        let until = std::time::Instant::now() + cooldown;
+        let mut window = self.window.lock().unwrap();
+        if window.as_ref().is_none_or(|(open, _)| *open < until) {
+            *window = Some((until, error));
+        }
+    }
+
+    /// The window of the mount, if currently open: the time until it closes
+    /// and the error that opened it. Lazily clears an expired window.
+    pub(crate) fn window(&self) -> Option<(std::time::Duration, wit_types::ProviderError)> {
+        let mut guard = self.window.lock().unwrap();
+        let now = std::time::Instant::now();
+        match &*guard {
+            Some((until, error)) if *until > now => Some((*until - now, error.clone())),
             Some(_) => {
                 *guard = None;
                 None
             },
             None => None,
         }
+    }
+
+    /// The instant the mount's window closes, if currently open.
+    pub fn rate_limited_until(&self) -> Option<std::time::Instant> {
+        self.window()
+            .map(|(remaining, _)| std::time::Instant::now() + remaining)
     }
 
     pub(crate) fn next_operation_id(&self) -> u64 {
