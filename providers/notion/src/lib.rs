@@ -13,8 +13,6 @@
 //! own feeds of a page and of a data source take what the search does not
 //! bring, the content and the comments of a page among them.
 
-use std::future::Future;
-
 use omnifs_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -82,45 +80,31 @@ pub(crate) struct DataSourceKey {
 
 /// The workspace of the connection, with the pages and the data sources
 /// that it can read.
-#[omnifs_sdk::object(kind = "notion.workspace", key = WorkspaceKey, load = fed_only)]
+#[omnifs_sdk::object(kind = "notion.workspace", key = WorkspaceKey, no_load)]
 #[derive(Deserialize)]
 pub(crate) struct Workspace {}
 
 /// A page of the workspace, a row of a data source too.
-#[omnifs_sdk::object(kind = "notion.page", key = PageKey, load = fed_only)]
+#[omnifs_sdk::object(kind = "notion.page", key = PageKey, no_load)]
 #[derive(Deserialize)]
 pub(crate) struct Page {}
 
 /// A comment of a page.
-#[omnifs_sdk::object(kind = "notion.comment", key = CommentKey, load = fed_only)]
+#[omnifs_sdk::object(kind = "notion.comment", key = CommentKey, no_load)]
 #[derive(Deserialize)]
 pub(crate) struct Comment {}
 
 /// A data source of a database of the workspace.
-#[omnifs_sdk::object(kind = "notion.data_source", key = DataSourceKey, load = fed_only)]
+#[omnifs_sdk::object(kind = "notion.data_source", key = DataSourceKey, no_load)]
 #[derive(Deserialize)]
 pub(crate) struct DataSource {}
-
-/// The load of an object of the mount, which no face asks for: the objects
-/// have no canonical bytes, and the facts of their faces come from feeds
-/// alone.
-fn fed_only<O: Object>(
-    _cx: &Cx<O::State>,
-    _key: &O::Key,
-    _since: Option<Validator>,
-) -> impl Future<Output = Result<Load<O>>> {
-    std::future::ready(Err(ProviderError::internal(format!(
-        "the object {} has no canonical bytes",
-        O::kind().as_str()
-    ))))
-}
 
 #[omnifs_sdk::provider(
     id = "notion",
     display_name = "Notion",
     description = "pages, data sources, and comments from your workspace",
     mount = "notion",
-    projection = 2,
+    projection = 3,
     capabilities(domain(
         "api.notion.com",
         "Fetch the pages, data sources, page content, and comments of a Notion workspace."

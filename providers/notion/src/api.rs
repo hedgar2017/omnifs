@@ -8,9 +8,7 @@
 //! [`EndpointHooks::classify`] for both; every other status falls through to
 //! the SDK's default handling.
 
-use std::time::Duration;
-
-use http::Response;
+use http::{HeaderMap, Response};
 use omnifs_sdk::endpoint::{EndpointHooks, HttpResponse};
 use omnifs_sdk::error::ProviderError;
 use serde::Deserialize;
@@ -34,12 +32,9 @@ impl EndpointHooks for NotionApi {
     /// which arms no window; `None` for every other answer.
     fn classify(&self, response: &Response<Vec<u8>>) -> Option<ProviderError> {
         match response.status().as_u16() {
-            529 => Some(rate_limited(
-                529,
-                response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|value| value.to_str().ok()),
+            529 => Some(ProviderError::from_http_answer(
+                429,
+                headers(response.headers()),
             )),
             429 => serde_json::from_slice::<Failure>(response.body())
                 .ok()
@@ -56,6 +51,19 @@ impl EndpointHooks for NotionApi {
     }
 }
 
+/// The headers of an answer as names and values, without a value that is no
+/// text.
+fn headers(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)))
+}
+
+/// The error of an answer of Notion with a failing status.
+pub(crate) fn refusal(response: &HttpResponse) -> ProviderError {
+    ProviderError::from_http_answer(response.status(), headers(response.headers()))
+}
+
 /// The error object of an answer of Notion.
 #[derive(Deserialize)]
 struct Failure {
@@ -67,30 +75,6 @@ struct Failure {
 #[derive(Deserialize)]
 struct AdditionalData {
     rate_limit_reason: Option<String>,
-}
-
-/// The rate-limited error of an answer with `status` and the seconds of its
-/// `Retry-After`.
-fn rate_limited(status: u16, retry_after: Option<&str>) -> ProviderError {
-    let message = match retry_after {
-        Some(value) => format!("HTTP {status}; retry_after={value}"),
-        None => format!("HTTP {status}"),
-    };
-    ProviderError::rate_limited(message).with_retry_after(
-        retry_after
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .map(Duration::from_secs),
-    )
-}
-
-/// The error of an answer of Notion with a failing status: the rate-limited
-/// error of a `429` with the seconds of its `Retry-After`, else the error of
-/// its status.
-pub(crate) fn status_error(response: &HttpResponse) -> ProviderError {
-    match response.status() {
-        429 => rate_limited(429, response.header("retry-after")),
-        status => ProviderError::from_http_status(status),
-    }
 }
 
 /// An answer `403` of Notion with the code `restricted_resource`: Notion gives

@@ -21,7 +21,6 @@ use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use omnifs_sdk::prelude::*;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::value::RawValue;
@@ -30,7 +29,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::api::{
     CommentObject, DataSourceObject, Found, Kind, List, Markdown, NotionApi, PageObject, decode,
-    restricted, status_error,
+    refusal, restricted,
 };
 use crate::{DataSource, DataSourceKey, Id, Page, PageKey, Workspace, WorkspaceKey};
 
@@ -123,18 +122,15 @@ impl Lacking {
     }
 }
 
-/// The token of the feed of a page: the `last_edited_time` of the page, its
-/// unfinished content and its unfinished comments, each of which the read
-/// that asks for it continues, and the time of the computer after which its
-/// finished comments count as lacking. The token of a removed page is `null`.
+/// The token of the feed of a page: the `last_edited_time` of the page, and
+/// its unfinished content and its unfinished comments, each of which the read
+/// that asks for it continues. The token of a removed page is `null`.
 #[derive(Serialize, Deserialize)]
 struct PageToken {
     #[serde(with = "time::serde::rfc3339")]
     last_edited_time: OffsetDateTime,
     content: Option<Content>,
     comments: Option<Comments>,
-    #[serde(with = "time::serde::rfc3339::option")]
-    comments_until: Option<OffsetDateTime>,
 }
 
 impl PageToken {
@@ -145,7 +141,6 @@ impl PageToken {
             last_edited_time,
             content: None,
             comments: None,
-            comments_until: None,
         }
     }
 }
@@ -180,7 +175,7 @@ impl Content {
 /// first request, their objects so far, and the time of the computer at the
 /// end of the minute of the `last_edited_time` of the page for an answer
 /// within it.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Comments {
     cursor: Option<String>,
     objects: Vec<Box<RawValue>>,
@@ -188,18 +183,15 @@ struct Comments {
     until: Option<OffsetDateTime>,
 }
 
-/// The token of the feed of a data source, which keeps nothing from an
-/// answer to the next.
-const DATA_SOURCE_TOKEN: &str = "null";
-
-fn encode<T: Serialize>(token: &T) -> Result<String> {
-    serde_json::to_string(token)
-        .map_err(|error| ProviderError::internal(format!("feed token: {error}")))
-}
-
-fn decode_token<T: DeserializeOwned>(token: &str) -> Result<T> {
-    serde_json::from_str(token)
-        .map_err(|error| ProviderError::invalid_input(format!("feed token: {error}")))
+impl Comments {
+    /// The comments of a page before their first request.
+    fn first() -> Self {
+        Self {
+            cursor: None,
+            objects: Vec::new(),
+            until: None,
+        }
+    }
 }
 
 // ===========================================================================
@@ -259,8 +251,36 @@ fn remove_content<K>(cx: &FeedCx<K>, id: &Id) -> Result<()> {
 fn listed<K>(cx: &FeedCx<K>, path: &str) -> Result<BTreeSet<Id>> {
     Ok(cx
         .names(path)?
-        .map(|listed| listed.names.into_iter().collect())
-        .unwrap_or_default())
+        .map_or_else(BTreeSet::new, |listed| listed.names.into_iter().collect()))
+}
+
+/// The `last_edited_time` of the object of the projection whose JSON is the
+/// fed file at `path`, none for a path without one. The file is read whole
+/// at the length that the projection gives it.
+fn projected_time<K>(cx: &FeedCx<K>, path: &str) -> Result<Option<OffsetDateTime>> {
+    let mut length = 0;
+    loop {
+        let Some(range) = cx.read_range(path, 0, length)? else {
+            return Ok(None);
+        };
+        if range.bytes.len() as u64 == range.length {
+            return Ok(Some(decode::<Found>(&range.bytes)?.last_edited_time));
+        }
+        length = u32::try_from(range.length)
+            .map_err(|_| ProviderError::too_large(format!("{path} has {} bytes", range.length)))?;
+    }
+}
+
+/// Check that the object `found` of an answer to a request of the object
+/// `id` is that object.
+fn answered(found: &Found, id: &Id) -> Result<()> {
+    if Id::of(&found.id)? == *id {
+        return Ok(());
+    }
+    Err(ProviderError::invalid_input(format!(
+        "Notion answered the request of {id} with {}",
+        found.id
+    )))
 }
 
 /// A request of Notion with a `start_cursor` whose answer has a status from
@@ -304,34 +324,36 @@ fn minute_end(
 /// The state that a part gives the feed of a page, with its token, or of a
 /// data source.
 enum Inner {
-    Page(Id, String),
+    Page(Id, Option<PageToken>),
     DataSource(Id),
 }
 
 /// One call of the feed of the workspace: its context, the latest time of
-/// its token, and the inner states of its part.
+/// its token, the inner states of its part, and whether its part declines
+/// the kept parts of the answer that it continues.
 struct WorkspaceFeed<'a> {
     cx: &'a FeedCx<WorkspaceKey>,
     latest: Option<Latest>,
     inner: Vec<Inner>,
+    anew: bool,
 }
 
 impl Workspace {
     /// The feed of the pages and the data sources of the workspace: the next
-    /// request of the stage of its token, else the first request of a full
-    /// listing for a read of `pages/` or `databases/`, its starting paths,
-    /// and of the changes for another read.
+    /// request of the stage of its token, but for unfinished changes at a
+    /// read of `pages/` or `databases/`, its starting paths, which a full
+    /// listing answers anew; else the first request of a full listing for a
+    /// read of `pages/` or `databases/`, and of the changes for another read.
     pub(crate) async fn feed(cx: FeedCx<WorkspaceKey>) -> Result<Feed> {
-        let token = cx
-            .raw_token()
-            .map(decode_token::<WorkspaceToken>)
-            .transpose()?;
+        let token = cx.token::<WorkspaceToken>()?;
         let first = token.is_none();
         let (latest, stage) = token.map_or((None, None), |token| (token.latest, token.stage));
+        let listing = cx.start().or(cx.due()).is_some();
         let mut feed = WorkspaceFeed {
             cx: &cx,
             latest,
             inner: Vec::new(),
+            anew: false,
         };
         match stage {
             Some(Stage::Listing {
@@ -345,8 +367,13 @@ impl Workspace {
                 lacking,
                 seen,
             }) => feed.missing(first, lacking, seen).await,
+            Some(Stage::Changes { .. }) if listing => {
+                feed.anew = true;
+                let lacking = feed.projected()?;
+                feed.listing(first, None, lacking, None).await
+            },
             Some(Stage::Changes { cursor, seen }) => feed.changes(Some(cursor), seen).await,
-            None if cx.start().or(cx.due()).is_some() => {
+            None if listing => {
                 let lacking = feed.projected()?;
                 feed.listing(first, None, lacking, None).await
             },
@@ -382,8 +409,8 @@ impl WorkspaceFeed<'_> {
             .await?;
         match response.status() {
             200 => Ok(Search::List(decode(response.body())?)),
-            _ if cursor_refused(cursor, &response) => Ok(Search::Refused(status_error(&response))),
-            _ => Err(status_error(&response)),
+            _ if cursor_refused(cursor, &response) => Ok(Search::Refused(refusal(&response))),
+            _ => Err(refusal(&response)),
         }
     }
 
@@ -392,13 +419,13 @@ impl WorkspaceFeed<'_> {
     /// and none after it, so that the next read decides between a full
     /// listing and the changes.
     fn restart(&self, stage: Option<Stage>, error: ProviderError) -> Result<Feed> {
-        Ok(Feed::raw_restart(
-            encode(&WorkspaceToken {
+        Feed::restart(
+            &WorkspaceToken {
                 latest: self.latest,
                 stage,
-            })?,
+            },
             error,
-        ))
+        )
     }
 
     /// The pages and the data sources of the projection, which a full
@@ -412,30 +439,25 @@ impl WorkspaceFeed<'_> {
 
     /// Take the result `found` of the search, or of a request by its ID,
     /// with its `object`, into the projection, its folder joining its listing
-    /// as `write` says: the removal of one in the trash; nothing of one with
-    /// an earlier `last_edited_time` than its object of the projection; and
-    /// the facts of another, with the state of its feed for a data source
+    /// as `write` says: nothing of one with an earlier `last_edited_time`
+    /// than its object of the projection; the removal of one in the trash;
+    /// and the facts of another, with the state of its feed for a data source
     /// and for a page that the projection lacks or has with another
     /// `last_edited_time`, whose content and comments it removes.
     fn take(&mut self, found: &Found, object: &RawValue, write: ListingWrite) -> Result<Id> {
         let id = Id::of(&found.id)?;
-        if found.in_trash {
-            self.remove(found.object, id.clone())?;
+        let projected = projected_time(
+            self.cx,
+            &match found.object {
+                Kind::Page => format!("{}/page.json", page_path(&id)),
+                Kind::DataSource => format!("{}/schema.json", data_source_path(&id)),
+            },
+        )?;
+        if projected.is_some_and(|projected| projected > found.last_edited_time) {
             return Ok(id);
         }
-        let projected = self
-            .cx
-            .read_record(
-                match found.object {
-                    Kind::Page => format!("{}/page.json", page_path(&id)),
-                    Kind::DataSource => format!("{}/schema.json", data_source_path(&id)),
-                },
-                u32::MAX,
-            )?
-            .map(|projected| decode::<Found>(&projected.bytes))
-            .transpose()?
-            .map(|projected| projected.last_edited_time);
-        if projected.is_some_and(|projected| projected > found.last_edited_time) {
+        if found.in_trash {
+            self.remove(found.object, id.clone())?;
             return Ok(id);
         }
         match found.object {
@@ -445,8 +467,7 @@ impl WorkspaceFeed<'_> {
                         remove_content(self.cx, &id)?;
                     }
                     let token = PageToken::new(found.last_edited_time);
-                    self.inner
-                        .push(Inner::Page(id.clone(), encode(&Some(token))?));
+                    self.inner.push(Inner::Page(id.clone(), Some(token)));
                 }
                 write_page(self.cx, &id, object, write)?;
             },
@@ -464,8 +485,7 @@ impl WorkspaceFeed<'_> {
         match kind {
             Kind::Page => {
                 self.cx.remove(page_path(&id))?;
-                self.inner
-                    .push(Inner::Page(id, encode(&None::<PageToken>)?));
+                self.inner.push(Inner::Page(id, None));
             },
             Kind::DataSource => {
                 self.cx.remove(data_source_path(&id))?;
@@ -523,7 +543,8 @@ impl WorkspaceFeed<'_> {
 
     /// A request of the first page or data source that a full listing
     /// lacks, by its ID: its facts, or its removal for `404` or in the trash;
-    /// the last part of the listing once it lacks none.
+    /// the last part of the listing once it lacks none. An answer of another
+    /// object is the error of the request.
     async fn missing(
         &mut self,
         first: bool,
@@ -542,10 +563,11 @@ impl WorkspaceFeed<'_> {
             200 => {
                 let object: Box<RawValue> = decode(response.body())?;
                 let found: Found = decode(object.get().as_bytes())?;
+                answered(&found, &id)?;
                 self.take(&found, &object, listing_write(first))?;
             },
             404 => self.remove(kind, id)?,
-            _ => return Err(status_error(&response)),
+            _ => return Err(refusal(&response)),
         }
         self.part(Some(Stage::Missing {
             first,
@@ -600,20 +622,23 @@ impl WorkspaceFeed<'_> {
     }
 
     /// A part with the latest time of the token and `stage`, followed by more
-    /// parts while a stage remains, with the inner states of its results.
+    /// parts while a stage remains, with the inner states of its results,
+    /// which declines the kept parts of the answer that it continues for a
+    /// full listing in place of the changes.
     fn part(&mut self, stage: Option<Stage>) -> Result<Feed> {
         let more = stage.is_some();
-        let mut part = Feed::raw_part(encode(&WorkspaceToken {
+        let mut part = Feed::part(&WorkspaceToken {
             latest: self.latest,
             stage,
-        })?)
+        })?
         .more(more);
+        if self.anew {
+            part = part.anew();
+        }
         for inner in self.inner.drain(..) {
             part = match inner {
-                Inner::Page(id, token) => part.raw_inner::<Page>(&PageKey { id }, token),
-                Inner::DataSource(id) => {
-                    part.raw_inner::<DataSource>(&DataSourceKey { id }, DATA_SOURCE_TOKEN)
-                },
+                Inner::Page(id, token) => part.inner::<Page>(&PageKey { id }, &token)?,
+                Inner::DataSource(id) => part.inner::<DataSource>(&DataSourceKey { id }, &())?,
             };
         }
         Ok(part.into())
@@ -676,11 +701,7 @@ impl Page {
             cx: &cx,
             id: &cx.key().id,
         };
-        let token = cx
-            .raw_token()
-            .map(decode_token::<Option<PageToken>>)
-            .transpose()?
-            .flatten();
+        let token = cx.token::<Option<PageToken>>()?.flatten();
         let asked = cx.start().or(cx.due()).and_then(Asked::of);
         let Some(token) = token else {
             return feed.page(None, asked).await;
@@ -696,7 +717,7 @@ impl Page {
         };
         match request {
             Some(Asked::Content) => feed.content(token).await,
-            Some(Asked::Comment) if token.comments.is_none() && feed.has_comments(&token)? => {
+            Some(Asked::Comment) if token.comments.is_none() && feed.has_comments()? => {
                 page_part(&token, false, None)
             },
             Some(Asked::Comments | Asked::Comment) => feed.comments(token).await,
@@ -714,7 +735,8 @@ impl PageFeed<'_> {
     /// removal of its content and its comments for another `last_edited_time`
     /// than that of `token`, or its removal for `404` or in the trash; then,
     /// in the same answer, what `asked` names, for a page without a token or
-    /// with another `last_edited_time`.
+    /// with another `last_edited_time`. An answer of another page is the
+    /// error of the request.
     async fn page(&self, token: Option<PageToken>, asked: Option<Asked>) -> Result<Feed> {
         let response = self
             .cx
@@ -725,9 +747,10 @@ impl PageFeed<'_> {
         let object: Box<RawValue> = match response.status() {
             200 => decode(response.body())?,
             404 => return self.removal(),
-            _ => return Err(status_error(&response)),
+            _ => return Err(refusal(&response)),
         };
         let found: Found = decode(object.get().as_bytes())?;
+        answered(&found, self.id)?;
         if found.in_trash {
             return self.removal();
         }
@@ -744,7 +767,7 @@ impl PageFeed<'_> {
         };
         match asked {
             Some(Asked::Content) => token.content = Some(Content::of(self.id)),
-            Some(Asked::Comments | Asked::Comment) => token.comments = Some(Comments::default()),
+            Some(Asked::Comments | Asked::Comment) => token.comments = Some(Comments::first()),
             None => {},
         }
         page_part(&token, asked.is_some(), None)
@@ -785,7 +808,7 @@ impl PageFeed<'_> {
                 },
                 404 if page => return self.removal(),
                 404 => {},
-                _ => return Err(status_error(&response)),
+                _ => return Err(refusal(&response)),
             }
             content.asked += 1;
         }
@@ -801,29 +824,29 @@ impl PageFeed<'_> {
     }
 
     /// Whether the comments of the page stand: `comments/` complete in the
-    /// projection, before the time after which they count as lacking.
-    fn has_comments(&self, token: &PageToken) -> Result<bool> {
-        Ok(token
-            .comments_until
-            .is_none_or(|until| OffsetDateTime::now_utc() < until)
-            && self
-                .cx
-                .count(format!("{}/comments", self.path()))?
-                .is_some_and(|comments| comments.complete))
+    /// projection, before the time after which it counts as lacking.
+    fn has_comments(&self) -> Result<bool> {
+        Ok(self
+            .cx
+            .count(format!("{}/comments", self.path()))?
+            .is_some_and(|comments| {
+                comments.complete && comments.until.is_none_or(|until| SystemTime::now() < until)
+            }))
     }
 
     /// A request of the comments, by the cursor of the previous one, and at
     /// their last part each comment, `comments/` complete, and the removal of
     /// each comment of the projection that their answers lack. The comments
     /// that Notion restricts for the connection are no comments. A cursor
-    /// that Notion refuses restarts the answer, with the token without the
-    /// comments, and a page with `404` to its first request is removed.
+    /// that Notion refuses restarts the answer, which drops its kept parts,
+    /// with the token of the page that the projection has, and a page with
+    /// `404` to its first request is removed.
     async fn comments(&self, mut token: PageToken) -> Result<Feed> {
         let Comments {
             cursor,
             mut objects,
             mut until,
-        } = token.comments.take().unwrap_or_default();
+        } = token.comments.take().unwrap_or_else(Comments::first);
         let mut request = self
             .cx
             .endpoint(NotionApi)
@@ -838,14 +861,11 @@ impl PageFeed<'_> {
         let none = match response.status() {
             200 => false,
             _ if cursor_refused(cursor.as_deref(), &response) => {
-                return Ok(Feed::raw_restart(
-                    encode(&Some(token))?,
-                    status_error(&response),
-                ));
+                return Feed::restart(&self.projected(token)?, refusal(&response));
             },
             404 => return self.removal(),
             _ if restricted(&response) => true,
-            _ => return Err(status_error(&response)),
+            _ => return Err(refusal(&response)),
         };
         if cursor.is_none() {
             until = minute_end(token.last_edited_time, sent, &response)?;
@@ -882,14 +902,27 @@ impl PageFeed<'_> {
         for id in listed(self.cx, &folder)?.difference(&written) {
             self.cx.remove(format!("{folder}/{id}"))?;
         }
-        token.comments_until = until;
         page_part(&token, false, until)
+    }
+
+    /// The token of the page that the projection has, without the kept
+    /// parts of an answer: its `last_edited_time` by its `page.json`, with
+    /// the unfinished content of `token` taken at that time; `null` for a
+    /// page that the projection lacks.
+    fn projected(&self, token: PageToken) -> Result<Option<PageToken>> {
+        let projected = projected_time(self.cx, &format!("{}/page.json", self.path()))?;
+        Ok(projected.map(|last_edited_time| PageToken {
+            content: token
+                .content
+                .filter(|_| last_edited_time == token.last_edited_time),
+            ..PageToken::new(last_edited_time)
+        }))
     }
 
     /// The removal of the page, with the token of a removed page.
     fn removal(&self) -> Result<Feed> {
         self.cx.remove(self.path())?;
-        Ok(Feed::raw_part(encode(&None::<PageToken>)?).into())
+        Ok(Feed::part(&None::<PageToken>)?.into())
     }
 }
 
@@ -898,9 +931,10 @@ impl PageFeed<'_> {
 // ===========================================================================
 
 impl DataSource {
-    /// The feed of a data source: the data source by its ID, its facts with
-    /// its folder joining `databases/`, or its removal for `404` or in the
-    /// trash.
+    /// The feed of a data source, whose token is `null`: the data source by
+    /// its ID, its facts with its folder joining `databases/`, or its removal
+    /// for `404` or in the trash. An answer of another data source is the
+    /// error of the request.
     pub(crate) async fn feed(cx: FeedCx<DataSourceKey>) -> Result<Feed> {
         let id = &cx.key().id;
         let response = cx
@@ -911,21 +945,22 @@ impl DataSource {
         let object: Box<RawValue> = match response.status() {
             200 => decode(response.body())?,
             404 => return data_source_removal(&cx, id),
-            _ => return Err(status_error(&response)),
+            _ => return Err(refusal(&response)),
         };
         let found: Found = decode(object.get().as_bytes())?;
+        answered(&found, id)?;
         if found.in_trash {
             return data_source_removal(&cx, id);
         }
         write_data_source(&cx, id, &object, ListingWrite::Join)?;
-        Ok(Feed::raw_part(DATA_SOURCE_TOKEN).into())
+        Ok(Feed::part(&())?.into())
     }
 }
 
 /// A part of the feed of a page with `token`, followed by `more` parts, its
 /// facts counting as lacking after `until`.
 fn page_part(token: &PageToken, more: bool, until: Option<OffsetDateTime>) -> Result<Feed> {
-    let part = Feed::raw_part(encode(&Some(token))?).more(more);
+    let part = Feed::part(&Some(token))?.more(more);
     Ok(match until {
         Some(until) => part.until(SystemTime::from(until)),
         None => part,
@@ -936,5 +971,5 @@ fn page_part(token: &PageToken, more: bool, until: Option<OffsetDateTime>) -> Re
 /// The removal of a data source.
 fn data_source_removal(cx: &FeedCx<DataSourceKey>, id: &Id) -> Result<Feed> {
     cx.remove(data_source_path(id))?;
-    Ok(Feed::raw_part(DATA_SOURCE_TOKEN).into())
+    Ok(Feed::part(&())?.into())
 }
