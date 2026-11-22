@@ -4,6 +4,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use omnifs_core::path::Path;
+use omnifs_engine::test_support::PendingTestCallout;
 use omnifs_engine::{DirCursor, LookupAnswer, Namespace, NsError};
 use omnifs_itest::{RuntimeHarness, make_initialized_runtime};
 use omnifs_wit::host::types::{Callout, CalloutResult, Header, HttpRequest, HttpResponse};
@@ -12,7 +13,7 @@ use serde_json::{Value, json};
 /// Past the deadline of a feed, `DYNAMIC_TTL_MILLIS` after its last answer.
 pub const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
 
-/// The fields of a file or a folder that the provider asks for.
+/// The fields of an item that the provider asks for.
 pub const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
 
 pub fn drive_harness() -> RuntimeHarness {
@@ -48,6 +49,16 @@ pub fn blob(status: u16, body: &[u8]) -> Answer {
     Answer::Blob(status, body.to_vec())
 }
 
+/// The next callout of the mount, which waits for its answer.
+pub async fn next_callout(harness: &RuntimeHarness) -> PendingTestCallout {
+    loop {
+        match harness.runtime.try_recv_test_callout() {
+            Some(callout) => break callout,
+            None => tokio::time::sleep(Duration::from_millis(2)).await,
+        }
+    }
+}
+
 /// Run a namespace operation, answer the callouts it makes in order with
 /// `answers`, and return its output with the requests of those callouts. An
 /// operation that makes another number of callouts times out.
@@ -60,12 +71,7 @@ pub async fn answering<T>(
     let answer = async {
         let mut requests = Vec::new();
         for answer in answers {
-            let callout = loop {
-                match runtime.try_recv_test_callout() {
-                    Some(callout) => break callout,
-                    None => tokio::time::sleep(Duration::from_millis(2)).await,
-                }
-            };
+            let callout = next_callout(harness).await;
             match (callout.callout(), answer) {
                 (Callout::Fetch(request), Answer::Fetch(result)) => {
                     requests.push(request.clone());
@@ -195,7 +201,7 @@ pub fn expect_changes(request: &HttpRequest, page: &str) {
     );
 }
 
-/// Check that `request` is that of the file or the folder `id` by its ID.
+/// Check that `request` is that of the item `id` by its ID.
 pub fn expect_item(request: &HttpRequest, id: &str) {
     expect(
         request,
@@ -279,8 +285,30 @@ pub fn failure(status: u16, reason: &str) -> Answer {
     )
 }
 
+/// The MD5 of the bytes `body` of a fixture.
+pub fn md5(body: &str) -> &'static str {
+    match body {
+        "notes" => "4358b5009c67d0e31d7fbf1663fcd3bf",
+        "notes!" => "c4366dc0b69a2618897dc1d57e976d94",
+        "kept" => "4d8b6084f3d167b76cac66a22a91be02",
+        "bytes" => "4b3a6218bb3e3a7303e8a171a60fcf92",
+        "shared" => "9e81e7b963c71363e2fb3eefcfecfc0e",
+        "old" => "149603e6c03516362a8da23f624db945",
+        "new" => "22af645d1859cb5ca6da0c484f1f37ea",
+        "gone" => "50c1f58be7f5e47e0f53d64c094783c2",
+        "busy" => "8bc1b2f84252c3df4edd53e4aad097a7",
+        "" => "d41d8cd98f00b204e9800998ecf8427e",
+        body => panic!("no MD5 of {body}"),
+    }
+}
+
+/// An uploaded file `id` with `name` and the bytes `body`.
+pub fn uploaded(id: &str, name: &str, body: &str) -> Value {
+    sized(id, name, md5(body), body.len() as u64)
+}
+
 /// An uploaded file `id` with `name`, the checksum `md5` and `size` bytes.
-pub fn uploaded(id: &str, name: &str, md5: &str, size: u64) -> Value {
+pub fn sized(id: &str, name: &str, md5: &str, size: u64) -> Value {
     json!({
         "id": id,
         "name": name,
