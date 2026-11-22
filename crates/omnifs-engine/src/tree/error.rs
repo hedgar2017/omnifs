@@ -153,12 +153,14 @@ mod tests {
     #[test]
     fn a_credential_that_the_upstream_rejects_is_apart_from_a_denied_path() {
         let kind = |kind| {
-            TreeError::from(crate::EngineError::ProviderError(wit_types::ProviderError {
-                kind,
-                message: String::new(),
-                retryable: false,
-                retry_after: None,
-            }))
+            TreeError::from(crate::EngineError::ProviderError(
+                wit_types::ProviderError {
+                    kind,
+                    message: String::new(),
+                    retryable: false,
+                    retry_after: None,
+                },
+            ))
             .kind
         };
         assert_eq!(

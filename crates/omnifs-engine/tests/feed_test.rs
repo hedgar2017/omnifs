@@ -402,3 +402,48 @@ async fn a_mount_without_its_provider_serves_the_ranges_of_a_fed_file() {
     assert_eq!(range.bytes, b"ok ");
     assert!(!range.eof);
 }
+
+/// An answer that writes the facts of a file as they were moves no attribute
+/// of the file and sends no event for it: a filesystem keeps what it has of
+/// an unchanged file.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_writes_a_file_as_it_was_changes_nothing_for_a_filesystem() {
+    let harness = make_initialized_runtime(CONFIG);
+    assert!(
+        names(&harness, &["shelves", "flaky", "books"])
+            .await
+            .is_err()
+    );
+    let segments = ["shelves", "flaky", "books", "1", "title"];
+    tokio::time::sleep(PAST_DEADLINE).await;
+    assert_eq!(read(&harness, &segments).await, "Book 1 (own)");
+    let title = path(&harness, &segments).await;
+    let change = harness
+        .namespace
+        .getattr(title.clone())
+        .await
+        .unwrap()
+        .change;
+    let calls = log(&harness).await.len();
+    let mut events = harness.namespace.subscribe();
+
+    // The own feed of the book answers again, with the same title.
+    tokio::time::sleep(PAST_DEADLINE).await;
+    assert_eq!(read(&harness, &segments).await, "Book 1 (own)");
+    assert_eq!(log(&harness).await.len(), calls + 1);
+    assert_eq!(
+        harness
+            .namespace
+            .getattr(title.clone())
+            .await
+            .unwrap()
+            .change,
+        change
+    );
+    while let Some(event) = events.try_recv() {
+        assert!(
+            !matches!(&event, omnifs_engine::NsEvent::AttrsChanged { path, .. } if *path == title),
+            "{event:?}"
+        );
+    }
+}
