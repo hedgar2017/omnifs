@@ -2952,51 +2952,55 @@ fn reconcile_listing_relations(
     // Exact lookup results and a parent's accumulated listing are one logical
     // projection. A positive hint may extend a snapshot but cannot silently
     // preserve an exhaustive claim; a definitive negative removes the name.
+    // The lookups of one parent reach its listing in one read and one write,
+    // whatever their count.
+    let mut by_parent = BTreeMap::<Path, Vec<(&str, &LookupPayload)>>::new();
     for record in records {
-        let DurableFact::Lookup(lookup) = &record.fact else {
-            continue;
-        };
-        let Some((parent, name)) = record.path.parent_and_name() else {
-            continue;
-        };
+        if let DurableFact::Lookup(lookup) = &record.fact
+            && let Some((parent, name)) = record.path.parent_and_name()
+        {
+            by_parent.entry(parent).or_default().push((name, lookup));
+        }
+    }
+    for (parent, lookups) in by_parent {
         let Some(mut listing) = read_dirents_fact(tx, facts, &parent)? else {
             continue;
         };
-        match lookup {
-            LookupPayload::Positive(meta) => {
-                let mut entries = BTreeMap::new();
-                entries.insert(
-                    name.to_string(),
-                    crate::view::DirentRecord {
-                        name: name.to_string(),
-                        meta: meta.clone(),
-                    },
-                );
-                listing = DirentsPayload::merged(Some(listing), entries, ListingWrite::Partial);
-                if apply_dirents(
-                    tx,
-                    facts,
-                    &DirentsMutation::Replace {
-                        path: parent.clone(),
-                        value: listing,
-                    },
-                )? {
-                    mutated.insert(parent);
-                }
+        let mut removed = false;
+        let mut entries = BTreeMap::new();
+        for (name, lookup) in lookups {
+            match lookup {
+                LookupPayload::Positive(meta) => {
+                    entries.insert(
+                        name.to_string(),
+                        crate::view::DirentRecord {
+                            name: name.to_string(),
+                            meta: meta.clone(),
+                        },
+                    );
+                },
+                LookupPayload::Negative { .. } => {
+                    entries.remove(name);
+                    if listing.entries().any(|entry| entry.name == name) {
+                        listing.remove_entry(name);
+                        removed = true;
+                    }
+                },
+            }
+        }
+        if !entries.is_empty() {
+            listing = DirentsPayload::merged(Some(listing), entries, ListingWrite::Partial);
+        }
+        let changed = apply_dirents(
+            tx,
+            facts,
+            &DirentsMutation::Replace {
+                path: parent.clone(),
+                value: listing,
             },
-            LookupPayload::Negative { .. } if listing.entries().any(|entry| entry.name == name) => {
-                listing.remove_entry(name);
-                apply_dirents(
-                    tx,
-                    facts,
-                    &DirentsMutation::Replace {
-                        path: parent.clone(),
-                        value: listing,
-                    },
-                )?;
-                mutated.insert(parent);
-            },
-            LookupPayload::Negative { .. } => {},
+        )?;
+        if changed || removed {
+            mutated.insert(parent);
         }
     }
 
@@ -4484,6 +4488,27 @@ mod tests {
         );
         assert!(store.kept_parts(b"feed").unwrap().is_empty());
         assert_eq!(store.feed_token(b"feed").unwrap(), Some("moved".into()));
+    }
+
+    /// The lookups of the children of one listing reach it in one read and
+    /// one write: the time of a listing grows with its children, not with
+    /// their square.
+    #[test]
+    fn a_listing_of_many_children_publishes_in_time_linear_in_them() {
+        let (_dir, _caches, store) = open_store("many");
+        let books = p("/shelf/books");
+        let names: Vec<String> = (0..20_000).map(|number| number.to_string()).collect();
+        let children: Vec<&str> = names.iter().map(String::as_str).collect();
+        let started = std::time::Instant::now();
+        publish_from_state(&store, fed_dir(&books, &children, ListingWrite::Complete));
+        publish_from_state(&store, fed_dir(&books, &children, ListingWrite::Complete));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let listing = store.dirents_payload(&books).unwrap().unwrap();
+        assert_eq!(listing.entries().count(), 20_000);
     }
 
     #[test]
