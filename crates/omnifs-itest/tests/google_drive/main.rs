@@ -304,6 +304,21 @@ async fn the_first_full_listing_takes_the_items_of_the_user_and_of_each_shared_d
         assert_eq!(&read, object, "{path}");
     }
 
+    // The path of the ID of an object without a MIME type asks Google Drive
+    // for it by its ID once in the sync, and has its error: the next
+    // operation in the sync has the error without a request.
+    let blank = without(google("blank-1", "form", "Blank", EDITED), "mimeType");
+    let (failed, requests) = answering(
+        &harness,
+        lookup(&harness, &at("others/blank-1")),
+        [ok(&blank)],
+    )
+    .await;
+    assert!(matches!(failed, Err(NsError::Invalid)), "{failed:?}");
+    expect_item(&requests[0], "blank-1");
+    let failed = served(&harness, lookup(&harness, &at("others/blank-1"))).await;
+    assert!(matches!(failed, Err(NsError::Invalid)), "{failed:?}");
+
     // The name that Google Drive states not is the error of its read, by
     // the item by its ID.
     let (nameless_read, requests) = reading(&harness, "files/broken-1/name", [ok(&nameless)]).await;
