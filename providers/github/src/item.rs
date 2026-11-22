@@ -1,7 +1,6 @@
 //! Path keys, object loads, collection methods, and live faces for the GitHub
 //! provider.
 
-use rc_zip_sync::ReadZip;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -10,8 +9,8 @@ use omnifs_sdk::prelude::*;
 
 use crate::api::GitHubApi;
 use crate::objects::{
-    ChangedFile, CheckRun, Comment, Issue, ItemData, Notification, Owner, PullRequest, Repo,
-    Review, ReviewComment, WorkflowRun,
+    ChangedFile, CheckRun, Comment, Issue, Notification, Owner, PullRequest, Repo, Review,
+    ReviewComment, WorkflowRun,
 };
 use crate::{
     CHECK_RUN_PAGE_SIZE, CheckRunsResponse, FILE_PAGE_SIZE, FilePath, NOTIFICATION_PAGE_SIZE,
@@ -51,7 +50,10 @@ pub(crate) struct RepoKey {
 pub(crate) struct IssueKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "a key of the route binds its `{filter}` capture, which its identity excludes"
+    )]
     pub(crate) filter: Facet<StateFilter>,
     pub(crate) number: u64,
 }
@@ -60,7 +62,6 @@ pub(crate) struct IssueKey {
 pub(crate) struct PullKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
-    #[allow(dead_code)]
     pub(crate) filter: Facet<StateFilter>,
     pub(crate) number: u64,
 }
@@ -69,7 +70,10 @@ pub(crate) struct PullKey {
 pub(crate) struct ChangedFileKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "a key of the route binds its `{filter}` capture, which its identity excludes"
+    )]
     pub(crate) filter: Facet<StateFilter>,
     pub(crate) number: u64,
     pub(crate) path: FilePath,
@@ -79,7 +83,6 @@ pub(crate) struct ChangedFileKey {
 pub(crate) struct ReviewKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
-    #[allow(dead_code)]
     pub(crate) filter: Facet<StateFilter>,
     pub(crate) number: u64,
     pub(crate) review_id: u64,
@@ -89,11 +92,12 @@ pub(crate) struct ReviewKey {
 pub(crate) struct ReviewCommentKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "a key of the route binds its `{filter}` capture, which its identity excludes"
+    )]
     pub(crate) filter: Facet<StateFilter>,
-    #[allow(dead_code)]
     pub(crate) number: u64,
-    #[allow(dead_code)]
     pub(crate) review_id: u64,
     pub(crate) comment_id: u64,
 }
@@ -102,9 +106,11 @@ pub(crate) struct ReviewCommentKey {
 pub(crate) struct CheckRunKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "a key of the route binds its `{filter}` capture, which its identity excludes"
+    )]
     pub(crate) filter: Facet<StateFilter>,
-    #[allow(dead_code)]
     pub(crate) number: u64,
     pub(crate) check_run_id: u64,
 }
@@ -131,7 +137,10 @@ pub(crate) struct CommentKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
     pub(crate) item_kind: ItemKind,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "a key of the route binds its `{filter}` capture, which its identity excludes"
+    )]
     pub(crate) filter: Facet<StateFilter>,
     pub(crate) number: u64,
     pub(crate) comment_id: u64,
@@ -169,16 +178,20 @@ impl Owner {
 }
 
 impl Repo {
+    /// A repository that moved answers `301` at its old path, which is not
+    /// followed: the repository is not at this path.
     pub(crate) async fn load(
         cx: &Cx,
         key: &RepoKey,
         since: Option<Validator>,
     ) -> Result<Load<Self>> {
-        cx.endpoint(GitHubApi)
+        let response = cx
+            .endpoint(GitHubApi)
             .get(format!("/repos/{}/{}", key.owner, key.repo))
             .maybe_if_none_match(since.as_ref())
-            .load_with(decode_json::<Self>)
-            .await
+            .send()
+            .await?;
+        moved_or_load(&response)
     }
 }
 
@@ -186,23 +199,18 @@ impl Issue {
     pub(crate) async fn load(
         cx: &Cx,
         key: &IssueKey,
-        since: Option<Validator>,
+        _since: Option<Validator>,
     ) -> Result<Load<Self>> {
         let repo = RepoId::new(&key.owner, &key.repo);
-        match cx
-            .endpoint(GitHubApi)
-            .get(format!("/repos/{repo}/issues/{}", key.number))
-            .maybe_if_none_match(since.as_ref())
-            .load_with(decode_json::<ItemData>)
-            .await?
-        {
-            Load::Fresh { value, .. } if value.is_pull_request() => Ok(Load::NotFound),
-            Load::Fresh {
-                value, canonical, ..
-            } => Ok(Load::fresh(Self(value), canonical)),
-            Load::Unchanged => Ok(Load::Unchanged),
-            Load::NotFound => Ok(Load::NotFound),
-        }
+        Ok(
+            match crate::feed::load_item(cx, &repo, ItemKind::Issues, key.number).await? {
+                Load::Fresh {
+                    value, canonical, ..
+                } => Load::fresh(Self(value), canonical),
+                Load::Unchanged => Load::Unchanged,
+                Load::NotFound => Load::NotFound,
+            },
+        )
     }
 }
 
@@ -210,22 +218,18 @@ impl PullRequest {
     pub(crate) async fn load(
         cx: &Cx,
         key: &PullKey,
-        since: Option<Validator>,
+        _since: Option<Validator>,
     ) -> Result<Load<Self>> {
         let repo = RepoId::new(&key.owner, &key.repo);
-        match cx
-            .endpoint(GitHubApi)
-            .get(format!("/repos/{repo}/pulls/{}", key.number))
-            .maybe_if_none_match(since.as_ref())
-            .load_with(decode_json::<ItemData>)
-            .await?
-        {
-            Load::Fresh {
-                value, canonical, ..
-            } => Ok(Load::fresh(Self(value), canonical)),
-            Load::Unchanged => Ok(Load::Unchanged),
-            Load::NotFound => Ok(Load::NotFound),
-        }
+        Ok(
+            match crate::feed::load_item(cx, &repo, ItemKind::Pulls, key.number).await? {
+                Load::Fresh {
+                    value, canonical, ..
+                } => Load::fresh(Self(value), canonical),
+                Load::Unchanged => Load::Unchanged,
+                Load::NotFound => Load::NotFound,
+            },
+        )
     }
 }
 
@@ -301,13 +305,13 @@ impl Comment {
         since: Option<Validator>,
     ) -> Result<Load<Self>> {
         let repo = RepoId::new(&key.owner, &key.repo);
-        // Comments live under the shared issues endpoint regardless of whether
-        // the parent is an issue or a pull.
-        cx.endpoint(GitHubApi)
+        let response = cx
+            .endpoint(GitHubApi)
             .get(format!("/repos/{repo}/issues/comments/{}", key.comment_id))
             .maybe_if_none_match(since.as_ref())
-            .load_with(decode_json::<Self>)
-            .await
+            .send()
+            .await?;
+        moved_or_load(&response)
     }
 }
 
@@ -477,27 +481,13 @@ impl Repo {
             return unchanged(&cx);
         };
         let len = runs.workflow_runs.len() as u64;
-        let entries = runs
-            .workflow_runs
-            .into_iter()
-            .map(|run| {
-                let files = vec![
-                    ("status".to_string(), inline_text(&run.status)),
-                    (
-                        "conclusion".to_string(),
-                        inline_text(run.conclusion.as_deref().unwrap_or("")),
-                    ),
-                ];
-                CollectionEntry::computed(
-                    RunKey {
-                        owner: key.owner.clone(),
-                        repo: key.repo.clone(),
-                        run_id: run.id,
-                    },
-                    files,
-                )
+        let entries = fresh(runs.workflow_runs, |run: &WorkflowRun| {
+            Some(RunKey {
+                owner: key.owner.clone(),
+                repo: key.repo.clone(),
+                run_id: run.id,
             })
-            .collect();
+        })?;
         Ok(with_page_validator(
             page_or_complete(entries, len, WORKFLOW_RUN_PAGE_SIZE, PageCursor(page + 1))?,
             page_etag(validator)?,
@@ -515,7 +505,7 @@ impl PullRequest {
             .endpoint(GitHubApi)
             .get(pull_files_path(&key.owner, &key.repo, key.number, page))
             .maybe_if_none_match(cx.validator())
-            .page::<Vec<ChangedFile>>()
+            .page::<Vec<Box<RawValue>>>()
             .await?;
         let PageAnswer::Fresh {
             value: files,
@@ -526,22 +516,15 @@ impl PullRequest {
             return unchanged(&cx);
         };
         let len = files.len() as u64;
-        let entries = files
-            .into_iter()
-            .filter_map(|file| {
-                let path = FilePath::from_github_path(&file.filename)?;
-                Some(CollectionEntry::computed(
-                    ChangedFileKey {
-                        owner: key.owner.clone(),
-                        repo: key.repo.clone(),
-                        filter: key.filter,
-                        number: key.number,
-                        path,
-                    },
-                    file.eager_leaves(),
-                ))
+        let entries = fresh(files, |file: &ChangedFile| {
+            Some(ChangedFileKey {
+                owner: key.owner.clone(),
+                repo: key.repo.clone(),
+                filter: key.filter,
+                number: key.number,
+                path: FilePath::from_github_path(&file.filename)?,
             })
-            .collect::<Vec<_>>();
+        })?;
         Ok(with_page_validator(
             page_or_complete(entries, len, FILE_PAGE_SIZE, PageCursor(page + 1))?,
             page_etag(validator)?,
@@ -561,7 +544,7 @@ impl PullRequest {
                 key.number
             ))
             .maybe_if_none_match(cx.validator())
-            .page::<Vec<Review>>()
+            .page::<Vec<Box<RawValue>>>()
             .await?;
         let PageAnswer::Fresh {
             value: reviews,
@@ -572,22 +555,15 @@ impl PullRequest {
             return unchanged(&cx);
         };
         let len = reviews.len() as u64;
-        let entries = reviews
-            .into_iter()
-            .map(|review| {
-                let review_id = review.id;
-                CollectionEntry::computed(
-                    ReviewKey {
-                        owner: key.owner.clone(),
-                        repo: key.repo.clone(),
-                        filter: key.filter,
-                        number: key.number,
-                        review_id,
-                    },
-                    review.eager_leaves(),
-                )
+        let entries = fresh(reviews, |review: &Review| {
+            Some(ReviewKey {
+                owner: key.owner.clone(),
+                repo: key.repo.clone(),
+                filter: key.filter,
+                number: key.number,
+                review_id: review.id,
             })
-            .collect::<Vec<_>>();
+        })?;
         Ok(with_page_validator(
             page_or_complete(entries, len, REVIEW_PAGE_SIZE, PageCursor(page + 1))?,
             page_etag(validator)?,
@@ -680,23 +656,15 @@ impl PullRequest {
             runs: page_etag(runs_etag)?.0,
         });
         let len = runs.check_runs.len() as u64;
-        let entries = runs
-            .check_runs
-            .into_iter()
-            .map(|check| {
-                let check_run_id = check.id;
-                CollectionEntry::computed(
-                    CheckRunKey {
-                        owner: key.owner.clone(),
-                        repo: key.repo.clone(),
-                        filter: key.filter,
-                        number: key.number,
-                        check_run_id,
-                    },
-                    check.eager_leaves(),
-                )
+        let entries = fresh(runs.check_runs, |check: &CheckRun| {
+            Some(CheckRunKey {
+                owner: key.owner.clone(),
+                repo: key.repo.clone(),
+                filter: key.filter,
+                number: key.number,
+                check_run_id: check.id,
             })
-            .collect::<Vec<_>>();
+        })?;
         Ok(with_page_validator(
             page_or_complete(
                 entries,
@@ -726,7 +694,7 @@ impl Review {
                 key.number, key.review_id
             ))
             .maybe_if_none_match(cx.validator())
-            .page::<Vec<ReviewComment>>()
+            .page::<Vec<Box<RawValue>>>()
             .await?;
         let PageAnswer::Fresh {
             value: comments,
@@ -737,23 +705,16 @@ impl Review {
             return unchanged(&cx);
         };
         let len = comments.len() as u64;
-        let entries = comments
-            .into_iter()
-            .map(|comment| {
-                let comment_id = comment.id;
-                CollectionEntry::computed(
-                    ReviewCommentKey {
-                        owner: key.owner.clone(),
-                        repo: key.repo.clone(),
-                        filter: key.filter,
-                        number: key.number,
-                        review_id: key.review_id,
-                        comment_id,
-                    },
-                    comment.eager_leaves(),
-                )
+        let entries = fresh(comments, |comment: &ReviewComment| {
+            Some(ReviewCommentKey {
+                owner: key.owner.clone(),
+                repo: key.repo.clone(),
+                filter: key.filter,
+                number: key.number,
+                review_id: key.review_id,
+                comment_id: comment.id,
             })
-            .collect::<Vec<_>>();
+        })?;
         Ok(with_page_validator(
             page_or_complete(entries, len, REVIEW_PAGE_SIZE, PageCursor(page + 1))?,
             page_etag(validator)?,
@@ -914,73 +875,77 @@ impl Repo {
 }
 
 impl WorkflowRun {
-    pub(crate) async fn log(cx: Cx, key: RunKey) -> Result<FileProjection> {
+    /// The archive of the logs of the run, which GitHub answers with a
+    /// redirect to its storage: the host follows it and holds the archive,
+    /// so that no size bounds it, and asks for it again by its validators.
+    pub(crate) async fn logs(cx: Cx, key: RunKey) -> Result<BlobFile<Zip>> {
         let repo = RepoId::new(&key.owner, &key.repo);
-        let resp = cx
+        let blob = cx
             .endpoint(GitHubApi)
             .get(format!("/repos/{repo}/actions/runs/{}/logs", key.run_id))
-            .send_checked()
+            .into_blob()
+            .follow_redirects()
+            .fetch()
             .await?;
-        // GitHub answers the archive with a redirect to its storage, which
-        // the host does not follow: only `200` has the archive.
-        if resp.status() != 200 {
-            return Err(ProviderError::from_http_status(resp.status()));
-        }
-        Ok(FileProjection::body(unzip_logs(resp.body())?)
-            .dynamic()
-            .build())
+        Ok(BlobFile::new(blob.id)
+            .size(FileSize::Exact(blob.size))
+            .stability(Stability::Dynamic))
     }
+}
+
+/// The format of a ZIP archive.
+pub(crate) struct Zip;
+
+impl Format for Zip {
+    const CT: ContentType = ContentType::Custom("application/zip");
 }
 
 // ===========================================================================
 // Helpers
 // ===========================================================================
 
-/// A dynamic `text/plain` preload leaf: a mutable upstream field cached at
-/// listing time, so it revalidates rather than pinning a stale value.
-fn inline_text(s: &str) -> FileProjection {
-    FileProjection::text(s, TextFormat::Raw).dynamic().build()
-}
-
-impl ChangedFile {
-    fn eager_leaves(&self) -> Vec<(String, FileProjection)> {
-        vec![
-            ("filename".to_string(), inline_text(&self.filename)),
-            ("status".to_string(), inline_text(&self.status)),
-        ]
+/// The entries of the rows of a page, each with its bytes as the canonical
+/// bytes of its object: a row of a list is the object that its own request
+/// answers. `key` names the entry of a row, none for a row without one.
+fn fresh<T: omnifs_sdk::object::Object + serde::de::DeserializeOwned>(
+    rows: Vec<Box<RawValue>>,
+    key: impl Fn(&T) -> Option<T::Key>,
+) -> Result<Vec<CollectionEntry<T>>> {
+    let mut entries = Vec::new();
+    for row in rows {
+        let value: T = serde_json::from_str(row.get())
+            .map_err(|error| ProviderError::invalid_input(format!("json decode: {error}")))?;
+        if let Some(key) = key(&value) {
+            entries.push(CollectionEntry::fresh(
+                key,
+                value,
+                Canonical::new(row.get().as_bytes(), None),
+            ));
+        }
     }
+    Ok(entries)
 }
 
-impl Review {
-    fn eager_leaves(&self) -> Vec<(String, FileProjection)> {
-        let login = self.user.as_ref().map_or("", |user| user.login.as_str());
-        vec![
-            ("state".to_string(), inline_text(&self.state)),
-            ("user".to_string(), inline_text(login)),
-        ]
-    }
-}
-
-impl ReviewComment {
-    fn eager_leaves(&self) -> Vec<(String, FileProjection)> {
-        let login = self.user.as_ref().map_or("", |user| user.login.as_str());
-        vec![
-            ("author".to_string(), inline_text(login)),
-            ("path".to_string(), inline_text(&self.path)),
-        ]
-    }
-}
-
-impl CheckRun {
-    fn eager_leaves(&self) -> Vec<(String, FileProjection)> {
-        vec![
-            ("name".to_string(), inline_text(&self.name)),
-            ("status".to_string(), inline_text(&self.status)),
-            (
-                "conclusion".to_string(),
-                inline_text(self.conclusion.as_deref().unwrap_or("")),
+/// The load of an object from its answer: `301`, `404`, and `410` say that
+/// it is not at this path, as a redirect that is not followed.
+fn moved_or_load<T: serde::de::DeserializeOwned>(response: &HttpResponse) -> Result<Load<T>> {
+    match response.status() {
+        200 => Ok(Load::fresh(
+            decode_json(response.body())?,
+            Canonical::new(
+                response.body(),
+                response.header("etag").map(VersionToken::from),
             ),
-        ]
+        )),
+        304 => Ok(Load::Unchanged),
+        301 | 404 | 410 => Ok(Load::NotFound),
+        status => Err(ProviderError::from_http_answer(
+            status,
+            response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?))),
+        )),
     }
 }
 
@@ -1113,24 +1078,4 @@ struct PullCommits {
 #[derive(Debug, Deserialize)]
 struct Commit {
     sha: String,
-}
-
-/// The files of the archive of the logs of a run, each under its name.
-fn unzip_logs(bytes: &[u8]) -> Result<Vec<u8>> {
-    let invalid = |error: &dyn std::fmt::Display| {
-        ProviderError::invalid_input(format!("the archive of the logs: {error}"))
-    };
-    let archive = bytes.read_zip().map_err(|error| invalid(&error))?;
-    let mut output = Vec::new();
-    for entry in archive.entries() {
-        if entry.name.ends_with('/') {
-            continue;
-        }
-        output.extend_from_slice(format!("=== {} ===\n", entry.name).as_bytes());
-        output.extend_from_slice(&entry.bytes().map_err(|error| invalid(&error))?);
-        if !output.ends_with(b"\n") {
-            output.push(b'\n');
-        }
-    }
-    Ok(output)
 }

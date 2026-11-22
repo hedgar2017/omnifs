@@ -1,6 +1,6 @@
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-
-//! github-provider: GitHub virtual filesystem provider for omnifs.
+//! github-provider: GitHub virtual filesystem provider for omnifs, a
+//! component of the target `wasm32-wasip2` alone.
+#![cfg(target_arch = "wasm32")]
 
 use omnifs_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -49,7 +49,7 @@ pub enum StateFilter {
     display_name = "GitHub",
     description = "repos, issues, and pull requests",
     mount = "github",
-    projection = 2,
+    projection = 3,
     capabilities(
         domain(
             "api.github.com",
@@ -185,7 +185,7 @@ impl GithubProvider {
             o.file("run.json").canonical::<Json>()?;
             o.file("status").computed(WorkflowRun::status)?;
             o.file("conclusion").computed(WorkflowRun::conclusion)?;
-            o.file("log").direct(WorkflowRun::log)?;
+            o.file("logs.zip").blob(WorkflowRun::logs)?;
             Ok(())
         })?;
 
@@ -378,10 +378,10 @@ pub(crate) const WORKFLOW_RUN_PAGE_SIZE: u64 = 30;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CheckRunsResponse {
-    pub(crate) check_runs: Vec<CheckRun>,
+    pub(crate) check_runs: Vec<Box<serde_json::value::RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkflowRunsResponse {
-    pub(crate) workflow_runs: Vec<WorkflowRun>,
+    pub(crate) workflow_runs: Vec<Box<serde_json::value::RawValue>>,
 }

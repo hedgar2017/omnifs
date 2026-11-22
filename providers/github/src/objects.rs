@@ -4,38 +4,37 @@ use omnifs_core::ContentType;
 use omnifs_sdk::prelude::*;
 use omnifs_sdk::repr::{Markdown, Representable};
 use serde::Deserialize;
-use serde::de::IgnoredAny;
+use time::OffsetDateTime;
 
 use crate::User;
 
-/// The single-item wire body shared by github.issue and github.pull
-/// (identical GitHub JSON shape). Not an Object itself; Issue/PullRequest
-/// are thin #[serde(transparent)] wrappers.
+/// An issue or a pull request as a node of GitHub GraphQL with the selection
+/// that the feeds ask for: the canonical bytes of `Issue` and `PullRequest`.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ItemData {
     pub(crate) number: u64,
     pub(crate) title: String,
-    pub(crate) body: Option<String>,
+    pub(crate) body: String,
     pub(crate) state: String,
-    pub(crate) user: Option<User>,
-    /// Set on the issues that are pull requests: `Issue::load` keeps the
-    /// kinds disjoint and the feeds read the kind of a row from it.
-    pub(crate) pull_request: Option<IgnoredAny>,
+    /// The author, `null` for an account that GitHub deleted.
+    pub(crate) author: Option<User>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub(crate) updated_at: OffsetDateTime,
+    pub(crate) comments: Total,
+}
+
+/// The `totalCount` of a connection of GitHub GraphQL.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Total {
+    pub(crate) total_count: u64,
 }
 
 impl ItemData {
-    pub(crate) fn is_pull_request(&self) -> bool {
-        self.pull_request.is_some()
-    }
-
     /// The login of the author, empty for an item without one.
     pub(crate) fn login(&self) -> &str {
-        self.user.as_ref().map_or("", |u| u.login.as_str())
-    }
-
-    /// The body, empty for an item without one.
-    pub(crate) fn body_text(&self) -> &str {
-        self.body.as_deref().unwrap_or("")
+        self.author.as_ref().map_or("", |u| u.login.as_str())
     }
 
     pub(crate) fn markdown(&self) -> Vec<u8> {
@@ -45,7 +44,7 @@ impl ItemData {
             self.number,
             self.state,
             self.login(),
-            self.body_text()
+            self.body
         )
         .into_bytes()
     }
