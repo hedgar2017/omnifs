@@ -330,3 +330,30 @@ async fn the_size_of_a_file_past_its_deadline_is_of_the_bytes_of_its_next_read()
     assert!(grown > learned, "{grown} > {learned}");
     assert_eq!(read().await, grown);
 }
+
+/// A mount without its provider serves a fed file as with it: by the ranges
+/// of its body in the projection, which no size bounds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mount_without_its_provider_serves_the_ranges_of_a_fed_file() {
+    let harness = make_initialized_runtime(CONFIG);
+    names(&harness, &["shelves", "oak", "books"]).await.unwrap();
+    assert_eq!(
+        read(&harness, &["shelves", "oak", "books", "1", "title"]).await,
+        "Book 1"
+    );
+
+    let offline = harness.without_providers().unwrap();
+    let mut file = Path::root();
+    let mut found = None;
+    for segment in ["test", "shelves", "oak", "books", "1", "title"] {
+        let answer = offline.lookup(file, segment).await.unwrap();
+        file = answer.path.clone();
+        found = Some(answer);
+    }
+    let attrs = found.unwrap().attrs().unwrap().clone();
+    assert_eq!(attrs.read_style, omnifs_engine::ReadStyle::Ranged);
+    assert_eq!(attrs.size, 6);
+    let range = offline.read(file, 2, 3).await.unwrap();
+    assert_eq!(range.bytes, b"ok ");
+    assert!(!range.eof);
+}

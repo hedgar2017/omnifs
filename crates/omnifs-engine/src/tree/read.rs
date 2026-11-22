@@ -213,12 +213,17 @@ impl EngineNamespace {
         let captured_epoch = resources.current_epoch();
         let attr_store = FileAttrStore::new(resources, path);
         // A fed file is served once its feeds have answered, so its read asks
-        // the provider for their claims.
-        if let Some(runtime) = entry.runtime()
-            && resources
-                .is_fed(path)
-                .map_err(|error| TreeError::internal(error.to_string()))?
+        // the provider for their claims; without the provider, the
+        // projection serves the range of the body that it has.
+        if resources
+            .is_fed(path)
+            .map_err(|error| TreeError::internal(error.to_string()))?
         {
+            let Some(runtime) = entry.runtime() else {
+                return fed_range(resources, node.fact(), offset, len, false)?.ok_or_else(|| {
+                    TreeError::offline_miss(format!("offline read has no body for {path}"))
+                });
+            };
             let content_type = path.content_type_mime(None).to_string();
             return match runtime
                 .read_file(path, content_type, captured_epoch)
@@ -352,20 +357,32 @@ async fn serve_fed_read(
 ) -> Result<FileRead> {
     let (fact, _) =
         super::feed::answer_claims(runtime, path, super::feed::FedFact::File, claims).await?;
-    let path = &fact;
-    let resources = &runtime.resources;
-    let attrs = FileAttrStore::new(resources, path).cached(now_millis(), true)?;
-    if let Some((body, length)) = resources
+    fed_range(&runtime.resources, &fact, offset, len, true)?
+        .ok_or_else(|| TreeError::not_found(fact.as_str()))
+}
+
+/// At most `len` bytes from `offset` of the body of the file record of the
+/// fed file at `path` in the projection, in a mount that is `online`, with
+/// its provider; none for a path without one.
+fn fed_range(
+    resources: &MountResources,
+    path: &omnifs_core::path::Path,
+    offset: u64,
+    len: u32,
+    online: bool,
+) -> Result<Option<FileRead>> {
+    let Some((body, length)) = resources
         .file_body(path, None)
         .map_err(|error| TreeError::internal(error.to_string()))?
-    {
-        let bytes = resources
-            .read_body_range(body, length, offset, len)
-            .map_err(|error| TreeError::internal(error.to_string()))?;
-        let eof = offset.saturating_add(bytes.len() as u64) >= length;
-        return Ok(FileRead::Range(ReadRange { bytes, eof, attrs }));
-    }
-    Err(TreeError::not_found(path.as_str()))
+    else {
+        return Ok(None);
+    };
+    let attrs = FileAttrStore::new(resources, path).cached(now_millis(), online)?;
+    let bytes = resources
+        .read_body_range(body, length, offset, len)
+        .map_err(|error| TreeError::internal(error.to_string()))?;
+    let eof = offset.saturating_add(bytes.len() as u64) >= length;
+    Ok(Some(FileRead::Range(ReadRange { bytes, eof, attrs })))
 }
 
 fn projected_read(

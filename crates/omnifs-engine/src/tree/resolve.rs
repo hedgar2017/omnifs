@@ -201,11 +201,12 @@ impl EngineNamespace {
         let resources = entry.resources()?;
         let offline = entry.runtime().is_none();
         // A fed fact is served once its feeds have answered, so its lookup
-        // asks the provider for their claims.
-        let fed = !offline
-            && resources
-                .is_fed(&rel)
-                .map_err(|error| TreeError::internal(error.to_string()))?;
+        // asks the provider for their claims; without the provider, the
+        // projection serves it as the fed fact that it is.
+        let fed_fact = resources
+            .is_fed(&rel)
+            .map_err(|error| TreeError::internal(error.to_string()))?;
+        let fed = !offline && fed_fact;
         if fed
             && above_fed
             && let Some(crate::view::LookupPayload::Positive(meta)) = resources
@@ -228,7 +229,7 @@ impl EngineNamespace {
                 ));
             }
             if let Some(node) = cached_child_node(entry, &mount, parent, name, &rel)? {
-                return Ok(node);
+                return Ok(if fed_fact { node.as_fed() } else { node });
             }
         }
 

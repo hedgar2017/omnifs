@@ -121,6 +121,11 @@ impl Node {
         self.fed
     }
 
+    /// This node with its facts from feeds.
+    pub(crate) fn as_fed(self) -> Self {
+        Self { fed: true, ..self }
+    }
+
     /// The path of the node's facts.
     pub(crate) fn fact(&self) -> &Path {
         &self.fact
