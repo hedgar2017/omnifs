@@ -185,6 +185,24 @@
     "captures": []
   },
   {
+    "template": "/hello/blob",
+    "kind": "File",
+    "object_kind": null,
+    "captures": []
+  },
+  {
+    "template": "/hello/blob-then-error",
+    "kind": "File",
+    "object_kind": null,
+    "captures": []
+  },
+  {
+    "template": "/hello/blob-of-another-size",
+    "kind": "File",
+    "object_kind": null,
+    "captures": []
+  },
+  {
     "template": "/hello/remote-a",
     "kind": "File",
     "object_kind": null,
@@ -356,6 +374,18 @@
       },
       {
         "name": "print",
+        "type_name": "u64",
+        "choices": null
+      }
+    ]
+  },
+  {
+    "template": "/memos/{memo}",
+    "kind": "Object",
+    "object_kind": "test.memo",
+    "captures": [
+      {
+        "name": "memo",
         "type_name": "u64",
         "choices": null
       }
