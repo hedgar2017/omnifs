@@ -94,9 +94,7 @@ pub struct CredentialClientOverrides {
     pub redirect_uri: Option<String>,
     pub scopes: Option<Vec<String>>,
     /// The subject of the assertions of a JWT bearer grant, in place of the
-    /// client itself. Serde skips it: the daemon stores it after the payload
-    /// of a credential with one, apart from the payload itself.
-    #[serde(skip)]
+    /// client itself.
     pub subject: Option<String>,
 }
 
