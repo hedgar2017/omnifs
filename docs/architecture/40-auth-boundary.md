@@ -33,7 +33,7 @@ Where an authorization server departs from the RFC of a grant, the provider decl
 
 ## Account and subject
 
-The account of a mount is the label of its stored credential: `provider:scheme:account` is the address of one credential, so two mounts of one provider with different tokens or OAuth clients have different accounts. It is never sent upstream. The subject is what a JWT bearer client asserts as `sub` in place of itself, as the user that a service account with delegation acts as; it is a fact of the credential, stored and fingerprinted with it, and given apart from the account.
+The account of a mount addresses its stored credential and is never sent upstream, and the subject is a fact of a credential that a JWT bearer client asserts. They are apart so that two mounts of one provider can hold different credentials without a change of what either asserts. `docs/contracts/10-system.md` owns the rules of both.
 
 ## Grants and needs
 
