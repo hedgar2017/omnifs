@@ -422,12 +422,6 @@ where
                 if size != len {
                     return Err("a fed file has the size of its inline bytes".into());
                 }
-                if len > crate::tree::MATERIALIZE_MAX_BYTES {
-                    return Err(format!(
-                        "fed file with inline bytes exceeds {} bytes",
-                        crate::tree::MATERIALIZE_MAX_BYTES
-                    ));
-                }
                 Ok(())
             },
             wit_types::ByteSource::Blob(_) => Ok(()),
@@ -955,6 +949,38 @@ mod tests {
 
     /// A fed file without bytes is a view leaf of the canonical bytes that
     /// its part stores for the object of its write, and no other file.
+    /// A fed file of inline bytes of any size is valid: the host stores it
+    /// and serves it by ranges, with no count of bytes of its own.
+    #[test]
+    fn a_fed_file_of_inline_bytes_of_any_size_is_valid() {
+        let part = Ok(wit_types::FeedAnswer::Part(wit_types::FeedPart {
+            token: "t".to_string(),
+            more: false,
+            inner: Vec::new(),
+            anchors: Vec::new(),
+            unlisted: false,
+            anew: false,
+            error: None,
+        }));
+        let bytes = vec![0_u8; 64 * 1024 * 1024 + 1];
+        let effects = wit_types::Effects {
+            fs: vec![wit_types::FsWrite {
+                id: None,
+                path: "/large".to_string(),
+                kind: wit_types::FsKind::File(file_out(
+                    wit_types::FileSize::Exact(bytes.len() as u64),
+                    wit_types::ByteSource::Inline(bytes),
+                    wit_types::Stability::Stable,
+                )),
+            }],
+            ..effects()
+        };
+        assert_eq!(
+            validate_feed(&part, &effects, false, false, |_| false),
+            Ok(())
+        );
+    }
+
     #[test]
     fn a_fed_file_without_bytes_is_a_view_leaf_of_a_canonical_of_its_part() {
         let part = Ok(wit_types::FeedAnswer::Part(wit_types::FeedPart {

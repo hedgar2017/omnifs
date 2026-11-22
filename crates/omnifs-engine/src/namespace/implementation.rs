@@ -1874,7 +1874,8 @@ mod tests {
         use crate::cache::identity::GitId;
         use crate::cache::{GitWrite, ProjectionTransition};
         use crate::git::GitExecutor;
-        use crate::tree::MATERIALIZE_MAX_BYTES;
+        // A host file larger than any one read of it.
+        const MATERIALIZE_MAX_BYTES: u64 = 64 * 1024 * 1024;
         use omnifs_wit::host::types::{CalloutResult, GitOpenRequest};
         use std::io::{Seek, SeekFrom, Write};
         #[cfg(unix)]

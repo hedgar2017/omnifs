@@ -14,7 +14,6 @@ use crate::view::{AttrPayload, EntryMeta, FileAttrsCache, LookupPayload};
 use crate::{EngineError, Runtime};
 use tracing::warn;
 
-use super::MATERIALIZE_MAX_BYTES;
 use super::error::{Result, TreeError};
 use super::node::{Node, PaginationControl, SyntheticContent};
 use crate::view::BodyId;
@@ -288,7 +287,7 @@ impl EngineNamespace {
     async fn read_synthetic(&self, node: &Node, content: &SyntheticContent) -> Result<ReadResult> {
         match content {
             SyntheticContent::Fixed(bytes) => Ok(ReadResult {
-                data: materialized_bytes(node.path(), bytes.clone())?,
+                data: bytes.clone(),
                 attrs: node.attrs().cloned(),
             }),
             SyntheticContent::PaginationControl(action) => {
@@ -318,7 +317,6 @@ impl EngineNamespace {
                     .resources
                     .memory_invalidate(&parent, RecordKind::Dirents, None);
                 let bytes = status.into_bytes();
-                enforce_observed_materialize_cap(node.path(), bytes.len())?;
                 let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 Ok(ReadResult {
                     data: bytes,
@@ -550,7 +548,6 @@ fn finish_read(
     };
     let stored = match result.bytes {
         ReadBytes::Inline(data) => {
-            enforce_observed_materialize_cap(path, data.len())?;
             let attrs = attrs
                 .learned_complete_content_attrs(data.len())
                 .map_err(|error| contradicts(error, data.len() as u64))?;
@@ -580,19 +577,4 @@ fn finish_read(
         .map_err(|error| contradicts(error, length))?;
     body_range(&runtime.resources, body, length, offset, len, Some(attrs))?
         .ok_or_else(|| lost_body(path))
-}
-
-fn enforce_observed_materialize_cap(path: &omnifs_core::path::Path, size: usize) -> Result<()> {
-    let size = u64::try_from(size).unwrap_or(u64::MAX);
-    if size <= MATERIALIZE_MAX_BYTES {
-        return Ok(());
-    }
-    Err(TreeError::too_large(format!(
-        "full read for {path} materialized {size} bytes, above cap {MATERIALIZE_MAX_BYTES}"
-    )))
-}
-
-fn materialized_bytes(path: &omnifs_core::path::Path, data: Vec<u8>) -> Result<Vec<u8>> {
-    enforce_observed_materialize_cap(path, data.len())?;
-    Ok(data)
 }
