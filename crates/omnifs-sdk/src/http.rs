@@ -4,8 +4,10 @@
 //! [`crate::endpoint`]; prefer typed endpoints for upstream APIs and reach
 //! for this layer only when the URL is fully dynamic. `send()` resolves to
 //! `http::Response<Vec<u8>>` with no status mapping: use
-//! [`ResponseExt::error_for_status`] for the default 4xx/5xx mapping or
-//! inspect the response directly.
+//! [`ResponseExt::error_for_status`] for the error of each status that is
+//! no content, or inspect the response directly. The answer of a redirect
+//! is the answer of the request, unless [`Request::follow_redirects`] asks
+//! the host to follow it; [`ResponseExt::url`] names the URL that answered.
 //!
 //! Sending never performs I/O in the guest. [`CalloutFuture`] yields the
 //! request through a WIT async host import; the component runtime suspends the
@@ -17,7 +19,7 @@
 //! layer, so raw `cx.http()` sends and blob fetches inherit it as well as
 //! typed endpoints: an open 429 window fast-fails in-guest without issuing
 //! a callout. Arming is not symmetric, though: only typed endpoint sends
-//! arm the breaker from a 429 response. A raw send surfaces the 429 as an
+//! arm the breaker from a 429 response, for the authority that answered. A raw send surfaces the 429 as an
 //! error without opening a window; call [`crate::note_rate_limited`] if a
 //! raw path should arm it.
 
@@ -29,7 +31,9 @@ use core::task::{Context, Poll};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
 #[cfg(target_arch = "wasm32")]
 use omnifs_wit::provider::omnifs::provider::callouts;
-use omnifs_wit::provider::types::{Callout, CalloutResult, Header, HttpRequest, HttpResponse};
+use omnifs_wit::provider::types::{
+    BlobFetchRequest, Callout, CalloutResult, Header, HttpRequest, HttpResponse,
+};
 
 /// Entry point returned by `cx.http()`. Starts a request against a fully
 /// formed URL; there is no base-URL resolution at this layer.
@@ -60,8 +64,33 @@ pub struct Request<'cx, S> {
     url: String,
     headers: HeaderMap,
     body: Option<Vec<u8>>,
+    follow_redirects: bool,
     error: Option<ProviderError>,
 }
+
+/// The URL that answered a request, and whether it is another than the one
+/// of the request: a response of a request of the SDK has it.
+#[derive(Clone, Debug)]
+pub(crate) struct AnsweredBy {
+    pub(crate) url: String,
+    pub(crate) redirected: bool,
+}
+
+impl AnsweredBy {
+    /// The URL that answered a request to `url`, whose host followed its
+    /// redirects to `redirected`.
+    pub(crate) fn new(url: String, redirected: Option<String>) -> Self {
+        Self {
+            redirected: redirected.is_some(),
+            url: redirected.unwrap_or(url),
+        }
+    }
+}
+
+/// The URL of a redirect that the host followed, until the request names
+/// the URL that it asked.
+#[derive(Clone)]
+struct Redirected(Option<String>);
 
 impl<'cx, S> Request<'cx, S> {
     fn new(cx: &'cx Cx<S>, method: Method, url: impl Into<String>) -> Self {
@@ -71,8 +100,20 @@ impl<'cx, S> Request<'cx, S> {
             url: url.into(),
             headers: HeaderMap::new(),
             body: None,
+            follow_redirects: false,
             error: None,
         }
+    }
+
+    /// Ask the host to follow the redirects of the answer, for a `GET` over
+    /// HTTPS: the answer is then of the last URL, which
+    /// [`ResponseExt::url`] names, and a redirect that the host refuses is
+    /// the error of the request. Without it a redirect is the answer.
+    /// `docs/contracts/10-system.md` owns what the host follows.
+    #[must_use]
+    pub fn follow_redirects(mut self) -> Self {
+        self.follow_redirects = true;
+        self
     }
 
     /// Append a header. Invalid names or values are recorded as a sticky
@@ -150,16 +191,29 @@ impl<'cx, S> Request<'cx, S> {
     pub fn send(self) -> CalloutFuture<'cx, Response<Vec<u8>>> {
         let cx = self.cx;
         match self.into_fetch_request() {
-            Ok(wit_request) => CalloutFuture::new(cx, Callout::Fetch(wit_request), |r| {
-                expect_callout(
-                    "fetch",
-                    |r| match r {
-                        CalloutResult::HttpResponse(resp) => Some(response_from_wit(resp)),
-                        _ => None,
-                    },
-                    r,
-                )
-            }),
+            Ok(wit_request) => {
+                let url = wit_request.url.clone();
+                CalloutFuture::new(cx, Callout::Fetch(wit_request), |r| {
+                    expect_callout(
+                        "fetch",
+                        |r| match r {
+                            CalloutResult::HttpResponse(resp) => Some(response_from_wit(resp)),
+                            _ => None,
+                        },
+                        r,
+                    )
+                })
+                .map(move |mut response| {
+                    let redirected = response
+                        .extensions_mut()
+                        .remove::<Redirected>()
+                        .and_then(|redirected| redirected.0);
+                    response
+                        .extensions_mut()
+                        .insert(AnsweredBy::new(url, redirected));
+                    response
+                })
+            },
             Err(error) => CalloutFuture::ready_error(cx, error),
         }
     }
@@ -179,6 +233,7 @@ impl<'cx, S> Request<'cx, S> {
             url: self.url,
             headers: WitHeaders(&self.headers).into(),
             body: self.body,
+            follow_redirects: self.follow_redirects,
         })
     }
 
@@ -237,6 +292,12 @@ impl<'cx, S> BlobRequest<'cx, S> {
         self
     }
 
+    /// As [`Request::follow_redirects`]: the blob is then of the last URL.
+    pub fn follow_redirects(mut self) -> Self {
+        self.inner = self.inner.follow_redirects();
+        self
+    }
+
     /// The MD5 in lowercase hexadecimal of the bytes that the request asks
     /// for, for a request that is the same for each content: the host
     /// answers with bytes of this MD5 alone.
@@ -247,19 +308,20 @@ impl<'cx, S> BlobRequest<'cx, S> {
 
     /// The version of the bytes that the request asks for, for a request
     /// that is the same for each version: the bytes of another version are
-    /// the blob of another request.
+    /// the blob of another request. 1 to 256 bytes without a control
+    /// character.
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
         self
     }
 
     /// Lower into a `fetch-blob` callout. Resolves to a
-    /// [`crate::blob::BlobRef`] carrying metadata only; the body is on the
-    /// host's disk. Fails immediately on a sticky builder error or when the
-    /// authority's rate-limit window is open.
-    /// Note the `BlobRef` carries the upstream status: chain
-    /// [`crate::blob::BlobRef::error_for_status`] for the default mapping.
-    pub fn send(self) -> CalloutFuture<'cx, crate::blob::BlobRef> {
+    /// [`crate::blob::BlobAnswer`], the answer of any status without its
+    /// body, which stays in the body store of the host for a successful
+    /// one: chain [`crate::blob::BlobAnswer::error_for_status`] for the
+    /// blob of a successful answer. Fails immediately on a sticky builder
+    /// error or when the authority's rate-limit window is open.
+    pub fn send(self) -> CalloutFuture<'cx, crate::blob::BlobAnswer> {
         if let Some(error) = self.inner.error {
             return CalloutFuture::ready_error(self.inner.cx, error);
         }
@@ -268,15 +330,27 @@ impl<'cx, S> BlobRequest<'cx, S> {
         if let Some(error) = self.inner.open_breaker_error() {
             return CalloutFuture::ready_error(self.inner.cx, error);
         }
-        let callout = crate::blob::blob_fetch_callout(
-            self.inner.method.as_str().to_string(),
-            self.inner.url,
-            WitHeaders(&self.inner.headers).into(),
-            self.inner.body,
-            self.md5,
-            self.version,
-        );
-        CalloutFuture::new(self.inner.cx, callout, crate::blob::extract_blob)
+        let url = self.inner.url.clone();
+        let callout = Callout::FetchBlob(BlobFetchRequest {
+            method: self.inner.method.as_str().to_string(),
+            url: self.inner.url,
+            headers: WitHeaders(&self.inner.headers).into(),
+            body: self.inner.body,
+            md5: self.md5,
+            version: self.version,
+            follow_redirects: self.inner.follow_redirects,
+        });
+        CalloutFuture::new(self.inner.cx, callout, |result| {
+            expect_callout(
+                "fetch-blob",
+                |result| match result {
+                    CalloutResult::BlobFetched(fetched) => Some(Ok(fetched)),
+                    _ => None,
+                },
+                result,
+            )
+        })
+        .map(move |fetched| crate::blob::BlobAnswer::new(url, fetched))
     }
 }
 
@@ -315,14 +389,22 @@ fn response_from_wit(resp: HttpResponse) -> Result<Response<Vec<u8>>> {
         builder = builder.header(name, value);
     }
     builder
+        .extension(Redirected(resp.redirected))
         .body(resp.body)
         .map_err(|e| ProviderError::internal(format!("response builder: {e}")))
 }
 
-/// The mapping of each status other than a successful one, and than the
-/// `304` that answers a conditional request, to `ProviderError`: the body of
-/// an informational, redirect, or failing answer is no content.
+/// The mapping of each status other than a successful one
+/// ([`crate::error::is_success`]), and than the `304` that answers a
+/// conditional request, to `ProviderError`
+/// ([`ProviderError::from_http_answer`]), and the URL that answered.
 pub trait ResponseExt: Sized {
+    /// The URL that answered: the one of the request, or the last one of
+    /// the redirects that the host followed for it. None for a response
+    /// that no request of the SDK answered.
+    fn url(&self) -> Option<&str>;
+    /// Whether another URL than the one of the request answered.
+    fn redirected(&self) -> bool;
     fn error_for_status(self) -> Result<Self>;
     /// Same check as `error_for_status` without consuming the response.
     /// Use when custom mapping (rate-limit detection, retry signals)
@@ -331,39 +413,36 @@ pub trait ResponseExt: Sized {
 }
 
 impl ResponseExt for Response<Vec<u8>> {
+    fn url(&self) -> Option<&str> {
+        self.extensions()
+            .get::<AnsweredBy>()
+            .map(|answered| answered.url.as_str())
+    }
+
+    fn redirected(&self) -> bool {
+        self.extensions()
+            .get::<AnsweredBy>()
+            .is_some_and(|answered| answered.redirected)
+    }
+
     fn error_for_status(self) -> Result<Self> {
         self.error_for_status_ref()?;
         Ok(self)
     }
 
     fn error_for_status_ref(&self) -> Result<()> {
-        if self.status().is_success() || self.status() == StatusCode::NOT_MODIFIED {
+        let status = self.status();
+        if crate::error::is_success(status.as_u16()) || status == StatusCode::NOT_MODIFIED {
             Ok(())
         } else {
-            Err(status_error(self))
+            Err(ProviderError::from_http_answer(
+                status.as_u16(),
+                self.headers()
+                    .iter()
+                    .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?))),
+            ))
         }
     }
-}
-
-fn status_error(resp: &Response<Vec<u8>>) -> ProviderError {
-    let status = resp.status();
-    if status != StatusCode::TOO_MANY_REQUESTS {
-        return ProviderError::from_http_status(status.as_u16());
-    }
-
-    let retry_after = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok());
-    let message = match retry_after {
-        Some(value) => format!("HTTP 429; retry_after={value}"),
-        None => "HTTP 429".to_string(),
-    };
-    // `Retry-After` is either delta-seconds or an HTTP-date. Honor the common
-    // delta-seconds form as structured backoff; an HTTP-date stays in the
-    // human-readable message only (no guest wall-clock math on the error path).
-    let retry_after_secs = retry_after.and_then(crate::rate_limit::parse_retry_after_secs);
-    ProviderError::rate_limited(message).with_retry_after(retry_after_secs)
 }
 
 /// Unified callout result extractor.
@@ -418,6 +497,16 @@ impl<'cx, T: 'cx> CalloutFuture<'cx, T> {
 
     pub(crate) fn ready_error<S>(_cx: &'cx Cx<S>, error: ProviderError) -> Self {
         Self::Ready(Some(Err(error)))
+    }
+
+    /// The future of `map` of the result of this callout.
+    pub(crate) fn map<U: 'cx>(self, map: impl FnOnce(T) -> U + 'cx) -> CalloutFuture<'cx, U> {
+        match self {
+            Self::Pending(future) => {
+                CalloutFuture::Pending(Box::pin(async move { future.await.map(map) }))
+            },
+            Self::Ready(result) => CalloutFuture::Ready(result.map(|result| result.map(map))),
+        }
     }
 }
 

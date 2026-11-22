@@ -2178,6 +2178,7 @@ mod tests {
                         status: 304,
                         headers: Vec::new(),
                         body: Vec::new(),
+                        redirected: None,
                     }));
                     continue;
                 };
@@ -2185,6 +2186,7 @@ mod tests {
                     status: 200,
                     headers: Vec::new(),
                     body: commit.as_bytes().to_vec(),
+                    redirected: None,
                 }));
                 let open = next().await;
                 let Callout::GitOpenRepo(git) = open.callout() else {

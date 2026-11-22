@@ -75,6 +75,7 @@ async fn fake_http_fetch(req: &wit_types::HttpRequest) -> wit_types::CalloutResu
             },
         ],
         body: b"{}".to_vec(),
+        redirected: None,
     });
     record_outcome(&result);
     result
@@ -95,15 +96,17 @@ async fn fake_http_fetch(req: &wit_types::HttpRequest) -> wit_types::CalloutResu
 ))]
 async fn fake_blob_fetch(req: &wit_types::BlobFetchRequest) -> wit_types::CalloutResult {
     let result = wit_types::CalloutResult::BlobFetched(wit_types::BlobFetched {
-        blob: 4242,
-        size: 1024,
-        content_type: Some("application/octet-stream".into()),
-        etag: Some("etag-abc".into()),
         status: 200,
         response_headers: vec![wit_types::Header {
             name: "Content-Type".into(),
             value: "application/octet-stream".into(),
         }],
+        redirected: None,
+        upstream: true,
+        content: Some(wit_types::BlobContent {
+            blob: 4242,
+            size: 1024,
+        }),
     });
     record_outcome(&result);
     result
@@ -139,6 +142,7 @@ fn http_request() -> wit_types::HttpRequest {
             },
         ],
         body: None,
+        follow_redirects: false,
     }
 }
 
@@ -153,6 +157,7 @@ fn blob_fetch_request() -> wit_types::BlobFetchRequest {
         body: None,
         md5: None,
         version: None,
+        follow_redirects: false,
     }
 }
 

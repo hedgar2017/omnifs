@@ -896,6 +896,7 @@ mod tests {
                 value: "Bearer super-secret".to_string(),
             }],
             body: None,
+            follow_redirects: false,
         });
 
         let summary = WitCalloutView(&callout).summary();

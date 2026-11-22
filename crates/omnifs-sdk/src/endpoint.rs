@@ -16,9 +16,10 @@
 //!   host-pushed validator ([`Cx::version`]) becomes `If-None-Match` and an
 //!   unchanged object costs no body transfer.
 //! - Structural layer, 2-state: [`json`](RequestBuilder::json) and
-//!   [`send_checked`](RequestBuilder::send_checked) return the value or error
-//!   on any 4xx/5xx, including 404. Use these when "missing" is not a
-//!   meaningful outcome for the route.
+//!   [`send_checked`](RequestBuilder::send_checked) return the value, or the
+//!   error of each status that is no content, including 404 and an
+//!   unfollowed redirect. Use these when "missing" is not a meaningful
+//!   outcome for the route.
 //! - Listing pages, conditional: [`page`](RequestBuilder::page) maps 304 to
 //!   [`PageAnswer::Unchanged`] and 200 to [`PageAnswer::Fresh`] with the
 //!   response `ETag` as the validator of the page. Pair it with
@@ -26,7 +27,13 @@
 //!   validator the host sends for a page past its deadline.
 //! - Raw: [`send`](RequestBuilder::send) returns the response of any status,
 //!   for a route that reads statuses the other terminals map, such as a
-//!   `301` or a `410`.
+//!   `410`, or the redirect of a request that does not follow it.
+//!
+//! The answer of a redirect is the answer of the request: a checked terminal
+//! takes it as an error. [`follow_redirects`](RequestBuilder::follow_redirects)
+//! asks the host to follow it, and [`HttpResponse::url`] names the URL that
+//! answered then, so that a route can tell the answer of another resource
+//! than the one it asked.
 //!
 //! Never set `Authorization` or any other credential header here. Auth is
 //! host-managed: the provider's `auth = ..` argument to `#[omnifs_sdk::provider]`
@@ -36,8 +43,9 @@
 //! and `Accept`.
 //!
 //! Every send participates in the per-authority rate-limit breaker: a 429
-//! arms a cooldown for the URL's authority (honoring `Retry-After`, else the
-//! endpoint's [`RateLimitPolicy`]), and later sends to that authority
+//! arms a cooldown for the authority of the URL that answered (honoring
+//! `Retry-After`, else the endpoint's [`RateLimitPolicy`]), and later sends
+//! to that authority
 //! fast-fail in-guest until the window passes. An upstream that signals
 //! errors off the status line (a 403 rate limit, an error in a 200 body)
 //! overrides [`EndpointHooks::classify`] to map the raw response to a typed
@@ -174,6 +182,7 @@ pub struct RequestBuilder<'a, E, S = ()> {
     /// instead of sending a malformed request.
     body_error: Option<ProviderError>,
     if_none_match: Option<String>,
+    follow_redirects: bool,
     endpoint: E,
 }
 
@@ -189,6 +198,7 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
             body_is_json: false,
             body_error: None,
             if_none_match: None,
+            follow_redirects: false,
             endpoint,
         }
     }
@@ -278,6 +288,15 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
         self
     }
 
+    /// As [`Request::follow_redirects`]: the host follows the redirects of
+    /// the answer of a `GET`, and [`HttpResponse::url`] names the URL that
+    /// answered.
+    #[must_use]
+    pub fn follow_redirects(mut self) -> Self {
+        self.follow_redirects = true;
+        self
+    }
+
     fn url(&self) -> String {
         let query: Vec<(&str, &str)> = self
             .query
@@ -295,17 +314,16 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
         }
         let url = self.url();
         let rate_limit = self.endpoint.rate_limit();
-        let policy = ResponsePolicy::new(
-            self.endpoint,
-            crate::rate_limit::authority_of(&url),
-            rate_limit,
-        );
+        let policy = ResponsePolicy::new(self.endpoint, rate_limit);
         let builder = self.cx.http();
         let mut req = if self.method == http::Method::POST {
             builder.post(url)
         } else {
             builder.get(url)
         };
+        if self.follow_redirects {
+            req = req.follow_redirects();
+        }
         // Endpoint defaults first, so a per-request `.header(..)` overrides.
         for (name, value) in policy.endpoint.default_headers() {
             req = req.header(name, value);
@@ -326,8 +344,9 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
 
     /// Send through the breaker: the check happens in `Request::send`; here we
     /// arm on a 429 (or an [`EndpointHooks::classify`] rate limit) and close
-    /// on a `status < 400` response so the next request to a throttled
-    /// authority fast-fails instead of calling out.
+    /// on a `status < 400` response, for the authority that answered, so the
+    /// next request to a throttled authority fast-fails instead of calling
+    /// out.
     async fn send_raw(self) -> Result<Response<Vec<u8>>> {
         let (request, policy) = self.into_http_request()?;
         let resp = request.send().await?;
@@ -336,7 +355,8 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
     }
 
     /// Object/revalidation terminal: 200 -> `Fresh(O::decode(body))`, 404 ->
-    /// `NotFound`, 304 -> `Unchanged`, other 4xx/5xx -> `Err`. On `Fresh` the
+    /// `NotFound`, 304 -> `Unchanged`, each other status that is no content
+    /// -> `Err`. On `Fresh` the
     /// stored [`Canonical`] is the raw response body verbatim with the response
     /// `ETag` as its validator; [`Object::decode`] only produces the in-memory
     /// value. Use [`Self::load_with`] for a one-off parse fn when no `Object`
@@ -353,8 +373,8 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
         load_from_response(resp, parse)
     }
 
-    /// Structural terminal: deserialize the body into `T`. 4xx/5xx -> `Err`;
-    /// there is no `Load` wrapper.
+    /// Structural terminal: deserialize the body into `T`. A status that is
+    /// no content -> `Err`; there is no `Load` wrapper.
     pub async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T> {
         let resp = self.send_raw().await?.error_for_status()?;
         decode_json_body(resp.body())
@@ -362,7 +382,7 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
 
     /// Conditional page terminal: 304 -> [`PageAnswer::Unchanged`], 200 ->
     /// [`PageAnswer::Fresh`] with the JSON-decoded body and the response
-    /// `ETag` as its validator, other 4xx/5xx -> `Err`; both answers keep the
+    /// `ETag` as its validator, each other status -> `Err`; both answers keep the
     /// response headers. Pair it with
     /// [`maybe_if_none_match`](Self::maybe_if_none_match) and the validator
     /// of the call ([`crate::collection::ListCx::validator`] or
@@ -412,44 +432,46 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
 
 struct ResponsePolicy<E> {
     endpoint: E,
-    authority: Option<String>,
     rate_limit: RateLimitPolicy,
 }
 
 impl<E: EndpointHooks> ResponsePolicy<E> {
-    fn new(endpoint: E, authority: Option<String>, rate_limit: RateLimitPolicy) -> Self {
+    fn new(endpoint: E, rate_limit: RateLimitPolicy) -> Self {
         Self {
             endpoint,
-            authority,
             rate_limit,
         }
     }
 
+    /// Take `resp`, the answer of an upstream: the breaker records it for
+    /// the authority of the URL that answered, which is another than the
+    /// one of the request after a redirect that the host followed.
     fn apply(&self, resp: &Response<Vec<u8>>) -> Result<()> {
+        let authority = resp.url().and_then(crate::rate_limit::authority_of);
         // Provider-specific classification runs first: it can detect error
         // signals the default status mapping misses (e.g. a 403 rate limit),
         // and a classified rate limit arms the breaker just like a native 429.
         if let Some(error) = self.endpoint.classify(resp) {
             if error.kind() == crate::error::ProviderErrorKind::RateLimited {
-                self.record_rate_limit(error.retry_after());
+                self.record_rate_limit(authority.as_deref(), error.retry_after());
             }
             return Err(error);
         }
 
         match resp.status() {
-            StatusCode::TOO_MANY_REQUESTS => self.record_rate_limit(self.retry_after(resp)),
-            status if status.as_u16() < 400 => self.record_success(),
+            StatusCode::TOO_MANY_REQUESTS => {
+                self.record_rate_limit(authority.as_deref(), self.retry_after(resp));
+            },
+            status if status.as_u16() < 400 => self.record_success(authority.as_deref()),
             _ => {},
         }
         Ok(())
     }
 
     fn retry_after(&self, resp: &Response<Vec<u8>>) -> Option<core::time::Duration> {
-        let parsed = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(crate::rate_limit::parse_retry_after_secs);
+        let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok());
+        let parsed = header("retry-after")
+            .and_then(|value| crate::rate_limit::retry_after(value, header("date")));
         let cooldown = match self.rate_limit {
             RateLimitPolicy::Cooldown(d) => Some(d),
             _ => None,
@@ -457,22 +479,26 @@ impl<E: EndpointHooks> ResponsePolicy<E> {
         parsed.or(cooldown)
     }
 
-    fn record_rate_limit(&self, retry_after: Option<core::time::Duration>) {
+    fn record_rate_limit(
+        &self,
+        authority: Option<&str>,
+        retry_after: Option<core::time::Duration>,
+    ) {
         if matches!(self.rate_limit, RateLimitPolicy::Off) {
             return;
         }
-        if let Some(authority) = &self.authority {
+        if let Some(authority) = authority {
             crate::rate_limit::with_breaker(|b| {
                 b.record_429(authority, retry_after);
             });
         }
     }
 
-    fn record_success(&self) {
+    fn record_success(&self, authority: Option<&str>) {
         if matches!(self.rate_limit, RateLimitPolicy::Off) {
             return;
         }
-        if let Some(authority) = &self.authority {
+        if let Some(authority) = authority {
             crate::rate_limit::with_breaker(|b| {
                 b.record_success(authority);
             });
@@ -487,7 +513,9 @@ fn load_from_response<T>(
     match resp.status() {
         StatusCode::NOT_MODIFIED => Ok(Load::Unchanged),
         StatusCode::NOT_FOUND => Ok(Load::NotFound),
-        status if !status.is_success() => Err(resp.error_for_status().unwrap_err()),
+        status if !crate::error::is_success(status.as_u16()) => {
+            Err(resp.error_for_status().unwrap_err())
+        },
         _ => {
             // The canonical is the raw response body verbatim (JSON, Atom, XML,
             // or opaque). `parse` only produces the in-memory value for
@@ -560,6 +588,19 @@ impl HttpResponse {
     pub fn body(&self) -> &[u8] {
         self.inner.body()
     }
+
+    /// The URL that answered: the one of the request, or the last one of
+    /// the redirects that the host followed for it.
+    pub fn url(&self) -> &str {
+        self.inner
+            .url()
+            .expect("the response of a request has the URL that answered")
+    }
+
+    /// Whether another URL than the one of the request answered.
+    pub fn redirected(&self) -> bool {
+        self.inner.redirected()
+    }
 }
 
 /// A builder for a blob fetch against an [`Endpoint`], lowering onto
@@ -589,11 +630,20 @@ impl<'a, E: EndpointHooks, S> BlobRequestBuilder<'a, E, S> {
         self
     }
 
-    /// Fetch the URL into the blob store and return its handle. Applies the
-    /// same 4xx/5xx mapping as the structural terminals, and the rate limit
-    /// of the endpoint by the status and the headers of the answer, whose
-    /// body the host holds, so a `BlobHandle` always refers to a successful
-    /// response body.
+    /// As [`RequestBuilder::follow_redirects`]: the blob is then of the
+    /// last URL.
+    #[must_use]
+    pub fn follow_redirects(mut self) -> Self {
+        self.inner = self.inner.follow_redirects();
+        self
+    }
+
+    /// Fetch the URL into the body store of the host and return its handle.
+    /// Applies the same status mapping as the structural terminals, and,
+    /// for an answer of the upstream, the rate limit of the endpoint by its
+    /// status and its headers: an answer that the host gave from its
+    /// projection tells nothing of the upstream now. A `BlobHandle` always
+    /// refers to the body of a successful answer.
     pub async fn fetch(self) -> Result<BlobHandle> {
         let (request, policy) = self.inner.into_http_request()?;
         let mut blob: BlobRequest<'a, S> = request.into_blob();
@@ -603,20 +653,20 @@ impl<'a, E: EndpointHooks, S> BlobRequestBuilder<'a, E, S> {
         if let Some(version) = self.version {
             blob = blob.version(version);
         }
-        let blob_ref = blob.send().await?;
-        let mut answer = Response::builder().status(blob_ref.status);
-        for (name, value) in &blob_ref.response_headers {
-            answer = answer.header(name, value);
+        policy.blob(blob.send().await?)
+    }
+}
+
+impl<E: EndpointHooks> ResponsePolicy<E> {
+    /// The handle of the blob of `answer`, or the error of its status.
+    fn blob(&self, answer: crate::blob::BlobAnswer) -> Result<BlobHandle> {
+        if answer.upstream() {
+            self.apply(&answer.response()?)?;
         }
-        policy.apply(
-            &answer
-                .body(Vec::new())
-                .map_err(|error| ProviderError::internal(error.to_string()))?,
-        )?;
-        let blob_ref = blob_ref.error_for_status()?;
+        let blob = answer.error_for_status()?;
         Ok(BlobHandle {
-            id: blob_ref.id,
-            size: blob_ref.size,
+            id: blob.id,
+            size: blob.size,
         })
     }
 }
@@ -688,12 +738,92 @@ mod tests {
     }
     impl EndpointHooks for TestEpCooldown {}
 
-    fn response(status: u16, headers: &[(&str, &str)]) -> Response<Vec<u8>> {
+    /// The answer of `answered` to a request to `asked`.
+    fn response(
+        asked: &str,
+        answered: Option<&str>,
+        status: u16,
+        headers: &[(&str, &str)],
+    ) -> Response<Vec<u8>> {
         let mut builder = Response::builder().status(status);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
-        builder.body(Vec::new()).expect("test response")
+        builder
+            .extension(crate::http::AnsweredBy::new(
+                asked.into(),
+                answered.map(Into::into),
+            ))
+            .body(Vec::new())
+            .expect("test response")
+    }
+
+    fn open(authority: &str) -> bool {
+        crate::rate_limit::with_breaker(|b| b.check(authority)).is_some()
+    }
+
+    /// The breaker records an answer for the authority of the URL that
+    /// answered it: the one of the request answered a redirect alone.
+    #[test]
+    fn the_breaker_records_an_answer_for_the_authority_that_answered() {
+        crate::rate_limit::with_breaker(crate::rate_limit::RateLimitBreaker::clear);
+        let policy = ResponsePolicy::new(TestEp, RateLimitPolicy::Default);
+        let limited = response(
+            "https://breaker.test/x",
+            Some("https://files.test/y"),
+            429,
+            &[("retry-after", "30")],
+        );
+        assert_eq!(limited.url(), Some("https://files.test/y"));
+        assert!(limited.redirected());
+        policy.apply(&limited).unwrap();
+        assert!(open("https://files.test"));
+        assert!(!open("https://breaker.test"));
+
+        // An answer of the authority of the request closes no window of
+        // another, and one of the other closes its own.
+        policy
+            .apply(&response("https://breaker.test/x", None, 200, &[]))
+            .unwrap();
+        assert!(open("https://files.test"));
+        policy
+            .apply(&response(
+                "https://breaker.test/x",
+                Some("https://files.test/y"),
+                200,
+                &[],
+            ))
+            .unwrap();
+        assert!(!open("https://files.test"));
+        crate::rate_limit::with_breaker(crate::rate_limit::RateLimitBreaker::clear);
+    }
+
+    /// The answer of a blob fetch that the host gave from its projection is
+    /// no answer of the upstream: it closes no window of the breaker.
+    #[test]
+    fn a_blob_from_the_projection_of_the_host_closes_no_window() {
+        use omnifs_wit::provider::types::{BlobContent, BlobFetched};
+        crate::rate_limit::with_breaker(|b| {
+            b.clear();
+            b.record_429("https://breaker.test", Some(Duration::from_secs(30)));
+        });
+        let policy = ResponsePolicy::new(TestEp, RateLimitPolicy::Default);
+        let answer = |upstream| {
+            crate::blob::BlobAnswer::new(
+                "https://breaker.test/file".into(),
+                BlobFetched {
+                    status: 200,
+                    response_headers: Vec::new(),
+                    redirected: None,
+                    upstream,
+                    content: Some(BlobContent { blob: 7, size: 3 }),
+                },
+            )
+        };
+        assert_eq!(policy.blob(answer(false)).unwrap().size, 3);
+        assert!(open("https://breaker.test"));
+        assert_eq!(policy.blob(answer(true)).unwrap().size, 3);
+        assert!(!open("https://breaker.test"));
     }
 
     #[test]
@@ -722,7 +852,7 @@ mod tests {
             .get("/x")
             .into_http_request()
             .unwrap();
-        let resp = response(429, &[]);
+        let resp = response("https://off-policy.test/x", None, 429, &[]);
         policy.apply(&resp).unwrap();
         let error = resp.error_for_status_ref().unwrap_err();
 
@@ -745,7 +875,7 @@ mod tests {
             .get("/x")
             .into_http_request()
             .unwrap();
-        let resp = response(429, &[]);
+        let resp = response("https://cooldown-policy.test/x", None, 429, &[]);
         policy.apply(&resp).unwrap();
         let error = resp.error_for_status_ref().unwrap_err();
 

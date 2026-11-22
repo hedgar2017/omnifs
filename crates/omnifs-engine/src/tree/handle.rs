@@ -21,7 +21,7 @@ use tokio::runtime::Handle;
 
 use super::error::{Result, TreeError};
 use super::node::Node;
-use super::read::{Chunk, enforce_declared_materialize_cap};
+use super::read::Chunk;
 use crate::EngineNamespace;
 
 /// Runtime-owned ranged read handle for `Deferred(Ranged)` files. Holds an
@@ -130,7 +130,6 @@ impl EngineNamespace {
             )));
         }
         if projected.is_deferred_full() {
-            enforce_declared_materialize_cap(node.path(), Some(projected))?;
             return Ok(None);
         }
 

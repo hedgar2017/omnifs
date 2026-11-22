@@ -544,7 +544,7 @@ impl ManifestFacts {
         if let Some(version) = &self.version {
             fields.push(("version", json_string(version)));
         }
-        fields.push(("witPackage", json_string("package omnifs:provider@0.11.0;")));
+        fields.push(("witPackage", json_string(omnifs_wit::PROVIDER_WIT_PACKAGE)));
         fields.push(("sdkVersion", json_string(env!("CARGO_PKG_VERSION"))));
         fields.push(("projection", self.projection.to_string()));
         fields.push(("refreshIntervalSecs", refresh_interval_secs.to_string()));

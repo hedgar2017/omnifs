@@ -177,13 +177,43 @@ impl ProviderError {
         Self::new(ProviderErrorKind::Unimplemented, message)
     }
 
+    /// The error of an HTTP answer of `status` with `headers`, for a status
+    /// that [`is_success`] does not take: the error of
+    /// [`Self::from_http_status`], with the time of the `Retry-After` of
+    /// the answer of any status that has one, as seconds or as an HTTP date
+    /// ([`crate::rate_limit::retry_after`]). The one mapping of the answer
+    /// of an inline request and of a blob fetch, and of a provider that
+    /// reads a status of its own.
+    pub fn from_http_answer<'a>(
+        status: u16,
+        headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
+        let (mut retry_after, mut date) = (None, None);
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("retry-after") {
+                retry_after = Some(value);
+            } else if name.eq_ignore_ascii_case("date") {
+                date = Some(value);
+            }
+        }
+        let error = Self::from_http_status(status);
+        match retry_after {
+            Some(value) => Self {
+                message: format!("{}; retry_after={value}", error.message),
+                ..error
+            }
+            .with_retry_after(crate::rate_limit::retry_after(value, date)),
+            None => error,
+        }
+    }
+
     /// Map a bare HTTP status code to an error of the matching kind.
     ///
     /// The table: 401 permission-denied, 403 denied, 404 not-found,
     /// 408 timeout, 429 rate-limited, any other 4xx invalid-input, 5xx
     /// network (retryable: the upstream may recover), anything else
-    /// internal. This does not read `Retry-After`; for a 429 with a
-    /// backoff header, chain [`Self::with_retry_after`] yourself.
+    /// internal. [`Self::from_http_answer`] reads the `Retry-After` of the
+    /// answer too.
     pub fn from_http_status(status: u16) -> Self {
         match status {
             401 => Self::permission_denied(format!("HTTP {status}")),
@@ -216,6 +246,13 @@ impl ProviderError {
         self.message = format!("{} [operation={op}; path={}]", self.message, path.as_str());
         self
     }
+}
+
+/// Whether `status` is of a successful answer, whose body is content: the
+/// one owner of that in the SDK. The body of an informational, redirect, or
+/// failing answer is no content.
+pub fn is_success(status: u16) -> bool {
+    (200..300).contains(&status)
 }
 
 impl fmt::Display for ProviderError {

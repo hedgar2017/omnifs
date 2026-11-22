@@ -12,11 +12,12 @@
 //!   from a file route; the host reads them without guest involvement.
 
 use crate::error::{ProviderError, Result};
-use omnifs_wit::provider::types::{BlobFetchRequest, BlobFetched, Callout, CalloutResult, Header};
+use omnifs_wit::provider::types::BlobFetched;
 
-/// Runtime-local handle for a blob stored in the host cache. Valid only for
-/// the current provider instance; do not persist it or derive paths from it.
-/// The host-owned cache reference, not this id, selects a rehydrated blob.
+/// Handle of a blob in the body store of the host. Valid only for the
+/// operation that fetched it: hand it to a file of that operation, and do
+/// not persist it or derive paths from it. The host, not this id, finds the
+/// answer that it keeps for a blob request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlobId(pub(crate) u64);
 
@@ -27,112 +28,204 @@ impl BlobId {
     }
 }
 
-/// Metadata returned by a blob fetch.
-///
-/// The response body stays in the host cache. Use [`Self::id`] when passing
-/// the blob to [`crate::projection::FileProjection::blob`].
-/// The fetch resolves for any upstream status; check
-/// [`Self::error_for_status`] before treating the blob as valid content.
+/// The answer of a blob fetch, of any status, without its body: the host
+/// stores the body of a successful answer alone.
+/// [`Self::error_for_status`] gives the blob of a successful answer.
+#[derive(Clone, Debug)]
+pub struct BlobAnswer {
+    /// HTTP status returned by the upstream fetch.
+    pub status: u16,
+    /// Response headers preserved for provider inspection.
+    pub response_headers: Vec<(String, String)>,
+    answered: crate::http::AnsweredBy,
+    upstream: bool,
+    content: Option<(BlobId, u64)>,
+}
+
+impl BlobAnswer {
+    /// The answer of the host to a blob fetch of `url`.
+    pub(crate) fn new(url: String, fetched: BlobFetched) -> Self {
+        Self {
+            status: fetched.status,
+            response_headers: fetched
+                .response_headers
+                .into_iter()
+                .map(|header| (header.name, header.value))
+                .collect(),
+            answered: crate::http::AnsweredBy::new(url, fetched.redirected),
+            upstream: fetched.upstream,
+            content: fetched
+                .content
+                .map(|content| (BlobId(content.blob), content.size)),
+        }
+    }
+
+    /// The URL that answered: the one of the request, or the last one of
+    /// the redirects that the host followed for it.
+    pub fn url(&self) -> &str {
+        &self.answered.url
+    }
+
+    /// Whether another URL than the one of the request answered.
+    pub fn redirected(&self) -> bool {
+        self.answered.redirected
+    }
+
+    /// Whether the upstream answered this fetch: the host answers a request
+    /// that it keeps the answer of from its projection, which tells nothing
+    /// of the upstream now.
+    pub fn upstream(&self) -> bool {
+        self.upstream
+    }
+
+    /// The header `name` of the answer.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.response_headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The answer as a response without a body, for the policy of an
+    /// endpoint.
+    pub(crate) fn response(&self) -> Result<http::Response<Vec<u8>>> {
+        let mut response = http::Response::builder().status(self.status);
+        for (name, value) in &self.response_headers {
+            response = response.header(name, value);
+        }
+        response
+            .extension(self.answered.clone())
+            .body(Vec::new())
+            .map_err(|error| ProviderError::internal(error.to_string()))
+    }
+
+    /// The blob of a successful status, and the error of any other, as
+    /// [`crate::http::ResponseExt::error_for_status`] gives it for an
+    /// inline answer ([`ProviderError::from_http_answer`]).
+    pub fn error_for_status(self) -> Result<BlobRef> {
+        let Some((id, size)) = self.content else {
+            return Err(ProviderError::from_http_answer(
+                self.status,
+                self.response_headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            ));
+        };
+        Ok(BlobRef {
+            id,
+            size,
+            content_type: self.header("content-type").map(ToOwned::to_owned),
+            etag: self.header("etag").map(ToOwned::to_owned),
+            answer: self,
+        })
+    }
+}
+
+/// The blob of a successful answer of a blob fetch: its body stays in the
+/// body store of the host. Use [`Self::id`] when passing the blob to
+/// [`crate::projection::FileProjection::blob`].
 #[derive(Clone, Debug)]
 pub struct BlobRef {
-    /// Runtime-local id of the cached blob.
+    /// Handle of the blob, of the operation that fetched it.
     pub id: BlobId,
-    /// Cached blob size in bytes.
+    /// Blob size in bytes.
     pub size: u64,
     /// Response `Content-Type`, when present.
     pub content_type: Option<String>,
     /// Response `ETag`, when present.
     pub etag: Option<String>,
-    /// HTTP status returned by the upstream fetch.
-    pub status: u16,
-    /// Response headers preserved for provider inspection.
-    pub response_headers: Vec<(String, String)>,
-}
-
-impl BlobRef {
-    /// The blob of a successful status, and the error of any other: the
-    /// body of an informational, redirect, or failing answer is no content.
-    /// Mirrors the inline-HTTP `error_for_status` so blob fetches participate
-    /// in the same error flow.
-    pub fn error_for_status(self) -> Result<Self> {
-        if (200..300).contains(&self.status) {
-            Ok(self)
-        } else {
-            Err(ProviderError::from_http_status(self.status))
-        }
-    }
-}
-
-impl From<BlobFetched> for BlobRef {
-    fn from(fetched: BlobFetched) -> Self {
-        Self {
-            id: BlobId(fetched.blob),
-            size: fetched.size,
-            content_type: fetched.content_type,
-            etag: fetched.etag,
-            status: fetched.status,
-            response_headers: fetched
-                .response_headers
-                .into_iter()
-                .map(|h| (h.name, h.value))
-                .collect(),
-        }
-    }
-}
-
-pub(crate) fn blob_fetch_callout(
-    method: String,
-    url: String,
-    headers: Vec<Header>,
-    body: Option<Vec<u8>>,
-    md5: Option<String>,
-    version: Option<String>,
-) -> Callout {
-    Callout::FetchBlob(BlobFetchRequest {
-        method,
-        url,
-        headers,
-        body,
-        md5,
-        version,
-    })
-}
-
-pub(crate) fn extract_blob(result: CalloutResult) -> Result<BlobRef> {
-    crate::http::expect_callout(
-        "fetch-blob",
-        |r| match r {
-            CalloutResult::BlobFetched(f) => Some(Ok(BlobRef::from(f))),
-            _ => None,
-        },
-        result,
-    )
+    /// The answer of the blob.
+    pub answer: BlobAnswer,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobId, BlobRef};
+    use super::BlobAnswer;
     use crate::error::ProviderErrorKind;
+    use core::time::Duration;
+    use omnifs_wit::provider::types::{BlobContent, BlobFetched, Header};
+
+    fn answer(status: u16, headers: &[(&str, &str)], redirected: Option<&str>) -> BlobAnswer {
+        BlobAnswer::new(
+            "https://files.test/a".into(),
+            BlobFetched {
+                status,
+                response_headers: headers
+                    .iter()
+                    .map(|(name, value)| Header {
+                        name: (*name).into(),
+                        value: (*value).into(),
+                    })
+                    .collect(),
+                redirected: redirected.map(Into::into),
+                upstream: true,
+                content: crate::error::is_success(status)
+                    .then_some(BlobContent { blob: 1, size: 4 }),
+            },
+        )
+    }
 
     #[test]
     fn a_blob_of_a_successful_status_alone_is_content() {
-        let blob = |status| BlobRef {
-            id: BlobId(1),
-            size: 0,
-            content_type: None,
-            etag: None,
-            status,
-            response_headers: Vec::new(),
-        };
         for status in [200, 206, 299] {
-            assert!(blob(status).error_for_status().is_ok(), "{status}");
+            let blob = answer(status, &[("ETag", "\"v\"")], None)
+                .error_for_status()
+                .unwrap();
+            assert_eq!(
+                (blob.size, blob.etag.as_deref()),
+                (4, Some("\"v\"")),
+                "{status}"
+            );
         }
         for status in [100, 199, 300, 302, 304, 399, 404, 500] {
-            assert!(blob(status).error_for_status().is_err(), "{status}");
+            assert!(
+                answer(status, &[], None).error_for_status().is_err(),
+                "{status}"
+            );
         }
         assert_eq!(
-            blob(404).error_for_status().unwrap_err().kind(),
+            answer(404, &[], None)
+                .error_for_status()
+                .unwrap_err()
+                .kind(),
             ProviderErrorKind::NotFound
+        );
+    }
+
+    /// The error of the status of a blob has the `Retry-After` of its
+    /// answer, as the one of an inline answer.
+    #[test]
+    fn the_error_of_a_blob_has_the_retry_after_of_its_answer() {
+        let error = answer(429, &[("Retry-After", "17")], None)
+            .error_for_status()
+            .unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::RateLimited);
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(17)));
+        let error = answer(
+            503,
+            &[
+                ("retry-after", "Sun, 06 Nov 1994 08:50:37 GMT"),
+                ("date", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            ],
+            None,
+        )
+        .error_for_status()
+        .unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::Network);
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn a_blob_names_the_url_that_answered() {
+        let asked = answer(200, &[], None);
+        assert_eq!(
+            (asked.url(), asked.redirected()),
+            ("https://files.test/a", false)
+        );
+        let other = answer(200, &[], Some("https://cdn.test/b"));
+        assert_eq!(
+            (other.url(), other.redirected()),
+            ("https://cdn.test/b", true)
         );
     }
 }

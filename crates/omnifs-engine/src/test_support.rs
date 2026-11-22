@@ -78,6 +78,16 @@ pub mod cache {
         caches.mount(name, id, spec_source)
     }
 
+    /// The names of the bodies that the body store of `caches` has.
+    pub fn bodies(caches: &Caches) -> Vec<String> {
+        let mut bodies: Vec<String> = std::fs::read_dir(caches.body.path_of_store())
+            .expect("the body store is a directory")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        bodies.sort();
+        bodies
+    }
+
     pub fn current_epoch(runtime: &crate::Runtime) -> u64 {
         runtime.resources.current_epoch()
     }
@@ -179,49 +189,51 @@ impl PendingTestCallout {
 
 impl Runtime {
     /// Answer the captured `fetch-blob` callout `pending` as the host does an
-    /// upstream answer with `status` and `body`: the body in the body store,
-    /// and its blob staged for the publication of the operation.
+    /// upstream answer with `status` and `body`, by the code of a fetch from
+    /// the answer of its upstream on: the validation of the request, the
+    /// MD5 of the body, the identity of the request, and the answer that
+    /// the projection keeps.
     #[doc(hidden)]
-    pub fn answer_test_blob(&self, pending: PendingTestCallout, status: u16, body: &[u8]) {
+    pub async fn answer_test_blob(&self, pending: PendingTestCallout, status: u16, body: &[u8]) {
         let wit_types::Callout::FetchBlob(request) = &pending.callout else {
             panic!("expected a fetch-blob, got {:?}", pending.callout);
         };
-        let headers = request
-            .headers
-            .iter()
-            .map(|header| (header.name.clone(), header.value.clone()))
-            .collect::<Vec<_>>();
-        let request = (request.md5.is_some() || request.version.is_some()).then(|| {
-            crate::cache::identity::BlobRequestId::new(
-                None,
-                &request.method,
-                &request.url,
-                &headers,
-                request.body.as_deref(),
-                request.md5.as_deref(),
-                request.version.as_deref(),
-            )
-        });
-        let stored = self
-            .resources
-            .body
-            .publish(body)
-            .expect("the body of a test blob publishes");
-        let record = self.resources.stage_blob_write(
-            pending.op_id,
-            request,
-            stored,
-            crate::cache::BlobMetadata {
-                size: body.len() as u64,
-                content_type: None,
-                etag: None,
-                status,
-                response_headers: Vec::new(),
-            },
-        );
-        pending.answer(wit_types::CalloutResult::BlobFetched(
-            record.as_ref().into(),
-        ));
+        let result = match self.blob.prepare(request) {
+            Ok(request) => self
+                .blob
+                .receive(
+                    pending.op_id,
+                    &request,
+                    None,
+                    crate::blob::Upstream {
+                        response: crate::cache::BlobResponse {
+                            status,
+                            headers: Vec::new(),
+                            redirected: None,
+                        },
+                        length: Some(body.len() as u64),
+                        body: futures::stream::iter([Ok(body.to_vec())]),
+                    },
+                )
+                .await
+                .unwrap_or_else(Into::into),
+            Err(early) => early,
+        };
+        pending.answer(result);
+    }
+
+    /// Whether the projection keeps an answer for the blob request
+    /// `request`.
+    #[doc(hidden)]
+    pub fn keeps_test_blob(&self, request: &wit_types::BlobFetchRequest) -> bool {
+        let request = self
+            .blob
+            .prepare(request)
+            .unwrap_or_else(|error| panic!("the blob request is not valid: {error:?}"));
+        self.resources
+            .kept_blob(request.id())
+            .expect("the projection reads its blob facts")
+            .is_some()
     }
 
     /// Non-blocking receive of the next captured provider callout, if one has

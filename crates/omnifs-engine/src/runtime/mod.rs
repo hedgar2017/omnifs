@@ -15,7 +15,6 @@ use crate::instance::Instance;
 use crate::invalidation::InvalidationState;
 use crate::tree_refs::TreeRefs;
 use omnifs_auth::{AuthBinding, CredentialHealth};
-use omnifs_core::path::Path;
 use omnifs_core::{MountName, ProviderId, ProviderRef};
 use omnifs_provider::{ConfigMetadata, ProviderManifest};
 use omnifs_wit::host::types as wit_types;
@@ -67,6 +66,9 @@ pub struct Runtime {
     // single set/get with no await held across it.
     window: std::sync::Mutex<Option<(std::time::Instant, wit_types::ProviderError)>>,
     pub(crate) test_callouts: Option<std::sync::Mutex<mpsc::Receiver<TestSignal>>>,
+    /// The blob executor of the mount, which answers a captured blob fetch
+    /// of a test as a fetch.
+    pub(crate) blob: BlobExecutor,
 }
 
 /// Validated state-neutral input for one provider runtime.
@@ -290,6 +292,7 @@ impl Runtime {
             feed_operations,
             window: std::sync::Mutex::new(None),
             test_callouts: test_rx.map(std::sync::Mutex::new),
+            blob,
         };
         let transition = crate::effect_apply::EffectApplier::new(&runtime.resources)
             .lower_effects(&initialize_effects, clock::now_millis())
@@ -385,34 +388,6 @@ impl Runtime {
     /// Resolve a host-issued Git tree handle for the private namespace facade.
     pub(crate) fn tree_ref(&self, tree_ref: u64) -> Option<crate::tree_refs::TreeRef> {
         self.trees.resolve(tree_ref)
-    }
-
-    /// Serve the canonical bytes for `path` from the anchor-keyed object
-    /// cache. When a `read-file` terminal answers `byte-source::canonical`, the
-    /// tree resolves the longest covering anchor and returns those bytes
-    /// without copying across the WIT. `None` when no stored anchor covers
-    /// `path`.
-    pub(crate) fn canonical_bytes_for(
-        &self,
-        path: &Path,
-    ) -> std::result::Result<Option<Vec<u8>>, EngineError> {
-        self.resources
-            .cached_canonical_for(path)
-            .map(|canonical| canonical.map(|canonical| canonical.bytes))
-            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))
-    }
-
-    /// Read the full bytes of a stored blob for a blob-backed `read-file`
-    /// terminal.
-    pub(crate) fn read_blob_full(
-        &self,
-        body: crate::view::BodyId,
-        expected_len: Option<u64>,
-    ) -> Result<Vec<u8>> {
-        self.resources
-            .body
-            .read(body, expected_len)
-            .map_err(|e| EngineError::ProviderProtocol(format!("read blob body: {e}")))
     }
 }
 

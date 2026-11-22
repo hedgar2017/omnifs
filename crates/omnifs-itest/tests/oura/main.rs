@@ -46,6 +46,7 @@ fn resume_json<T>(op: &mut omnifs_engine::test_support::TestOp<'_, T>, body: &'s
             value: "\"v1\"".to_string(),
         }],
         body: body.to_vec(),
+        redirected: None,
     })])
     .unwrap();
 }

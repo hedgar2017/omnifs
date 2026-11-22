@@ -36,6 +36,7 @@ fn resume_http<T>(op: &mut TestOp<'_, T>, body: Vec<u8>) {
         status: 200,
         headers: Vec::new(),
         body,
+        redirected: None,
     })])
     .unwrap();
 }
@@ -47,12 +48,11 @@ fn resume_paper_atom<T>(op: &mut TestOp<'_, T>) {
 fn resume_blob(op: &mut TestOp<'_, ReadFileOutcome>, blob: u64) {
     op.answer_callouts(vec![CalloutResult::BlobFetched(
         omnifs_wit::host::types::BlobFetched {
-            blob,
-            size: 4,
-            content_type: Some("application/pdf".to_string()),
-            etag: None,
             status: 200,
             response_headers: Vec::new(),
+            redirected: None,
+            upstream: true,
+            content: Some(omnifs_wit::host::types::BlobContent { blob, size: 4 }),
         },
     )])
     .unwrap();

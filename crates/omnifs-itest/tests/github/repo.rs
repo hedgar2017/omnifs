@@ -59,6 +59,7 @@ fn github_repo_tree_opens_a_new_commit() {
             status: 200,
             headers: Vec::new(),
             body: NEXT.as_bytes().to_vec(),
+            redirected: None,
         })])
         .unwrap();
         let [Callout::GitOpenRepo(open)] = list.callouts() else {

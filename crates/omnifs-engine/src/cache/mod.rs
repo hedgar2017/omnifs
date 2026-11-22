@@ -1,4 +1,5 @@
 pub(crate) mod body;
+pub(crate) mod collect;
 pub(crate) mod identity;
 pub(crate) mod memory;
 pub mod mount;

@@ -90,8 +90,9 @@ pub async fn answering<T>(
                         url: request.url.clone(),
                         headers,
                         body: request.body.clone(),
+                        follow_redirects: false,
                     });
-                    runtime.answer_test_blob(callout, status, &body);
+                    runtime.answer_test_blob(callout, status, &body).await;
                 },
                 (callout, _) => panic!("another callout than its answer: {callout:?}"),
             }
@@ -261,6 +262,7 @@ pub fn bytes(status: u16, body: &[u8]) -> Answer {
             value: "application/octet-stream".to_owned(),
         }],
         body: body.to_vec(),
+        redirected: None,
     }))
 }
 

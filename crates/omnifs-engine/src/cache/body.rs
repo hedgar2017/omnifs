@@ -1,19 +1,139 @@
 //! Global content-addressed storage for durable provider bodies.
 
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 pub(crate) use crate::view::BodyId;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// One append-only body store shared by all projections.
+/// One content-addressed body store shared by all projections. A body stays
+/// while a fact of a projection refers to it or a [`BodyHold`] holds it, and
+/// leaves with the collection after ([`crate::cache::collect`]).
 #[derive(Debug)]
 pub(crate) struct BodyStore {
     root: PathBuf,
+    pins: Arc<Mutex<Pins>>,
+    /// Held by each publication from its first body to its commit, so that
+    /// a collection begins after the publications in flight.
+    publications: RwLock<()>,
+    /// The bytes of the bodies that the store took since the begin of its
+    /// last collection.
+    taken: AtomicU64,
+    /// The bytes of the bodies that its last collection left.
+    left: AtomicU64,
+}
+
+/// The bodies that a collection must leave whatever the projections refer
+/// to: the ones that a [`BodyHold`] holds, and, for a collection in flight,
+/// each one that a publication or a hold named since its begin, whose
+/// reference the collection may not have read.
+#[derive(Debug, Default)]
+struct Pins {
+    held: HashMap<BodyId, usize>,
+    named: Option<HashSet<BodyId>>,
+}
+
+impl Pins {
+    fn name(&mut self, id: BodyId) {
+        if let Some(named) = &mut self.named {
+            named.insert(id);
+        }
+    }
+}
+
+/// Keeps a body in the store while it lives: the body of an operation in
+/// flight, which no fact refers to yet, or the body of a file that a reader
+/// was told of.
+#[derive(Debug)]
+pub(crate) struct BodyHold {
+    pins: Arc<Mutex<Pins>>,
+    id: BodyId,
+}
+
+impl BodyHold {
+    #[must_use]
+    pub(crate) fn id(&self) -> BodyId {
+        self.id
+    }
+}
+
+impl Clone for BodyHold {
+    fn clone(&self) -> Self {
+        let mut pins = self.pins.lock();
+        *pins.held.entry(self.id).or_default() += 1;
+        Self {
+            pins: Arc::clone(&self.pins),
+            id: self.id,
+        }
+    }
+}
+
+impl Drop for BodyHold {
+    fn drop(&mut self) {
+        let mut pins = self.pins.lock();
+        if let Some(count) = pins.held.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                pins.held.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// A collection of the store in flight, from [`BodyStore::begin_collection`]
+/// to its drop.
+pub(crate) struct Collection<'a> {
+    store: &'a BodyStore,
+}
+
+impl Collection<'_> {
+    /// Remove each body of the store that is not in `referred`, that no
+    /// hold holds, and that nothing named since the begin of the
+    /// collection. Returns the bodies that it removed.
+    pub(crate) fn sweep(self, referred: &HashSet<BodyId>) -> Result<Vec<BodyId>, BodyStoreError> {
+        let mut removed = Vec::new();
+        let mut left = 0_u64;
+        for entry in fs::read_dir(&self.store.root)? {
+            let entry = entry?;
+            let Some(id) = entry.file_name().to_str().and_then(body_of_name) else {
+                continue;
+            };
+            let length = entry.metadata()?.len();
+            if referred.contains(&id) {
+                left = left.saturating_add(length);
+                continue;
+            }
+            // The check and the removal are one step for a publication,
+            // which names its body before it looks for it.
+            let pins = self.store.pins.lock();
+            if pins.held.contains_key(&id)
+                || pins.named.as_ref().is_some_and(|named| named.contains(&id))
+            {
+                left = left.saturating_add(length);
+                continue;
+            }
+            fs::remove_file(entry.path())?;
+            drop(pins);
+            removed.push(id);
+        }
+        if !removed.is_empty() {
+            sync_directory(&self.store.root)?;
+        }
+        self.store.left.store(left, Ordering::Relaxed);
+        Ok(removed)
+    }
+}
+
+impl Drop for Collection<'_> {
+    fn drop(&mut self) {
+        self.store.pins.lock().named = None;
+    }
 }
 
 impl BodyStore {
@@ -43,7 +163,69 @@ impl BodyStore {
                 fs::remove_file(path)?;
             }
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            pins: Arc::default(),
+            publications: RwLock::new(()),
+            taken: AtomicU64::new(0),
+            left: AtomicU64::new(0),
+        })
+    }
+
+    /// Keep the body `id` in the store while the hold lives. The hold of a
+    /// body that the store lacks keeps nothing: [`Self::validate`] after it
+    /// tells whether the store has the body.
+    pub(crate) fn hold(&self, id: BodyId) -> BodyHold {
+        let mut pins = self.pins.lock();
+        pins.name(id);
+        *pins.held.entry(id).or_default() += 1;
+        BodyHold {
+            pins: Arc::clone(&self.pins),
+            id,
+        }
+    }
+
+    /// Whether a hold holds the body `id`.
+    pub(crate) fn is_held(&self, id: BodyId) -> bool {
+        self.pins.lock().held.contains_key(&id)
+    }
+
+    /// The publication of a projection in flight: held from before its
+    /// first body to after its commit.
+    pub(crate) fn publication(&self) -> RwLockReadGuard<'_, ()> {
+        self.publications.read()
+    }
+
+    /// Whether a collection is due: the store took as many bytes since its
+    /// last collection as that one left, so that the bodies without a
+    /// reference never outweigh the ones with one, and the scan of a
+    /// collection is paid by the bytes that came since the one before.
+    pub(crate) fn collection_due(&self) -> bool {
+        let taken = self.taken.load(Ordering::Relaxed);
+        taken > 0 && taken >= self.left.load(Ordering::Relaxed)
+    }
+
+    /// Begin a collection: from here on, the store names each body of a
+    /// publication and of a hold to the collection, and each publication
+    /// that began before has ended. The facts that the caller reads after
+    /// refer to each body that a sweep may not remove, beside those.
+    pub(crate) fn begin_collection(&self) -> Collection<'_> {
+        {
+            let mut pins = self.pins.lock();
+            let held = pins.held.keys().copied().collect();
+            pins.named = Some(held);
+        }
+        self.taken.store(0, Ordering::Relaxed);
+        drop(self.publications.write());
+        Collection { store: self }
+    }
+
+    fn name(&self, id: BodyId) {
+        self.pins.lock().name(id);
+    }
+
+    fn took(&self, length: u64) {
+        self.taken.fetch_add(length, Ordering::Relaxed);
     }
 
     /// Publish bytes before any projection can reference their returned id.
@@ -99,6 +281,7 @@ impl BodyStore {
     /// durable.
     fn link(&self, bytes: &[u8]) -> Result<(BodyId, bool), BodyStoreError> {
         let id = BodyId::from_bytes(bytes);
+        self.name(id);
         let destination = self.path(id);
         match fs::symlink_metadata(&destination) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -125,6 +308,7 @@ impl BodyStore {
             match fs::hard_link(&temporary, &destination) {
                 Ok(()) => {
                     fs::remove_file(&temporary)?;
+                    self.took(bytes.len() as u64);
                     Ok((id, true))
                 },
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -160,25 +344,18 @@ impl BodyStore {
         })
     }
 
-    /// Publish a streamed body without materializing it in memory.
-    pub(crate) fn publish_staged(&self, mut staged: BodyWriter) -> Result<BodyId, BodyStoreError> {
-        staged
-            .file
-            .as_mut()
-            .expect("staged body file exists")
-            .flush()?;
-        staged
-            .file
-            .as_ref()
-            .expect("staged body file exists")
-            .sync_all()?;
+    /// Publish a streamed body without materializing it in memory. The hold
+    /// of the body keeps it until a fact refers to it.
+    pub(crate) fn publish_staged(
+        &self,
+        mut staged: BodyWriter,
+    ) -> Result<BodyHold, BodyStoreError> {
+        let file = staged.file.as_mut().expect("staged body file exists");
+        file.flush()?;
+        file.sync_all()?;
         let id = BodyId::from_digest_bytes(*staged.hasher.finalize().as_bytes());
         let expected_len = staged.length;
-        let metadata = staged
-            .file
-            .as_ref()
-            .expect("staged body file exists")
-            .metadata()?;
+        let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() != expected_len {
             return Err(BodyStoreError::Length {
                 id,
@@ -186,41 +363,20 @@ impl BodyStore {
                 actual: metadata.len(),
             });
         }
+        let hold = self.hold(id);
         let destination = self.path(id);
-        match fs::symlink_metadata(&destination) {
-            Ok(existing) if existing.file_type().is_symlink() || !existing.is_file() => {
-                Err(BodyStoreError::Destination { id })
+        match fs::hard_link(&staged.path, &destination) {
+            Ok(()) => self.took(expected_len),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                self.validate(id, Some(expected_len))?;
             },
-            Ok(_) => {
-                Self::verify_destination(&destination, id, expected_len)?;
-                drop(staged.file.take());
-                fs::remove_file(&staged.path)?;
-                sync_directory(&self.root)?;
-                staged.published = true;
-                Ok(id)
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match fs::hard_link(&staged.path, &destination) {
-                    Ok(()) => {
-                        drop(staged.file.take());
-                        fs::remove_file(&staged.path)?;
-                        sync_directory(&self.root)?;
-                        staged.published = true;
-                        Ok(id)
-                    },
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        Self::verify_destination(&destination, id, expected_len)?;
-                        drop(staged.file.take());
-                        fs::remove_file(&staged.path)?;
-                        sync_directory(&self.root)?;
-                        staged.published = true;
-                        Ok(id)
-                    },
-                    Err(error) => Err(error.into()),
-                }
-            },
-            Err(error) => Err(error.into()),
+            Err(error) => return Err(error.into()),
         }
+        drop(staged.file.take());
+        fs::remove_file(&staged.path)?;
+        sync_directory(&self.root)?;
+        staged.published = true;
+        Ok(hold)
     }
 
     pub(crate) fn read(
@@ -289,21 +445,34 @@ impl BodyStore {
         Ok(bytes)
     }
 
+    /// Whether the store has the body `id` with `expected_len` bytes, for
+    /// a fact that is about to refer to it. The digest of a body is of its
+    /// whole, which its publication checked: the store reads no body again
+    /// for it.
     pub(crate) fn validate(
         &self,
         id: BodyId,
         expected_len: Option<u64>,
     ) -> Result<(), BodyStoreError> {
+        self.name(id);
         let metadata = fs::symlink_metadata(self.path(id))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(BodyStoreError::Destination { id });
+        }
         let length = metadata.len();
-        if expected_len.is_some_and(|expected| expected != length) {
+        if let Some(expected) = expected_len.filter(|expected| *expected != length) {
             return Err(BodyStoreError::Length {
                 id,
-                expected: expected_len.unwrap_or(length),
+                expected,
                 actual: length,
             });
         }
-        Self::verify_file(&self.path(id), id, length)
+        Ok(())
+    }
+
+    /// The directory of the store.
+    pub(crate) fn path_of_store(&self) -> &Path {
+        &self.root
     }
 
     #[must_use]
@@ -402,6 +571,13 @@ impl Drop for BodyWriter {
     }
 }
 
+/// The body whose file in the store has `name`, none for another file.
+fn body_of_name(name: &str) -> Option<BodyId> {
+    let mut digest = [0_u8; 32];
+    hex::decode_to_slice(name, &mut digest).ok()?;
+    Some(BodyId::from_digest_bytes(digest))
+}
+
 fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
@@ -454,6 +630,118 @@ impl std::fmt::Display for BodyId {
 #[cfg(test)]
 mod tests {
     use super::BodyStore;
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    /// A collection removes the body that nothing refers to, and leaves the
+    /// one that a fact refers to and the one that a hold holds, until the
+    /// collection after the end of the hold.
+    #[test]
+    fn a_collection_leaves_the_body_of_a_reference_and_of_a_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BodyStore::open(dir.path()).unwrap();
+        let referred = store.publish(b"referred").unwrap();
+        let pinned = store.publish(b"held").unwrap();
+        let lost = store.publish(b"lost").unwrap();
+        let hold = store.hold(pinned);
+        let also = hold.clone();
+
+        let removed = store
+            .begin_collection()
+            .sweep(&HashSet::from([referred]))
+            .unwrap();
+        assert_eq!(removed, vec![lost]);
+        assert!(store.validate(referred, Some(8)).is_ok());
+        assert!(store.validate(pinned, Some(4)).is_ok());
+        assert!(store.validate(lost, None).is_err());
+
+        // A body stays while one of its holds lives.
+        drop(hold);
+        assert!(store.is_held(pinned));
+        assert!(
+            store
+                .begin_collection()
+                .sweep(&HashSet::from([referred]))
+                .unwrap()
+                .is_empty()
+        );
+        drop(also);
+        assert!(!store.is_held(pinned));
+        let removed = store
+            .begin_collection()
+            .sweep(&HashSet::from([referred]))
+            .unwrap();
+        assert_eq!(removed, vec![pinned]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// The body that a publication names after the begin of a collection
+    /// stays, whatever the collection read of the facts: its fact commits
+    /// after that read. A publication in flight at the begin ends first.
+    #[test]
+    fn a_collection_leaves_the_body_that_a_publication_names_since_its_begin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BodyStore::open(dir.path()).unwrap();
+        let before = store.publish(b"before").unwrap();
+        let known = store.publish(b"known").unwrap();
+
+        let collection = store.begin_collection();
+        // During the collection: a new body, a body that the store had, by
+        // its bytes and by its validation for a fact, and a staged body.
+        let new = store.publish(b"new").unwrap();
+        assert_eq!(store.publish(b"known").unwrap(), known);
+        let mut staged = store.stage().unwrap();
+        staged.write_all(b"staged").unwrap();
+        let staged = store.publish_staged(staged).unwrap().id();
+        let removed = collection.sweep(&HashSet::new()).unwrap();
+        assert_eq!(removed, vec![before]);
+        for (body, length) in [(new, 3), (known, 5), (staged, 6)] {
+            assert!(store.validate(body, Some(length)).is_ok());
+        }
+
+        // The begin of a collection waits for the publication in flight.
+        let store = std::sync::Arc::new(store);
+        let publication = store.publication();
+        let (began, waits) = std::sync::mpsc::channel();
+        let collector = std::thread::spawn({
+            let store = std::sync::Arc::clone(&store);
+            move || {
+                let collection = store.begin_collection();
+                began.send(()).unwrap();
+                collection.sweep(&HashSet::new()).unwrap().len()
+            }
+        });
+        assert!(
+            waits
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a collection began beside a publication in flight"
+        );
+        drop(publication);
+        assert_eq!(collector.join().unwrap(), 3);
+    }
+
+    /// A collection is due once the store took as many bytes as the one
+    /// before left.
+    #[test]
+    fn a_collection_is_due_by_the_bytes_that_the_store_took_since_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BodyStore::open(dir.path()).unwrap();
+        assert!(!store.collection_due());
+        let kept = store.publish(b"12345678").unwrap();
+        assert!(store.collection_due());
+        store
+            .begin_collection()
+            .sweep(&HashSet::from([kept]))
+            .unwrap();
+        assert!(!store.collection_due());
+        store.publish(b"1234").unwrap();
+        // The bytes of a body that the store has are no bytes that it took.
+        store.publish(b"12345678").unwrap();
+        assert!(!store.collection_due());
+        store.publish(b"abcd").unwrap();
+        assert!(store.collection_due());
+    }
 
     #[test]
     fn publish_all_publishes_each_body_once_beside_a_body_of_the_store() {

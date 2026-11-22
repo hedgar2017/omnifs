@@ -15,7 +15,9 @@
 
 use crate::authority::{ApprovedHttpTransport, RuntimeAuthority};
 use crate::cache::identity::BlobRequestId;
-use crate::callouts::{callout_denied, callout_internal, callout_network, record_outcome};
+use crate::callouts::{
+    callout_denied, callout_internal, callout_invalid, callout_network, record_outcome,
+};
 use crate::log_redaction::{LogUrl, WitHeaders};
 use dashmap::DashMap;
 use omnifs_auth::{AuthBinding, RefreshOutcome};
@@ -45,10 +47,17 @@ pub struct HttpStack {
 }
 
 /// The most redirects that the host follows for one request.
-const MAX_REDIRECTS: usize = 10;
+pub(crate) const MAX_REDIRECTS: usize = 10;
 
-/// The bound of the wait for an answer: for the whole of it, body included,
-/// or for its status alone, where the caller bounds the wait for its body.
+/// Whether `status` is of a successful answer, whose body is content: the
+/// one owner of that in the host.
+pub(crate) fn successful(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
+/// The bound of the wait for an answer: for the whole of it, body included
+/// and each redirect with it, or for the status of each of its hops alone,
+/// where the caller bounds the wait for its body.
 #[derive(Clone, Copy)]
 pub(crate) enum Wait {
     Whole(Duration),
@@ -64,14 +73,21 @@ pub(crate) struct ValidatedRequest {
     canonical_url: String,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
+    follow_redirects: bool,
+}
+
+/// The identity of the bytes that a blob request asks for.
+#[derive(Clone, Copy)]
+pub(crate) struct BlobPin<'a> {
+    pub md5: Option<&'a str>,
+    pub version: Option<&'a str>,
 }
 
 impl ValidatedRequest {
     pub(crate) fn blob_request_id(
         &self,
         auth: Option<&AuthBinding>,
-        md5: Option<&str>,
-        version: Option<&str>,
+        pin: BlobPin<'_>,
     ) -> BlobRequestId {
         BlobRequestId::new(
             auth.map(omnifs_auth::AuthBinding::credential_id),
@@ -79,14 +95,39 @@ impl ValidatedRequest {
             &self.canonical_url,
             &self.headers,
             self.body.as_deref(),
-            md5,
-            version,
+            self.follow_redirects,
+            pin.md5,
+            pin.version,
         )
     }
 
     pub(crate) fn original_url(&self) -> &str {
         &self.original_url
     }
+
+    pub(crate) fn is_get(&self) -> bool {
+        self.method == reqwest::Method::GET
+    }
+
+    /// Whether the provider wrote the header `name` of the request.
+    pub(crate) fn has_header(&self, name: &str) -> bool {
+        self.headers.iter().any(|(header, _)| header == name)
+    }
+}
+
+/// Headers of the host for the hop of a request to `url`: the validators of
+/// the answer that the host keeps of that URL.
+pub(crate) struct HopHeaders {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
+/// The answer of an upstream to a request: the response of the URL that
+/// answered, which `redirected` names when it is another than the one of
+/// the request.
+pub(crate) struct Answer {
+    pub response: reqwest::Response,
+    pub redirected: Option<String>,
 }
 
 impl HttpStack {
@@ -125,29 +166,16 @@ impl HttpStack {
         }
     }
 
-    /// Authorize, build, and dispatch a request. Returns the in-flight
-    /// response on success or a fully-formed `CalloutResult` on any
-    /// pre-flight or network failure. `reqwest::Response` is the only
-    /// reqwest type that crosses this boundary; everything else stays
-    /// hidden inside the stack.
-    pub async fn send(
-        &self,
-        method: &str,
-        url: &str,
-        headers: &[wit_types::Header],
-        body: Option<&[u8]>,
-        timeout: Duration,
-    ) -> Result<reqwest::Response, wit_types::CalloutResult> {
-        let request = self.validate(method, url, headers, body)?;
-        self.send_validated(&request, Wait::Whole(timeout)).await
-    }
-
+    /// Validate `method`, `url`, and `headers` against the authority of the
+    /// mount. A request that follows redirects is a `GET` or a `HEAD` over
+    /// HTTPS: the host follows no other.
     pub(crate) fn validate(
         &self,
         method: &str,
         url: &str,
         headers: &[wit_types::Header],
         body: Option<&[u8]>,
+        follow_redirects: bool,
     ) -> Result<ValidatedRequest, wit_types::CalloutResult> {
         let transport = self
             .authority
@@ -155,6 +183,15 @@ impl HttpStack {
             .map_err(|error| callout_denied(error.to_string()))?;
         let method = reqwest::Method::from_str(method)
             .map_err(|_| callout_denied(format!("unsupported HTTP method: {method}")))?;
+        if follow_redirects
+            && !(matches!(transport, ApprovedHttpTransport::Https(_))
+                && (method == reqwest::Method::GET || method == reqwest::Method::HEAD))
+        {
+            return Err(callout_invalid(format!(
+                "the host follows the redirects of a GET or a HEAD over HTTPS alone, not of {method} {}",
+                LogUrl(url)
+            )));
+        }
         let mut normalized = Vec::with_capacity(headers.len());
         for header in headers {
             let name = HeaderName::from_str(&header.name).map_err(|error| {
@@ -180,59 +217,123 @@ impl HttpStack {
             canonical_url,
             headers: normalized,
             body: body.map(ToOwned::to_owned),
+            follow_redirects,
         })
     }
 
-    /// Dispatch `request` and follow the redirects of its answer: the
-    /// answer of a `GET` or a `HEAD` that redirects to a URL that the
-    /// authority of the mount approves is the answer of that URL, with the
-    /// credential of that URL alone, for at most [`MAX_REDIRECTS`]
-    /// redirects. Any other redirect is the answer itself.
+    /// Dispatch `request` and return the answer of its upstream. The answer
+    /// of a redirect status is the answer itself, unless the request follows
+    /// redirects: then each `301`, `302`, `303`, `307`, and `308` with a
+    /// `Location` is a hop to that URL, for at most [`MAX_REDIRECTS`] hops.
+    /// A hop is to an HTTPS URL that the authority of the mount approves,
+    /// with the credential that the mount declares for that URL alone, and
+    /// with the headers and the body of the provider for a hop to the
+    /// origin of the request alone. A hop that the host refuses, and one
+    /// too many, is an error that is not retryable and names the host of
+    /// the hop: never the redirect as the answer. `host` gives the headers
+    /// of the host for the hop to its URL.
     pub(crate) async fn send_validated(
         &self,
         request: &ValidatedRequest,
+        host: Option<&HopHeaders>,
         wait: Wait,
-    ) -> Result<reqwest::Response, wit_types::CalloutResult> {
+    ) -> Result<Answer, wit_types::CalloutResult> {
+        let whole = match wait {
+            Wait::Whole(timeout) => Some(tokio::time::Instant::now() + timeout),
+            Wait::Status(_) => None,
+        };
         let mut transport = request.transport.clone();
         let mut url = request.original_url.clone();
-        for _ in 0..=MAX_REDIRECTS {
+        let mut redirected = None;
+        for hop in 0..=MAX_REDIRECTS {
+            let own = hop == 0 || same_origin(&request.transport, &transport);
+            let mut headers = if own {
+                request.headers.clone()
+            } else {
+                Vec::new()
+            };
+            if let Some(host) = host.filter(|host| host.url == url) {
+                headers.extend(host.headers.iter().cloned());
+            }
+            let wait = match (wait, whole) {
+                (Wait::Whole(_), Some(deadline)) => Wait::Whole(
+                    deadline
+                        .checked_duration_since(tokio::time::Instant::now())
+                        .filter(|left| !left.is_zero())
+                        .ok_or_else(|| {
+                            callout_network(format!(
+                                "{} did not answer in time",
+                                LogUrl(&request.original_url)
+                            ))
+                        })?,
+                ),
+                (wait, _) => wait,
+            };
             let response = self
-                .send_authorized(request, &transport, &url, wait)
+                .send_authorized(
+                    &request.method,
+                    &transport,
+                    &url,
+                    &headers,
+                    request.body.as_deref().filter(|_| own),
+                    wait,
+                )
                 .await?;
-            let Some(target) = redirect_target(&request.method, &transport, &response) else {
-                return Ok(response);
+            let location = if request.follow_redirects {
+                redirect_location(&response)
+            } else {
+                None
             };
-            let Ok(approved) = self.authority.approve_http(target.as_str()) else {
-                return Ok(response);
+            let Some(location) = location else {
+                return Ok(Answer {
+                    response,
+                    redirected,
+                });
             };
-            transport = approved;
+            let target = redirect_target(&transport, location).ok_or_else(|| {
+                callout_denied(format!(
+                    "{} redirects to a location that is no URL",
+                    LogUrl(&url)
+                ))
+            })?;
+            let target_host = target.host_str().unwrap_or_default().to_owned();
+            if target.scheme() != "https" {
+                return Err(callout_denied(format!(
+                    "{} redirects to the host {target_host} over {}, and a redirect leaves no HTTPS",
+                    LogUrl(&url),
+                    target.scheme()
+                )));
+            }
+            if hop == MAX_REDIRECTS {
+                return Err(callout_denied(format!(
+                    "{} redirects more than {MAX_REDIRECTS} times, the last to the host {target_host}",
+                    LogUrl(&request.original_url)
+                )));
+            }
+            transport = self.authority.approve_http(target.as_str()).map_err(|error| {
+                callout_denied(format!(
+                    "{} redirects to the host {target_host}, which the mount does not approve: {error}",
+                    LogUrl(&url)
+                ))
+            })?;
             url = target.into();
+            redirected = Some(url.clone());
         }
-        Err(callout_network(format!(
-            "{} redirects more than {MAX_REDIRECTS} times",
-            LogUrl(&request.original_url)
-        )))
+        unreachable!("the last hop returns its answer or its error")
     }
 
-    /// Dispatch `request` to `url` with its credential, once more after a
+    /// Dispatch a request to `url` with its credential, once more after a
     /// refresh of a credential that the upstream rejected.
     async fn send_authorized(
         &self,
-        request: &ValidatedRequest,
+        method: &reqwest::Method,
         transport: &ApprovedHttpTransport,
         url: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
         wait: Wait,
     ) -> Result<reqwest::Response, wit_types::CalloutResult> {
-        let send = || {
-            self.send_once(
-                request.method.clone(),
-                transport,
-                url,
-                &request.headers,
-                request.body.as_deref(),
-                wait,
-            )
-        };
+        let send = || self.send_once(method.clone(), transport, url, headers, body, wait);
         let response = send().await?;
         let rejection = match &self.auth {
             Some(auth) => {
@@ -294,12 +395,7 @@ impl HttpStack {
             Wait::Whole(timeout) => request.timeout(timeout).send().await,
             Wait::Status(timeout) => tokio::time::timeout(timeout, request.send())
                 .await
-                .map_err(|_| {
-                    callout_network(format!(
-                        "the upstream sent nothing for {} seconds",
-                        timeout.as_secs()
-                    ))
-                })?,
+                .map_err(|_| callout_network(idle_message(timeout)))?,
         }
         .map_err(|e| callout_network(e.to_string()))
     }
@@ -359,56 +455,88 @@ impl HttpStack {
         req: &wit_types::HttpRequest,
         timeout: Duration,
     ) -> wit_types::CalloutResult {
-        let result = match self
-            .send(
-                &req.method,
-                &req.url,
-                &req.headers,
-                req.body.as_deref(),
-                timeout,
-            )
-            .await
-        {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let response_headers = decode_response_headers(response.headers());
-                match response.bytes().await {
-                    Ok(body) => wit_types::CalloutResult::HttpResponse(wit_types::HttpResponse {
-                        status,
-                        headers: response_headers
-                            .into_iter()
-                            .map(|(name, value)| wit_types::Header { name, value })
-                            .collect(),
-                        body: body.to_vec(),
-                    }),
-                    Err(e) => callout_network(e.to_string()),
-                }
-            },
+        let result = match self.answer(req, timeout).await {
+            Ok(response) => wit_types::CalloutResult::HttpResponse(response),
             Err(early) => early,
         };
         record_outcome(&result);
         result
     }
+
+    async fn answer(
+        &self,
+        req: &wit_types::HttpRequest,
+        timeout: Duration,
+    ) -> Result<wit_types::HttpResponse, wit_types::CalloutResult> {
+        let request = self.validate(
+            &req.method,
+            &req.url,
+            &req.headers,
+            req.body.as_deref(),
+            req.follow_redirects,
+        )?;
+        let Answer {
+            response,
+            redirected,
+        } = self
+            .send_validated(&request, None, Wait::Whole(timeout))
+            .await?;
+        let status = response.status().as_u16();
+        let headers = wit_headers(decode_response_headers(response.headers()));
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| callout_network(error.to_string()))?;
+        Ok(wit_types::HttpResponse {
+            status,
+            headers,
+            body: body.to_vec(),
+            redirected,
+        })
+    }
 }
 
-/// The URL that `response` redirects a request of `method` over `transport`
-/// to: the `Location` of a redirect status, against the URL of the request,
-/// for a `GET` or a `HEAD` over HTTPS.
-fn redirect_target(
-    method: &reqwest::Method,
-    transport: &ApprovedHttpTransport,
-    response: &reqwest::Response,
-) -> Option<Url> {
+/// The message of the error of an upstream that sent nothing for `bound`.
+pub(crate) fn idle_message(bound: Duration) -> String {
+    format!(
+        "the upstream sent nothing for {} seconds",
+        bound.as_secs_f64()
+    )
+}
+
+/// The `Location` of an answer that redirects: of the status `301`, `302`,
+/// `303`, `307`, or `308`.
+fn redirect_location(response: &reqwest::Response) -> Option<&HeaderValue> {
+    if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    response.headers().get(reqwest::header::LOCATION)
+}
+
+/// The URL of `location` against the URL of the hop over `transport` that
+/// answered it.
+fn redirect_target(transport: &ApprovedHttpTransport, location: &HeaderValue) -> Option<Url> {
     let ApprovedHttpTransport::Https(url) = transport else {
         return None;
     };
-    if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
-        || !(method == reqwest::Method::GET || method == reqwest::Method::HEAD)
-    {
-        return None;
-    }
-    let location = response.headers().get(reqwest::header::LOCATION)?;
     url.join(location.to_str().ok()?).ok()
+}
+
+/// Whether the hop over `hop` is to the origin of the request over
+/// `request`: the same scheme, host, and port.
+fn same_origin(request: &ApprovedHttpTransport, hop: &ApprovedHttpTransport) -> bool {
+    let (ApprovedHttpTransport::Https(request), ApprovedHttpTransport::Https(hop)) = (request, hop)
+    else {
+        return false;
+    };
+    request.host() == hop.host() && request.port_or_known_default() == hop.port_or_known_default()
+}
+
+pub(crate) fn wit_headers(headers: Vec<(String, String)>) -> Vec<wit_types::Header> {
+    headers
+        .into_iter()
+        .map(|(name, value)| wit_types::Header { name, value })
+        .collect()
 }
 
 /// Combine auth and request headers into a single `HeaderMap`. Invalid
@@ -462,71 +590,4 @@ pub(crate) fn decode_response_headers(headers: &HeaderMap) -> Vec<(String, Strin
             },
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ApprovedHttpTransport, HttpStack, Url, redirect_target};
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
-    fn answer(status: u16, location: Option<&str>) -> reqwest::Response {
-        let mut response = http::Response::builder().status(status);
-        if let Some(location) = location {
-            response = response.header(http::header::LOCATION, location);
-        }
-        response.body(reqwest::Body::from("")).unwrap().into()
-    }
-
-    #[test]
-    fn a_get_follows_the_location_of_a_redirect_against_its_url() {
-        let https = ApprovedHttpTransport::Https(Url::parse("https://api.test/a/b?c").unwrap());
-        let target = |method: reqwest::Method, status, location| {
-            redirect_target(&method, &https, &answer(status, location)).map(|url| url.to_string())
-        };
-        for status in [301, 302, 303, 307, 308] {
-            assert_eq!(
-                target(reqwest::Method::GET, status, Some("/moved")).as_deref(),
-                Some("https://api.test/moved"),
-                "{status}"
-            );
-        }
-        assert_eq!(
-            target(reqwest::Method::HEAD, 302, Some("https://files.test/x")).as_deref(),
-            Some("https://files.test/x")
-        );
-        // The answer of another status, of another method, and of a
-        // redirect without a location is the answer itself.
-        assert_eq!(target(reqwest::Method::GET, 200, Some("/moved")), None);
-        assert_eq!(target(reqwest::Method::GET, 304, Some("/moved")), None);
-        assert_eq!(target(reqwest::Method::POST, 302, Some("/moved")), None);
-        assert_eq!(target(reqwest::Method::GET, 302, None), None);
-    }
-
-    /// The client follows no redirect by itself: [`HttpStack::send_validated`]
-    /// follows each to a URL that the authority approves alone.
-    #[tokio::test]
-    async fn client_builder_returns_redirect_response_without_following_it() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: /followed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
-        });
-
-        let client = HttpStack::client_builder().build().unwrap();
-        let response = client
-            .get(format!("http://{address}/start"))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
-        server.await.unwrap();
-    }
 }

@@ -49,6 +49,7 @@ fn github_provider_routes_namespace_and_numeric_paths() {
             status: 200,
             headers: Vec::<Header>::new(),
             body: br#"{"name":"Hello-World"}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match repo_listing.result().unwrap() {
@@ -103,6 +104,7 @@ fn github_provider_routes_namespace_and_numeric_paths() {
                 ]
             }"#
             .to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match runs_listed.result().unwrap() {
@@ -153,6 +155,7 @@ fn github_action_run_list_projects_files() {
                 ]
             }"#
             .to_vec(),
+            redirected: None,
         })])
         .unwrap();
 
@@ -216,6 +219,7 @@ fn github_provider_action_run_lookup_validates_and_listing_validates() {
             status: 200,
             headers: Vec::<Header>::new(),
             body: br#"{"id":123,"status":"completed","conclusion":"success"}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
 
@@ -273,6 +277,7 @@ fn github_owner_listing_tracks_browsed_repos() {
             status: 200,
             headers: Vec::<Header>::new(),
             body: br#"{"name":"Hello-World"}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     assert!(
@@ -296,6 +301,7 @@ fn github_owner_listing_tracks_browsed_repos() {
             status: 200,
             headers: Vec::<Header>::new(),
             body: br#"{"login":"octocat","type":"User"}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     let org_repos_fetch = owner_listing.expect_single_fetch();
@@ -311,6 +317,7 @@ fn github_owner_listing_tracks_browsed_repos() {
             status: 404,
             headers: Vec::<Header>::new(),
             body: br#"{"message":"Not Found"}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     let repos_fetch = owner_listing.expect_single_fetch();
@@ -340,6 +347,7 @@ fn github_owner_listing_tracks_browsed_repos() {
                 value: r#""repos-1""#.to_string(),
             }],
             body: format!("[{repo_page}]").into_bytes(),
+            redirected: None,
         })])
         .unwrap();
     // The validator and the cursor of a page carry the owner kind, so a page
@@ -424,6 +432,7 @@ fn github_owner_listing_tracks_browsed_repos() {
                 value: r#""repos-2""#.to_string(),
             }],
             body: br#"[{"name":"Hello-World"},{"name":"new-repo"}]"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match first_changed.result().unwrap() {
@@ -465,6 +474,7 @@ fn github_owner_listing_tracks_browsed_repos() {
                 value: r#""repos-page-2""#.to_string(),
             }],
             body: br#"[{"name":"z-last"}]"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match page_two.result().unwrap() {
@@ -496,6 +506,7 @@ fn github_root_and_owner_listings_ignore_unclassified_repo_paths() {
             status: 200,
             headers: Vec::<Header>::new(),
             body: b"{}".to_vec(),
+            redirected: None,
         })])
         .unwrap();
         assert!(
@@ -529,6 +540,7 @@ fn github_root_and_owner_listings_ignore_unclassified_repo_paths() {
             status: 200,
             headers: Vec::<Header>::new(),
             body: br#"{"login":"open","type":"User"}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     let org_repos_fetch = owner_listing.expect_single_fetch();
@@ -544,6 +556,7 @@ fn github_root_and_owner_listings_ignore_unclassified_repo_paths() {
             status: 404,
             headers: Vec::<Header>::new(),
             body: br#"{"message":"Not Found"}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     let repos_fetch = owner_listing.expect_single_fetch();
@@ -560,6 +573,7 @@ fn github_root_and_owner_listings_ignore_unclassified_repo_paths() {
             status: 200,
             headers: vec![header("ETag", r#""page-1""#)],
             body: b"[]".to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match owner_listing.result().unwrap() {
@@ -648,6 +662,7 @@ fn github_provider_missing_item_resources_validate_on_lookup() {
             status: 404,
             headers: Vec::<Header>::new(),
             body: b"{\"message\":\"Not Found\"}".to_vec(),
+            redirected: None,
         })])
         .unwrap();
 
@@ -662,7 +677,7 @@ fn github_provider_missing_item_resources_validate_on_lookup() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn github_pr_lookup_is_fed_and_exposes_diff() {
-    use omnifs_wit::host::types::{BlobFetched, ByteSource, Callout, CalloutResult};
+    use omnifs_wit::host::types::{BlobContent, BlobFetched, ByteSource, Callout, CalloutResult};
 
     let harness = github_harness();
 
@@ -731,6 +746,7 @@ fn github_pr_lookup_is_fed_and_exposes_diff() {
             headers: Vec::new(),
             body: format!(r#"{{"base":{{"sha":"base-1"}},"head":{{"sha":"{head}"}}}}"#)
                 .into_bytes(),
+            redirected: None,
         })])
         .unwrap();
         let diff_fetch = match diff.callouts() {
@@ -757,12 +773,11 @@ fn github_pr_lookup_is_fed_and_exposes_diff() {
         assert_eq!(diff_fetch.version.as_deref(), Some(version.as_str()));
 
         diff.answer_callouts(vec![CalloutResult::BlobFetched(BlobFetched {
-            blob,
-            size: 25,
-            content_type: Some("application/octet-stream".to_string()),
-            etag: None,
             status: 200,
             response_headers: Vec::new(),
+            redirected: None,
+            upstream: true,
+            content: Some(BlobContent { blob, size: 25 }),
         })])
         .unwrap();
 
@@ -804,6 +819,7 @@ fn github_pr_files_list_and_read_changed_file_objects() {
             status: 200,
             headers: vec![header("ETag", r#""page-1""#)],
             body: files_response.clone(),
+            redirected: None,
         })])
         .unwrap();
     match listed.result().unwrap() {
@@ -848,6 +864,7 @@ fn github_pr_files_list_and_read_changed_file_objects() {
         status: 200,
         headers: Vec::new(),
         body: files_response,
+        redirected: None,
     })])
     .unwrap();
     match read.result().unwrap() {
@@ -894,6 +911,7 @@ fn github_pr_reviews_and_review_comments_list_and_read_objects() {
                 }
             ]"#
             .to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match reviews.result().unwrap() {
@@ -941,6 +959,7 @@ fn github_pr_reviews_and_review_comments_list_and_read_objects() {
                 "user":{"login":"reviewer"}
             }"#
             .to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match review_md.result().unwrap() {
@@ -976,6 +995,7 @@ fn github_pr_reviews_and_review_comments_list_and_read_objects() {
                 }
             ]"#
             .to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match comments.result().unwrap() {
@@ -1017,6 +1037,7 @@ fn github_pr_reviews_and_review_comments_list_and_read_objects() {
                 "user":{"login":"reviewer"}
             }"#
             .to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match comment_md.result().unwrap() {
@@ -1053,6 +1074,7 @@ fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
             status: 200,
             headers: vec![header("ETag", r#""pull-1""#)],
             body: br#"{"base":{"sha":"base123"},"head":{"sha":"abc123"}}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     let check_fetch = checks.expect_single_fetch();
@@ -1087,6 +1109,7 @@ fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
             status: 200,
             headers: vec![header("ETag", r#""runs-1""#)],
             body: format!(r#"{{"check_runs":[{first_page}]}}"#).into_bytes(),
+            redirected: None,
         })])
         .unwrap();
     // The first page's validator carries the ETag and the head SHA of the pull
@@ -1170,6 +1193,7 @@ fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
             status: 200,
             headers: vec![header("ETag", r#""pull-2""#)],
             body: br#"{"base":{"sha":"base123"},"head":{"sha":"abc123"}}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     assert_eq!(
@@ -1206,6 +1230,7 @@ fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
             status: 200,
             headers: vec![header("ETag", r#""page-1""#)],
             body: br#"{"check_runs":[]}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match page_two.result().unwrap() {
@@ -1241,6 +1266,7 @@ fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
                 "output":{"title":"CI","summary":"All green"}
             }"#
             .to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match check_md.result().unwrap() {
@@ -1280,6 +1306,7 @@ fn github_notifications_list_and_read_thread_objects() {
                 }
             ]"#
             .to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match listed.result().unwrap() {
@@ -1321,6 +1348,7 @@ fn github_notifications_list_and_read_thread_objects() {
             "repository":{"full_name":"octocat/Hello-World"}
         }"#
         .to_vec(),
+        redirected: None,
     })])
     .unwrap();
     match item.result().unwrap() {
@@ -1365,6 +1393,7 @@ fn github_projected_resource_reads_return_all_fetched_siblings() {
             status: 200,
             headers: Vec::new(),
             body: br#"{"id":123,"status":"completed","conclusion":"success"}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match run_listed.result().unwrap() {
@@ -1405,6 +1434,7 @@ fn github_projected_resource_reads_return_all_fetched_siblings() {
             headers: vec![header("ETag", r#""page-1""#)],
             body: br#"{"workflow_runs":[{"id":42,"status":"in_progress","conclusion":null}]}"#
                 .to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match index_listed.result().unwrap() {
@@ -1486,6 +1516,7 @@ fn github_provider_resource_reads_do_not_fall_back_to_provider_cache() {
                 status: 200,
                 headers: case.ok_headers.clone(),
                 body: case.ok_body.to_vec(),
+                redirected: None,
             })])
             .unwrap();
         match first.result().unwrap() {
@@ -1617,6 +1648,7 @@ fn github_action_log_has_the_files_of_the_archive_and_fails_without_it() {
             status,
             headers,
             body,
+            redirected: None,
         })])
         .unwrap();
         read.into_ok()
@@ -1665,6 +1697,7 @@ fn github_provider_comment_routes_id_dirs_and_refetch() {
                 value: "\"c\"".to_string(),
             }],
             body: body.to_vec(),
+            redirected: None,
         })]
     }
 
@@ -1793,6 +1826,7 @@ fn github_provider_comment_routes_id_dirs_and_refetch() {
             status: 404,
             headers: Vec::new(),
             body: b"{\"message\":\"Not Found\"}".to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match missing.result().unwrap() {
@@ -1835,6 +1869,7 @@ fn github_owner_listing_asks_for_the_profile_once_and_the_repos_of_an_organizati
             status: 200,
             headers: Vec::new(),
             body: br#"{"login":"openai","type":"Organization","name":null,"bio":null}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     let repos_fetch = listing.expect_single_fetch();
@@ -1851,6 +1886,7 @@ fn github_owner_listing_asks_for_the_profile_once_and_the_repos_of_an_organizati
             status: 200,
             headers: vec![header("ETag", r#""page-1""#)],
             body: br#"[{"name":"api"}]"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match listing.result().unwrap() {
@@ -1915,6 +1951,7 @@ fn github_provider_polls_events_and_invalidates_caches() {
                 value: "\"comment-1\"".to_string(),
             }],
             body: br#"{"id":1,"user":{"login":"octocat"},"body":"A comment"}"#.to_vec(),
+            redirected: None,
         })])
         .unwrap();
     match issue_cached.result().unwrap() {
@@ -1973,6 +2010,7 @@ fn github_provider_list_routes_preserve_typed_http_errors() {
             value: "\"denied\"".to_string(),
         }],
         body: br#"{"message":"forbidden"}"#.to_vec(),
+        redirected: None,
     })])
     .unwrap();
     match op.result().unwrap() {
@@ -2017,6 +2055,7 @@ fn item_json_byte_equals_single_get() {
             status: 200,
             headers: Vec::new(),
             body: item_json.to_vec(),
+            redirected: None,
         })])
         .unwrap();
         let Ok(ReadFileOutcome::Found(file)) = step.result().unwrap() else {
@@ -2072,6 +2111,7 @@ async fn github_action_runs_page_is_asked_again_with_its_etag_after_its_deadline
             headers: vec![header("ETag", r#""runs-1""#)],
             body: br#"{"workflow_runs":[{"id":123,"status":"completed","conclusion":"success"}]}"#
                 .to_vec(),
+            redirected: None,
         }],
     )
     .await;
@@ -2103,6 +2143,7 @@ async fn github_action_runs_page_is_asked_again_with_its_etag_after_its_deadline
             status: 429,
             headers: vec![header("Retry-After", "60")],
             body: br#"{"message":"API rate limit exceeded"}"#.to_vec(),
+            redirected: None,
         }],
     )
     .await;
@@ -2130,6 +2171,7 @@ fn github_page_answers_without_an_etag_or_with_another_poll_interval_fail() {
         status: 200,
         headers: Vec::new(),
         body: br#"{"workflow_runs":[]}"#.to_vec(),
+        redirected: None,
     })])
     .unwrap();
     assert!(matches!(
@@ -2146,6 +2188,7 @@ fn github_page_answers_without_an_etag_or_with_another_poll_interval_fail() {
                 header("X-Poll-Interval", "soon"),
             ],
             body: b"[]".to_vec(),
+            redirected: None,
         })])
         .unwrap();
     assert!(matches!(
@@ -2188,6 +2231,7 @@ async fn github_notifications_are_asked_again_only_after_their_poll_interval() {
                 "repository":{"full_name":"octocat/Hello-World"}
             }]"#
             .to_vec(),
+            redirected: None,
         }],
     )
     .await;
@@ -2212,6 +2256,7 @@ async fn github_notifications_are_asked_again_only_after_their_poll_interval() {
             status: 304,
             headers: vec![header("X-Poll-Interval", "1")],
             body: Vec::new(),
+            redirected: None,
         }],
     )
     .await;
@@ -2243,6 +2288,7 @@ fn pull_seven() -> HttpResponse {
             "pull_request":{"url":"https://api.github.com/repos/octocat/Hello-World/pulls/7"}
         }"#
         .to_vec(),
+        redirected: None,
     }
 }
 
@@ -2280,6 +2326,7 @@ async fn pull_page_is_asked_again_with_its_etag_after_its_deadline(
             status: 200,
             headers: vec![header("ETag", r#""page-1""#)],
             body: body.to_vec(),
+            redirected: None,
         }],
     )
     .await;

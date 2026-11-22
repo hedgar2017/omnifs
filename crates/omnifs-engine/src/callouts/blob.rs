@@ -6,14 +6,17 @@
 //! round-trip back through the provider.
 
 use crate::cache::MountResources;
-use crate::cache::body::{BodyStore, BodyStoreError, BodyWriter};
+use crate::cache::body::{BodyStore, BodyStoreError};
 use crate::cache::identity::BlobRequestId;
-use crate::cache::mount::{BlobMetadata, BlobRecord};
+use crate::cache::mount::{BlobBody, BlobResponse};
 use crate::callouts::{
     callout_error, callout_internal, callout_invalid, callout_network, callout_too_large,
     record_outcome,
 };
-use crate::http::{HttpStack, decode_response_headers};
+use crate::http::{
+    Answer, BlobPin, HopHeaders, HttpStack, ValidatedRequest, Wait, decode_response_headers,
+    idle_message, successful, wit_headers,
+};
 use crate::log_redaction::{LogUrl, WitHeaders};
 use futures::StreamExt;
 use md5::{Digest as _, Md5};
@@ -22,10 +25,13 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The longest wait for the status of the answer of a blob fetch, and for
-/// the next bytes of its body: no time bounds the whole of a body, which no
-/// size bounds beside the limit that its mount declares.
+/// The longest wait for the status of each hop of a blob fetch, and for the
+/// next bytes of its body. `docs/contracts/10-system.md` owns what bounds a
+/// fetch.
 const BLOB_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// The longest version of a blob request, in bytes.
+const MAX_VERSION_BYTES: usize = 256;
 
 /// Host-side size limits for blob fetches: the limit that the mount
 /// declares bounds how much data the host stores on disk for one fetch, and
@@ -46,44 +52,34 @@ impl BlobLimits {
 
 /// Errors raised while fetching or storing host-resident blobs.
 #[derive(Debug, thiserror::Error)]
-enum BlobError {
-    #[error("{operation} exceeds host blob cap ({actual} > {max} bytes)")]
-    TooLarge {
-        operation: &'static str,
-        max: u64,
-        actual: u64,
-    },
+pub(crate) enum BlobError {
+    #[error("fetch blob exceeds the limit of the mount ({actual} > {max} bytes)")]
+    TooLarge { max: u64, actual: u64 },
     #[error("network: {0}")]
     Network(String),
     /// The upstream answered with other bytes than the provider asked for,
     /// as of a file that changed after the provider read its MD5.
     #[error("the upstream answered bytes of the MD5 {actual}, not {expected}")]
     Content { expected: String, actual: String },
-    #[error("I/O error")]
-    Io(#[source] std::io::Error),
     #[error("{0}")]
     Internal(String),
 }
 
 impl From<std::io::Error> for BlobError {
     fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl BlobError {
-    /// Add operation context to an I/O error without relabeling typed failures.
-    fn with_io_context(self, context: &'static str) -> Self {
-        match self {
-            Self::Io(error) => Self::Internal(format!("{context}: {error}")),
-            other => other,
-        }
+        Self::Internal(format!("fetch blob: {error}"))
     }
 }
 
 impl From<BodyStoreError> for BlobError {
     fn from(error: BodyStoreError) -> Self {
         Self::Internal(format!("body store publication failed: {error}"))
+    }
+}
+
+impl From<crate::cache::ProjectionError> for BlobError {
+    fn from(error: crate::cache::ProjectionError) -> Self {
+        Self::Internal(error.to_string())
     }
 }
 
@@ -99,18 +95,60 @@ impl From<BlobError> for wit_types::CalloutResult {
                 error.to_string(),
                 false,
             ),
-            BlobError::Io(_) => callout_internal(error.to_string()),
             BlobError::Internal(msg) => callout_internal(msg),
         }
     }
 }
 
-/// Executes provider blob callouts against a host-owned disk cache.
+/// Executes provider blob callouts against the body store of the host.
 #[derive(Clone)]
 pub struct BlobExecutor {
     http: Arc<HttpStack>,
     resources: Arc<MountResources>,
     limits: BlobLimits,
+    idle: Duration,
+}
+
+/// The answer of an upstream to a blob request as a fetch takes it: its
+/// response, the bytes that it declares, and the stream of its body.
+pub(crate) struct Upstream<S> {
+    pub response: BlobResponse,
+    pub length: Option<u64>,
+    pub body: S,
+}
+
+/// A blob request after its validation: its HTTP request, the MD5 of the
+/// bytes that it asks for, its identity, and whether it names the identity
+/// of its bytes.
+pub struct BlobRequest {
+    http: ValidatedRequest,
+    md5: Option<String>,
+    id: BlobRequestId,
+    pinned: bool,
+}
+
+impl BlobRequest {
+    pub(crate) fn id(&self) -> BlobRequestId {
+        self.id
+    }
+
+    /// Whether the host may ask the upstream whether the answer that it
+    /// keeps for this request still stands: for a `GET` whose provider
+    /// wrote no condition and no range of its own.
+    fn revalidates(&self) -> bool {
+        !self.pinned
+            && self.http.is_get()
+            && ![
+                "if-none-match",
+                "if-modified-since",
+                "if-match",
+                "if-unmodified-since",
+                "if-range",
+                "range",
+            ]
+            .iter()
+            .any(|name| self.http.has_header(name))
+    }
 }
 
 impl BlobExecutor {
@@ -120,13 +158,20 @@ impl BlobExecutor {
             http,
             resources,
             limits,
+            idle: BLOB_IDLE_TIMEOUT,
         }
     }
 
-    /// Fetch an HTTP response body into the blob cache.
-    ///
-    /// The body is streamed to a temporary file and published by the cache
-    /// only after the response has stayed within the configured fetch cap.
+    /// The executor with another idle bound, for the test of the bound.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_idle_bound(mut self, idle: Duration) -> Self {
+        self.idle = idle;
+        self
+    }
+
+    /// Fetch the answer of an HTTP request, the body of a successful one
+    /// into the body store.
     #[tracing::instrument(target = "omnifs_callout", skip_all, fields(
         method = req.method.as_str(),
         url = %LogUrl(&req.url),
@@ -145,213 +190,290 @@ impl BlobExecutor {
         req: &wit_types::BlobFetchRequest,
         operation_id: u64,
     ) -> wit_types::CalloutResult {
-        let result = match (
-            self.http
-                .validate(&req.method, &req.url, &req.headers, req.body.as_deref()),
-            req.md5.as_deref().map(valid_md5).transpose(),
-        ) {
-            (Err(early), _) => early,
-            (_, Err(invalid)) => callout_invalid(invalid),
-            (Ok(request), Ok(md5)) => {
-                // The request with the identity of its bytes, by their MD5
-                // or their version, has one answer, which the projection
-                // keeps; a request without one is asked each time.
-                let request_id = (md5.is_some() || req.version.is_some()).then(|| {
-                    request.blob_request_id(
-                        self.http.auth_binding_for_url(request.original_url()),
-                        md5,
-                        req.version.as_deref(),
-                    )
-                });
-                match request_id {
-                    Some(request_id) => {
-                        let lock = self.resources.blob_request_lock(request_id);
-                        let guard = lock.lock().await;
-                        let result = match self.resources.blob_for_request(request_id) {
-                            Ok(Some(record)) => {
-                                let record = self.resources.stage_blob_write(
-                                    operation_id,
-                                    Some(request_id),
-                                    record.body,
-                                    record.metadata(),
-                                );
-                                wit_types::CalloutResult::BlobFetched(record.as_ref().into())
-                            },
-                            Ok(None) => {
-                                self.download(operation_id, Some(request_id), &request, md5)
-                                    .await
-                            },
-                            Err(error) => BlobError::Internal(error.to_string()).into(),
-                        };
-                        drop(guard);
-                        self.resources.release_blob_request_lock(request_id, lock);
-                        result
-                    },
-                    None => self.download(operation_id, None, &request, md5).await,
-                }
+        let result = match self.prepare(req) {
+            Ok(request) => {
+                let lock = self.resources.blob_request_lock(request.id);
+                let guard = lock.lock().await;
+                let result = self.answer(&request, operation_id).await;
+                drop(guard);
+                self.resources.release_blob_request_lock(request.id, lock);
+                result.unwrap_or_else(|early| early)
             },
+            Err(early) => early,
         };
         record_outcome(&result);
         result
     }
 
-    /// Ask the upstream for `request` and stage its answer.
-    async fn download(
+    /// Validate the facts of `req`, from which alone the host derives the
+    /// identity of the request.
+    pub(crate) fn prepare(
         &self,
-        operation_id: u64,
-        request_id: Option<BlobRequestId>,
-        request: &crate::http::ValidatedRequest,
-        md5: Option<&str>,
-    ) -> wit_types::CalloutResult {
-        match self
-            .http
-            .send_validated(request, crate::http::Wait::Status(BLOB_IDLE_TIMEOUT))
-            .await
-        {
-            Ok(response) => match self
-                .materialize(operation_id, request_id, response, md5)
-                .await
-            {
-                Ok(record) => wit_types::CalloutResult::BlobFetched((&record).into()),
-                Err(error) => error.into(),
-            },
-            Err(early) => early,
-        }
-    }
-
-    /// Stream the response body to disk and persist the cache record.
-    /// Internal helper that keeps `BlobError` typed up to the public
-    /// `fetch` boundary so the `?` operator and `From` impls stay in
-    /// play here.
-    async fn materialize(
-        &self,
-        operation_id: u64,
-        request_id: Option<BlobRequestId>,
-        response: reqwest::Response,
-        md5: Option<&str>,
-    ) -> Result<BlobRecord, BlobError> {
-        let status = response.status().as_u16();
-        let response_headers = decode_response_headers(response.headers());
-        let etag = lookup_header(&response_headers, "etag");
-        let content_type = lookup_header(&response_headers, "content-type");
-
-        // The body of a failing status is of no content.
-        let staged = stream_response_body(
-            response,
-            &self.resources.body,
-            self.limits.max_fetch_blob_bytes,
-            md5.filter(|_| (200..300).contains(&status)),
-        )
-        .await
-        .map_err(|error| error.with_io_context("fetch blob"))?;
-        let size = staged.size;
-        let body = self
-            .resources
-            .body
-            .publish_staged(staged.writer)
-            .map_err(|error| BlobError::from(error).with_io_context("publish body"))?;
-
-        let metadata = BlobMetadata {
-            status,
-            content_type,
-            etag,
-            response_headers,
-            size,
+        req: &wit_types::BlobFetchRequest,
+    ) -> Result<BlobRequest, wit_types::CalloutResult> {
+        let http = self.http.validate(
+            &req.method,
+            &req.url,
+            &req.headers,
+            req.body.as_deref(),
+            req.follow_redirects,
+        )?;
+        let pin = BlobPin {
+            md5: req
+                .md5
+                .as_deref()
+                .map(valid_md5)
+                .transpose()
+                .map_err(callout_invalid)?,
+            version: req
+                .version
+                .as_deref()
+                .map(valid_version)
+                .transpose()
+                .map_err(callout_invalid)?,
         };
-        Ok((*self
-            .resources
-            .stage_blob_write(operation_id, request_id, body, metadata))
-        .clone())
+        let id = http.blob_request_id(self.http.auth_binding_for_url(http.original_url()), pin);
+        Ok(BlobRequest {
+            http,
+            md5: pin.md5.map(ToOwned::to_owned),
+            id,
+            pinned: pin.md5.is_some() || pin.version.is_some(),
+        })
     }
-}
 
-impl From<&BlobRecord> for wit_types::BlobFetched {
-    fn from(record: &BlobRecord) -> Self {
-        Self {
-            blob: record.id,
-            size: record.size,
-            content_type: record.content_type.clone(),
-            etag: record.etag.clone(),
-            status: record.status,
-            response_headers: record
-                .response_headers
-                .iter()
-                .map(|(name, value)| wit_types::Header {
-                    name: name.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
+    /// Answer `request` from the projection, or ask its upstream.
+    async fn answer(
+        &self,
+        request: &BlobRequest,
+        operation_id: u64,
+    ) -> Result<wit_types::CalloutResult, wit_types::CalloutResult> {
+        let resources = Arc::clone(&self.resources);
+        let id = request.id;
+        let kept = blocking(move || Ok(resources.kept_blob(id)?)).await?;
+        let (kept, validators) = match kept {
+            // The request with the identity of its bytes has one answer.
+            Some((response, body)) if request.pinned => {
+                return Ok(self.fetched(operation_id, response, Some(body), false));
+            },
+            Some((response, body)) if request.revalidates() => {
+                let validators = validators(&response, request.http.original_url());
+                (Some((response, body)), validators)
+            },
+            _ => (None, None),
+        };
+        let Answer {
+            response,
+            redirected,
+        } = self
+            .http
+            .send_validated(&request.http, validators.as_ref(), Wait::Status(self.idle))
+            .await?;
+        let upstream = Upstream {
+            response: BlobResponse {
+                status: response.status().as_u16(),
+                headers: decode_response_headers(response.headers()),
+                redirected,
+            },
+            length: response.content_length(),
+            body: response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|error| error.to_string())),
+        };
+        Ok(self.receive(operation_id, request, kept, upstream).await?)
+    }
+
+    /// Take the answer of the upstream to `request`: the answer that the
+    /// host keeps for a `304` to its validators, no body for another status
+    /// than a successful one, and the body of a successful one into the
+    /// body store, of the MD5 of the request alone.
+    pub(crate) async fn receive<B: AsRef<[u8]> + Send + 'static>(
+        &self,
+        operation_id: u64,
+        request: &BlobRequest,
+        kept: Option<(BlobResponse, BlobBody)>,
+        upstream: Upstream<impl futures::Stream<Item = Result<B, String>> + Unpin>,
+    ) -> Result<wit_types::CalloutResult, BlobError> {
+        let Upstream {
+            response: answered,
+            length,
+            body,
+        } = upstream;
+        if let Some((kept, body)) = kept
+            && answered.status == 304
+        {
+            return Ok(self.fetched(operation_id, kept, Some(body), true));
         }
+        if !successful(answered.status) {
+            return Ok(self.fetched(operation_id, answered, None, true));
+        }
+        let keeps = request.pinned
+            || (request.revalidates()
+                && answered.status == 200
+                && validators(&answered, request.http.original_url()).is_some());
+        let body = stream_response_body(
+            body,
+            length,
+            Arc::clone(&self.resources.body),
+            self.limits.max_fetch_blob_bytes,
+            request.md5.clone(),
+            self.idle,
+        )
+        .await?;
+        let body = if keeps {
+            let resources = Arc::clone(&self.resources);
+            let (id, answered) = (request.id, answered.clone());
+            blocking(move || {
+                resources.keep_blob(id, answered, &body)?;
+                Ok(body)
+            })
+            .await?
+        } else {
+            body
+        };
+        Ok(self.fetched(operation_id, answered, Some(body), true))
+    }
+
+    /// The answer of a blob fetch for the provider, with a blob handle of
+    /// the operation for its body.
+    fn fetched(
+        &self,
+        operation_id: u64,
+        response: BlobResponse,
+        body: Option<BlobBody>,
+        upstream: bool,
+    ) -> wit_types::CalloutResult {
+        wit_types::CalloutResult::BlobFetched(wit_types::BlobFetched {
+            status: response.status,
+            response_headers: wit_headers(response.headers),
+            redirected: response.redirected,
+            upstream,
+            content: body.map(|body| wit_types::BlobContent {
+                size: body.length,
+                blob: self.resources.blob_handle(operation_id, body),
+            }),
+        })
     }
 }
 
-struct StagedBlob {
-    writer: BodyWriter,
-    size: u64,
-}
-
-/// Stage the body of `response`, of at most the `limit` bytes of a mount
-/// with one and, for `md5`, of bytes of that MD5 alone.
-async fn stream_response_body(
-    response: reqwest::Response,
-    body: &BodyStore,
-    limit: Option<u64>,
-    md5: Option<&str>,
-) -> Result<StagedBlob, BlobError> {
-    let max_bytes = limit.unwrap_or(u64::MAX);
-    if let Some(content_length) = response.content_length()
-        && content_length > max_bytes
-    {
-        return Err(BlobError::TooLarge {
-            operation: "fetch blob",
-            max: max_bytes,
-            actual: content_length,
-        });
-    }
-    let mut writer = body.stage().map_err(BlobError::from)?;
-    let mut stream = response.bytes_stream();
-    let mut total = 0_u64;
-    let mut digest = md5.map(|_| Md5::new());
-    while let Some(chunk) = tokio::time::timeout(BLOB_IDLE_TIMEOUT, stream.next())
+/// Run the disk work `work` of a fetch off the thread of the provider
+/// instance, which runs every operation of the instance.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, BlobError> + Send + 'static,
+) -> Result<T, BlobError> {
+    tokio::task::spawn_blocking(work)
         .await
-        .map_err(|_| idle())?
-    {
-        let chunk = chunk.map_err(|e| BlobError::Network(e.to_string()))?;
-        let chunk_len = u64::try_from(chunk.len()).map_err(|_| BlobError::TooLarge {
-            operation: "fetch blob",
-            max: max_bytes,
-            actual: u64::MAX,
-        })?;
-        total = total.checked_add(chunk_len).ok_or(BlobError::TooLarge {
-            operation: "fetch blob",
-            max: max_bytes,
-            actual: u64::MAX,
-        })?;
-        if total > max_bytes {
-            return Err(BlobError::TooLarge {
-                operation: "fetch blob",
-                max: max_bytes,
-                actual: total,
-            });
-        }
-        if let Some(digest) = &mut digest {
-            digest.update(&chunk);
-        }
-        writer.write_all(&chunk).map_err(BlobError::Io)?;
-    }
-    if let (Some(expected), Some(digest)) = (md5, digest) {
-        let actual = hex::encode(digest.finalize());
-        if actual != expected {
-            return Err(BlobError::Content {
-                expected: expected.to_owned(),
-                actual,
-            });
-        }
-    }
-    Ok(StagedBlob {
-        writer,
-        size: total,
+        .map_err(|error| BlobError::Internal(format!("blob task failed: {error}")))?
+}
+
+/// The validators of `response`, the answer that the host keeps of a
+/// request to `url`, as the conditions of the next request to the URL that
+/// answered it; none for an answer without an `ETag` and a `Last-Modified`.
+fn validators(response: &BlobResponse, url: &str) -> Option<HopHeaders> {
+    let headers = [
+        ("etag", "if-none-match"),
+        ("last-modified", "if-modified-since"),
+    ]
+    .into_iter()
+    .filter_map(|(validator, condition)| {
+        let (_, value) = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(validator))?;
+        Some((condition.to_owned(), value.clone()))
     })
+    .collect::<Vec<_>>();
+    (!headers.is_empty()).then(|| HopHeaders {
+        url: response
+            .redirected
+            .clone()
+            .unwrap_or_else(|| url.to_owned()),
+        headers,
+    })
+}
+
+/// A part of the body of an answer for the task that writes it.
+enum Part<B> {
+    Bytes(B),
+    /// The body ended: a channel that closes without it is of a fetch that
+    /// stopped, whose bytes are no body.
+    End,
+}
+
+/// Publish the body `stream`, which declares `declared` bytes, in `store`,
+/// of at most the `limit` bytes of a mount with one and, for `md5`, of
+/// bytes of that MD5 alone. The writes and the digests run on a blocking
+/// task; the wait for each next bytes is at most `idle`.
+async fn stream_response_body<B: AsRef<[u8]> + Send + 'static>(
+    mut stream: impl futures::Stream<Item = Result<B, String>> + Unpin,
+    declared: Option<u64>,
+    store: Arc<BodyStore>,
+    limit: Option<u64>,
+    md5: Option<String>,
+    idle: Duration,
+) -> Result<BlobBody, BlobError> {
+    if let (Some(max), Some(actual)) = (limit, declared)
+        && actual > max
+    {
+        return Err(BlobError::TooLarge { max, actual });
+    }
+    let (parts, mut taken) = tokio::sync::mpsc::channel::<Part<B>>(1);
+    let writer = tokio::task::spawn_blocking(move || {
+        let mut writer = store.stage()?;
+        let mut digest = md5.as_ref().map(|_| Md5::new());
+        let mut length = 0_u64;
+        loop {
+            match taken.blocking_recv() {
+                Some(Part::Bytes(chunk)) => {
+                    length = length
+                        .checked_add(chunk.as_ref().len() as u64)
+                        .ok_or_else(|| BlobError::Internal("body length overflow".into()))?;
+                    if let Some(max) = limit.filter(|max| length > *max) {
+                        return Err(BlobError::TooLarge {
+                            max,
+                            actual: length,
+                        });
+                    }
+                    if let Some(digest) = &mut digest {
+                        digest.update(chunk.as_ref());
+                    }
+                    writer.write_all(chunk.as_ref())?;
+                },
+                Some(Part::End) => break,
+                None => return Err(BlobError::Network("the fetch stopped".into())),
+            }
+        }
+        if let (Some(expected), Some(digest)) = (md5, digest) {
+            let actual = hex::encode(digest.finalize());
+            if actual != expected {
+                return Err(BlobError::Content { expected, actual });
+            }
+        }
+        Ok(BlobBody {
+            length,
+            hold: store.publish_staged(writer)?,
+        })
+    });
+    let read = async {
+        loop {
+            let part = match tokio::time::timeout(idle, stream.next()).await {
+                Err(_) => return Err(BlobError::Network(idle_message(idle))),
+                Ok(Some(Err(error))) => return Err(BlobError::Network(error)),
+                Ok(Some(Ok(chunk))) => Part::Bytes(chunk),
+                Ok(None) => Part::End,
+            };
+            let end = matches!(part, Part::End);
+            // A writer that is gone has the error of the fetch.
+            if parts.send(part).await.is_err() || end {
+                return Ok(());
+            }
+        }
+    }
+    .await;
+    drop(parts);
+    let written = writer
+        .await
+        .map_err(|error| BlobError::Internal(format!("blob task failed: {error}")))?;
+    read.and(written)
 }
 
 /// `md5` as the MD5 of the bytes of a blob request: 32 lowercase
@@ -370,76 +492,115 @@ fn valid_md5(md5: &str) -> Result<&str, String> {
     }
 }
 
-/// The error of a blob fetch whose upstream sent nothing for
-/// [`BLOB_IDLE_TIMEOUT`].
-fn idle() -> BlobError {
-    BlobError::Network(format!(
-        "the upstream sent nothing for {} seconds",
-        BLOB_IDLE_TIMEOUT.as_secs()
-    ))
-}
-
-fn lookup_header(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.clone())
+/// `version` as the version of the bytes of a blob request: 1 to
+/// [`MAX_VERSION_BYTES`] bytes without a control character.
+fn valid_version(version: &str) -> Result<&str, String> {
+    if !version.is_empty()
+        && version.len() <= MAX_VERSION_BYTES
+        && !version.chars().any(char::is_control)
+    {
+        Ok(version)
+    } else {
+        Err(format!(
+            "the version of a blob request is 1 to {MAX_VERSION_BYTES} bytes without a control character, not {version:?}"
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::body::BodyStore;
-    #[tokio::test]
-    async fn stream_response_body_rejects_large_content_length_before_writing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let body = BodyStore::open(tmp.path()).unwrap();
-        let response: reqwest::Response = http::Response::builder()
-            .header(http::header::CONTENT_LENGTH, "5")
-            .body(reqwest::Body::from("abcde"))
-            .unwrap()
-            .into();
 
-        let result = stream_response_body(response, &body, Some(4), None).await;
-
-        assert!(matches!(result, Err(BlobError::TooLarge { actual: 5, .. })));
+    fn body(
+        chunks: &[&'static [u8]],
+    ) -> impl futures::Stream<Item = Result<&'static [u8], String>> + Unpin + use<> {
+        futures::stream::iter(chunks.iter().map(|chunk| Ok(*chunk)).collect::<Vec<_>>())
     }
 
-    #[tokio::test]
-    async fn stream_response_body_rejects_body_that_exceeds_cap() {
-        let tmp = tempfile::tempdir().unwrap();
-        let body = BodyStore::open(tmp.path()).unwrap();
-        let chunks = futures::stream::iter([
-            Ok::<_, std::io::Error>(b"abc".to_vec()),
-            Ok::<_, std::io::Error>(b"de".to_vec()),
-        ]);
-        let response: reqwest::Response = http::Response::builder()
-            .body(reqwest::Body::wrap_stream(chunks))
-            .unwrap()
-            .into();
-
-        let result = stream_response_body(response, &body, Some(4), None).await;
-
-        assert!(matches!(result, Err(BlobError::TooLarge { actual: 5, .. })));
+    fn files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
     }
 
-    #[tokio::test]
-    async fn stream_response_body_stages_until_explicit_publish() {
+    /// The limit that a mount declares bounds a body by the bytes that it
+    /// declares and by the bytes that come, and a body above it leaves
+    /// nothing in the store. No size bounds the body of a mount without a
+    /// limit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_above_the_limit_of_its_mount_is_refused_and_leaves_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let body = BodyStore::open(tmp.path()).unwrap();
-        let response: reqwest::Response = http::Response::builder()
-            .body(reqwest::Body::from("abcde"))
-            .unwrap()
-            .into();
+        let store = Arc::new(BodyStore::open(tmp.path()).unwrap());
+        let stream = |declared, limit| {
+            stream_response_body(
+                body(&[b"abc", b"de"]),
+                declared,
+                Arc::clone(&store),
+                limit,
+                None,
+                BLOB_IDLE_TIMEOUT,
+            )
+        };
+        assert!(matches!(
+            stream(Some(5), Some(4)).await,
+            Err(BlobError::TooLarge { max: 4, actual: 5 })
+        ));
+        assert!(matches!(
+            stream(None, Some(4)).await,
+            Err(BlobError::TooLarge { max: 4, actual: 5 })
+        ));
+        assert_eq!(files(tmp.path()), 0);
 
-        // No size bounds the body of a mount without a limit.
         assert_eq!(BlobLimits::default().max_fetch_blob_bytes, None);
-        let staged = stream_response_body(response, &body, None, None)
-            .await
-            .expect("stage body");
+        let whole = stream(None, None).await.expect("a body without a limit");
+        assert_eq!(whole.length, 5);
+        assert_eq!(
+            store.read_range(whole.hold.id(), 5, 0, 5).unwrap(),
+            b"abcde"
+        );
+        assert_eq!(stream(Some(5), Some(5)).await.unwrap().length, 5);
+    }
 
-        assert_eq!(staged.size, 5);
-        let id = body.publish_staged(staged.writer).unwrap();
-        assert_eq!(body.read(id, None).unwrap(), b"abcde");
+    /// The bytes of a body that fails, or of another MD5 than the request
+    /// asks for, are no body of the store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_that_fails_or_has_another_md5_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(BodyStore::open(tmp.path()).unwrap());
+        let failing = futures::stream::iter([Ok(&b"abc"[..]), Err("reset".to_string())]);
+        let failed = stream_response_body(
+            failing,
+            None,
+            Arc::clone(&store),
+            None,
+            None,
+            BLOB_IDLE_TIMEOUT,
+        )
+        .await;
+        assert!(matches!(failed, Err(BlobError::Network(message)) if message == "reset"));
+        let other = stream_response_body(
+            body(&[b"abc"]),
+            None,
+            Arc::clone(&store),
+            None,
+            Some("00000000000000000000000000000000".to_string()),
+            BLOB_IDLE_TIMEOUT,
+        )
+        .await;
+        assert!(matches!(
+            other,
+            Err(BlobError::Content { actual, .. }) if actual == "900150983cd24fb0d6963f7d28e17f72"
+        ));
+        assert_eq!(files(tmp.path()), 0);
+        let same = stream_response_body(
+            body(&[b"a", b"bc"]),
+            None,
+            Arc::clone(&store),
+            None,
+            Some("900150983cd24fb0d6963f7d28e17f72".to_string()),
+            BLOB_IDLE_TIMEOUT,
+        )
+        .await
+        .expect("the bytes of the MD5");
+        assert_eq!(same.length, 3);
+        assert_eq!(files(tmp.path()), 1);
     }
 }

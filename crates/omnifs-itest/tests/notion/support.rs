@@ -132,6 +132,7 @@ pub fn answer(status: u16, headers: &[(&str, &str)], body: &Value) -> CalloutRes
             })
             .collect(),
         body: body.to_string().into_bytes(),
+        redirected: None,
     })
 }
 

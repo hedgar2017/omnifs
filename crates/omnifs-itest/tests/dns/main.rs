@@ -291,6 +291,7 @@ fn dns_record_read_emits_no_canonical_store() {
         status: 200,
         headers: Vec::new(),
         body: canned_a_response("example.com", "93.184.216.34"),
+        redirected: None,
     })])
     .unwrap();
 
@@ -382,6 +383,7 @@ fn dns_record_read_is_mutable_not_immutable() {
         status: 200,
         headers: Vec::new(),
         body: canned_a_response("example.com", "93.184.216.34"),
+        redirected: None,
     })])
     .unwrap();
 
@@ -438,6 +440,7 @@ fn empty_http_response(status: u16) -> CalloutResult {
         status,
         headers: Vec::new(),
         body: Vec::new(),
+        redirected: None,
     })
 }
 
@@ -457,12 +460,14 @@ fn dns_all_keeps_partial_success_under_rate_limit() {
         status: 200,
         headers: Vec::new(),
         body: canned_a_response("example.com", "93.184.216.34"),
+        redirected: None,
     })];
     outcomes.extend((1..fetches.len()).map(|_| {
         CalloutResult::HttpResponse(HttpResponse {
             status: 429,
             headers: Vec::new(),
             body: Vec::new(),
+            redirected: None,
         })
     }));
 

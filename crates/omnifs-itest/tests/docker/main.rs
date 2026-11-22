@@ -28,6 +28,7 @@ fn resume_http<T>(op: &mut TestOp<'_, T>, body: Vec<u8>) {
         status: 200,
         headers: Vec::new(),
         body,
+        redirected: None,
     })])
     .unwrap();
 }

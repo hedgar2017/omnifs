@@ -221,6 +221,7 @@ async fn test_execute_fetch_returns_denied_when_auth_is_required_but_missing() {
         url: "https://api.github.com/repos".to_string(),
         headers: Vec::new(),
         body: None,
+        follow_redirects: false,
     };
     match stack.fetch(&req, Duration::from_secs(30)).await {
         wit_types::CalloutResult::CalloutError(wit_types::CalloutError {
@@ -253,6 +254,7 @@ async fn oauth_401_refreshes_and_retries_once() {
         url: api.url(),
         headers: Vec::new(),
         body: None,
+        follow_redirects: false,
     };
 
     match stack.fetch(&req, Duration::from_secs(5)).await {
@@ -331,6 +333,7 @@ async fn fetch_blob_uses_same_oauth_retry_path() {
                 body: None,
                 md5: None,
                 version: None,
+                follow_redirects: false,
             },
             0,
         )
@@ -339,7 +342,7 @@ async fn fetch_blob_uses_same_oauth_retry_path() {
     match result {
         wit_types::CalloutResult::BlobFetched(blob) => {
             assert_eq!(blob.status, 200);
-            assert_eq!(blob.size, 9);
+            assert_eq!(size(&blob), Some(9));
         },
         other => panic!("expected blob fetch, got {other:?}"),
     }
@@ -373,6 +376,7 @@ async fn fetch_blob_answers_the_bytes_of_the_md5_that_the_provider_asks_for() {
             body: None,
             md5: Some(md5.to_string()),
             version: None,
+            follow_redirects: false,
         };
         let executor = &executor;
         async move { executor.fetch(&request, 0).await }
@@ -384,6 +388,8 @@ async fn fetch_blob_answers_the_bytes_of_the_md5_that_the_provider_asks_for() {
             &other,
             wit_types::CalloutResult::CalloutError(error)
                 if error.message.contains("3d93da86c9045cb1b17e96790cd19789")
+                    && error.kind == wit_types::ErrorKind::VersionMismatch
+                    && !error.retryable
         ),
         "{other:?}"
     );
@@ -398,14 +404,14 @@ async fn fetch_blob_answers_the_bytes_of_the_md5_that_the_provider_asks_for() {
     let calls = api.calls();
     let asked = fetch("3d93da86c9045cb1b17e96790cd19789").await;
     assert!(
-        matches!(&asked, wit_types::CalloutResult::BlobFetched(blob) if blob.size == 9),
+        matches!(&asked, wit_types::CalloutResult::BlobFetched(blob) if size(blob) == Some(9) && blob.upstream),
         "{asked:?}"
     );
     assert!(api.calls() > calls);
     let calls = api.calls();
     let held = fetch("3d93da86c9045cb1b17e96790cd19789").await;
     assert!(
-        matches!(held, wit_types::CalloutResult::BlobFetched(_)),
+        matches!(&held, wit_types::CalloutResult::BlobFetched(blob) if size(blob) == Some(9) && !blob.upstream),
         "{held:?}"
     );
     assert_eq!(api.calls(), calls, "the host holds the bytes of the MD5");
@@ -432,6 +438,7 @@ async fn oauth_refresh_failure_surfaces_denied_and_preserves_snapshot() {
         url: api.url(),
         headers: Vec::new(),
         body: None,
+        follow_redirects: false,
     };
 
     match stack.fetch(&req, Duration::from_secs(5)).await {
@@ -790,4 +797,596 @@ fn authorization_header(request: &str) -> Option<String> {
         name.eq_ignore_ascii_case("authorization")
             .then(|| value.trim().to_string())
     })
+}
+
+fn size(blob: &wit_types::BlobFetched) -> Option<u64> {
+    blob.content.as_ref().map(|content| content.size)
+}
+
+/// What a scripted upstream does with a request: answer it, or send the
+/// start of an answer and nothing after.
+enum Reply {
+    Answer(String),
+    Stall(String),
+}
+
+fn reply(status: &str, headers: &[(&str, &str)], body: &str) -> Reply {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    Reply::Answer(format!(
+        "HTTP/1.1 {status}\r\ncontent-length: {}\r\n{headers}connection: close\r\n\r\n{body}",
+        body.len()
+    ))
+}
+
+/// A local HTTPS upstream that answers each request by its script and keeps
+/// the requests that it took.
+#[derive(Clone)]
+struct Upstream {
+    port: u16,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Upstream {
+    async fn start(script: impl Fn(&str) -> Reply + Send + Sync + 'static) -> Self {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "files.test".to_string(),
+        ])
+        .unwrap();
+        let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+            tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(
+                cert.key_pair.serialize_der(),
+            ),
+        );
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let upstream = Self {
+            port: listener.local_addr().unwrap().port(),
+            requests: Arc::default(),
+        };
+        let requests = Arc::clone(&upstream.requests);
+        let script = Arc::new(script);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (acceptor, requests, script) =
+                    (acceptor.clone(), Arc::clone(&requests), Arc::clone(&script));
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let request = read_http_request(&mut stream).await.to_ascii_lowercase();
+                    requests.lock().unwrap().push(request.clone());
+                    match script(&request) {
+                        Reply::Answer(answer) => {
+                            stream.write_all(answer.as_bytes()).await.unwrap();
+                        },
+                        Reply::Stall(start) => {
+                            stream.write_all(start.as_bytes()).await.unwrap();
+                            stream.flush().await.unwrap();
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        },
+                    }
+                });
+            }
+        });
+        upstream
+    }
+
+    fn url(&self, host: &str, path: &str) -> String {
+        format!("https://{host}:{}{path}", self.port)
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+/// A client that takes the certificate of a local upstream and finds
+/// `files.test` at the loopback address.
+fn local_client() -> reqwest::Client {
+    reqwest::ClientBuilder::new()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve("files.test", "127.0.0.1:0".parse().unwrap())
+        .build()
+        .unwrap()
+}
+
+/// A stack whose mount approves `domains` and declares its token for
+/// `localhost` alone.
+fn local_stack(domains: &[&str]) -> HttpStack {
+    let manifest = AuthManifest {
+        schemes: vec![AuthScheme::StaticToken(StaticTokenScheme {
+            key: "pat".to_string(),
+            header_name: Some("Authorization".to_string()),
+            value_prefix: "Bearer ".to_string(),
+            description: "pat".to_string(),
+            inject_domains: vec!["localhost".to_string()],
+            creation_url: None,
+            validation: None,
+            ambient_sources: Vec::new(),
+        })],
+    };
+    let auth = static_binding(
+        &manifest,
+        Some(CredentialEntry::static_token(SecretString::from(
+            "secret-token".to_string(),
+        ))),
+    );
+    HttpStack::with_https_client(
+        Some(auth),
+        RuntimeAuthority::for_test(domains, &[], &["/tmp/omnifs-test.sock"]),
+        local_client(),
+    )
+}
+
+fn get(url: String, follow_redirects: bool) -> wit_types::HttpRequest {
+    wit_types::HttpRequest {
+        method: "GET".to_string(),
+        url,
+        headers: vec![wit_types::Header {
+            name: "x-provider".to_string(),
+            value: "of-the-origin".to_string(),
+        }],
+        body: None,
+        follow_redirects,
+    }
+}
+
+fn path_of(request: &str) -> &str {
+    request.split(' ').nth(1).unwrap_or_default()
+}
+
+fn refusal(result: &wit_types::CalloutResult) -> &wit_types::CalloutError {
+    match result {
+        wit_types::CalloutResult::CalloutError(error) => error,
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+/// The answer of a redirect is the answer of a request that did not ask the
+/// host to follow it.
+#[tokio::test]
+async fn a_redirect_is_the_answer_of_a_request_that_does_not_follow_it() {
+    let upstream = Upstream::start(|request| match path_of(request) {
+        "/start" => reply("302 Found", &[("location", "/moved")], ""),
+        _ => reply("200 OK", &[], "moved"),
+    })
+    .await;
+    let stack = local_stack(&["localhost"]);
+    let result = stack
+        .fetch(
+            &get(upstream.url("localhost", "/start"), false),
+            Duration::from_secs(5),
+        )
+        .await;
+    match result {
+        wit_types::CalloutResult::HttpResponse(response) => {
+            assert_eq!((response.status, response.redirected), (302, None));
+        },
+        other => panic!("expected the redirect, got {other:?}"),
+    }
+    assert_eq!(upstream.requests().len(), 1);
+}
+
+/// A request that follows redirects has the answer of the last URL, which
+/// its answer names. Each hop has the credential that the mount declares
+/// for its URL alone, and the headers of the provider go to the origin of
+/// the request alone.
+#[tokio::test]
+async fn a_request_follows_each_redirect_that_it_asked_for_with_the_credential_and_the_headers_of_its_hop()
+ {
+    let files = Upstream::start(|_| reply("200 OK", &[], "the file")).await;
+    let target = files.url("files.test", "/file");
+    let api = Upstream::start(move |request| match path_of(request) {
+        "/start" => reply("302 Found", &[("location", "/next?x=1")], ""),
+        _ => reply("307 Temporary Redirect", &[("location", &target)], ""),
+    })
+    .await;
+    let stack = local_stack(&["localhost", "files.test"]);
+    let result = stack
+        .fetch(
+            &get(api.url("localhost", "/start"), true),
+            Duration::from_secs(5),
+        )
+        .await;
+    match result {
+        wit_types::CalloutResult::HttpResponse(response) => {
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"the file");
+            assert_eq!(response.redirected, Some(files.url("files.test", "/file")));
+        },
+        other => panic!("expected the answer of the last URL, got {other:?}"),
+    }
+    let api_requests = api.requests();
+    assert_eq!(
+        api_requests.iter().map(|r| path_of(r)).collect::<Vec<_>>(),
+        ["/start", "/next?x=1"]
+    );
+    for request in &api_requests {
+        assert!(
+            request.contains("authorization: bearer secret-token"),
+            "{request}"
+        );
+        assert!(request.contains("x-provider: of-the-origin"), "{request}");
+    }
+    let file_requests = files.requests();
+    assert_eq!(file_requests.len(), 1);
+    assert!(
+        !file_requests[0].contains("authorization"),
+        "{}",
+        file_requests[0]
+    );
+    assert!(
+        !file_requests[0].contains("x-provider"),
+        "{}",
+        file_requests[0]
+    );
+}
+
+/// A hop that the host refuses, and one too many, is an error that is not
+/// retryable and names the host of the hop: never the redirect as content.
+#[tokio::test]
+async fn a_refused_hop_and_one_too_many_are_errors_that_name_the_host() {
+    let upstream = Upstream::start(|request| match path_of(request) {
+        "/loop" => reply("302 Found", &[("location", "/loop")], ""),
+        "/elsewhere" => reply("302 Found", &[("location", "https://other.test/x")], ""),
+        "/plain" => reply("301 Moved", &[("location", "http://localhost/x")], ""),
+        "/socket" => reply(
+            "301 Moved",
+            &[("location", "unix:///tmp/omnifs-test.sock")],
+            "",
+        ),
+        _ => reply("200 OK", &[], "ok"),
+    })
+    .await;
+    let stack = local_stack(&["localhost"]);
+    let fetch = |path: &str| {
+        let request = get(upstream.url("localhost", path), true);
+        let stack = &stack;
+        async move { stack.fetch(&request, Duration::from_secs(5)).await }
+    };
+
+    let looped = fetch("/loop").await;
+    let error = refusal(&looped);
+    assert_eq!(
+        (error.kind, error.retryable),
+        (wit_types::ErrorKind::Denied, false)
+    );
+    assert!(
+        error.message.contains("more than 10 times") && error.message.contains("localhost"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        upstream.requests().len(),
+        11,
+        "the request and its ten hops"
+    );
+
+    for (path, host, reason) in [
+        ("/elsewhere", "other.test", "does not approve"),
+        ("/plain", "localhost", "leaves no HTTPS"),
+        ("/socket", "", "leaves no HTTPS"),
+    ] {
+        let before = upstream.requests().len();
+        let refused = fetch(path).await;
+        let error = refusal(&refused);
+        assert_eq!(
+            (error.kind, error.retryable),
+            (wit_types::ErrorKind::Denied, false),
+            "{path}"
+        );
+        assert!(
+            error.message.contains(host) && error.message.contains(reason),
+            "{path}: {}",
+            error.message
+        );
+        assert_eq!(
+            upstream.requests().len(),
+            before + 1,
+            "{path}: no hop went out"
+        );
+    }
+}
+
+/// The host follows the redirects of a `GET` or a `HEAD` over HTTPS alone:
+/// another request that asks for them is refused before it goes out.
+#[tokio::test]
+async fn a_request_over_a_socket_or_of_another_method_follows_no_redirect() {
+    let stack = local_stack(&["localhost"]);
+    let mut post = get("https://localhost/x".to_string(), true);
+    post.method = "POST".to_string();
+    let socket = get(
+        format!("unix://{}/x", hex::encode("/tmp/omnifs-test.sock")),
+        true,
+    );
+    for request in [post, socket] {
+        let refused = stack.fetch(&request, Duration::from_secs(5)).await;
+        let error = refusal(&refused);
+        assert_eq!(
+            (error.kind, error.retryable),
+            (wit_types::ErrorKind::InvalidInput, false),
+            "{}: {}",
+            request.url,
+            error.message
+        );
+    }
+}
+
+/// The refresh of a credential that an upstream rejects is of the hop that
+/// rejected it.
+#[tokio::test]
+async fn a_hop_that_rejects_its_credential_refreshes_it_and_asks_again() {
+    let tokens = FakeTokenServer::start(false).await;
+    let upstream = Upstream::start(|request| match path_of(request) {
+        "/start" => reply("302 Found", &[("location", "/resource")], ""),
+        _ if request.contains("authorization: bearer access-refresh-1") => {
+            reply("200 OK", &[], "fresh")
+        },
+        _ => reply(
+            "401 Unauthorized",
+            &[("www-authenticate", "Bearer error=\"invalid_token\"")],
+            "",
+        ),
+    })
+    .await;
+    let (auth, _sink, _key) = oauth_binding(tokens.endpoint(), "localhost".to_string());
+    let stack = HttpStack::with_https_client(
+        Some(auth),
+        RuntimeAuthority::for_test(&["localhost"], &[], &[]),
+        local_client(),
+    );
+    let mut request = get(upstream.url("localhost", "/start"), true);
+    request.headers.clear();
+    let result = stack.fetch(&request, Duration::from_secs(5)).await;
+    assert!(
+        matches!(&result, wit_types::CalloutResult::HttpResponse(response)
+            if response.status == 200 && response.body == b"fresh"),
+        "{result:?}"
+    );
+    assert_eq!(tokens.refreshes(), 1);
+    assert_eq!(
+        upstream
+            .requests()
+            .iter()
+            .map(|r| path_of(r))
+            .collect::<Vec<_>>(),
+        ["/start", "/resource", "/resource"]
+    );
+}
+
+struct Blobs {
+    _temp: tempfile::TempDir,
+    caches: Arc<Caches>,
+    executor: BlobExecutor,
+}
+
+fn blobs(stack: HttpStack) -> Blobs {
+    let temp = tempfile::tempdir().unwrap();
+    let caches = Caches::open(temp.path()).unwrap();
+    let name = omnifs_core::MountName::new("test").unwrap();
+    let resources = mount(&caches, &name, b"blob-test").unwrap();
+    let executor = BlobExecutor::new(Arc::new(stack), resources, BlobLimits::default());
+    Blobs {
+        _temp: temp,
+        caches,
+        executor,
+    }
+}
+
+fn blob_request(url: String) -> wit_types::BlobFetchRequest {
+    wit_types::BlobFetchRequest {
+        method: "GET".to_string(),
+        url,
+        headers: Vec::new(),
+        body: None,
+        md5: None,
+        version: None,
+        follow_redirects: false,
+    }
+}
+
+fn fetched(result: wit_types::CalloutResult) -> wit_types::BlobFetched {
+    match result {
+        wit_types::CalloutResult::BlobFetched(blob) => blob,
+        other => panic!("expected a blob, got {other:?}"),
+    }
+}
+
+/// The MD5 and the version of a blob request are facts that the host
+/// validates before it asks its upstream.
+#[tokio::test]
+async fn a_blob_request_of_an_md5_or_a_version_that_is_not_valid_is_refused() {
+    let upstream = Upstream::start(|_| reply("200 OK", &[], "body")).await;
+    let blobs = blobs(local_stack(&["localhost"]));
+    let long = "v".repeat(257);
+    for (md5, version) in [
+        (Some("3D93DA86C9045CB1B17E96790CD19789"), None),
+        (Some("3d93da86c9045cb1b17e96790cd1978"), None),
+        (Some("version:7"), None),
+        (None, Some("")),
+        (None, Some("one\ntwo")),
+        (None, Some(long.as_str())),
+    ] {
+        let mut request = blob_request(upstream.url("localhost", "/file"));
+        request.md5 = md5.map(str::to_owned);
+        request.version = version.map(str::to_owned);
+        let refused = blobs.executor.fetch(&request, 0).await;
+        let error = refusal(&refused);
+        assert_eq!(
+            (error.kind, error.retryable),
+            (wit_types::ErrorKind::InvalidInput, false),
+            "{md5:?} {version:?}"
+        );
+    }
+    assert!(upstream.requests().is_empty());
+    let mut request = blob_request(upstream.url("localhost", "/file"));
+    request.version = Some("v".repeat(256));
+    assert_eq!(
+        size(&fetched(blobs.executor.fetch(&request, 0).await)),
+        Some(4)
+    );
+}
+
+/// The answer of another status than a successful one has no body in the
+/// host, and answers no later request.
+#[tokio::test]
+async fn the_answer_of_a_failing_status_stores_no_body_and_answers_no_other_request() {
+    let upstream =
+        Upstream::start(|_| reply("500 Oops", &[("retry-after", "7")], "a failure")).await;
+    let blobs = blobs(local_stack(&["localhost"]));
+    let mut request = blob_request(upstream.url("localhost", "/file"));
+    request.version = Some("1".to_string());
+    for asked in 1..=2 {
+        let blob = fetched(blobs.executor.fetch(&request, 0).await);
+        assert_eq!((blob.status, blob.upstream), (500, true));
+        assert!(blob.content.is_none());
+        assert!(
+            blob.response_headers
+                .iter()
+                .any(|header| header.name == "retry-after" && header.value == "7")
+        );
+        assert_eq!(upstream.requests().len(), asked);
+        assert!(omnifs_engine::test_support::cache::bodies(&blobs.caches).is_empty());
+    }
+}
+
+/// The host waits for the status of an answer, and for each next bytes of
+/// its body, for its idle bound alone, and keeps nothing of a body that
+/// stopped.
+#[tokio::test]
+async fn a_blob_fetch_ends_with_an_upstream_that_sends_nothing_for_the_idle_bound() {
+    let upstream = Upstream::start(|request| match path_of(request) {
+        "/silent" => Reply::Stall(String::new()),
+        _ => Reply::Stall("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhalf".to_string()),
+    })
+    .await;
+    let mut blobs = blobs(local_stack(&["localhost"]));
+    blobs.executor = blobs.executor.with_idle_bound(Duration::from_millis(300));
+    for path in ["/silent", "/half"] {
+        let started = std::time::Instant::now();
+        let stopped = blobs
+            .executor
+            .fetch(&blob_request(upstream.url("localhost", path)), 0)
+            .await;
+        let error = refusal(&stopped);
+        assert_eq!(
+            (error.kind, error.retryable),
+            (wit_types::ErrorKind::Network, true),
+            "{path}"
+        );
+        assert!(
+            error.message.contains("sent nothing for 0.3 seconds"),
+            "{}",
+            error.message
+        );
+        assert!(started.elapsed() < Duration::from_secs(10), "{path}");
+        assert!(omnifs_engine::test_support::cache::bodies(&blobs.caches).is_empty());
+    }
+}
+
+/// A blob request without the identity of its bytes keeps the validators
+/// of its answer: the host asks its upstream whether the answer stands, and
+/// downloads the bytes again for another answer alone.
+#[tokio::test]
+async fn a_blob_request_without_a_version_asks_whether_its_kept_answer_stands() {
+    let version = Arc::new(AtomicUsize::new(1));
+    let upstream = Upstream::start({
+        let version = Arc::clone(&version);
+        move |request| {
+            let etag = format!("\"v{}\"", version.load(Ordering::SeqCst));
+            match path_of(request) {
+                "/start" => reply("302 Found", &[("location", "/file")], ""),
+                "/plain" => reply("200 OK", &[], "no validator"),
+                _ if request.contains(&format!("if-none-match: {etag}")) => {
+                    reply("304 Not Modified", &[("etag", &etag)], "")
+                },
+                _ => reply("200 OK", &[("etag", &etag)], &format!("content {etag}")),
+            }
+        }
+    })
+    .await;
+    let blobs = blobs(local_stack(&["localhost"]));
+    let mut request = blob_request(upstream.url("localhost", "/start"));
+    request.follow_redirects = true;
+    let file = Some(upstream.url("localhost", "/file"));
+
+    let first = fetched(blobs.executor.fetch(&request, 1).await);
+    assert_eq!(
+        (first.status, first.upstream, size(&first)),
+        (200, true, Some(12))
+    );
+    assert_eq!(first.redirected, file);
+    assert_eq!(
+        omnifs_engine::test_support::cache::bodies(&blobs.caches).len(),
+        1
+    );
+
+    // The second fetch asks the URL that answered with its validator, and
+    // takes `304` as the answer that the host keeps: no body comes again.
+    let second = fetched(blobs.executor.fetch(&request, 2).await);
+    assert_eq!(
+        (second.status, second.upstream, size(&second)),
+        (200, true, Some(12))
+    );
+    assert_eq!(second.redirected, file);
+    let requests = upstream.requests();
+    assert_eq!(
+        requests.iter().map(|r| path_of(r)).collect::<Vec<_>>(),
+        ["/start", "/file", "/start", "/file"]
+    );
+    assert!(!requests[1].contains("if-none-match") && !requests[2].contains("if-none-match"));
+    assert!(
+        requests[3].contains("if-none-match: \"v1\""),
+        "{}",
+        requests[3]
+    );
+    assert_eq!(
+        omnifs_engine::test_support::cache::bodies(&blobs.caches).len(),
+        1
+    );
+
+    // Another answer replaces the kept one.
+    version.store(2, Ordering::SeqCst);
+    let third = fetched(blobs.executor.fetch(&request, 3).await);
+    assert_eq!((third.status, size(&third)), (200, Some(12)));
+    assert_eq!(
+        omnifs_engine::test_support::cache::bodies(&blobs.caches).len(),
+        2
+    );
+    let fourth = fetched(blobs.executor.fetch(&request, 4).await);
+    assert_eq!(size(&fourth), Some(12));
+    assert!(
+        upstream
+            .requests()
+            .last()
+            .unwrap()
+            .contains("if-none-match: \"v2\"")
+    );
+
+    // The answer without a validator is of its operation alone: the host
+    // asks each time.
+    let plain = blob_request(upstream.url("localhost", "/plain"));
+    for _ in 0..2 {
+        let blob = fetched(blobs.executor.fetch(&plain, 5).await);
+        assert_eq!((blob.upstream, size(&blob)), (true, Some(12)));
+    }
+    assert_eq!(
+        upstream
+            .requests()
+            .iter()
+            .filter(|r| path_of(r) == "/plain")
+            .count(),
+        2
+    );
 }

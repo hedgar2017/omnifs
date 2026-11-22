@@ -14,6 +14,7 @@ fn http_ok(body: &[u8]) -> CalloutResult {
         status: 200,
         headers: Vec::<Header>::new(),
         body: body.to_vec(),
+        redirected: None,
     })
 }
 

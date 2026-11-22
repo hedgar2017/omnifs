@@ -26,7 +26,10 @@ use std::sync::{Arc, Weak};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
 
-use super::body::{BodyId, BodyStore};
+use super::body::{BodyHold, BodyId, BodyStore};
+#[cfg(test)]
+use super::collect::Collected;
+use super::collect::Collector;
 use super::identity::ProjectionId;
 use super::identity::{BlobRequestId, GitId};
 use super::projection::{ProjectionStore, ProjectionStoreError};
@@ -45,36 +48,21 @@ pub struct CachedCanonical {
     pub validator: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct BlobMetadata {
+/// What an upstream answered to a blob request, without its body.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BlobResponse {
     pub status: u16,
-    pub content_type: Option<String>,
-    pub etag: Option<String>,
-    pub response_headers: Vec<(String, String)>,
-    pub size: u64,
+    pub headers: Vec<(String, String)>,
+    /// The URL that answered, for the answer of another URL than the one
+    /// of the request.
+    pub redirected: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct BlobRecord {
-    pub id: u64,
-    pub body: BodyId,
-    pub size: u64,
-    pub content_type: Option<String>,
-    pub etag: Option<String>,
-    pub status: u16,
-    pub response_headers: Vec<(String, String)>,
-}
-
-impl BlobRecord {
-    pub(crate) fn metadata(&self) -> BlobMetadata {
-        BlobMetadata {
-            status: self.status,
-            content_type: self.content_type.clone(),
-            etag: self.etag.clone(),
-            response_headers: self.response_headers.clone(),
-            size: self.size,
-        }
-    }
+/// The body of a blob handle, which the handle holds in the body store for
+/// its operation.
+pub(crate) struct BlobBody {
+    pub length: u64,
+    pub hold: BodyHold,
 }
 
 #[derive(Debug, Clone)]
@@ -97,11 +85,30 @@ pub(crate) struct RecordWrite {
     pub fact: FactPayload,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// The answer that the projection keeps for a blob request: the response
+/// of a successful status and its body.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BlobFact {
     pub body_id: [u8; 32],
     pub length: u64,
-    pub metadata: BlobMetadata,
+    pub response: BlobResponse,
+    /// Whether the last collection found no fact of a file with the body
+    /// ([`crate::cache::collect`]).
+    pub lapsed: bool,
+}
+
+impl BlobFact {
+    /// The fact of the value of a blob key, none for another value.
+    pub(crate) fn decode(value: &[u8]) -> Option<Self> {
+        match postcard::from_bytes(value) {
+            Ok(DurableFact::Blob(fact)) => Some(fact),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn encode(self) -> Result<Vec<u8>, ProjectionError> {
+        Ok(postcard::to_allocvec(&DurableFact::Blob(self))?)
+    }
 }
 
 /// The Git tree of a path: its clone, its relative path in the clone, and
@@ -111,13 +118,6 @@ pub(crate) struct GitFact {
     pub id: GitId,
     pub relative_path: String,
     pub commit: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BlobWrite {
-    pub request: BlobRequestId,
-    pub body: BodyId,
-    pub metadata: BlobMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +271,6 @@ pub(crate) struct ProjectionTransition {
     pub objects: Vec<ObjectMutation>,
     pub freshness: Vec<Freshness>,
     pub invalidations: Vec<Invalidation>,
-    pub blobs: Vec<BlobWrite>,
     pub git: Vec<GitWrite>,
     /// Paths whose facts, with the facts beneath them, leave the projection;
     /// each leaves its parent listing as complete as it was.
@@ -291,7 +290,6 @@ impl ProjectionTransition {
             && self.objects.is_empty()
             && self.freshness.is_empty()
             && self.invalidations.is_empty()
-            && self.blobs.is_empty()
             && self.git.is_empty()
             && self.removals.is_empty()
             && self.feed.is_none()
@@ -479,8 +477,11 @@ impl DurableFact {
     }
 }
 
+/// The prefix of the keys of the answers of the blob requests.
+pub(crate) const BLOB_KEYS: &[u8] = b"b:";
+
 fn blob_key(request: BlobRequestId) -> Vec<u8> {
-    let mut key = b"b:".to_vec();
+    let mut key = BLOB_KEYS.to_vec();
     key.extend_from_slice(request.filesystem_name().as_bytes());
     key
 }
@@ -593,6 +594,7 @@ impl Record {
 /// startup and shared via `Arc`.
 pub struct Caches {
     pub(crate) body: Arc<BodyStore>,
+    collector: Arc<Collector>,
     projection_root: std::path::PathBuf,
     pub(crate) projection_database: OptimisticTxDatabase,
     projection_fences: Mutex<HashMap<ProjectionId, Weak<ResourceFence>>>,
@@ -614,12 +616,24 @@ impl Caches {
             .cache_size(PROJECTION_BLOCK_CACHE_BYTES)
             .open()?;
         let body = Arc::new(BodyStore::open(dir.join("bodies"))?);
+        let collector = Collector::new(Arc::clone(&body), projection_database.clone());
+        // What a stop between the publication of a body and the commit of
+        // its fact left leaves here, before an operation.
+        collector.collect()?;
         Ok(Arc::new(Self {
             body,
+            collector,
             projection_root,
             projection_database,
             projection_fences: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Collect the body store and the kept answers of the blob requests of
+    /// every projection ([`crate::cache::collect`]).
+    #[cfg(test)]
+    pub(crate) fn collect(&self) -> Result<Collected, ProjectionError> {
+        self.collector.collect()
     }
 
     /// Return the sole owner of one mount's cache and blob resources.
@@ -665,15 +679,12 @@ pub struct MountResources {
     pub(crate) body: Arc<BodyStore>,
     pub(crate) memory: MemoryTier,
     pub(crate) coherence: Mutex<Coherence>,
+    collector: Arc<Collector>,
     pub(crate) request_locks: dashmap::DashMap<BlobRequestId, Arc<AsyncMutex<()>>>,
-    /// The handle of the answer of each blob request that an operation in
-    /// flight staged, which the projection does not have yet.
-    pub(crate) request_handles: dashmap::DashMap<BlobRequestId, u64>,
-    pub(crate) pending_blob_writes: dashmap::DashMap<u64, Vec<BlobWrite>>,
-    pub(crate) blob_handles: dashmap::DashMap<u64, Arc<BlobRecord>>,
-    /// The blob handles of each operation in flight, each with the request
-    /// that it staged.
-    operation_blobs: dashmap::DashMap<u64, Vec<(u64, Option<BlobRequestId>)>>,
+    /// The body of each blob handle of an operation in flight.
+    pub(crate) blob_handles: dashmap::DashMap<u64, BlobBody>,
+    /// The blob handles of each operation in flight.
+    operation_blobs: dashmap::DashMap<u64, Vec<u64>>,
     pub(crate) next_blob_id: AtomicU64,
     /// The calls of feeds in flight, by the count of [`Self::sequence`] at
     /// their begin.
@@ -725,48 +736,23 @@ impl ResourceFence {
 }
 
 /// The blobs of one operation, from its begin to its end: its blob handles
-/// are of the operation alone, and the answers of its blob requests with the
-/// identity of their bytes publish with its terminal.
-pub(crate) struct BlobPublicationGuard<'a> {
+/// are of the operation alone, and each holds its body in the body store
+/// until then.
+pub(crate) struct OperationBlobs<'a> {
     resources: &'a MountResources,
     operation_id: u64,
 }
 
-impl BlobPublicationGuard<'_> {
-    /// The answers of the blob requests of the operation, for the
-    /// publication of its terminal.
-    pub(crate) fn take(&mut self) -> Vec<BlobWrite> {
-        self.resources.take_blob_writes(self.operation_id)
-    }
-}
-
-impl Drop for BlobPublicationGuard<'_> {
+impl Drop for OperationBlobs<'_> {
     fn drop(&mut self) {
-        // The answer of a request with the identity of its bytes stands
-        // whatever its operation did after it: an operation that failed
-        // publishes it alone, so that no request downloads it again.
-        let blobs = self.resources.take_blob_writes(self.operation_id);
-        if !blobs.is_empty()
-            && let Err(error) = self.resources.publish(
-                ProjectionTransition {
-                    blobs,
-                    ..ProjectionTransition::default()
-                },
-                self.resources.current_epoch(),
-            )
-        {
-            tracing::warn!(%error, "the blobs of a failed operation were not published");
-        }
         if let Some((_, handles)) = self.resources.operation_blobs.remove(&self.operation_id) {
-            for (handle, request) in handles {
+            for handle in handles {
                 self.resources.blob_handles.remove(&handle);
-                if let Some(request) = request {
-                    self.resources
-                        .request_handles
-                        .remove_if(&request, |_, staged| *staged == handle);
-                }
             }
         }
+        // The end of an operation is where a collection may begin: none
+        // of its publications is in flight.
+        self.resources.collector.collect_when_due();
     }
 }
 
@@ -843,9 +829,8 @@ impl MountResources {
             coherence: Mutex::new(Coherence {
                 invalidation_epoch: 0,
             }),
+            collector: Arc::clone(&caches.collector),
             request_locks: dashmap::DashMap::new(),
-            request_handles: dashmap::DashMap::new(),
-            pending_blob_writes: dashmap::DashMap::new(),
             blob_handles: dashmap::DashMap::new(),
             operation_blobs: dashmap::DashMap::new(),
             next_blob_id: AtomicU64::new(1),
@@ -890,8 +875,8 @@ impl MountResources {
         }
     }
 
-    pub(crate) fn blob_publication(&self, operation_id: u64) -> BlobPublicationGuard<'_> {
-        BlobPublicationGuard {
+    pub(crate) fn operation_blobs(&self, operation_id: u64) -> OperationBlobs<'_> {
+        OperationBlobs {
             resources: self,
             operation_id,
         }
@@ -920,19 +905,12 @@ impl MountResources {
         self.coherence.lock().invalidation_epoch
     }
 
-    /// The body of the blob of `handle` and its length. The answer of a
-    /// failing status is no content.
+    /// The body of the blob of `handle` and its length.
     pub(crate) fn body_for_handle(&self, handle: u64) -> Result<(BodyId, u64), ProjectionError> {
-        let record = self.blob_handles.get(&handle).ok_or_else(|| {
+        let blob = self.blob_handles.get(&handle).ok_or_else(|| {
             ProjectionError::Inconsistent(format!("unknown runtime blob handle {handle}"))
         })?;
-        if !(200..300).contains(&record.status) {
-            return Err(ProjectionError::Inconsistent(format!(
-                "blob handle {handle} is the answer of status {}, which is no content",
-                record.status
-            )));
-        }
-        Ok((record.body, record.size))
+        Ok((blob.hold.id(), blob.length))
     }
 
     /// The lock of `request`, which one fetch of it holds at a time, and
@@ -955,71 +933,61 @@ impl MountResources {
         drop(lock);
     }
 
-    /// The answer of `request` that an operation in flight staged or that
-    /// the projection has.
-    pub(crate) fn blob_for_request(
+    /// The answer that the projection keeps for `request`, with a hold of
+    /// its body.
+    pub(crate) fn kept_blob(
         &self,
         request: BlobRequestId,
-    ) -> Result<Option<Arc<BlobRecord>>, ProjectionError> {
-        if let Some(handle) = self.request_handles.get(&request)
-            && let Some(record) = self.blob_handles.get(&*handle)
-        {
-            return Ok(Some(Arc::clone(&record)));
-        }
+    ) -> Result<Option<(BlobResponse, BlobBody)>, ProjectionError> {
         let Some(bytes) = self.projection.get(&blob_key(request))? else {
             return Ok(None);
         };
-        let DurableFact::Blob(fact) = postcard::from_bytes(&bytes)? else {
-            return Err(ProjectionError::Inconsistent(
-                "blob request key contains a non-blob fact".into(),
-            ));
-        };
-        // The answer of a failing status answers its own request alone.
-        if !(200..300).contains(&fact.metadata.status) {
-            return Ok(None);
+        let fact = BlobFact::decode(&bytes).ok_or_else(|| {
+            ProjectionError::Inconsistent("blob request key contains a non-blob fact".into())
+        })?;
+        let hold = self.body.hold(BodyId::from_digest_bytes(fact.body_id));
+        self.body.validate(hold.id(), Some(fact.length))?;
+        Ok(Some((
+            fact.response,
+            BlobBody {
+                length: fact.length,
+                hold,
+            },
+        )))
+    }
+
+    /// Keep `response` and `body` as the answer of `request`, from the end
+    /// of its fetch, whatever its operation does after: the answer is of
+    /// the request, not of the operation.
+    pub(crate) fn keep_blob(
+        &self,
+        request: BlobRequestId,
+        response: BlobResponse,
+        body: &BlobBody,
+    ) -> Result<(), ProjectionError> {
+        let fact = BlobFact {
+            body_id: *body.hold.id().as_bytes(),
+            length: body.length,
+            response,
+            lapsed: false,
         }
-        let body = BodyId::from_digest_bytes(fact.body_id);
-        if fact.metadata.size != fact.length {
-            return Err(ProjectionError::Inconsistent(
-                "blob fact length does not match its body".into(),
-            ));
-        }
-        self.body.validate(body, Some(fact.length))?;
-        Ok(Some(Arc::new(BlobRecord {
-            id: 0,
-            body,
-            size: fact.metadata.size,
-            content_type: fact.metadata.content_type,
-            etag: fact.metadata.etag,
-            status: fact.metadata.status,
-            response_headers: fact.metadata.response_headers,
-        })))
+        .encode()?;
+        self.projection.transact(|tx, facts| {
+            put(tx, facts, blob_key(request), &fact)?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// A blob handle of the operation `operation_id` for `body`.
-    fn blob_handle(
-        &self,
-        operation_id: u64,
-        request: Option<BlobRequestId>,
-        body: BodyId,
-        metadata: BlobMetadata,
-    ) -> Arc<BlobRecord> {
-        let id = self.next_blob_id.fetch_add(1, Ordering::Relaxed);
-        let record = Arc::new(BlobRecord {
-            id,
-            body,
-            size: metadata.size,
-            content_type: metadata.content_type,
-            etag: metadata.etag,
-            status: metadata.status,
-            response_headers: metadata.response_headers,
-        });
-        self.blob_handles.insert(id, Arc::clone(&record));
+    pub(crate) fn blob_handle(&self, operation_id: u64, body: BlobBody) -> u64 {
+        let handle = self.next_blob_id.fetch_add(1, Ordering::Relaxed);
+        self.blob_handles.insert(handle, body);
         self.operation_blobs
             .entry(operation_id)
             .or_default()
-            .push((id, request));
-        record
+            .push(handle);
+        handle
     }
 
     /// A blob handle of the operation `operation_id` for the body `body` of
@@ -1030,59 +998,9 @@ impl MountResources {
         body: BodyId,
         length: u64,
     ) -> Result<u64, ProjectionError> {
+        let hold = self.body.hold(body);
         self.body.validate(body, Some(length))?;
-        Ok(self
-            .blob_handle(
-                operation_id,
-                None,
-                body,
-                BlobMetadata {
-                    size: length,
-                    content_type: None,
-                    etag: None,
-                    status: 200,
-                    response_headers: Vec::new(),
-                },
-            )
-            .id)
-    }
-
-    /// A blob handle of the operation `operation_id` for the answer of a
-    /// blob request. With `request`, the identity of a request with the
-    /// identity of its bytes, the answer of a successful status answers that
-    /// request from then on: for each operation in flight at once, and from
-    /// the projection once the terminal of its operation publishes it. The
-    /// answer of a failing status, and of a request without the identity of
-    /// its bytes, answers its own request alone.
-    pub(crate) fn stage_blob_write(
-        &self,
-        operation_id: u64,
-        request: Option<BlobRequestId>,
-        body: BodyId,
-        metadata: BlobMetadata,
-    ) -> Arc<BlobRecord> {
-        let request = request.filter(|_| (200..300).contains(&metadata.status));
-        if let Some(request) = request {
-            self.pending_blob_writes
-                .entry(operation_id)
-                .or_default()
-                .push(BlobWrite {
-                    request,
-                    body,
-                    metadata: metadata.clone(),
-                });
-        }
-        let record = self.blob_handle(operation_id, request, body, metadata);
-        if let Some(request) = request {
-            self.request_handles.insert(request, record.id);
-        }
-        record
-    }
-
-    pub(crate) fn take_blob_writes(&self, operation_id: u64) -> Vec<BlobWrite> {
-        self.pending_blob_writes
-            .remove(&operation_id)
-            .map_or_else(Vec::new, |(_, writes)| writes)
+        Ok(self.blob_handle(operation_id, BlobBody { length, hold }))
     }
 
     // Every publication phase shares one coherence guard and one Fjall
@@ -1099,12 +1017,12 @@ impl MountResources {
             objects,
             freshness,
             invalidations,
-            blobs,
             git,
             removals: removed_paths,
             feed,
             kept,
         } = transition;
+        let _publication = self.body.publication();
         // Bodies become immutable and addressable before the projection
         // transaction can publish a reference to them. This work intentionally
         // happens before taking the coherence mutex.
@@ -1178,18 +1096,6 @@ impl MountResources {
             });
         }
 
-        let mut prepared_blobs = Vec::new();
-        for blob in &blobs {
-            self.body.validate(blob.body, Some(blob.metadata.size))?;
-            prepared_blobs.push((
-                blob_key(blob.request),
-                DurableFact::Blob(BlobFact {
-                    body_id: *blob.body.as_bytes(),
-                    length: blob.metadata.size,
-                    metadata: blob.metadata.clone(),
-                }),
-            ));
-        }
         let prepared_git = git
             .iter()
             .map(|git| {
@@ -1373,14 +1279,6 @@ impl MountResources {
                         record.path.as_str().as_bytes(),
                     )?;
                 }
-            }
-            for (key, fact) in &prepared_blobs {
-                put(
-                    tx,
-                    facts,
-                    key.clone(),
-                    postcard::to_allocvec(fact).map_err(ProjectionError::from)?,
-                )?;
             }
             for (key, fact) in &prepared_git {
                 put(
@@ -1639,32 +1537,6 @@ impl MountResources {
                 "durable fact kind does not match its path key".into(),
             )),
         }
-    }
-
-    /// At most `len` bytes of `body` of `length` bytes from `offset`.
-    pub(crate) fn read_body_range(
-        &self,
-        body: BodyId,
-        length: u64,
-        offset: u64,
-        len: u32,
-    ) -> Result<Vec<u8>, ProjectionError> {
-        self.body
-            .read_range(body, length, offset, len)
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn read_body(&self, body: BodyId, length: u64) -> Result<Vec<u8>, ProjectionError> {
-        self.body.read(body, Some(length)).map_err(Into::into)
-    }
-
-    pub(crate) fn memory_get(
-        &self,
-        path: &Path,
-        kind: RecordKind,
-        aux: Option<&str>,
-    ) -> Option<Arc<Record>> {
-        self.memory.mem_get(&Key::with_aux(path, kind, aux))
     }
 
     pub(crate) fn memory_invalidate(&self, path: &Path, kind: RecordKind, aux: Option<&str>) {
@@ -2035,6 +1907,119 @@ impl MountResources {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// The file fact of `path` with `aux`: its version token, its body, and
+    /// the length of its body, without its bytes.
+    pub(crate) fn file_fact(
+        &self,
+        path: &Path,
+        aux: Option<&str>,
+    ) -> Result<Option<(Option<String>, BodyId, u64)>, ProjectionError> {
+        let Some(bytes) = self
+            .projection
+            .get(&fact_key(path.as_str(), RecordKind::File, aux))?
+        else {
+            return Ok(None);
+        };
+        match postcard::from_bytes(&bytes)? {
+            DurableFact::File {
+                version_token,
+                body_id,
+                length,
+                ..
+            } => Ok(Some((
+                version_token,
+                BodyId::from_digest_bytes(body_id),
+                length,
+            ))),
+            _ => Err(ProjectionError::Inconsistent(
+                "durable fact kind does not match its path key".into(),
+            )),
+        }
+    }
+
+    /// The body of the canonical of the object of `path` and its length,
+    /// without its bytes.
+    pub(crate) fn canonical_body(
+        &self,
+        path: &Path,
+    ) -> Result<Option<(BodyId, u64)>, ProjectionError> {
+        let Some(id) = self.id_of_path(path)? else {
+            return Ok(None);
+        };
+        let Some((body, length, _)) = read_object_row_direct(&self.projection, &id)? else {
+            return Err(ProjectionError::Inconsistent(
+                "path index points to a missing object row".into(),
+            ));
+        };
+        Ok(Some((body, length)))
+    }
+
+    /// At most `len` bytes of `body` of `length` bytes from `offset`, with
+    /// the body held for the read; none for a body that the store has no
+    /// more, as of a fact that a publication replaced since its read.
+    pub(crate) fn held_body_range(
+        &self,
+        body: BodyId,
+        length: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<Option<Vec<u8>>, ProjectionError> {
+        let _hold = self.body.hold(body);
+        match self.body.validate(body, Some(length)) {
+            Ok(()) => {},
+            Err(super::body::BodyStoreError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            },
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Some(self.body.read_range(body, length, offset, len)?))
+    }
+
+    /// The bodies that the fact of a projection at `key` with `value`
+    /// refers to, into `bodies`: of the file of a lookup, of an attribute,
+    /// and of an entry of a listing, of a file fact, of the canonical of an
+    /// object, and of the blobs of a kept part of a feed. The answer of a
+    /// blob request is no reference here: a collection owns when it leaves
+    /// ([`crate::cache::collect`]).
+    pub(crate) fn body_references(
+        key: &[u8],
+        value: &[u8],
+        bodies: &mut HashSet<BodyId>,
+    ) -> Result<(), ProjectionError> {
+        let mut meta = |meta: &EntryMeta| {
+            if let EntryMeta::File { attrs: Some(attrs) } = meta
+                && let ByteSource::Body(body) = attrs.byte_source()
+            {
+                bodies.insert(body);
+            }
+        };
+        if key.starts_with(b"r:") {
+            match postcard::from_bytes(value)? {
+                DurableFact::Lookup(LookupPayload::Positive(entry)) => meta(&entry),
+                DurableFact::Attr(attr) => meta(&attr.meta),
+                DurableFact::Dirents(listing) => listing
+                    .pages
+                    .iter()
+                    .flat_map(|page| &page.entries)
+                    .for_each(|entry| meta(&entry.meta)),
+                DurableFact::File { body_id, .. } => {
+                    bodies.insert(BodyId::from_digest_bytes(body_id));
+                },
+                DurableFact::Lookup(LookupPayload::Negative { .. })
+                | DurableFact::Blob(_)
+                | DurableFact::Git { .. } => {},
+            }
+        } else if key.starts_with(b"o:") {
+            let (body, _, _): ([u8; 32], u64, Option<String>) = postcard::from_bytes(value)?;
+            bodies.insert(BodyId::from_digest_bytes(body));
+        } else if key.starts_with(b"k:") {
+            bodies.extend(crate::ops::feed::kept_bodies(value)?);
+        }
+        Ok(())
     }
 }
 
@@ -4727,93 +4712,278 @@ mod tests {
     }
 
     fn blob_request(url: &str, version: Option<&str>) -> BlobRequestId {
-        BlobRequestId::new(None, "GET", url, &[], None, None, version)
+        BlobRequestId::new(None, "GET", url, &[], None, false, None, version)
     }
 
-    fn blob_metadata(status: u16) -> BlobMetadata {
-        BlobMetadata {
-            size: 4,
-            content_type: None,
-            etag: None,
-            status,
-            response_headers: Vec::new(),
+    fn blob_response() -> BlobResponse {
+        BlobResponse {
+            status: 200,
+            headers: vec![("etag".into(), "\"v1\"".into())],
+            redirected: None,
         }
     }
 
+    fn blob_body(store: &MountResources, bytes: &[u8]) -> BlobBody {
+        let body = store.body.publish(bytes).unwrap();
+        BlobBody {
+            length: bytes.len() as u64,
+            hold: store.body.hold(body),
+        }
+    }
+
+    fn file_of(path: &str, body: BodyId, length: u64) -> ProjectionTransition {
+        ProjectionTransition {
+            records: vec![RecordWrite {
+                path: p(path),
+                aux: None,
+                fact: FactPayload::FileBody {
+                    version_token: None,
+                    content_type: None,
+                    body,
+                    length,
+                },
+            }],
+            ..ProjectionTransition::default()
+        }
+    }
+
+    fn has_body(store: &MountResources, body: BodyId) -> bool {
+        store.body.path(body).exists()
+    }
+
+    /// The answer of a blob request is of the request: the projection has
+    /// it from the end of its fetch, whatever its operation does after, and
+    /// the handle of its body is of the operation alone.
     #[test]
     fn the_answer_of_a_blob_request_outlives_its_operation_and_its_handle_does_not() {
         let (_dir, _caches, store) = open_store("m");
-        let body = store.body.publish(b"body").unwrap();
         let request = blob_request("https://example.test/body", Some("1"));
+        assert!(store.kept_blob(request).unwrap().is_none());
 
-        // The operation that staged the answer failed: the answer stands,
-        // for an operation in flight at once and from the projection after.
-        let failed = store.blob_publication(1);
-        let handle = store
-            .stage_blob_write(1, Some(request), body, blob_metadata(200))
-            .id;
-        assert_eq!(store.body_for_handle(handle).unwrap(), (body, 4));
-        assert_eq!(store.blob_for_request(request).unwrap().unwrap().body, body);
-        drop(failed);
+        let operation = store.operation_blobs(1);
+        let body = blob_body(&store, b"body");
+        let id = body.hold.id();
+        store.keep_blob(request, blob_response(), &body).unwrap();
+        let handle = store.blob_handle(1, body);
+        assert_eq!(store.body_for_handle(handle).unwrap(), (id, 4));
+        // The operation ends without a publication of its own.
+        drop(operation);
         assert!(store.body_for_handle(handle).is_err());
-        assert!(
-            store.blob_handles.is_empty()
-                && store.request_handles.is_empty()
-                && store.operation_blobs.is_empty()
-                && store.pending_blob_writes.is_empty()
-        );
-        let reopened = store.blob_for_request(request).unwrap().unwrap();
-        assert_eq!((reopened.body, reopened.size), (body, 4));
-
-        // The terminal of an operation publishes its answers itself.
-        let other = blob_request("https://example.test/other", Some("1"));
-        let mut second = store.blob_publication(2);
-        store.stage_blob_write(2, Some(other), body, blob_metadata(200));
-        let writes = second.take();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].request, other);
-        drop(second);
-        assert!(store.blob_for_request(other).unwrap().is_none());
-
-        // The answer of a failing status, and of a request without the
-        // identity of its bytes, answers its own request alone, and the
-        // answer of a failing status is no content.
-        let third = store.blob_publication(3);
-        let refused = store
-            .stage_blob_write(3, Some(other), body, blob_metadata(302))
-            .id;
-        assert!(store.body_for_handle(refused).is_err());
-        store.stage_blob_write(3, None, body, blob_metadata(200));
-        assert!(store.blob_for_request(other).unwrap().is_none());
-        drop(third);
-        assert!(store.blob_for_request(other).unwrap().is_none());
+        assert!(store.blob_handles.is_empty() && store.operation_blobs.is_empty());
+        let (response, kept) = store.kept_blob(request).unwrap().unwrap();
+        assert_eq!(response, blob_response());
+        assert_eq!((kept.hold.id(), kept.length), (id, 4));
 
         // A kept part names the body of its blob, which a handle of the
         // operation that publishes it serves.
-        let fourth = store.blob_publication(4);
-        let kept = store.body_handle(4, body, 4).unwrap();
-        assert_eq!(store.body_for_handle(kept).unwrap(), (body, 4));
-        drop(fourth);
-        assert!(store.body_for_handle(kept).is_err());
+        let later = store.operation_blobs(2);
+        let part = store.body_handle(2, id, 4).unwrap();
+        assert_eq!(store.body_for_handle(part).unwrap(), (id, 4));
+        assert!(store.body_handle(2, id, 5).is_err());
+        drop(later);
+        assert!(store.body_for_handle(part).is_err());
 
-        let corrupt = blob_request("https://example.test/corrupt", Some("1"));
-        let corrupt_fact = DurableFact::Blob(BlobFact {
+        // A fact of a body that the store lacks answers no request.
+        let lost = blob_request("https://example.test/lost", Some("1"));
+        let fact = BlobFact {
             body_id: [0; 32],
             length: 4,
-            metadata: blob_metadata(200),
-        });
+            response: blob_response(),
+            lapsed: false,
+        }
+        .encode()
+        .unwrap();
         store
             .projection
             .transact(|tx, facts| {
-                tx.insert(
-                    facts,
-                    blob_key(corrupt),
-                    postcard::to_allocvec(&corrupt_fact)
-                        .map_err(|error| ProjectionStoreError::Transaction(error.to_string()))?,
-                );
+                tx.insert(facts, blob_key(lost), &*fact);
                 Ok(())
             })
             .unwrap();
-        assert!(store.blob_for_request(corrupt).is_err());
+        assert!(store.kept_blob(lost).is_err());
+    }
+
+    /// The body of a revision that a publication replaced leaves the disk
+    /// with the next collection, and the body that a file has stays.
+    #[test]
+    fn a_collection_removes_the_body_of_a_replaced_revision() {
+        let (_dir, caches, store) = open_store("m");
+        let first = store.body.publish(b"revision 1").unwrap();
+        let second = store.body.publish(b"revision 2").unwrap();
+        store.publish(file_of("/file", first, 10), 0).unwrap();
+        assert_eq!(
+            caches.collect().unwrap().bodies,
+            1,
+            "the body without a fact"
+        );
+        assert!(has_body(&store, first) && !has_body(&store, second));
+
+        let second = store.body.publish(b"revision 2").unwrap();
+        store.publish(file_of("/file", second, 10), 0).unwrap();
+        assert!(has_body(&store, first));
+        assert_eq!(caches.collect().unwrap().bodies, 1);
+        assert!(!has_body(&store, first) && has_body(&store, second));
+        assert_eq!(
+            store.file_fact(&p("/file"), None).unwrap().unwrap().1,
+            second
+        );
+        // The inline bytes of a lookup, the canonical of an object, and the
+        // file of another projection are references too.
+        let other = caches
+            .mount(
+                &MountName::new("other").unwrap(),
+                ProjectionId::new(b"other"),
+                b"other",
+            )
+            .unwrap();
+        let shared = other.body.publish(b"other body").unwrap();
+        other.publish(file_of("/shared", shared, 10), 0).unwrap();
+        publish_object(&store, b"object", b"canonical", &[p("/object")]);
+        store
+            .publish(
+                ProjectionTransition {
+                    records: vec![RecordWrite {
+                        path: p("/inline"),
+                        aux: None,
+                        fact: FactPayload::Lookup(LookupPayload::Positive(EntryMeta::file(
+                            FileAttrsCache::inline(
+                                b"inline".to_vec(),
+                                crate::view::Stability::Stable,
+                                None,
+                            )
+                            .unwrap(),
+                        ))),
+                    }],
+                    ..ProjectionTransition::default()
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(caches.collect().unwrap(), Collected::default());
+        for bytes in [&b"canonical"[..], b"inline", b"other body", b"revision 2"] {
+            assert!(has_body(&store, BodyId::from_bytes(bytes)), "{bytes:?}");
+        }
+    }
+
+    /// A kept part of a feed refers to the bodies of its blobs.
+    #[test]
+    fn a_kept_part_refers_to_the_bodies_of_its_blobs() {
+        use omnifs_wit::host::types as wit;
+        let body = BodyId::from_bytes(b"blob of a part");
+        let part = postcard::to_allocvec(&(
+            wit::FeedPart {
+                token: String::new(),
+                more: true,
+                inner: Vec::new(),
+                anchors: Vec::new(),
+            },
+            wit::Effects {
+                canonical: Vec::new(),
+                fs: Vec::new(),
+                invalidations: Vec::new(),
+                removals: Vec::new(),
+            },
+            vec![(*body.as_bytes(), 14_u64)],
+        ))
+        .unwrap();
+        let mut bodies = HashSet::new();
+        MountResources::body_references(&kept_key(b"object", 0), &part, &mut bodies).unwrap();
+        MountResources::body_references(&kept_token_key(b"object"), b"token", &mut bodies).unwrap();
+        assert_eq!(bodies, HashSet::from([body]));
+    }
+
+    /// What a stop between the publication of a body and the commit of its
+    /// fact left leaves with the collection of the next start.
+    #[test]
+    fn the_body_of_a_stop_before_its_fact_leaves_at_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = MountName::new("m").unwrap();
+        let orphan = {
+            let caches = Caches::open(dir.path()).unwrap();
+            let store = caches.mount(&name, ProjectionId::new(b"m"), b"m").unwrap();
+            let kept = store.body.publish(b"kept").unwrap();
+            store.publish(file_of("/kept", kept, 4), 0).unwrap();
+            // A body whose publication never committed, and a staged file.
+            std::fs::write(dir.path().join("bodies/.body-1-1.tmp"), b"staged").unwrap();
+            store.body.publish(b"orphan").unwrap()
+        };
+        let caches = Caches::open(dir.path()).unwrap();
+        let store = caches.mount(&name, ProjectionId::new(b"m"), b"m").unwrap();
+        assert!(!has_body(&store, orphan));
+        assert!(has_body(&store, BodyId::from_bytes(b"kept")));
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("bodies"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    /// The answer of a blob request stays while a file has its body, and
+    /// leaves, with its body, at the second collection in a row that finds
+    /// no file with it.
+    #[test]
+    fn the_answer_of_a_blob_request_leaves_after_the_files_of_its_body() {
+        let (_dir, caches, store) = open_store("m");
+        let request = blob_request("https://example.test/body", Some("1"));
+        let unused = blob_request("https://example.test/unused", Some("1"));
+        let (body, other) = {
+            let body = blob_body(&store, b"body");
+            let other = blob_body(&store, b"other");
+            store.keep_blob(request, blob_response(), &body).unwrap();
+            store.keep_blob(unused, blob_response(), &other).unwrap();
+            store
+                .publish(file_of("/file", body.hold.id(), 4), 0)
+                .unwrap();
+            // The body of an operation in flight is the body of a file to
+            // come: its answer does not lapse.
+            assert_eq!(caches.collect().unwrap(), Collected::default());
+            (body.hold.id(), other.hold.id())
+        };
+        // The answer that no file took stays for one collection, as of an
+        // operation that failed and runs again.
+        assert_eq!(caches.collect().unwrap(), Collected::default());
+        assert!(store.kept_blob(unused).unwrap().is_some());
+        assert_eq!(
+            caches.collect().unwrap(),
+            Collected {
+                bodies: 1,
+                blobs: 1
+            }
+        );
+        assert!(store.kept_blob(unused).unwrap().is_none() && !has_body(&store, other));
+        assert!(store.kept_blob(request).unwrap().is_some());
+
+        // An answer that lapsed and that a file takes then stays.
+        let again = blob_body(&store, b"other");
+        store.keep_blob(unused, blob_response(), &again).unwrap();
+        drop(again);
+        assert_eq!(caches.collect().unwrap(), Collected::default());
+        store.publish(file_of("/again", other, 5), 0).unwrap();
+        assert_eq!(caches.collect().unwrap(), Collected::default());
+        assert_eq!(caches.collect().unwrap(), Collected::default());
+
+        // Without the file of its body, the answer leaves at the second
+        // collection, and its body with it.
+        store
+            .publish(
+                ProjectionTransition {
+                    removals: vec![p("/file")],
+                    ..ProjectionTransition::default()
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(caches.collect().unwrap(), Collected::default());
+        assert!(has_body(&store, body));
+        assert_eq!(
+            caches.collect().unwrap(),
+            Collected {
+                bodies: 1,
+                blobs: 1
+            }
+        );
+        assert!(store.kept_blob(request).unwrap().is_none() && !has_body(&store, body));
+        assert!(store.kept_blob(unused).unwrap().is_some());
     }
 }

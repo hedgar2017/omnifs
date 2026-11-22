@@ -191,13 +191,15 @@ pub(crate) fn record_outcome(result: &wit_types::CalloutResult) {
             span.record("response_body_bytes", r.body.len());
         },
         wit_types::CalloutResult::BlobFetched(r) => {
-            span.record("blob", r.blob);
             span.record("status", r.status);
             span.record(
                 "response_headers",
                 tracing::field::display(WitHeaders(&r.response_headers)),
             );
-            span.record("response_body_bytes", r.size);
+            if let Some(content) = &r.content {
+                span.record("blob", content.blob);
+                span.record("response_body_bytes", content.size);
+            }
         },
         wit_types::CalloutResult::GitRepoOpened(r) => {
             span.record("tree_ref", r.tree);

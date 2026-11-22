@@ -6,21 +6,19 @@
 //! drives the internal read path from its own executor and turns the neutral
 //! `ReadResult` into kernel/protocol identity + reply encoding.
 
-use crate::cache::{
-    FactPayload, MountResources, ProjectionTransition, Record as CacheRecord, RecordKind,
-    RecordWrite,
-};
+use crate::cache::{FactPayload, MountResources, ProjectionTransition, RecordKind, RecordWrite};
 use crate::clock::now_millis;
 use crate::ops::namespace::{ReadBytes, ReadOutcome, ReadReply};
 use crate::pagination::NextPageOutcome;
 use crate::view as view_types;
-use crate::view::{AttrPayload, EntryMeta, FileAttrsCache, FilePayload, LookupPayload};
+use crate::view::{AttrPayload, EntryMeta, FileAttrsCache, LookupPayload};
 use crate::{EngineError, Runtime};
 use tracing::warn;
 
 use super::MATERIALIZE_MAX_BYTES;
 use super::error::{Result, TreeError};
 use super::node::{Node, PaginationControl, SyntheticContent};
+use crate::view::BodyId;
 use crate::{EngineNamespace, RequestCtx};
 use omnifs_api::events::CacheKind;
 
@@ -60,8 +58,9 @@ impl ReadRange {
     }
 }
 
-/// A read of a file: the whole file, or the range of the read from a body
-/// of the projection, without the rest of the body in memory.
+/// A read of a file: the whole file, for bytes that the host has in memory
+/// as they came, or the range of the read from a body of the body store,
+/// without the rest of the body in memory.
 enum FileRead {
     Whole(ReadResult),
     Range(ReadRange),
@@ -154,9 +153,9 @@ impl<'a> FileAttrStore<'a> {
 }
 
 impl EngineNamespace {
-    /// At most `len` bytes of a file from `offset`: of a fed file from its
-    /// body in the projection, which no size bounds, and of another file
-    /// from the whole of it.
+    /// At most `len` bytes of a file from `offset`: from its body in the
+    /// body store, which no size bounds, for each file whose bytes the
+    /// store has.
     pub(crate) async fn read(
         &self,
         node: &Node,
@@ -229,30 +228,22 @@ impl EngineNamespace {
                 .read_file(path, content_type, captured_epoch)
                 .await?
             {
-                ReadReply::File(result) => finish_read(&runtime, path, result).map(FileRead::Whole),
+                ReadReply::File(result) => finish_read(&runtime, path, result, offset, len),
                 ReadReply::Feed(claims) => {
                     serve_fed_read(&runtime, path, &claims, offset, len).await
                 },
             };
         }
-        let now = now_millis();
-        let expired = !offline
-            && resources
-                .view_expired(path, now)
-                .map_err(|error| TreeError::internal(error.to_string()))?;
-        let projected_attrs = attr_store
-            .cached(now, !offline)?
-            .or_else(|| (!expired).then(|| node.attrs().cloned()).flatten());
-        let attrs = projected_attrs.as_ref();
-        enforce_declared_materialize_cap(path, attrs)?;
-
-        if let Some(result) =
-            projected_read(&attr_store, resources, path, attrs, offline, captured_epoch)?
-        {
-            return Ok(FileRead::Whole(result));
-        }
-        if let Some(result) = cached_read(resources, path, attrs, offline, now)? {
-            return Ok(FileRead::Whole(result));
+        if let Some(read) = stored_read(
+            &attr_store,
+            resources,
+            node,
+            offline,
+            captured_epoch,
+            offset,
+            len,
+        )? {
+            return Ok(read);
         }
 
         if offline {
@@ -292,7 +283,7 @@ impl EngineNamespace {
             },
         };
 
-        finish_read(&runtime, path, result).map(FileRead::Whole)
+        finish_read(&runtime, path, result, offset, len)
     }
 
     /// Serve a host-synthesized node. A `Fixed` synthetic (a mount-root ignore
@@ -371,287 +362,232 @@ fn fed_range(
     len: u32,
     online: bool,
 ) -> Result<Option<FileRead>> {
-    let Some((body, length)) = resources
-        .file_body(path, None)
+    for _ in 0..2 {
+        let Some((body, length)) = resources
+            .file_body(path, None)
+            .map_err(|error| TreeError::internal(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let attrs = FileAttrStore::new(resources, path).cached(now_millis(), online)?;
+        if let Some(range) = body_range(resources, body, length, offset, len, attrs)? {
+            return Ok(Some(range));
+        }
+    }
+    Err(lost_body(path))
+}
+
+/// The error of a fact of `path` whose body the store lacks at two reads of
+/// the fact in a row.
+fn lost_body(path: &omnifs_core::path::Path) -> TreeError {
+    TreeError::internal(format!(
+        "the projection refers to a body of {path} that the body store lacks"
+    ))
+}
+
+/// The range of a read from `body` of `length` bytes, with `attrs` as the
+/// attrs of its file; none for a body that the store has no more.
+fn body_range(
+    resources: &MountResources,
+    body: BodyId,
+    length: u64,
+    offset: u64,
+    len: u32,
+    attrs: Option<FileAttrsCache>,
+) -> Result<Option<FileRead>> {
+    let Some(bytes) = resources
+        .held_body_range(body, length, offset, len)
         .map_err(|error| TreeError::internal(error.to_string()))?
     else {
         return Ok(None);
     };
-    let attrs = FileAttrStore::new(resources, path).cached(now_millis(), online)?;
-    let bytes = resources
-        .read_body_range(body, length, offset, len)
-        .map_err(|error| TreeError::internal(error.to_string()))?;
     let eof = offset.saturating_add(bytes.len() as u64) >= length;
     Ok(Some(FileRead::Range(ReadRange { bytes, eof, attrs })))
 }
 
-fn projected_read(
+/// The attrs of a file with `attrs` whose whole content has `length` bytes.
+fn learned(
+    path: &omnifs_core::path::Path,
+    attrs: &FileAttrsCache,
+    length: u64,
+) -> Result<FileAttrsCache> {
+    usize::try_from(length)
+        .map_err(|error| error.to_string())
+        .and_then(|length| attrs.learned_complete_content_attrs(length))
+        .map_err(|error| {
+            TreeError::internal(format!(
+                "the body of {path} contradicts its file attrs: {error}"
+            ))
+        })
+}
+
+/// The read of a file from what the projection has of it: the bytes of its
+/// attrs, or a range of its body in the body store, as the body of its
+/// attrs, the canonical of its object, or its file record. None for a file
+/// that the projection has no bytes of.
+fn stored_read(
     attr_store: &FileAttrStore<'_>,
     resources: &MountResources,
-    path: &omnifs_core::path::Path,
-    attrs: Option<&FileAttrsCache>,
+    node: &Node,
     offline: bool,
     captured_epoch: u64,
-) -> Result<Option<ReadResult>> {
-    if let Some(attrs) = attrs
-        && matches!(attrs.size(), view_types::FileSize::Exact(0))
-        && (!offline || !matches!(attrs.byte_source(), view_types::ByteSource::Deferred(_)))
-    {
-        return Ok(Some(ReadResult {
-            data: Vec::new(),
-            attrs: Some(attrs.clone()),
-        }));
-    }
-
-    if let Some(attrs) = attrs
-        && let Some(bytes) = attrs.inline_bytes()
-    {
-        let data = bytes.to_vec();
-        enforce_observed_materialize_cap(path, data.len())?;
-        let attrs = attrs
-            .learned_complete_content_attrs(data.len())
-            .map_err(|error| {
-                TreeError::internal(format!(
-                    "inline projection for {path} contradicts file attrs: {error}"
-                ))
-            })?;
-        if !offline {
-            attr_store.publish(attrs.clone(), captured_epoch)?;
+    offset: u64,
+    len: u32,
+) -> Result<Option<FileRead>> {
+    let path = node.path();
+    let internal = |error: crate::cache::ProjectionError| TreeError::internal(error.to_string());
+    // A fact that a publication replaced between its read and the read of
+    // its body names a body that the store has no more: the next read of
+    // the facts has the body that replaced it.
+    for _ in 0..2 {
+        let now = now_millis();
+        let expired = !offline && resources.view_expired(path, now).map_err(internal)?;
+        let projected = attr_store
+            .cached(now, !offline)?
+            .or_else(|| (!expired).then(|| node.attrs().cloned()).flatten());
+        let Some(attrs) = projected.as_ref() else {
+            return Ok(None);
+        };
+        if matches!(attrs.size(), view_types::FileSize::Exact(0))
+            && (!offline || !matches!(attrs.byte_source(), view_types::ByteSource::Deferred(_)))
+        {
+            return Ok(Some(FileRead::Whole(ReadResult {
+                data: Vec::new(),
+                attrs: Some(attrs.clone()),
+            })));
         }
-        return Ok(Some(ReadResult {
-            data,
-            attrs: Some(attrs),
-        }));
+        if let Some(bytes) = attrs.inline_bytes() {
+            let learned = learned(path, attrs, bytes.len() as u64)?;
+            if !offline {
+                attr_store.publish(learned.clone(), captured_epoch)?;
+            }
+            return Ok(Some(FileRead::Whole(ReadResult {
+                data: bytes.to_vec(),
+                attrs: Some(learned),
+            })));
+        }
+        let stored = match attrs.byte_source() {
+            view_types::ByteSource::Body(body) => {
+                let view_types::FileSize::Exact(length) = attrs.size() else {
+                    return Err(TreeError::internal(
+                        "validated durable body metadata lost its exact length",
+                    ));
+                };
+                Some((body, length))
+            },
+            view_types::ByteSource::Canonical => {
+                resources.canonical_body(path).map_err(internal)?
+            },
+            view_types::ByteSource::Inline(_) | view_types::ByteSource::Deferred(_) => None,
+        };
+        let stored = match stored {
+            Some(stored) => Some(stored),
+            None => file_record(resources, path, attrs, offline, expired)?,
+        };
+        let Some((body, length)) = stored else {
+            return Ok(None);
+        };
+        let learned = learned(path, attrs, length)?;
+        if let Some(range) = body_range(resources, body, length, offset, len, Some(learned))? {
+            crate::inspector::cache_event(CacheKind::FileHit);
+            return Ok(Some(range));
+        }
     }
-
-    if let Some(attrs) = attrs
-        && matches!(attrs.byte_source(), view_types::ByteSource::Canonical)
-        && let Some(canonical) = resources
-            .cached_canonical_for(path)
-            .map_err(|error| TreeError::internal(error.to_string()))?
-    {
-        enforce_observed_materialize_cap(path, canonical.bytes.len())?;
-        let attrs = attrs
-            .learned_complete_content_attrs(canonical.bytes.len())
-            .map_err(|error| {
-                TreeError::internal(format!(
-                    "canonical projection for {path} contradicts its body: {error}"
-                ))
-            })?;
-        return Ok(Some(ReadResult {
-            data: canonical.bytes,
-            attrs: Some(attrs),
-        }));
-    }
-
+    // The projection has no bytes of a file whose body the store lacks:
+    // its provider answers the read.
     Ok(None)
 }
 
-fn cached_read(
+/// The body and the length of the file record of `path` that is still a
+/// faithful answer for `attrs`: of the version of a dynamic file, and of a
+/// size that the attrs allow. None past the deadline of the path of a mount
+/// with its provider, which `expired` tells.
+fn file_record(
     resources: &MountResources,
     path: &omnifs_core::path::Path,
-    attrs: Option<&FileAttrsCache>,
+    attrs: &FileAttrsCache,
     offline: bool,
-    now: u64,
-) -> Result<Option<ReadResult>> {
-    let file_cache_aux = attrs.and_then(|attrs| {
-        if offline {
-            attrs.durable_observation_cache_aux()
-        } else {
-            attrs.online_cache_aux()
-        }
-    });
-
-    if let Some(aux) = file_cache_aux {
-        if let Some(record) = resources.memory_get(path, RecordKind::File, aux.as_deref())
-            && let Some(payload) = file_payload_for_attrs(&record, attrs)
-        {
-            crate::inspector::cache_event(CacheKind::FileHit);
-            return read_result_from_cache(path, payload, attrs).map(Some);
-        }
-        let durable = if offline {
-            resources.cache_get(path, RecordKind::File, aux.as_deref())
-        } else {
-            resources.view_get(path, RecordKind::File, aux.as_deref(), now)
-        }
-        .map_err(|error| TreeError::internal(error.to_string()))?;
-        if let Some(record) = durable
-            && let Some(payload) = file_payload_for_attrs(&record, attrs)
-        {
-            crate::inspector::cache_event(CacheKind::FileHit);
-            return read_result_from_cache(path, payload, attrs).map(Some);
-        }
-    }
-
-    if offline
-        && let Some(attrs) = attrs
-        && let view_types::ByteSource::Body(body) = attrs.byte_source()
+    expired: bool,
+) -> Result<Option<(BodyId, u64)>> {
+    let aux = if offline {
+        attrs.durable_observation_cache_aux()
+    } else {
+        attrs.online_cache_aux()
+    };
+    let Some(aux) = aux.filter(|_| !expired) else {
+        return Ok(None);
+    };
+    let Some((version_token, body, length)) = resources
+        .file_fact(path, aux.as_deref())
+        .map_err(|error| TreeError::internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    if matches!(attrs.stability(), view_types::Stability::Dynamic)
+        && version_token.as_deref() != attrs.version_token()
     {
-        let view_types::FileSize::Exact(length) = attrs.size() else {
-            return Err(TreeError::internal(
-                "validated durable body metadata lost its exact length",
-            ));
-        };
-        let data = resources
-            .read_body(body, length)
-            .map_err(|error| TreeError::internal(error.to_string()))?;
-        enforce_observed_materialize_cap(path, data.len())?;
-        return Ok(Some(ReadResult {
-            data,
-            attrs: Some(attrs.clone()),
-        }));
+        return Ok(None);
     }
-
-    Ok(None)
+    let faithful =
+        usize::try_from(length).is_ok_and(|length| attrs.validate_complete_content(length).is_ok());
+    Ok(faithful.then_some((body, length)))
 }
 
-/// Resolve a cold `read-file` terminal into bytes + learned attrs, validate, and
-/// durably cache unless the canonical hybrid forbids it or the write fence
-/// rejects it.
+/// Resolve a cold `read-file` terminal into the read of its file: the whole
+/// of inline bytes, which came through the provider, and a range of the
+/// body of a blob or of a canonical, which the body store has.
 fn finish_read(
     runtime: &Runtime,
     path: &omnifs_core::path::Path,
     result: ReadOutcome,
-) -> Result<ReadResult> {
-    let Some((data, result_attrs)) = resolve_read_payload(runtime, path, result)? else {
+    offset: u64,
+    len: u32,
+) -> Result<FileRead> {
+    let attrs = result.attrs;
+    let contradicts = |error: String, actual: u64| {
+        warn!(
+            path = %path,
+            expected = ?attrs.size(),
+            actual,
+            error,
+            "provider returned bytes that contradict file attrs"
+        );
+        TreeError::internal(format!(
+            "read for {path} returned bytes that contradict file attrs"
+        ))
+    };
+    let stored = match result.bytes {
+        ReadBytes::Inline(data) => {
+            enforce_observed_materialize_cap(path, data.len())?;
+            let attrs = attrs
+                .learned_complete_content_attrs(data.len())
+                .map_err(|error| contradicts(error, data.len() as u64))?;
+            return Ok(FileRead::Whole(ReadResult {
+                data,
+                attrs: Some(attrs),
+            }));
+        },
+        ReadBytes::Body(body) => match attrs.size() {
+            view_types::FileSize::Exact(length) => Some((body, length)),
+            view_types::FileSize::NonZero | view_types::FileSize::Unknown => None,
+        },
+        ReadBytes::Canonical => runtime
+            .resources
+            .canonical_body(path)
+            .map_err(|error| TreeError::internal(error.to_string()))?,
+    };
+    let Some((body, length)) = stored else {
+        warn!(path = %path, "read answered a byte source that the projection lacks");
         return Err(TreeError::internal(format!(
             "read for {path} could not resolve its byte source"
         )));
     };
-    enforce_observed_materialize_cap(path, data.len())?;
-
-    let attrs_cache = result_attrs
-        .learned_complete_content_attrs(data.len())
-        .map_err(|error| {
-            warn!(
-                path = %path,
-                expected = ?result_attrs.size(),
-                actual = data.len(),
-                error,
-                "provider returned bytes that contradict file attrs"
-            );
-            TreeError::internal(format!(
-                "read for {path} returned bytes that contradict file attrs"
-            ))
-        })?;
-    Ok(ReadResult {
-        data,
-        attrs: Some(attrs_cache),
-    })
-}
-
-/// Materialize a `read-file` terminal into bytes. Inline content travels in the
-/// WIT; blob content is pulled from the host blob cache; `canonical` is served
-/// from the anchor-keyed canonical store without copying across the WIT.
-/// Returns `None` when the byte source can't be resolved
-/// (logged at warn for diagnostics).
-fn resolve_read_payload(
-    runtime: &Runtime,
-    path: &omnifs_core::path::Path,
-    result: ReadOutcome,
-) -> Result<Option<(Vec<u8>, FileAttrsCache)>> {
-    let attrs = result.attrs;
-    match result.bytes {
-        ReadBytes::Inline(bytes) => Ok(Some((bytes, attrs))),
-        ReadBytes::Body(body) => match runtime.read_blob_full(
-            body,
-            match attrs.size() {
-                view_types::FileSize::Exact(length) => Some(length),
-                view_types::FileSize::NonZero | view_types::FileSize::Unknown => None,
-            },
-        ) {
-            Ok(bytes) => Ok(Some((bytes, attrs))),
-            Err(e) => {
-                warn!(path = %path, error = %e, "blob-backed read failed");
-                Ok(None)
-            },
-        },
-        ReadBytes::Canonical => {
-            if let Some(bytes) = runtime
-                .canonical_bytes_for(path)
-                .map_err(|error| TreeError::internal(error.to_string()))?
-            {
-                Ok(Some((bytes, attrs)))
-            } else {
-                warn!(
-                    path = %path,
-                    "read answered byte-source::canonical but no canonical covers the path"
-                );
-                Ok(None)
-            }
-        },
-    }
-}
-
-/// Validate a cached `File` record against the projected attrs, returning the
-/// decoded payload only when it is still a faithful answer for the projection.
-fn file_payload_for_attrs(
-    record: &CacheRecord,
-    attrs: Option<&FileAttrsCache>,
-) -> Option<FilePayload> {
-    let payload = FilePayload::deserialize(&record.payload)?;
-    let attrs = attrs?;
-    if matches!(attrs.stability(), view_types::Stability::Dynamic)
-        && payload.version_token.as_deref() != attrs.version_token()
-    {
-        return None;
-    }
-    if attrs
-        .validate_complete_content(payload.content.len())
-        .is_err()
-    {
-        return None;
-    }
-    Some(payload)
-}
-
-/// A cache hit serves complete cached bytes, so the read result can learn the
-/// exact size the same way a cold provider read does. Most hits already carry a
-/// learned size from an earlier read; preloaded file payloads can arrive before
-/// any renderer has promoted the placeholder attrs.
-fn read_result_from_cache(
-    path: &omnifs_core::path::Path,
-    payload: FilePayload,
-    attrs: Option<&FileAttrsCache>,
-) -> Result<ReadResult> {
-    let content_len = payload.content.len();
-    enforce_observed_materialize_cap(path, content_len)?;
-    let attrs = attrs
-        .map(|attrs| {
-            attrs
-                .learned_complete_content_attrs(content_len)
-                .map_err(|error| {
-                    TreeError::internal(format!(
-                        "cached file payload for {path} contradicts file attrs: {error}"
-                    ))
-                })
-        })
-        .transpose()?;
-    Ok(ReadResult {
-        data: payload.content,
-        attrs,
-    })
-}
-
-pub(crate) fn enforce_declared_materialize_cap(
-    path: &omnifs_core::path::Path,
-    attrs: Option<&FileAttrsCache>,
-) -> Result<()> {
-    let Some(attrs) = attrs else {
-        return Ok(());
-    };
-    if !attrs.is_deferred_full() {
-        return Ok(());
-    }
-    let view_types::FileSize::Exact(size) = attrs.size() else {
-        return Ok(());
-    };
-    if size <= MATERIALIZE_MAX_BYTES {
-        return Ok(());
-    }
-    Err(TreeError::too_large(format!(
-        "full read for {path} declares {size} bytes, above materialize cap {MATERIALIZE_MAX_BYTES}"
-    )))
+    let attrs = usize::try_from(length)
+        .map_err(|error| error.to_string())
+        .and_then(|length| attrs.learned_complete_content_attrs(length))
+        .map_err(|error| contradicts(error, length))?;
+    body_range(&runtime.resources, body, length, offset, len, Some(attrs))?
+        .ok_or_else(|| lost_body(path))
 }
 
 fn enforce_observed_materialize_cap(path: &omnifs_core::path::Path, size: usize) -> Result<()> {
@@ -667,34 +603,4 @@ fn enforce_observed_materialize_cap(path: &omnifs_core::path::Path, size: usize)
 fn materialized_bytes(path: &omnifs_core::path::Path, data: Vec<u8>) -> Result<Vec<u8>> {
     enforce_observed_materialize_cap(path, data.len())?;
     Ok(data)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tree::error::TreeErrorKind;
-
-    #[test]
-    fn declared_materialize_cap_is_inclusive() {
-        let path = omnifs_core::path::Path::parse("/message").expect("valid path");
-        let at_cap = FileAttrsCache::deferred(
-            view_types::FileSize::Exact(MATERIALIZE_MAX_BYTES),
-            view_types::ReadMode::Full,
-            view_types::Stability::Stable,
-            None,
-        )
-        .expect("valid capped attrs");
-        assert!(enforce_declared_materialize_cap(&path, Some(&at_cap)).is_ok());
-
-        let above_cap = FileAttrsCache::deferred(
-            view_types::FileSize::Exact(MATERIALIZE_MAX_BYTES + 1),
-            view_types::ReadMode::Full,
-            view_types::Stability::Stable,
-            None,
-        )
-        .expect("valid oversized attrs");
-        let error = enforce_declared_materialize_cap(&path, Some(&above_cap))
-            .expect_err("full materialization above the cap must be rejected");
-        assert_eq!(error.kind, TreeErrorKind::TooLarge);
-    }
 }

@@ -88,6 +88,7 @@ pub fn not_modified() -> HttpResponse {
         status: 304,
         headers: Vec::new(),
         body: Vec::new(),
+        redirected: None,
     }
 }
 

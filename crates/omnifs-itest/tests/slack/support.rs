@@ -83,8 +83,9 @@ pub async fn answering<T>(
                         url: request.url.clone(),
                         headers,
                         body: request.body.clone(),
+                        follow_redirects: false,
                     });
-                    runtime.answer_test_blob(callout, status, &body);
+                    runtime.answer_test_blob(callout, status, &body).await;
                 },
                 (callout, _) => panic!("another callout than its answer: {callout:?}"),
             }
@@ -234,6 +235,7 @@ fn answer(status: u16, headers: &[(&str, &str)], body: &Value) -> Answer {
             })
             .collect(),
         body: body.to_string().into_bytes(),
+        redirected: None,
     }))
 }
 

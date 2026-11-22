@@ -177,6 +177,19 @@ impl KeptPart {
     }
 }
 
+/// The bodies of the blobs of the kept part `bytes` of the projection, which
+/// the part refers to in the body store.
+pub(crate) fn kept_bodies(
+    bytes: &[u8],
+) -> std::result::Result<Vec<crate::view::BodyId>, postcard::Error> {
+    let kept: KeptPart = postcard::from_bytes(bytes)?;
+    Ok(kept
+        .bodies
+        .into_iter()
+        .map(|(body, _)| crate::view::BodyId::from_digest_bytes(body))
+        .collect())
+}
+
 /// What one answer of a feed changes: the listings it writes into and the
 /// files it writes, which keep their identity in filesystems, and the paths
 /// it removes, whose answers filesystems drop.
@@ -472,7 +485,7 @@ impl Runtime {
             object.path.as_str(),
         );
         let captured_epoch = self.resources.current_epoch();
-        let mut blob_guard = self.resources.blob_publication(id);
+        let _blobs = self.resources.operation_blobs(id);
         let tokened = call.token.is_some();
         let FeedCall {
             token,
@@ -506,7 +519,6 @@ impl Runtime {
             })
             .map_err(EngineError::ProviderProtocol)?;
             super::lifecycle::inspect_result(&span, &wire_result);
-            let pending_blobs = blob_guard.take();
             let answer = self.provider_result(wire_result)?;
             // The facts of the part of this call under the anchor of its
             // object, whose time is its `until`: a fact that the part writes
@@ -547,7 +559,6 @@ impl Runtime {
                         object,
                         KeptPart { part, ..last },
                         &origin,
-                        pending_blobs,
                         captured_epoch,
                     )?;
                     inspector::record_outcome(&span, InspectorOutcome::Ok);
@@ -602,7 +613,7 @@ impl Runtime {
                     ended: part.ended,
                 })
                 .collect::<Vec<_>>();
-            let (mut transition, changes) = EffectApplier::new(&self.resources)
+            let (transition, changes) = EffectApplier::new(&self.resources)
                 .lower_feed(
                     object,
                     answer,
@@ -612,7 +623,6 @@ impl Runtime {
                     clock::now_millis(),
                 )
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-            transition.blobs.extend(pending_blobs);
             let Some(published) = self.publish_feed_transition(transition, captured_epoch)? else {
                 inspector::record_outcome(&span, InspectorOutcome::Ok);
                 return Ok(FeedStep::Moved);
@@ -670,8 +680,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Keep a part of a later answer of the feed of `object`, with the blobs
-    /// of its call. Its effects lower first, so that a part that cannot
+    /// Keep a part of a later answer of the feed of `object`. Its effects lower first, so that a part that cannot
     /// publish fails at its own call. `false` for a part whose feed another
     /// answer moved the state of, which the projection does not keep.
     fn keep_feed_part(
@@ -679,7 +688,6 @@ impl Runtime {
         object: &FeedObject,
         kept: KeptPart,
         origin: &FeedOrigin,
-        blobs: Vec<crate::cache::BlobWrite>,
         captured_epoch: u64,
     ) -> Result<bool> {
         EffectApplier::new(&self.resources)
@@ -697,7 +705,6 @@ impl Runtime {
             )
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
         let transition = ProjectionTransition {
-            blobs,
             kept: Some(KeptWrite {
                 object: object.id.as_bytes().to_vec(),
                 from: origin.from,

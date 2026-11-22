@@ -145,6 +145,9 @@ async fn test_read_file_sibling_projections_do_not_erase_parent_dirents() {
         entry_names,
         vec![
             "README.md",
+            "blob",
+            "blob-of-another-size",
+            "blob-then-error",
             "bundle",
             "feed",
             "fresh-full",

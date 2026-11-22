@@ -902,6 +902,10 @@ impl TestProvider {
         // Each suspends on an HTTP callout. Two distinct paths (so reads do not
         // coalesce) let the host concurrency test hold two ops in flight at once
         // to prove independent ops interleave on one instance.
+        r.file("/hello/blob").handler(blob)?;
+        r.file("/hello/blob-then-error").handler(blob_then_error)?;
+        r.file("/hello/blob-of-another-size")
+            .handler(blob_of_another_size)?;
         r.file("/hello/remote-a").handler(remote)?;
         r.file("/hello/remote-b").handler(remote)?;
         // A read parked on a slow upstream: the filesystem concurrency net holds
@@ -1062,6 +1066,42 @@ async fn fresh_full(cx: Cx<State>) -> Result<FileProjection> {
             .dynamic()
             .build(),
     )
+}
+
+/// The blob of a fixed version of the fixture endpoint, of the bytes that the
+/// host test answers its fetch with.
+async fn fixture_blob(cx: &Cx<State>) -> Result<omnifs_sdk::blob::BlobRef> {
+    cx.http()
+        .get("https://httpbin.org/bytes")
+        .into_blob()
+        .version("1")
+        .send()
+        .await?
+        .error_for_status()
+}
+
+/// A file of the bytes of a blob, which never cross to the provider.
+async fn blob(cx: Cx<State>) -> Result<FileProjection> {
+    let blob = fixture_blob(&cx).await?;
+    Ok(FileProjection::blob(blob.id)
+        .size(FileSize::Exact(blob.size))
+        .build())
+}
+
+/// A read that fetches a blob and then fails: the host keeps the answer of
+/// the fetch whatever the read does after it.
+async fn blob_then_error(cx: Cx<State>) -> Result<FileProjection> {
+    fixture_blob(&cx).await?;
+    Err(ProviderError::internal("the read failed after its blob"))
+}
+
+/// A read that fetches a blob and declares another size than its body has,
+/// which the host refuses when it lowers the answer.
+async fn blob_of_another_size(cx: Cx<State>) -> Result<FileProjection> {
+    let blob = fixture_blob(&cx).await?;
+    Ok(FileProjection::blob(blob.id)
+        .size(FileSize::Exact(blob.size + 1))
+        .build())
 }
 
 /// Issues a single HTTP callout and returns its body verbatim. The handler

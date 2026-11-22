@@ -3572,6 +3572,7 @@ dependencies = [
 name = "omnifs-sdk-macros"
 version = "0.2.1"
 dependencies = [
+ "omnifs-wit",
  "proc-macro2",
  "quote",
  "serde_json",

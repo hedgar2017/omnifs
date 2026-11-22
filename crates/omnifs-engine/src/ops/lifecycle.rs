@@ -28,7 +28,7 @@ impl Runtime {
             "lookup_child",
             child_path.as_str(),
         );
-        let mut blob_guard = self.resources.blob_publication(id);
+        let _blobs = self.resources.operation_blobs(id);
         async {
             let (wire_result, effects) = self
                 .instance
@@ -43,13 +43,11 @@ impl Runtime {
             })
             .map_err(EngineError::ProviderProtocol)?;
             inspect_result(&span, &wire_result);
-            let pending_blobs = blob_guard.take();
             let wire_result = self.provider_result(wire_result)?;
             let applier = EffectApplier::new(&self.resources);
             let mut transition = applier
                 .lower_effects(&effects, clock::now_millis())
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-            transition.blobs.extend(pending_blobs);
             let (result, result_transition) = applier
                 .lower_lookup(
                     parent_path,
@@ -85,7 +83,7 @@ impl Runtime {
             "list_children",
             path.as_str(),
         );
-        let mut blob_guard = self.resources.blob_publication(id);
+        let _blobs = self.resources.operation_blobs(id);
         async {
             let (wire_result, effects) = self
                 .instance
@@ -107,14 +105,12 @@ impl Runtime {
             )
             .map_err(EngineError::ProviderProtocol)?;
             inspect_result(&span, &wire_result);
-            let pending_blobs = blob_guard.take();
             let wire_result = self.provider_result(wire_result)?;
             let applier = EffectApplier::new(&self.resources);
             let now_millis = clock::now_millis();
             let mut transition = applier
                 .lower_effects(&effects, now_millis)
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-            transition.blobs.extend(pending_blobs);
             let (result, result_transition) = applier
                 .lower_list(path, wire_result, &request, now_millis, |tree| {
                     self.tree_ref(tree).map(|reference| reference.id)
@@ -147,7 +143,7 @@ impl Runtime {
             "read_file",
             path.as_str(),
         );
-        let mut blob_guard = self.resources.blob_publication(id);
+        let _blobs = self.resources.operation_blobs(id);
         async {
             let (wire_result, effects) = self
                 .instance
@@ -163,7 +159,6 @@ impl Runtime {
             })
             .map_err(EngineError::ProviderProtocol)?;
             inspect_result(&span, &wire_result);
-            let pending_blobs = blob_guard.take();
             let wire_result = self.provider_result(wire_result)?;
             let applier = EffectApplier::new(&self.resources);
             let mut transition = applier
@@ -175,7 +170,6 @@ impl Runtime {
                         .lower_read(path, value, &transition.objects)
                         .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
                     merge_transition(&mut transition, result_transition);
-                    transition.blobs.extend(pending_blobs);
                     ReadReply::File(result)
                 },
                 wit_types::ReadFileOutcome::Feed(claims) => ReadReply::Feed(
@@ -186,7 +180,6 @@ impl Runtime {
                         .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?,
                 ),
                 wit_types::ReadFileOutcome::NotFound(maybe_id) => {
-                    drop(pending_blobs);
                     transition.records.push(crate::cache::RecordWrite {
                         path: path.clone(),
                         aux: None,
@@ -237,7 +230,7 @@ impl Runtime {
             "open_file",
             path.as_str(),
         );
-        let mut blob_guard = self.resources.blob_publication(id);
+        let _blobs = self.resources.operation_blobs(id);
         async {
             let (wire_result, effects) = self
                 .instance
@@ -248,14 +241,12 @@ impl Runtime {
             })
             .map_err(EngineError::ProviderProtocol)?;
             inspect_result(&span, &wire_result);
-            let pending_blobs = blob_guard.take();
             let wire_result = self.provider_result(wire_result)?;
             let outcome = OpenOutcome::from_wit(wire_result);
             let meta = crate::view::EntryMeta::file(outcome.attrs.clone());
             let mut transition = EffectApplier::new(&self.resources)
                 .lower_effects(&effects, clock::now_millis())
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-            transition.blobs.extend(pending_blobs);
             transition.records.extend([
                 crate::cache::RecordWrite {
                     path: path.clone(),
@@ -290,7 +281,7 @@ impl Runtime {
         let id = self.next_operation_id();
         let span =
             inspector::provider_span(id, &self.mount_name, &self.provider_name, "read_chunk", "");
-        let mut blob_guard = self.resources.blob_publication(id);
+        let _blobs = self.resources.operation_blobs(id);
         async {
             let (wire_result, effects) =
                 self.instance.read_chunk(id, handle, offset, length).await?;
@@ -299,12 +290,10 @@ impl Runtime {
             })
             .map_err(EngineError::ProviderProtocol)?;
             inspect_result(&span, &wire_result);
-            let pending_blobs = blob_guard.take();
             let wire_result = self.provider_result(wire_result)?;
             let mut transition = EffectApplier::new(&self.resources)
                 .lower_effects(&effects, clock::now_millis())
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-            transition.blobs.extend(pending_blobs);
             let mut outcome = ChunkOutcome::from_wit(wire_result);
             if let (Some(path), Some(attrs)) = (path, attrs)
                 && outcome.eof
@@ -359,7 +348,7 @@ impl Runtime {
         let id = self.next_operation_id();
         let span =
             inspector::provider_span(id, &self.mount_name, &self.provider_name, "on_event", "");
-        let mut blob_guard = self.resources.blob_publication(id);
+        let _blobs = self.resources.operation_blobs(id);
         async {
             let (wire_result, effects) = self.instance.on_event(id, event).await?;
             crate::op_validate::validate_event(&wire_result, &effects, |tree| {
@@ -367,13 +356,10 @@ impl Runtime {
             })
             .map_err(EngineError::ProviderProtocol)?;
             inspect_result(&span, &wire_result);
-            let pending_blobs = blob_guard.take();
             self.provider_result(wire_result)?;
             let transition = EffectApplier::new(&self.resources)
                 .lower_effects(&effects, clock::now_millis())
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-            let mut transition = transition;
-            transition.blobs.extend(pending_blobs);
             self.publish_transition(transition, captured_epoch)?;
             inspector::record_outcome(&span, InspectorOutcome::Ok);
             Ok(())
@@ -466,7 +452,6 @@ fn merge_transition(
     target.objects.append(&mut addition.objects);
     target.freshness.append(&mut addition.freshness);
     target.invalidations.append(&mut addition.invalidations);
-    target.blobs.append(&mut addition.blobs);
     target.git.append(&mut addition.git);
     target.removals.append(&mut addition.removals);
 }

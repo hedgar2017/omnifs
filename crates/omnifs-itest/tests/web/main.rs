@@ -262,5 +262,6 @@ fn html_response(body: &[u8]) -> CalloutResult {
             value: "text/html; charset=utf-8".to_string(),
         }],
         body: body.to_vec(),
+        redirected: None,
     })
 }

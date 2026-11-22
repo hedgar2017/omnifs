@@ -96,6 +96,7 @@ fn answer(status: u16, headers: &[(&str, &str)], body: &Value) -> HttpResponse {
             })
             .collect(),
         body: body.to_string().into_bytes(),
+        redirected: None,
     }
 }
 
@@ -108,6 +109,7 @@ fn empty(status: u16, headers: &[(&str, &str)]) -> HttpResponse {
         status,
         headers: answer(status, headers, &Value::Null).headers,
         body: Vec::new(),
+        redirected: None,
     }
 }
 

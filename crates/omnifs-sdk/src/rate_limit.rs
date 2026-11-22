@@ -7,8 +7,11 @@
 //! [`crate::endpoint::RateLimitPolicy`], else by a small default; while the
 //! window is open, sends to that authority fail in-guest with a
 //! rate-limited error carrying the remaining cooldown, without issuing a
-//! callout. The first response with status < 400 disarms the authority, and
-//! the whole breaker is cleared on provider shutdown so a window never
+//! callout. An answer is of the authority of the URL that answered it, which
+//! is another than the one of the request after a redirect that the host
+//! followed; the first answer of an upstream with status < 400 disarms its
+//! authority, an answer that the host gave from its projection disarms none,
+//! and the whole breaker is cleared on provider shutdown so a window never
 //! leaks across instance teardown.
 //!
 //! Providers do not drive this module directly; the send paths do. The one
@@ -122,10 +125,71 @@ pub fn authority_of(url: &str) -> Option<String> {
     Some(authority)
 }
 
-/// Parse an HTTP `Retry-After` value's delta-seconds form into a Duration.
-/// An HTTP-date form returns None (no guest wall-clock math on the error path).
-pub fn parse_retry_after_secs(value: &str) -> Option<Duration> {
-    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+/// The time of the `Retry-After` value `value` of an answer: its seconds,
+/// or the time from the `Date` of the answer, `date`, to its HTTP date, and
+/// from now for an answer without a `Date`. None for a value that is
+/// neither, and no time for a date that passed.
+pub fn retry_after(value: &str, date: Option<&str>) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let until = http_date(value)?;
+    let from = match date.and_then(http_date) {
+        Some(date) => date,
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    };
+    Some(Duration::from_secs(until.saturating_sub(from)))
+}
+
+/// The seconds since the Unix epoch of an HTTP date in each of its three
+/// forms (RFC 9110, 5.6.7): `Sun, 06 Nov 1994 08:49:37 GMT`,
+/// `Sunday, 06-Nov-94 08:49:37 GMT`, and `Sun Nov  6 08:49:37 1994`.
+fn http_date(value: &str) -> Option<u64> {
+    let fields: Vec<&str> = value
+        .split([' ', ',', '-'])
+        .filter(|field| !field.is_empty())
+        .collect();
+    let ([_, day, month, year, time, "GMT"] | [_, month, day, time, year]) = fields.as_slice()
+    else {
+        return None;
+    };
+    let day: u64 = day.parse().ok()?;
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|name| name == month)? as u64
+        + 1;
+    let year = match (year.len(), year.parse::<u64>().ok()?) {
+        // A year of two digits is of the fifty years to come or of the
+        // fifty before (RFC 9110, 5.6.7).
+        (2, year) if year >= 70 => 1900 + year,
+        (2, year) => 2000 + year,
+        (4, year) if year >= 1970 => year,
+        _ => return None,
+    };
+    let mut clock = time.split(':').map(|part| part.parse::<u64>().ok());
+    let (hour, minute, second) = (clock.next()??, clock.next()??, clock.next()??);
+    if clock.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    {
+        return None;
+    }
+    // The days from the epoch to a civil date, with the year from March.
+    let (shifted_year, shifted_month) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = shifted_year / 400;
+    let year_of_era = shifted_year - era * 400;
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = (era * 146_097 + day_of_era).checked_sub(719_468)?;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 #[cfg(test)]
@@ -202,5 +266,49 @@ mod tests {
             authority_of("http://x.test:8080/p"),
             Some("http://x.test:8080".into())
         );
+    }
+
+    #[test]
+    fn a_retry_after_is_seconds_or_an_http_date_from_the_date_of_its_answer() {
+        assert_eq!(retry_after(" 120 ", None), Some(Duration::from_secs(120)));
+        let date = Some("Sun, 06 Nov 1994 08:49:37 GMT");
+        for until in [
+            "Sun, 06 Nov 1994 08:50:37 GMT",
+            "Sunday, 06-Nov-94 08:50:37 GMT",
+            "Sun Nov  6 08:50:37 1994",
+        ] {
+            assert_eq!(
+                retry_after(until, date),
+                Some(Duration::from_secs(60)),
+                "{until}"
+            );
+        }
+        // A date that passed is no time to wait, and one of an answer
+        // without a `Date` counts from now.
+        assert_eq!(
+            retry_after("Sun, 06 Nov 1994 08:49:00 GMT", date),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            retry_after("Sun, 06 Nov 1994 08:49:00 GMT", None),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            http_date("Tue, 29 Feb 2000 12:00:00 GMT"),
+            Some(951_825_600)
+        );
+        assert_eq!(
+            http_date("Sun, 22 Nov 2026 00:00:00 GMT"),
+            Some(1_795_305_600)
+        );
+        for other in [
+            "soon",
+            "",
+            "Sun, 06 Nov 1994 08:49 GMT",
+            "Sun, 32 Nov 1994 08:49:37 GMT",
+        ] {
+            assert_eq!(retry_after(other, date), None, "{other}");
+        }
     }
 }

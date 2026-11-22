@@ -902,6 +902,7 @@ async fn content<K>(cx: &FeedCx<K>) -> Result<Feed> {
         },
         status => return Err(ProviderError::from_http_status(status)),
     }
+    let blob = blob.error_for_status()?;
     let handle = BlobHandle {
         id: blob.id,
         size: blob.size,

@@ -6,8 +6,10 @@
 //! module, so Cargo feature unification cannot displace the guest `Guest`
 //! traits while a host crate enables `host-bindings`.
 
-/// Package declaration from `wit/provider.wit`.
-pub const PROVIDER_WIT_PACKAGE: &str = "package omnifs:provider@0.11.0;";
+/// Package declaration from `wit/provider.wit`: the one copy of it in Rust,
+/// which the provider macro writes into a manifest and a host requires of
+/// an artifact.
+pub const PROVIDER_WIT_PACKAGE: &str = "package omnifs:provider@0.12.0;";
 
 #[cfg(test)]
 mod tests {
