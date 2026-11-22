@@ -140,6 +140,12 @@ pub fn start_server(
                 },
             }
         }
+        // The stop ends each connection that this thread took, the last one
+        // too, which it registered after the stop shut the others down: the
+        // stop, and not a time, ends the read of each worker.
+        for connection in thread_workers.lock().expect("workers lock").iter() {
+            let _ = connection.stream.shutdown(std::net::Shutdown::Both);
+        }
         join_workers(&thread_workers);
     });
 
