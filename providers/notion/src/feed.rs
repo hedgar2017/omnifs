@@ -10,8 +10,9 @@
 //! object of the projection leaves the projection as it is. A page or a data
 //! source that the request by its ID of a full listing answers with another
 //! status than `200`, `401`, `404`, or `429` stays as the projection has it,
-//! and its own feed takes it in each sync, with Notion's error for a read of
-//! its paths. The own feed of a page takes it by its ID, its content, and its
+//! and the listing goes on: its own feed has Notion's error for the rest of
+//! the sync, which an operation that lacks a fact of it has without a
+//! request. The own feed of a page takes it by its ID, its content, and its
 //! comments, and the own feed of a data source takes it by its ID, a part for
 //! each request.
 //!
@@ -320,18 +321,10 @@ fn minute(time: OffsetDateTime) -> Result<OffsetDateTime> {
 // ===========================================================================
 
 /// The state that a part gives the feed of a page, with its token, or of a
-/// data source, which stays unlisted for one that the inventory of the
-/// workspace does not have.
+/// data source, with the error of Notion for one that it refused.
 enum Inner {
-    Page(Id, Option<PageToken>, Listed),
-    DataSource(Id, Listed),
-}
-
-/// Whether the inventory of the workspace has an object.
-#[derive(Clone, Copy)]
-enum Listed {
-    Yes,
-    No,
+    Page(Id, Option<PageToken>, Option<ProviderError>),
+    DataSource(Id, Option<ProviderError>),
 }
 
 /// One call of the feed of the workspace: its context, the latest time of
@@ -490,14 +483,13 @@ impl WorkspaceFeed<'_> {
                         remove_content(self.cx, &id)?;
                     }
                     let token = PageToken::new(found.last_edited_time);
-                    self.inner
-                        .push(Inner::Page(id.clone(), Some(token), Listed::Yes));
+                    self.inner.push(Inner::Page(id.clone(), Some(token), None));
                 }
                 write_page(self.cx, &id, object, write)?;
             },
             Kind::DataSource => {
                 write_data_source(self.cx, &id, object, write)?;
-                self.inner.push(Inner::DataSource(id.clone(), Listed::Yes));
+                self.inner.push(Inner::DataSource(id.clone(), None));
             },
         }
         Ok(id)
@@ -509,11 +501,11 @@ impl WorkspaceFeed<'_> {
         match kind {
             Kind::Page => {
                 self.cx.remove(page_path(&id))?;
-                self.inner.push(Inner::Page(id, None, Listed::Yes));
+                self.inner.push(Inner::Page(id, None, None));
             },
             Kind::DataSource => {
                 self.cx.remove(data_source_path(&id))?;
-                self.inner.push(Inner::DataSource(id, Listed::Yes));
+                self.inner.push(Inner::DataSource(id, None));
             },
         }
         Ok(())
@@ -564,8 +556,8 @@ impl WorkspaceFeed<'_> {
     /// A request by its ID of the next page or data source of the sweep of a
     /// full listing: its facts, its removal for `404` or in the trash, or for
     /// another status than `401` and `429`, its facts as the projection has
-    /// them with its own feed unlisted, which takes it in each sync; the last
-    /// part of the listing after the sweep. An answer of another object is
+    /// them with the error of Notion for its own feed; the last part of the
+    /// listing after the sweep. An answer of another object is
     /// the error of the request.
     async fn missing(&mut self, mut sweep: Sweep, seen: Option<Latest>) -> Result<Feed> {
         let next = match &mut sweep {
@@ -589,7 +581,7 @@ impl WorkspaceFeed<'_> {
             },
             (404, Err(_)) => self.remove(kind, id.clone())?,
             (401 | 429, Err(error)) => return Err(error),
-            (_, Err(_)) => self.unlisted(kind, id.clone())?,
+            (_, Err(error)) => self.refused(kind, id.clone(), error)?,
         }
         if let Sweep::Later(after) = &mut sweep {
             *after = Some((kind, id));
@@ -597,17 +589,17 @@ impl WorkspaceFeed<'_> {
         self.part(Some(Stage::Missing { sweep, seen }))
     }
 
-    /// Leave the page or the data source `id` as the projection has it, with
-    /// its own feed unlisted from the token of what the projection has: the
-    /// inventory of the workspace does not have it.
-    fn unlisted(&mut self, kind: Kind, id: Id) -> Result<()> {
+    /// Leave the page or the data source `id` that Notion refused with
+    /// `error` as the projection has it, with the token of what the
+    /// projection has and `error` for its own feed for the rest of the sync.
+    fn refused(&mut self, kind: Kind, id: Id, error: ProviderError) -> Result<()> {
         match kind {
             Kind::Page => {
                 let token = projected_time(self.cx, &format!("{}/page.json", page_path(&id)))?
                     .map(PageToken::new);
-                self.inner.push(Inner::Page(id, token, Listed::No));
+                self.inner.push(Inner::Page(id, token, Some(error)));
             },
-            Kind::DataSource => self.inner.push(Inner::DataSource(id, Listed::No)),
+            Kind::DataSource => self.inner.push(Inner::DataSource(id, Some(error))),
         }
         Ok(())
     }
@@ -673,17 +665,15 @@ impl WorkspaceFeed<'_> {
         }
         for inner in self.inner.drain(..) {
             part = match inner {
-                Inner::Page(id, token, Listed::Yes) => {
-                    part.inner::<Page>(&PageKey { id }, &token)?
+                Inner::Page(id, token, None) => part.inner::<Page>(&PageKey { id }, &token)?,
+                Inner::Page(id, token, Some(error)) => {
+                    part.inner_failed::<Page>(&PageKey { id }, &token, error)?
                 },
-                Inner::Page(id, token, Listed::No) => {
-                    part.inner_unlisted::<Page>(&PageKey { id }, &token)?
-                },
-                Inner::DataSource(id, Listed::Yes) => {
+                Inner::DataSource(id, None) => {
                     part.inner::<DataSource>(&DataSourceKey { id }, &())?
                 },
-                Inner::DataSource(id, Listed::No) => {
-                    part.inner_unlisted::<DataSource>(&DataSourceKey { id }, &())?
+                Inner::DataSource(id, Some(error)) => {
+                    part.inner_failed::<DataSource>(&DataSourceKey { id }, &(), error)?
                 },
             };
         }
