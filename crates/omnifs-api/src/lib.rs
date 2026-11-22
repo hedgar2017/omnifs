@@ -14,9 +14,9 @@ pub mod grpc;
 
 pub use control::{
     CONTROL_LOG_TAIL_MAX_LINES, CONTROL_MESSAGE_MAX_BYTES, CONTROL_MUTATION_TIMEOUT_SECS,
-    CONTROL_REQUEST_TIMEOUT_SECS, CONTROL_SHUTDOWN_DRAIN_SECS, CONTROL_SHUTDOWN_TIMEOUT_SECS,
-    CONTROL_STREAM_ITEM_MAX_BYTES, CONTROL_STREAM_PAYLOAD_MAX_BYTES, ControlError,
-    ControlErrorCode, MutationOp, MutationOpResult, ProviderImportDisposition,
+    CONTROL_PROTOCOL, CONTROL_REQUEST_TIMEOUT_SECS, CONTROL_SHUTDOWN_DRAIN_SECS,
+    CONTROL_SHUTDOWN_TIMEOUT_SECS, CONTROL_STREAM_ITEM_MAX_BYTES, CONTROL_STREAM_PAYLOAD_MAX_BYTES,
+    ControlError, ControlErrorCode, MutationOp, MutationOpResult, ProviderImportDisposition,
     ProviderImportReceipt, ProviderReference, ServingOutcome,
 };
 pub use credential::{
@@ -70,6 +70,10 @@ pub struct DaemonInfo {
     /// The program of the daemon, the BLAKE3 digest of the bytes of its
     /// executable at its start; none from a daemon of a build without it.
     pub program: Option<String>,
+    /// The number of the control protocol of the daemon,
+    /// [`CONTROL_PROTOCOL`] of its build; 0 from a daemon of a build before
+    /// the number.
+    pub protocol: u32,
 }
 
 /// Opaque identity of one daemon recovery offer.
@@ -355,6 +359,7 @@ mod tests {
             attach_unix: Some(PathBuf::from("/tmp/omnifs-local.sock")),
             attach_tcp: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)),
             program: None,
+            protocol: crate::CONTROL_PROTOCOL,
         };
         let info_json = serde_json::to_value(&info).unwrap();
         assert!(info_json.get("config_dir").is_none());

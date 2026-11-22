@@ -201,18 +201,18 @@ impl wire::control_server::Control for GrpcControlService {
         _request: Request<wire::Empty>,
     ) -> Result<Response<wire::StatusResponse>, Status> {
         let daemon = self.daemon()?;
-        Ok(Response::new(wire::StatusResponse {
+        reply(wire::StatusResponse {
             status: Some(grpc::to_daemon_status(&daemon.control_status())),
-        }))
+        })
     }
 
     async fn get_inventory(
         &self,
         _request: Request<wire::Empty>,
     ) -> Result<Response<wire::InventoryResponse>, Status> {
-        Ok(Response::new(wire::InventoryResponse {
+        reply(wire::InventoryResponse {
             inventory: Some(grpc::to_daemon_inventory(&self.inventory().await?)),
-        }))
+        })
     }
 
     async fn get_daemon_info(
@@ -354,7 +354,7 @@ impl wire::control_server::Control for GrpcControlService {
                 .and_modify(|row| row.1 = true)
                 .or_insert((provider, true, false));
         }
-        Ok(Response::new(wire::ListProvidersResponse {
+        reply(wire::ListProvidersResponse {
             providers: rows
                 .into_values()
                 .map(|(metadata, embedded, retained)| wire::ProviderEntry {
@@ -363,7 +363,7 @@ impl wire::control_server::Control for GrpcControlService {
                     retained,
                 })
                 .collect(),
-        }))
+        })
     }
 
     async fn get_provider_metadata(
@@ -381,9 +381,7 @@ impl wire::control_server::Control for GrpcControlService {
             .map_err(grpc_internal)?
             .map(api_provider_metadata)
             .map(|metadata| grpc::to_provider_metadata(&metadata));
-        Ok(Response::new(wire::GetProviderMetadataResponse {
-            metadata,
-        }))
+        reply(wire::GetProviderMetadataResponse { metadata })
     }
 
     async fn import_provider(
@@ -505,9 +503,9 @@ impl wire::control_server::Control for GrpcControlService {
     ) -> Result<Response<wire::ListMountsResponse>, Status> {
         let daemon = self.daemon()?;
         let mounts = daemon.mount_records().await.map_err(grpc_internal)?;
-        Ok(Response::new(wire::ListMountsResponse {
+        reply(wire::ListMountsResponse {
             mounts: mounts.iter().map(grpc::to_mount_record).collect(),
-        }))
+        })
     }
 
     async fn get_mount(
@@ -525,9 +523,9 @@ impl wire::control_server::Control for GrpcControlService {
                 api_mount_record(mount, mount_health, auth_health).map_err(grpc_internal)
             })
             .transpose()?;
-        Ok(Response::new(wire::GetMountResponse {
+        reply(wire::GetMountResponse {
             mount: mount.as_ref().map(grpc::to_mount_record),
-        }))
+        })
     }
 
     async fn list_credentials(
@@ -548,9 +546,9 @@ impl wire::control_server::Control for GrpcControlService {
                     .map_err(grpc_internal)?,
             );
         }
-        Ok(Response::new(wire::ListCredentialsResponse {
+        reply(wire::ListCredentialsResponse {
             credentials: credentials.iter().map(grpc::to_credential_status).collect(),
-        }))
+        })
     }
 
     async fn get_credential_status(
@@ -575,9 +573,9 @@ impl wire::control_server::Control for GrpcControlService {
             ),
             None => None,
         };
-        Ok(Response::new(wire::GetCredentialStatusResponse {
+        reply(wire::GetCredentialStatusResponse {
             status: status.as_ref().map(grpc::to_credential_status),
-        }))
+        })
     }
 
     type SubscribeInspectorStream = ReceiverStream<Result<wire::InspectorStreamItem, Status>>;

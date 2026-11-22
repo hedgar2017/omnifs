@@ -99,6 +99,7 @@ impl DaemonContext {
             attach_unix,
             attach_tcp,
             program: Some(self.program.clone()),
+            protocol: omnifs_api::CONTROL_PROTOCOL,
         }
     }
 

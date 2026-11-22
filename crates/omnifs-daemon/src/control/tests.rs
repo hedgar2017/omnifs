@@ -233,6 +233,72 @@ async fn the_status_of_a_credential_names_the_subject_of_its_client() {
     runtime.shutdown().await;
 }
 
+/// A daemon names the control protocol of its build in its info, in each
+/// phase, and answers a request for its state after the begin of its
+/// teardown with the error that it is shutting down.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(unsafe_code)]
+async fn a_daemon_names_its_control_protocol_and_its_teardown() {
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = crate::ENV_LOCK.lock().await;
+    let home = std::fs::canonicalize(dir.path()).unwrap();
+    unsafe {
+        std::env::set_var("OMNIFS_HOME", &home);
+    }
+    let runtime = test_daemon(&dir).await;
+    let mut c = client(&home.join("control.sock")).await;
+    let protocol =
+        |info: wire::DaemonInfoResponse| grpc::daemon_info(&info.info.unwrap()).unwrap().protocol;
+    assert_eq!(
+        protocol(
+            c.get_daemon_info(wire::Empty {})
+                .await
+                .unwrap()
+                .into_inner()
+        ),
+        omnifs_api::CONTROL_PROTOCOL
+    );
+    c.get_inventory(wire::Empty {}).await.unwrap();
+
+    runtime.control.set_shutting_down();
+    assert_eq!(
+        protocol(
+            c.get_daemon_info(wire::Empty {})
+                .await
+                .unwrap()
+                .into_inner()
+        ),
+        omnifs_api::CONTROL_PROTOCOL
+    );
+    let status = c.get_inventory(wire::Empty {}).await.unwrap_err();
+    assert_eq!(error_code(&status), ControlErrorCode::ShuttingDown);
+    let status = c.get_recovery_state(wire::Empty {}).await.unwrap_err();
+    assert_eq!(error_code(&status), ControlErrorCode::ShuttingDown);
+    runtime.shutdown().await;
+}
+
+/// The daemon answers a message over the limit of a control message with
+/// its own error, which names the size and the limit.
+#[test]
+fn a_reply_over_the_limit_of_a_control_message_is_an_error_of_the_daemon() {
+    let mount = |config: usize| wire::ListMountsResponse {
+        mounts: vec![wire::MountRecord {
+            definition: Some(wire::MountDefinition {
+                config: vec![0; config].into(),
+                ..wire::MountDefinition::default()
+            }),
+            ..wire::MountRecord::default()
+        }],
+    };
+    assert!(super::reply(mount(1024)).is_ok());
+    let status = super::reply(mount(CONTROL_MESSAGE_MAX_BYTES)).unwrap_err();
+    assert_eq!(error_code(&status), ControlErrorCode::Internal);
+    assert_eq!(
+        status.message(),
+        "the answer of the daemon has 1048588 bytes, over the 1048576 bytes of a control message"
+    );
+}
+
 #[test]
 fn manager_recovery_required_maps_to_recovery_required() {
     let error = crate::manager::ManagerError::RecoveryRequired("blocked".to_owned());

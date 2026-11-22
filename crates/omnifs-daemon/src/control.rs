@@ -71,7 +71,7 @@ impl ControlPhase {
     /// Shared by the accessors that still answer while starting or in
     /// recovery but have nothing to report once teardown has begun.
     fn shutting_down() -> ControlError {
-        ControlError::new(ControlErrorCode::NotReady, "daemon is shutting down")
+        ControlError::new(ControlErrorCode::ShuttingDown, "daemon is shutting down")
     }
 
     /// The phase that `WatchPhase` gives, with the error of a recovery as its
@@ -265,6 +265,7 @@ pub(crate) fn grpc_code(code: ControlErrorCode) -> tonic::Code {
         ControlErrorCode::InvalidRequest => tonic::Code::InvalidArgument,
         ControlErrorCode::Busy => tonic::Code::ResourceExhausted,
         ControlErrorCode::NotReady
+        | ControlErrorCode::ShuttingDown
         | ControlErrorCode::RecoveryRequired
         | ControlErrorCode::LeaseExpired
         | ControlErrorCode::LeaseNotHeld => tonic::Code::FailedPrecondition,
@@ -278,6 +279,19 @@ pub(crate) fn grpc_code(code: ControlErrorCode) -> tonic::Code {
 pub(crate) fn grpc_status(error: ControlError) -> Status {
     let details = grpc::to_error_detail(&error).encode_to_vec();
     Status::with_details(grpc_code(error.code), error.message, Bytes::from(details))
+}
+
+/// The reply of a request with `message`, or the error of a message over
+/// the limit of a control message, which the daemon answers itself: the
+/// transport would refuse it without an error of the control protocol.
+pub(crate) fn reply<M: prost::Message>(message: M) -> Result<Response<M>, Status> {
+    let length = message.encoded_len();
+    if length > CONTROL_MESSAGE_MAX_BYTES {
+        return Err(grpc_internal(format!(
+            "the answer of the daemon has {length} bytes, over the {CONTROL_MESSAGE_MAX_BYTES} bytes of a control message"
+        )));
+    }
+    Ok(Response::new(message))
 }
 
 pub(crate) fn grpc_internal(error: impl std::fmt::Display) -> Status {

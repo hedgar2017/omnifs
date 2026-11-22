@@ -219,6 +219,7 @@ pub fn daemon_info(v: &wire::DaemonInfo) -> Result<DaemonInfo, FromGrpcError> {
             .map(|x| x.parse().map_err(|_| FromGrpcError::Invalid("attach tcp")))
             .transpose()?,
         program: v.program.clone(),
+        protocol: v.protocol,
     })
 }
 pub fn to_daemon_info(v: &DaemonInfo) -> wire::DaemonInfo {
@@ -230,6 +231,7 @@ pub fn to_daemon_info(v: &DaemonInfo) -> wire::DaemonInfo {
         attach_unix: v.attach_unix.as_ref().map(|x| path_bytes(x).into()),
         attach_tcp: v.attach_tcp.map(|x| x.to_string()),
         program: v.program.clone(),
+        protocol: v.protocol,
     }
 }
 fn recovery_offer(v: &wire::RecoveryOffer) -> Result<RecoveryOffer, FromGrpcError> {
@@ -569,6 +571,7 @@ pub fn error_detail(v: &wire::ErrorDetail) -> Result<ControlError, FromGrpcError
         wire::ErrorCode::AlreadyExists => ControlErrorCode::AlreadyExists,
         wire::ErrorCode::Conflict => ControlErrorCode::Conflict,
         wire::ErrorCode::Internal => ControlErrorCode::Internal,
+        wire::ErrorCode::ShuttingDown => ControlErrorCode::ShuttingDown,
         wire::ErrorCode::Unspecified => return Err(FromGrpcError::Unspecified("error code")),
     };
     Ok(ControlError::new(code, v.message.clone()))
@@ -587,6 +590,7 @@ pub fn to_error_detail(v: &ControlError) -> wire::ErrorDetail {
             ControlErrorCode::AlreadyExists => wire::ErrorCode::AlreadyExists as i32,
             ControlErrorCode::Conflict => wire::ErrorCode::Conflict as i32,
             ControlErrorCode::Internal => wire::ErrorCode::Internal as i32,
+            ControlErrorCode::ShuttingDown => wire::ErrorCode::ShuttingDown as i32,
         },
         message: v.message.clone(),
     }
@@ -1508,6 +1512,7 @@ mod tests {
             program: Some(
                 "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
             ),
+            protocol: crate::CONTROL_PROTOCOL,
         };
         let active_mutation = ActiveMutation {
             mutation_id: MutationId::from_bytes([7; 16]),
