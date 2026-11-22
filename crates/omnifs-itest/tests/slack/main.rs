@@ -691,14 +691,19 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
                 ],
                 Some("cursor-2"),
             )),
-            network(),
+            rate_limited("1"),
         ],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert!(
+        matches!(stopped, Err(NsError::RateLimited { .. })),
+        "{stopped:?}"
+    );
     expect_history(&requests[0], "C01", None);
     expect_history(&requests[1], "C01", Some("cursor-2"));
 
+    // The replies are asked after the window of the stop.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     let replies = |n: u32| format!("channels/C01/messages/{}/replies", ts(n));
     let asked = thread(message(1, Some("U01"), "Question, edited"), 2, 3);
     let (listing, requests) = answering(
@@ -969,8 +974,9 @@ async fn the_content_of_a_file_is_the_blob_of_its_edit_timestamp() {
 /// The first request again after `invalid_cursor` to a request with a
 /// `cursor`: of a full listing of the users, of the channels, of the first
 /// sweep of a channel, of the replies of a message, of a sweep down to the
-/// latest message, and of a later sweep of each page, each with the timeout
-/// of its read.
+/// latest message, and of a later sweep of each page, each after the window
+/// of its timeout, which is the error of its read, or with its read served
+/// what the projection has after the end of the first sweep of the channel.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
@@ -987,6 +993,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
     expect_users(&requests[0], None);
     expect_users(&requests[1], Some("cursor-2"));
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "users"),
@@ -1012,6 +1019,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
     expect_channels(&requests[0], None);
     expect_channels(&requests[1], Some("cursor-2"));
+    tokio::time::sleep(PAST_DEADLINE).await;
     channels(&harness, &[channel("C01", "general")]).await;
 
     let question = || thread(message(1, Some("U01"), "Question"), 1, 11);
@@ -1027,6 +1035,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
     expect_history(&requests[0], "C01", None);
     expect_history(&requests[1], "C01", Some("cursor-2"));
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "channels/C01/messages"),
@@ -1053,18 +1062,29 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
     expect_replies(&requests[0], "C01", &ts(1), None);
     expect_replies(&requests[1], "C01", &ts(1), Some("cursor-2"));
+    tokio::time::sleep(PAST_DEADLINE).await;
+    // The channel is past its deadline after the window of the stop: its
+    // sweep comes before the replies.
     let (listing, requests) = answering(
         &harness,
         names(&harness, &replies),
-        vec![ok(&page(
-            "messages",
-            &[question(), reply(11, 1, "U02", "An answer")],
-            None,
-        ))],
+        vec![
+            ok(&page(
+                "messages",
+                &[message(2, Some("U02"), "Second"), question()],
+                None,
+            )),
+            ok(&page(
+                "messages",
+                &[question(), reply(11, 1, "U02", "An answer")],
+                None,
+            )),
+        ],
     )
     .await;
     assert_eq!(listing.unwrap(), stamps(&[11]));
-    expect_replies(&requests[0], "C01", &ts(1), None);
+    expect_history(&requests[0], "C01", None);
+    expect_replies(&requests[1], "C01", &ts(1), None);
 
     let history = || {
         ok(&page(
@@ -1090,9 +1110,12 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     tokio::time::sleep(PAST_DEADLINE).await;
     let text = format!("channels/C01/messages/{}/text", ts(2));
     let (stopped, requests) = answering(&harness, read(&harness, &text), stop()).await;
-    assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
+    // The read of a later sweep that stopped is served what the projection
+    // has.
+    assert_eq!(stopped.unwrap(), "Second");
     expect_history(&requests[0], "C01", None);
     expect_history(&requests[1], "C01", Some("cursor-2"));
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (read_text, requests) = answering(&harness, read(&harness, &text), vec![history()]).await;
     assert_eq!(read_text.unwrap(), "Second");
     expect_history(&requests[0], "C01", None);
@@ -1100,9 +1123,10 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     tokio::time::sleep(PAST_DEADLINE).await;
     let (stopped, requests) =
         answering(&harness, names(&harness, "channels/C01/messages"), stop()).await;
-    assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
+    assert_eq!(stopped.unwrap(), stamps(&[1, 2, 3]));
     expect_history(&requests[0], "C01", None);
     expect_history(&requests[1], "C01", Some("cursor-2"));
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "channels/C01/messages"),
@@ -1183,7 +1207,7 @@ async fn the_errors_of_slack_remove_fail_and_wait() {
 
     for (error, kind) in [
         ("missing_scope", "permission denied"),
-        ("invalid_auth", "permission denied"),
+        ("invalid_auth", "mount credential is unavailable"),
         ("internal_error", "network error"),
         ("request_timeout", "timeout"),
         ("invalid_arguments", "invalid argument"),
@@ -1198,6 +1222,11 @@ async fn the_errors_of_slack_remove_fail_and_wait() {
         let refused = listing.unwrap_err().to_string();
         assert!(refused.starts_with(kind), "{error}: {refused}");
         expect_history(&requests[0], "C03", None);
+        // The next request waits for the end of the window of a failure for
+        // now.
+        if matches!(kind, "network error" | "timeout") {
+            tokio::time::sleep(PAST_DEADLINE).await;
+        }
     }
 
     let (listing, requests) = answering(
@@ -1305,7 +1334,8 @@ async fn a_channel_that_left_and_came_back_takes_each_page_again() {
         ],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    // The read of the failure is served what the projection has.
+    assert_eq!(stopped.unwrap(), "A message");
     expect_history(&requests[1], "C01", Some("cursor-2"));
     leave_and_come_back().await;
     let (listing, requests) = answering(
