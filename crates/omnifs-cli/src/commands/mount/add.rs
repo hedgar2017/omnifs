@@ -151,7 +151,9 @@ impl AddArgs {
         }
         let account = self.account.clone();
         if self.token.is_some() || self.token_env.is_some() {
-            return Auth::static_token(auth_manifest, self.scheme.as_deref(), account).map(Some);
+            return Auth::static_token(auth_manifest, self.scheme.as_deref(), account)?
+                .with_scopes(&self.scopes)
+                .map(Some);
         }
         let auth = match self.scheme.as_deref() {
             Some(scheme) => Some(Auth::from_scheme(auth_manifest, scheme, account)?),
@@ -163,10 +165,23 @@ impl AddArgs {
             subject: self.subject.clone(),
         };
         let Some(auth) = auth else {
-            client.refuse()?;
+            // A provider without auth has no credential to label, no client,
+            // and no scope.
+            let without = format!("provider `{}` declares no auth", manifest.id);
+            client.refuse(&without)?;
+            anyhow::ensure!(
+                self.account.is_none(),
+                "`--account` labels the stored credential of a mount, and {without}"
+            );
+            anyhow::ensure!(
+                self.scopes.is_empty(),
+                "`--scope` needs an OAuth auth scheme, and {without}"
+            );
             return Ok(None);
         };
-        auth.with_client(client).map(Some)
+        auth.with_client(client, auth_manifest)?
+            .with_scopes(&self.scopes)
+            .map(Some)
     }
 
     /// Apply `--config-json`'s override onto an already-generated default
@@ -319,8 +334,8 @@ mod tests {
     }
 
     /// The account of an invocation is the label of its stored credential,
-    /// and the subject is of its OAuth client, which an OAuth scheme alone
-    /// takes.
+    /// and the subject is of its OAuth client, which the scheme of a JWT
+    /// bearer grant alone takes.
     #[test]
     fn the_selected_auth_has_the_account_apart_from_the_subject_of_its_oauth_client() {
         let manifest = provider_manifest();
@@ -338,12 +353,16 @@ mod tests {
 
         let auth = selected(&[
             "linear",
+            "--scheme",
+            "service-account",
             "--account",
             "work",
             "--client-id",
             "client",
             "--subject",
             "ada@example.test",
+            "--scope",
+            "read",
         ])
         .unwrap()
         .unwrap();
@@ -351,12 +370,71 @@ mod tests {
         let oauth = auth.as_oauth().unwrap();
         assert_eq!(oauth.client_id.as_deref(), Some("client"));
         assert_eq!(oauth.subject.as_deref(), Some("ada@example.test"));
+        assert_eq!(oauth.scopes, Some(vec!["read".to_owned()]));
+    }
 
-        assert!(selected(&["linear", "--scheme", "pat", "--subject", "ada@example.test"]).is_err());
-        assert!(
-            add_args(&["web", "--subject", "ada@example.test"])
+    /// An invocation refuses each flag that its auth cannot use, in place of
+    /// leaving it out: an account, a client, a subject or scopes for a
+    /// provider without auth; a client, a subject or scopes for a static
+    /// token; and a subject for a flow with a sign-in.
+    #[test]
+    fn the_selected_auth_refuses_each_flag_that_it_cannot_use() {
+        let manifest = provider_manifest();
+        let auth_manifest = manifest
+            .auth
+            .as_ref()
+            .map(omnifs_provider::ProviderAuthManifest::wasm_auth_manifest);
+        let refusal = |arguments: &[&str]| {
+            add_args(arguments)
+                .selected_auth(&manifest, auth_manifest.as_ref())
+                .unwrap_err()
+                .to_string()
+        };
+        let without_auth = |arguments: &[&str]| {
+            add_args(arguments)
                 .selected_auth(&web_manifest(), None)
-                .is_err()
+                .unwrap_err()
+                .to_string()
+        };
+
+        assert_eq!(
+            without_auth(&["web", "--account", "work"]),
+            "`--account` labels the stored credential of a mount, and provider `web` declares no auth"
+        );
+        assert_eq!(
+            without_auth(&["web", "--subject", "ada@example.test"]),
+            "`--subject` needs an OAuth auth scheme, and provider `web` declares no auth"
+        );
+        assert_eq!(
+            without_auth(&["web", "--client-id", "client"]),
+            "`--client-id` needs an OAuth auth scheme, and provider `web` declares no auth"
+        );
+        assert_eq!(
+            without_auth(&["web", "--scope", "read"]),
+            "`--scope` needs an OAuth auth scheme, and provider `web` declares no auth"
+        );
+        assert!(
+            add_args(&["web"])
+                .selected_auth(&web_manifest(), None)
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            refusal(&["linear", "--scheme", "pat", "--subject", "ada@example.test"]),
+            "`--subject` needs an OAuth auth scheme, and the auth scheme `pat` takes a static token"
+        );
+        assert_eq!(
+            refusal(&["linear", "--scheme", "pat", "--scope", "read"]),
+            "`--scope` needs an OAuth auth scheme, and the auth scheme `pat` takes a static token"
+        );
+        assert_eq!(
+            refusal(&["linear", "--token-env", "TOKEN", "--scope", "read"]),
+            "`--scope` needs an OAuth auth scheme, and the auth scheme `pat` takes a static token"
+        );
+        assert_eq!(
+            refusal(&["linear", "--subject", "ada@example.test"]),
+            "`--subject` needs the auth scheme of a JWT bearer grant, whose client asserts its subject, and the auth scheme `oauth` has a sign-in, whose user is its subject"
         );
     }
 
@@ -685,6 +763,23 @@ mod tests {
                         creation_url: None,
                         validation: None,
                         ambient_sources: Vec::new(),
+                    }),
+                    AuthScheme::Oauth(OauthScheme {
+                        key: "service-account".to_string(),
+                        display_name: "Linear service account".to_string(),
+                        authorization_endpoint: String::new(),
+                        token_endpoint: "https://api.linear.app/oauth/token".to_string(),
+                        revocation_endpoint: None,
+                        default_client_id: None,
+                        default_scopes: vec!["read".to_string()],
+                        flow: OAuthFlow::JwtBearer,
+                        token_endpoint_auth: TokenEndpointAuthMethod::None,
+                        refresh_token_rotates: false,
+                        extra_authorize_params: vec![],
+                        extra_token_params: vec![],
+                        inject_domains: domains.clone(),
+                        inject_header_name: None,
+                        inject_value_prefix: "Bearer ".to_string(),
                     }),
                 ],
             }),

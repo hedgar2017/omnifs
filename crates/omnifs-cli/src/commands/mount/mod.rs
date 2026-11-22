@@ -20,11 +20,10 @@ pub(crate) use revoke::RevokeArgs;
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 use omnifs_api::{
-    CredentialKey, CredentialMaterial, CredentialSubmission, MountOpResult, MountRecord,
-    MutationOpResult,
+    CredentialKey, CredentialStatus, CredentialStatusKind, CredentialSubmission, MountOpResult,
+    MountRecord, MutationOpResult,
 };
 use omnifs_core::MountName;
-use secrecy::ExposeSecret as _;
 
 use crate::error::{ExitCode, WithExitCode, WithHint};
 use crate::mutation::PlannedOp;
@@ -100,14 +99,6 @@ pub struct ReauthArgs {
     /// itself, as the user that a service account acts as.
     #[arg(long, value_name = "SUBJECT", conflicts_with_all = ["token", "token_env"])]
     pub subject: Option<String>,
-}
-
-fn effective_oauth_scopes(explicit: &[String], prior: &[String]) -> Vec<String> {
-    if explicit.is_empty() {
-        prior.to_vec()
-    } else {
-        explicit.to_vec()
-    }
 }
 
 impl MountArgs {
@@ -345,7 +336,6 @@ impl ReauthArgs {
         })
     }
 
-    #[allow(clippy::too_many_lines)] // one linear reauthentication flow
     pub(crate) async fn run_with_output(
         &self,
         output: &crate::ui::output::Output,
@@ -368,101 +358,16 @@ impl ReauthArgs {
             account_label: auth.account_label.clone(),
         };
         let state = crate::client_state::ClientState::resolve()?;
-        let status = rpc.credential_status(key.clone()).await?;
+        let stored = rpc.credential_status(key.clone()).await?;
         let metadata = rpc
             .provider_metadata(record.definition.provider)
             .await?
             .ok_or_else(|| anyhow!("provider metadata is unavailable for `{mount_name}`"))?;
         let manifest = omnifs_provider::ProviderManifest::from_bytes(&metadata.manifest)
             .context("parse daemon provider metadata")?;
-        let auth_manifest = manifest
-            .auth
-            .as_ref()
-            .map(omnifs_provider::ProviderAuthManifest::wasm_auth_manifest);
-        let selected = crate::auth::Auth::from_scheme(
-            auth_manifest.as_ref(),
-            &auth.scheme,
-            Some(auth.account_label.clone()),
-        )?
-        .with_client(crate::auth::OAuthClientArgs {
-            client_id: self.client_id.clone(),
-            client_secret_file: self.client_secret_file.clone(),
-            subject: self.subject.clone(),
-        })?;
-
-        // `--no-input` must never reach an OAuth browser handoff (it would hang
-        // on the browser confirm or the manual-code paste). Mirror the add-side
-        // guard: bail naming the interactive and static-token alternatives.
-        let interactive = prompt.interactive();
-        if !interactive && create::oauth_needs_user(auth_manifest.as_ref(), &selected) {
-            return Err(anyhow!(
-                "`omnifs mount reauth {mount_name}` cannot complete OAuth without a terminal"
-            ))
-            .with_hint("run it interactively")
-            .with_hint("or use a static-token scheme with --token - or --token-env VAR")
-            .with_exit_code(ExitCode::AuthRequired);
-        }
-
-        // `reauth`'s own auth-outcome block shares the same key set `mount
-        // add` uses for its completed-auth rows (`oauth`/`signed in`/
-        // `credential`), since both flows route through the same
-        // `login`/`run_static_token_init` primitives.
-        let submission = if selected.is_oauth() {
-            let requested_scopes = effective_oauth_scopes(
-                &self.scopes,
-                status.as_ref().map_or(&[][..], |status| &status.scopes),
-            );
-            output.narrate(format!("re-authenticating `{mount_name}` over OAuth"));
-            crate::auth::login::login_for_submission(
-                record.definition.provider,
-                &manifest,
-                &selected,
-                &auth.account_label,
-                crate::auth::LoginInteractivity {
-                    no_browser: self.no_browser,
-                    no_input: prompt.no_input(),
-                    scopes: Some(&requested_scopes),
-                },
-                output,
-                crate::auth::auth_receipt_key_width(),
-            )
-            .await?
-        } else {
-            let source = TokenSource::resolve(
-                self.token.as_deref(),
-                self.token_env.as_deref(),
-                interactive,
-            )?;
-            let token = source.read(output)?;
-            if !self.no_validate {
-                let scheme = selected.static_token_scheme(&manifest)?;
-                if let Some(validation) = scheme.validation.as_ref() {
-                    token_validation::validate_static_token(
-                        validation,
-                        scheme.header_name.as_deref().unwrap_or("Authorization"),
-                        &scheme.value_prefix,
-                        token.expose_secret(),
-                        output,
-                    )
-                    .await?;
-                }
-            }
-            CredentialSubmission {
-                provider: record.definition.provider,
-                scheme: auth.scheme.clone(),
-                account_label: auth.account_label.clone(),
-                material: CredentialMaterial::StaticToken {
-                    token: omnifs_api::SecretBytes::new(token.expose_secret().as_bytes().to_vec()),
-                },
-                overrides: omnifs_api::CredentialClientOverrides {
-                    client_id: None,
-                    client_secret: None,
-                    redirect_uri: None,
-                    scopes: None,
-                    subject: None,
-                },
-            }
-        };
+        let submission = self
+            .submission(&record, stored.as_ref(), &manifest, prompt, output)
+            .await?;
         if let Some(outcome) = crate::mutation::run(&rpc, &state, output, || async move {
             Ok(vec![PlannedOp::submit_credential(&key, submission)])
         })
@@ -479,6 +384,112 @@ impl ReauthArgs {
             crate::auth::auth_receipt_key_width(),
         );
         Ok(())
+    }
+
+    /// The credential of this invocation for the mount of `record`, whose
+    /// provider has `manifest` and whose stored credential has the status
+    /// `stored`. An OAuth credential keeps the subject and the scopes of the
+    /// stored one unless the invocation gives others, and without a stored
+    /// one it has the subject of the invocation alone and the scopes that
+    /// the manifest declares.
+    async fn submission(
+        &self,
+        record: &MountRecord,
+        stored: Option<&CredentialStatus>,
+        manifest: &omnifs_provider::ProviderManifest,
+        prompt: PromptMode,
+        output: &crate::ui::output::Output,
+    ) -> anyhow::Result<CredentialSubmission> {
+        let mount_name = self.name.as_str();
+        let auth = record
+            .definition
+            .auth
+            .as_ref()
+            .ok_or_else(|| anyhow!("mount `{mount_name}` needs no authentication"))?;
+        // A deleted credential has no material: its status is of none.
+        let stored = stored.filter(|stored| stored.status != CredentialStatusKind::Deleted);
+        let auth_manifest = manifest
+            .auth
+            .as_ref()
+            .map(omnifs_provider::ProviderAuthManifest::wasm_auth_manifest);
+        let selected = crate::auth::Auth::from_scheme(
+            auth_manifest.as_ref(),
+            &auth.scheme,
+            Some(auth.account_label.clone()),
+        )?
+        .with_client(
+            crate::auth::OAuthClientArgs {
+                client_id: self.client_id.clone(),
+                client_secret_file: self.client_secret_file.clone(),
+                subject: self.subject.clone(),
+            },
+            auth_manifest.as_ref(),
+        )?
+        .with_scopes(&self.scopes)?;
+
+        let interactive = prompt.interactive();
+        let crate::auth::Auth::OAuth(oauth) = selected else {
+            let source = TokenSource::resolve(
+                self.token.as_deref(),
+                self.token_env.as_deref(),
+                interactive,
+            )?;
+            let token = source.read(output)?;
+            return run_static_token_init(
+                record.definition.provider,
+                manifest,
+                &selected,
+                token,
+                !self.no_validate,
+                output,
+            )
+            .await;
+        };
+        anyhow::ensure!(
+            self.token.is_none() && self.token_env.is_none(),
+            "`--token` and `--token-env` give a static token, and mount `{mount_name}` has the OAuth auth scheme `{}`",
+            auth.scheme
+        );
+        let selected = crate::auth::Auth::OAuth(crate::auth::OAuth {
+            subject: oauth
+                .subject
+                .or_else(|| stored.and_then(|stored| stored.subject.clone())),
+            scopes: oauth
+                .scopes
+                .or_else(|| stored.map(|stored| stored.scopes.clone())),
+            ..oauth
+        });
+
+        // `--no-input` must never reach an OAuth browser handoff (it would hang
+        // on the browser confirm or the manual-code paste). Mirror the add-side
+        // guard: bail naming the interactive and static-token alternatives.
+        if !interactive && create::oauth_needs_user(auth_manifest.as_ref(), &selected) {
+            return Err(anyhow!(
+                "`omnifs mount reauth {mount_name}` cannot complete OAuth without a terminal"
+            ))
+            .with_hint("run it interactively")
+            .with_hint("or use a static-token scheme with --token - or --token-env VAR")
+            .with_exit_code(ExitCode::AuthRequired);
+        }
+
+        // `reauth`'s own auth-outcome block shares the same key set `mount
+        // add` uses for its completed-auth rows (`oauth`/`signed in`/
+        // `credential`), since both flows route through the same
+        // `login`/`run_static_token_init` primitives.
+        output.narrate(format!("re-authenticating `{mount_name}` over OAuth"));
+        crate::auth::login::login_for_submission(
+            record.definition.provider,
+            manifest,
+            &selected,
+            &auth.account_label,
+            crate::auth::LoginInteractivity {
+                no_browser: self.no_browser,
+                no_input: prompt.no_input(),
+            },
+            output,
+            crate::auth::auth_receipt_key_width(),
+        )
+        .await
     }
 }
 
@@ -604,13 +615,351 @@ fn finish_mount_removal(
 mod tests {
     use super::*;
 
-    #[test]
-    fn reauth_keeps_granted_scopes_without_an_explicit_override() {
-        let prior = vec!["repo".to_owned(), "read:user".to_owned()];
-        assert_eq!(effective_oauth_scopes(&[], &prior), prior);
+    /// The PEM of an RSA private key, the one of the tests of `omnifs-auth`.
+    const ASSERTION_KEY: &str =
+        include_str!("../../../../omnifs-auth/src/fixtures/assertion_key.pem");
+
+    /// The manifest of a provider with a static token and with the JWT
+    /// bearer grant `flow` of the token endpoint at `address`, as the daemon
+    /// gives it for a mount; unvalidated, for an endpoint without TLS.
+    fn reauth_manifest(
+        address: std::net::SocketAddr,
+        flow: &serde_json::Value,
+    ) -> omnifs_provider::ProviderManifest {
+        serde_json::from_value(serde_json::json!({
+            "id": "demo",
+            "displayName": "Demo",
+            "provider": "demo.wasm",
+            "defaultMount": "demo",
+            "projection": 1,
+            "refreshIntervalSecs": 0,
+            "capabilities": [{
+                "kind": "domain",
+                "value": "api.demo.test",
+                "why": "Fetch the objects of the demo."
+            }],
+            "auth": {
+                "default": "service-account",
+                "schemes": [{
+                    "oauth": {
+                        "key": "service-account",
+                        "displayName": "Demo service account",
+                        "tokenEndpoint": format!("http://{address}/token"),
+                        "defaultScopes": ["declared"],
+                        "flow": flow,
+                        "injectDomains": ["api.demo.test"],
+                        "injectValuePrefix": "Bearer "
+                    }
+                }, {
+                    "staticToken": {
+                        "key": "pat",
+                        "valuePrefix": "Bearer ",
+                        "description": "Demo token",
+                        "injectDomains": ["api.demo.test"]
+                    }
+                }],
+                "guidance": {
+                    "service-account": { "setupSteps": ["Pass the client and its key."] }
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    fn reauth_mount(scheme: &str) -> MountRecord {
+        let mut mount = daemon_mount(omnifs_api::MountHealth::Active);
+        mount.definition.auth = Some(omnifs_api::MountCredential {
+            scheme: scheme.to_owned(),
+            account_label: "work".to_owned(),
+        });
+        mount
+    }
+
+    /// The status of the stored credential of `reauth_mount`, which asserts
+    /// `subject` and has `scopes`.
+    fn stored_credential(subject: Option<&str>, scopes: &[&str]) -> CredentialStatus {
+        CredentialStatus {
+            key: CredentialKey {
+                provider_name: "demo".to_owned(),
+                scheme: "service-account".to_owned(),
+                account_label: "work".to_owned(),
+            },
+            provider: omnifs_core::ProviderId::from_digest([0x12; 32]),
+            kind: omnifs_api::CredentialKind::OAuth,
+            scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            subject: subject.map(str::to_owned),
+            auth_fingerprint: omnifs_core::AuthRuntimeFingerprint::from_digest([5; 32]),
+            version: omnifs_core::CredentialVersion::initial(),
+            generation: omnifs_core::CredentialGeneration::initial(),
+            status: CredentialStatusKind::Active,
+            last_mutation_id: omnifs_core::MutationId::from_bytes([6; 16]),
+        }
+    }
+
+    fn reauth_args() -> ReauthArgs {
+        ReauthArgs {
+            name: "github".to_owned(),
+            no_browser: false,
+            token: None,
+            token_env: None,
+            no_validate: false,
+            scopes: Vec::new(),
+            client_id: None,
+            client_secret_file: None,
+            subject: None,
+        }
+    }
+
+    /// The request of an assertion: the parameters of its form and the
+    /// claims of its assertion.
+    struct Assertion {
+        form: std::collections::BTreeMap<String, String>,
+        claims: serde_json::Value,
+    }
+
+    /// A local token endpoint that answers one assertion with an access
+    /// token, and gives the request.
+    async fn token_endpoint() -> (std::net::SocketAddr, tokio::task::JoinHandle<Assertion>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0; 1];
+                stream.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            let answer = r#"{"access_token":"access","token_type":"Bearer","expires_in":3600}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let form: std::collections::BTreeMap<String, String> = reqwest::Url::parse(&format!(
+                "http://form/?{}",
+                String::from_utf8(body).unwrap()
+            ))
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+            let payload = form["assertion"].split('.').nth(1).unwrap();
+            let claims = serde_json::from_slice(&base64url(payload)).unwrap();
+            Assertion { form, claims }
+        });
+        (address, request)
+    }
+
+    /// The bytes of `text` in base64url without padding, as a part of a JWT.
+    fn base64url(text: &str) -> Vec<u8> {
+        let mut bits = 0_u32;
+        let mut count = 0;
+        let mut bytes = Vec::new();
+        for byte in text.bytes() {
+            let value = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'-' => 62,
+                b'_' => 63,
+                other => panic!("no base64url: {other}"),
+            };
+            bits = (bits << 6) | u32::from(value);
+            count += 6;
+            if count >= 8 {
+                count -= 8;
+                bytes.push(u8::try_from(bits >> count).unwrap());
+                bits &= (1 << count) - 1;
+            }
+        }
+        bytes
+    }
+
+    /// The submission and the assertion of `args`, with the client
+    /// `robot@demo.test` and its key, for a mount of the JWT bearer grant
+    /// `flow` with the stored credential `stored`.
+    async fn reauthenticate(
+        args: ReauthArgs,
+        flow: serde_json::Value,
+        stored: Option<&CredentialStatus>,
+    ) -> (CredentialSubmission, Assertion) {
+        let (address, request) = token_endpoint().await;
+        let key = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(key.path(), ASSERTION_KEY).unwrap();
+        let args = ReauthArgs {
+            client_id: Some("robot@demo.test".to_owned()),
+            client_secret_file: Some(key.path().to_str().unwrap().to_owned()),
+            ..args
+        };
+        let output = Output::new(crate::ui::output::OutputMode::Json, true);
+        let submission = args
+            .submission(
+                &reauth_mount("service-account"),
+                stored,
+                &reauth_manifest(address, &flow),
+                output.prompt_mode(),
+                &output,
+            )
+            .await
+            .unwrap();
+        (submission, request.await.unwrap())
+    }
+
+    fn scope_claim() -> serde_json::Value {
+        serde_json::json!({ "jwtBearerScopeClaim": { "claim": "scope" } })
+    }
+
+    /// A re-authentication without a subject and without scopes of its own
+    /// asserts the subject of the stored credential with its scopes, and
+    /// stores them again.
+    #[tokio::test]
+    async fn a_reauthentication_keeps_the_subject_and_the_scopes_of_the_stored_credential() {
+        let stored = stored_credential(Some("ada@demo.test"), &["stored", "other"]);
+        let (submission, assertion) =
+            reauthenticate(reauth_args(), scope_claim(), Some(&stored)).await;
+        assert_eq!(assertion.claims["iss"], "robot@demo.test");
+        assert_eq!(assertion.claims["sub"], "ada@demo.test");
+        assert_eq!(assertion.claims["scope"], "stored other");
         assert_eq!(
-            effective_oauth_scopes(&["gist".to_owned()], &prior),
-            vec!["gist"]
+            submission.overrides.subject.as_deref(),
+            Some("ada@demo.test")
+        );
+        assert_eq!(
+            submission.overrides.scopes,
+            Some(vec!["stored".to_owned(), "other".to_owned()])
+        );
+        assert_eq!(submission.account_label, "work");
+        assert_eq!(submission.scheme, "service-account");
+    }
+
+    /// The subject and the scopes of the invocation stand in place of the
+    /// stored ones.
+    #[tokio::test]
+    async fn a_reauthentication_takes_the_subject_and_the_scopes_of_its_invocation() {
+        let stored = stored_credential(Some("ada@demo.test"), &["stored"]);
+        let args = ReauthArgs {
+            subject: Some("bob@demo.test".to_owned()),
+            scopes: vec!["given".to_owned()],
+            ..reauth_args()
+        };
+        let (submission, assertion) = reauthenticate(args, scope_claim(), Some(&stored)).await;
+        assert_eq!(assertion.claims["sub"], "bob@demo.test");
+        assert_eq!(assertion.claims["scope"], "given");
+        assert_eq!(
+            submission.overrides.subject.as_deref(),
+            Some("bob@demo.test")
+        );
+        assert_eq!(submission.overrides.scopes, Some(vec!["given".to_owned()]));
+    }
+
+    /// Without a stored credential, as after `omnifs credential rm`, a
+    /// re-authentication requests the scopes that the manifest of the
+    /// provider declares, never none, and asserts the client itself.
+    #[tokio::test]
+    async fn a_reauthentication_without_a_stored_credential_takes_the_scopes_of_the_manifest() {
+        let deleted = CredentialStatus {
+            status: CredentialStatusKind::Deleted,
+            ..stored_credential(None, &[])
+        };
+        for stored in [None, Some(&deleted)] {
+            let (submission, assertion) =
+                reauthenticate(reauth_args(), serde_json::json!("jwtBearer"), stored).await;
+            assert_eq!(assertion.form["scope"], "declared");
+            assert_eq!(assertion.claims["sub"], "robot@demo.test");
+            assert_eq!(submission.overrides.scopes, None);
+            assert_eq!(submission.overrides.subject, None);
+
+            let (_, assertion) = reauthenticate(reauth_args(), scope_claim(), stored).await;
+            assert_eq!(assertion.claims["scope"], "declared");
+            assert!(!assertion.form.contains_key("scope"));
+        }
+    }
+
+    /// A re-authentication refuses what the auth scheme of its mount cannot
+    /// take: a static token for an OAuth scheme, and a client, a subject or
+    /// scopes for a static token.
+    #[tokio::test]
+    async fn a_reauthentication_refuses_what_the_auth_scheme_of_its_mount_cannot_take() {
+        let address = "127.0.0.1:9".parse().unwrap();
+        let manifest = reauth_manifest(address, &scope_claim());
+        let output = Output::new(crate::ui::output::OutputMode::Json, true);
+        let refusal = |args: ReauthArgs, scheme: &'static str| {
+            let manifest = &manifest;
+            let output = &output;
+            async move {
+                args.submission(
+                    &reauth_mount(scheme),
+                    None,
+                    manifest,
+                    output.prompt_mode(),
+                    output,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+            }
+        };
+        assert_eq!(
+            refusal(
+                ReauthArgs {
+                    token_env: Some("DEMO_TOKEN".to_owned()),
+                    ..reauth_args()
+                },
+                "service-account"
+            )
+            .await,
+            "`--token` and `--token-env` give a static token, and mount `github` has the OAuth auth scheme `service-account`"
+        );
+        assert_eq!(
+            refusal(
+                ReauthArgs {
+                    subject: Some("ada@demo.test".to_owned()),
+                    ..reauth_args()
+                },
+                "pat"
+            )
+            .await,
+            "`--subject` needs an OAuth auth scheme, and the auth scheme `pat` takes a static token"
+        );
+        assert_eq!(
+            refusal(
+                ReauthArgs {
+                    client_id: Some("client".to_owned()),
+                    client_secret_file: Some("key.pem".to_owned()),
+                    ..reauth_args()
+                },
+                "pat"
+            )
+            .await,
+            "`--client-id`, `--client-secret-file` need an OAuth auth scheme, and the auth scheme `pat` takes a static token"
+        );
+        assert_eq!(
+            refusal(
+                ReauthArgs {
+                    scopes: vec!["read".to_owned()],
+                    ..reauth_args()
+                },
+                "pat"
+            )
+            .await,
+            "`--scope` needs an OAuth auth scheme, and the auth scheme `pat` takes a static token"
         );
     }
 

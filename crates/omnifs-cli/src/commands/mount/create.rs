@@ -308,8 +308,9 @@ pub(crate) async fn assemble_mount_build(
     // prompt) promotes an OAuth default to a static token, which lets a
     // `--no-input` run of an OAuth-default provider complete headlessly. The
     // OAuth bail only fires when nothing was imported. An invocation with a
-    // credential of its own imports none.
-    let import_outcome = if args.gives_credential() {
+    // credential of its own, or with the scopes of an OAuth sign-in, imports
+    // none.
+    let import_outcome = if args.gives_credential() || !args.scopes.is_empty() {
         ImportOutcome {
             auth: default_auth,
             token: None,
@@ -355,12 +356,6 @@ pub(crate) async fn assemble_mount_build(
     } else {
         create_config(&manifest, output, interactive)?
     };
-    let mut auth = auth;
-    if let Some(Auth::OAuth(oauth)) = auth.as_mut()
-        && !args.scopes.is_empty()
-    {
-        oauth.scopes = Some(args.scopes.clone());
-    }
     let mut limits = manifest_limits(&manifest);
     if let Some(raw) = args.limits_json.as_deref() {
         limits = Some(parse_json_flag("--limits-json", raw)?);
@@ -517,7 +512,6 @@ impl MountBuild {
                 crate::auth::LoginInteractivity {
                     no_browser: args.no_browser,
                     no_input: prompt.no_input(),
-                    scopes: (!args.scopes.is_empty()).then_some(args.scopes.as_slice()),
                 },
                 output,
                 key_width,

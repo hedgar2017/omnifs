@@ -59,16 +59,22 @@ pub(crate) struct OAuthClientArgs {
 }
 
 impl OAuthClientArgs {
-    fn is_empty(&self) -> bool {
-        self.client_id.is_none() && self.client_secret_file.is_none() && self.subject.is_none()
-    }
-
-    /// Refuses a client of the invocation, which an OAuth scheme alone
-    /// takes.
-    pub(crate) fn refuse(&self) -> anyhow::Result<()> {
+    /// Refuses each flag of a client of the invocation, which an OAuth
+    /// scheme alone takes, for `auth`, which is none.
+    pub(crate) fn refuse(&self, auth: &str) -> anyhow::Result<()> {
+        let given: Vec<&str> = [
+            ("`--client-id`", self.client_id.is_some()),
+            ("`--client-secret-file`", self.client_secret_file.is_some()),
+            ("`--subject`", self.subject.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(flag, given)| given.then_some(flag))
+        .collect();
         anyhow::ensure!(
-            self.is_empty(),
-            "`--client-id`, `--client-secret-file` and `--subject` need an OAuth auth scheme"
+            given.is_empty(),
+            "{} {} an OAuth auth scheme, and {auth}",
+            given.join(", "),
+            if given.len() == 1 { "needs" } else { "need" }
         );
         Ok(())
     }
@@ -124,19 +130,58 @@ impl Auth {
     }
 
     /// This auth with the client of an invocation, which an OAuth scheme
-    /// alone takes.
-    pub(crate) fn with_client(self, client: OAuthClientArgs) -> anyhow::Result<Self> {
+    /// alone takes, and whose subject a flow without a sign-in alone
+    /// asserts: the user of a sign-in is the subject of its own grant.
+    pub(crate) fn with_client(
+        self,
+        client: OAuthClientArgs,
+        auth_manifest: Option<&omnifs_auth::AuthManifest>,
+    ) -> anyhow::Result<Self> {
+        match self {
+            Self::OAuth(oauth) => {
+                if client.subject.is_some()
+                    && let Some(scheme) = auth_manifest.and_then(|manifest| {
+                        manifest.resolve_oauth_scheme(oauth.scheme.as_deref()).ok()
+                    })
+                    && scheme.flow.needs_user()
+                {
+                    anyhow::bail!(
+                        "`--subject` needs the auth scheme of a JWT bearer grant, whose client asserts its subject, and the auth scheme `{}` has a sign-in, whose user is its subject",
+                        scheme.key
+                    );
+                }
+                Ok(Self::OAuth(OAuth {
+                    client_id: client.client_id,
+                    client_secret_file: client.client_secret_file,
+                    subject: client.subject,
+                    ..oauth
+                }))
+            },
+            Self::StaticToken(token) => {
+                client.refuse(&format!(
+                    "the auth scheme `{}` takes a static token",
+                    token.scheme.as_deref().unwrap_or_default()
+                ))?;
+                Ok(Self::StaticToken(token))
+            },
+        }
+    }
+
+    /// This auth with the scopes of an invocation, which an OAuth scheme
+    /// alone requests; none of the invocation leave the ones of the auth.
+    pub(crate) fn with_scopes(self, scopes: &[String]) -> anyhow::Result<Self> {
+        if scopes.is_empty() {
+            return Ok(self);
+        }
         match self {
             Self::OAuth(oauth) => Ok(Self::OAuth(OAuth {
-                client_id: client.client_id,
-                client_secret_file: client.client_secret_file,
-                subject: client.subject,
+                scopes: Some(scopes.to_vec()),
                 ..oauth
             })),
-            Self::StaticToken(_) => {
-                client.refuse()?;
-                Ok(self)
-            },
+            Self::StaticToken(token) => anyhow::bail!(
+                "`--scope` needs an OAuth auth scheme, and the auth scheme `{}` takes a static token",
+                token.scheme.as_deref().unwrap_or_default()
+            ),
         }
     }
 

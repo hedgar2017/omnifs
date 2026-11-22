@@ -28,23 +28,23 @@ const MANUAL_PROMPT_CANCELED: &str = "omnifs-manual-oauth-prompt-canceled";
 /// Bundled so the credential-submission flow keeps a readable argument list
 /// instead of carrying three separate positional bools/slices.
 #[derive(Clone, Copy)]
-pub(crate) struct LoginInteractivity<'a> {
+pub(crate) struct LoginInteractivity {
     pub(crate) no_browser: bool,
     pub(crate) no_input: bool,
-    /// `None` uses the provider or auth-config default. `Some([])` is an
-    /// explicit empty scope set and must not fall back to provider defaults.
-    pub(crate) scopes: Option<&'a [String]>,
 }
 
-/// Run the provider-declared OAuth flow for a daemon credential submission.
-/// This performs only the user-facing flow. The daemon receives the resulting
-/// material and owns all durable credential state and upstream revocation.
+/// Run the provider-declared OAuth flow for a daemon credential submission,
+/// with the client, the subject and the scopes of `auth`: no scopes of
+/// `auth` request the ones that the manifest of the provider declares, and
+/// an empty list of them requests none. This performs only the user-facing
+/// flow. The daemon receives the resulting material and owns all durable
+/// credential state and upstream revocation.
 pub(crate) async fn login_for_submission(
     provider: ProviderId,
     manifest: &ProviderManifest,
     auth: &Auth,
     account_label: &str,
-    interactivity: LoginInteractivity<'_>,
+    interactivity: LoginInteractivity,
     output: &crate::ui::output::Output,
     key_width: usize,
 ) -> anyhow::Result<CredentialSubmission> {
@@ -60,10 +60,7 @@ pub(crate) async fn login_for_submission(
         .resolve_oauth_scheme(Some(scheme_key))?
         .clone();
     let config = auth.as_oauth().map(super::OAuth::request_config);
-    let mut request = OAuthRequest::from_config(config.as_ref(), scheme)?;
-    if let Some(scopes) = interactivity.scopes {
-        request.override_default_scopes(scopes.to_vec());
-    }
+    let request = OAuthRequest::from_config(config.as_ref(), scheme)?;
     let guidance = manifest
         .auth
         .as_ref()
@@ -81,10 +78,7 @@ pub(crate) async fn login_for_submission(
         key_width,
     )
     .await?;
-    let requested_scopes = interactivity
-        .scopes
-        .map(<[String]>::to_vec)
-        .or_else(|| auth.as_oauth().and_then(|oauth| oauth.scopes.clone()));
+    let requested_scopes = auth.as_oauth().and_then(|oauth| oauth.scopes.clone());
     let expires_at_unix = entry.expires_at().map(time::OffsetDateTime::unix_timestamp);
     let refresh_token = entry
         .refresh_token()
@@ -117,14 +111,13 @@ async fn run_oauth(
     request: OAuthRequest,
     mount: &str,
     guidance: &SchemeGuidance,
-    interactivity: LoginInteractivity<'_>,
+    interactivity: LoginInteractivity,
     output: &crate::ui::output::Output,
     key_width: usize,
 ) -> anyhow::Result<CredentialEntry> {
     let LoginInteractivity {
         no_browser,
         no_input,
-        ..
     } = interactivity;
     output.narrate(format!(
         "requesting OAuth for `{mount}` using scheme `{}` ({})",
@@ -413,7 +406,6 @@ mod tests {
             LoginInteractivity {
                 no_browser: true,
                 no_input: true,
-                scopes: None,
             },
             &output,
             0,

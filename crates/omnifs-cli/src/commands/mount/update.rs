@@ -4,12 +4,10 @@ use crate::auth::Auth;
 use anyhow::{Context, anyhow};
 use clap::{ArgGroup, Args};
 use omnifs_api::{
-    CredentialKey, CredentialMaterial, CredentialSubmission, MountField, MountLimits, MountPatch,
-    MutationOpResult,
+    CredentialKey, CredentialSubmission, MountField, MountLimits, MountPatch, MutationOpResult,
 };
 use omnifs_core::MountName;
 use omnifs_provider::ProviderManifest;
-use secrecy::ExposeSecret as _;
 use serde::Serialize;
 
 use crate::client_state::ClientState;
@@ -131,7 +129,8 @@ impl UpdateArgs {
                 auth_manifest.as_ref(),
                 &auth.scheme,
                 Some(auth.account_label.clone()),
-            )?;
+            )?
+            .with_scopes(&self.scopes)?;
             Some(
                 self.collect_submission(provider, &manifest, &selected, auth, &output)
                     .await?,
@@ -297,7 +296,6 @@ impl UpdateArgs {
                 crate::auth::LoginInteractivity {
                     no_browser: self.no_browser,
                     no_input: prompt.no_input(),
-                    scopes: (!self.scopes.is_empty()).then_some(self.scopes.as_slice()),
                 },
                 output,
                 crate::auth::auth_receipt_key_width(),
@@ -310,34 +308,8 @@ impl UpdateArgs {
             prompt.interactive(),
         )?;
         let token = source.read(output)?;
-        if !self.no_validate {
-            let scheme = auth.static_token_scheme(manifest)?;
-            if let Some(validation) = scheme.validation.as_ref() {
-                super::token_validation::validate_static_token(
-                    validation,
-                    scheme.header_name.as_deref().unwrap_or("Authorization"),
-                    &scheme.value_prefix,
-                    token.expose_secret(),
-                    output,
-                )
-                .await?;
-            }
-        }
-        Ok(CredentialSubmission {
-            provider,
-            scheme: credential.scheme.clone(),
-            account_label: credential.account_label.clone(),
-            material: CredentialMaterial::StaticToken {
-                token: omnifs_api::SecretBytes::new(token.expose_secret().as_bytes().to_vec()),
-            },
-            overrides: omnifs_api::CredentialClientOverrides {
-                client_id: None,
-                client_secret: None,
-                redirect_uri: None,
-                scopes: None,
-                subject: None,
-            },
-        })
+        super::run_static_token_init(provider, manifest, auth, token, !self.no_validate, output)
+            .await
     }
 }
 
