@@ -334,16 +334,34 @@ impl TryFrom<StoredProvider> for LoadedProvider {
     }
 }
 
-/// Return the non-secret scopes granted by a stored OAuth credential.
+/// The facts of a stored credential that its status shows, none of them a
+/// secret: the scopes that the upstream granted to an OAuth credential, and
+/// the subject that its client asserts in place of itself.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CredentialFacts {
+    pub(crate) scopes: Vec<String>,
+    pub(crate) subject: Option<String>,
+}
+
+/// The facts of `stored`, none for a deleted credential, which has no
+/// material.
 ///
-/// Credential material stays daemon-owned. Callers receive only this narrow
-/// presentation fact, never the access or refresh token.
-pub(crate) fn credential_scopes(stored: &StoredCredential) -> anyhow::Result<Vec<String>> {
+/// Credential material stays daemon-owned. Callers receive only these narrow
+/// presentation facts, never the access or refresh token.
+pub(crate) fn credential_facts(stored: &StoredCredential) -> anyhow::Result<CredentialFacts> {
     if stored.summary.state == CredentialState::Deleted {
-        return Ok(Vec::new());
+        return Ok(CredentialFacts::default());
     }
     let payload = decode_payload(stored.material.expose())?;
-    Ok(material_scopes(&payload.material))
+    Ok(CredentialFacts {
+        scopes: material_scopes(&payload.material),
+        subject: payload.overrides.subject,
+    })
+}
+
+/// The scopes that the upstream granted to the stored OAuth credential.
+pub(crate) fn credential_scopes(stored: &StoredCredential) -> anyhow::Result<Vec<String>> {
+    credential_facts(stored).map(|facts| facts.scopes)
 }
 
 /// The input of a mount: unavailable with the error of its provider, whose

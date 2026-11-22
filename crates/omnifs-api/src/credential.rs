@@ -160,6 +160,10 @@ pub struct CredentialStatus {
     /// Static-token credentials always report an empty list. This field is
     /// non-secret and intentionally excludes the token material itself.
     pub scopes: Vec<String>,
+    /// The subject that the stored OAuth client asserts in place of itself,
+    /// which is not a secret; none for a client that asserts itself, for a
+    /// static token, and for a credential without stored material.
+    pub subject: Option<String>,
     pub auth_fingerprint: AuthRuntimeFingerprint,
     pub version: CredentialVersion,
     pub generation: CredentialGeneration,

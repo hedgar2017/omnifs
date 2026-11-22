@@ -41,24 +41,19 @@ pub(crate) fn credential_id(
     omnifs_auth::CredentialId::new(key.provider_name, key.scheme, key.account_label)
 }
 
+/// The status of the credential of `summary`, with the scopes and the
+/// subject of its stored material, which are not secrets.
 pub(crate) async fn api_credential_status(
     state: &StateStore,
     summary: omnifs_state::CredentialSummary,
 ) -> anyhow::Result<CredentialStatus> {
-    let scopes = state
+    let facts = state
         .get_credential(&summary.id)
         .await?
-        .map(|stored| credential_scopes(&stored))
+        .map(|stored| credential_facts(&stored))
         .transpose()?
         .unwrap_or_default();
-    Ok(api_credential_status_with_scopes(&summary, scopes))
-}
-
-pub(crate) fn api_credential_status_with_scopes(
-    summary: &omnifs_state::CredentialSummary,
-    scopes: Vec<String>,
-) -> CredentialStatus {
-    CredentialStatus {
+    Ok(CredentialStatus {
         key: CredentialKey {
             provider_name: summary.id.provider_name().to_owned(),
             scheme: summary.id.scheme().to_owned(),
@@ -66,13 +61,14 @@ pub(crate) fn api_credential_status_with_scopes(
         },
         provider: summary.provider,
         kind: api_credential_kind(summary.kind),
-        scopes,
+        scopes: facts.scopes,
+        subject: facts.subject,
         auth_fingerprint: summary.auth_fingerprint,
         version: summary.version,
         generation: summary.generation,
         status: api_credential_status_kind(summary.state),
         last_mutation_id: summary.last_mutation_id,
-    }
+    })
 }
 
 pub(crate) fn api_provider_metadata(
@@ -103,8 +99,12 @@ pub(crate) const fn api_provider_import_disposition(
 }
 
 /// Project one batch op's durable outcome onto the wire result the client
-/// sees, in submitted order.
-pub(crate) fn api_mutation_op_result(outcome: &omnifs_state::OpOutcome) -> MutationOpResult {
+/// sees, in submitted order, with `subject` of the credential that the op
+/// submitted, which the store does not give with its outcome.
+pub(crate) fn api_mutation_op_result(
+    outcome: &omnifs_state::OpOutcome,
+    subject: Option<String>,
+) -> MutationOpResult {
     match outcome {
         omnifs_state::OpOutcome::Mount(outcome) => MutationOpResult::Mount(MountOpResult {
             name: outcome.name.clone(),
@@ -112,26 +112,24 @@ pub(crate) fn api_mutation_op_result(outcome: &omnifs_state::OpOutcome) -> Mutat
             revision: outcome.revision,
         }),
         omnifs_state::OpOutcome::Credential(outcome) => {
-            MutationOpResult::Credential(api_credential_outcome(outcome.clone()))
+            let outcome = outcome.clone();
+            MutationOpResult::Credential(CredentialStatus {
+                key: CredentialKey {
+                    provider_name: outcome.provider_name,
+                    scheme: outcome.scheme,
+                    account_label: outcome.account_label,
+                },
+                provider: outcome.provider,
+                kind: api_credential_kind(outcome.kind),
+                scopes: outcome.scopes,
+                subject,
+                auth_fingerprint: outcome.auth_fingerprint,
+                version: outcome.version,
+                generation: outcome.generation,
+                status: api_credential_status_kind(outcome.state),
+                last_mutation_id: outcome.last_mutation_id,
+            })
         },
-    }
-}
-
-fn api_credential_outcome(outcome: omnifs_state::CredentialMutationOutcome) -> CredentialStatus {
-    CredentialStatus {
-        key: CredentialKey {
-            provider_name: outcome.provider_name,
-            scheme: outcome.scheme,
-            account_label: outcome.account_label,
-        },
-        provider: outcome.provider,
-        kind: api_credential_kind(outcome.kind),
-        scopes: outcome.scopes,
-        auth_fingerprint: outcome.auth_fingerprint,
-        version: outcome.version,
-        generation: outcome.generation,
-        status: api_credential_status_kind(outcome.state),
-        last_mutation_id: outcome.last_mutation_id,
     }
 }
 

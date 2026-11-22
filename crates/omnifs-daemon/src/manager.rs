@@ -372,7 +372,13 @@ impl ManagerState {
     ) -> Result<ApplyOutcome, ManagerError> {
         self.retry_stuck().await?;
         let mut state_ops = Vec::with_capacity(ops.len());
+        // The subject of each submitted credential, which its result names.
+        let mut subjects = Vec::with_capacity(ops.len());
         for op in ops {
+            subjects.push(match &op {
+                MutationOp::SubmitCredential(submission) => submission.overrides.subject.clone(),
+                _ => None,
+            });
             state_ops.push(self.resolve_op(op).await?);
         }
         let revocations: Vec<CredentialId> = state_ops
@@ -385,7 +391,10 @@ impl ManagerState {
         let outcomes = self.state.apply_batch(id, state_ops).await?;
         let results = outcomes
             .iter()
-            .map(crate::control::mapping::api_mutation_op_result)
+            .zip(subjects)
+            .map(|(outcome, subject)| {
+                crate::control::mapping::api_mutation_op_result(outcome, subject)
+            })
             .collect();
         let serving = match self.prepare_and_activate(id).await {
             Ok(()) => ServingOutcome {

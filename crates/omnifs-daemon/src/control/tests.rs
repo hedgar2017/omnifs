@@ -54,7 +54,22 @@ fn provider_wasm() -> Vec<u8> {
                     "description": "Demo token",
                     "injectDomains": ["api.demo.test"]
                 }
-            }]
+            }, {
+                "oauth": {
+                    "key": "service-account",
+                    "displayName": "Demo service account",
+                    "tokenEndpoint": "https://auth.demo.test/token",
+                    "defaultScopes": ["read"],
+                    "flow": "jwtBearer",
+                    "injectDomains": ["api.demo.test"],
+                    "injectValuePrefix": "Bearer "
+                }
+            }],
+            "guidance": {
+                "service-account": {
+                    "setupSteps": ["Pass the client and its key."]
+                }
+            }
         }
     }))
     .unwrap();
@@ -134,6 +149,88 @@ async fn import_provider_bytes(
 
 async fn import_test_provider(c: &mut Client, bytes: Vec<u8>) -> omnifs_core::ProviderId {
     import_provider_bytes(c, bytes).await.provider.id
+}
+
+/// The credential of the client `robot@demo.test` of the scheme
+/// `service-account` of `provider`, which asserts `subject`.
+fn service_account_submission(
+    provider: omnifs_core::ProviderId,
+    subject: Option<&str>,
+) -> omnifs_api::CredentialSubmission {
+    omnifs_api::CredentialSubmission {
+        provider,
+        scheme: "service-account".to_owned(),
+        account_label: "default".to_owned(),
+        material: omnifs_api::CredentialMaterial::OAuth {
+            access_token: omnifs_api::SecretBytes::new(b"access".to_vec()),
+            refresh_token: None,
+            expires_at_unix: None,
+            token_type: "Bearer".to_owned(),
+            scopes: vec!["read".to_owned()],
+            upstream_identity: None,
+        },
+        overrides: omnifs_api::CredentialClientOverrides {
+            client_id: Some("robot@demo.test".to_owned()),
+            client_secret: Some(omnifs_api::SecretBytes::new(b"key".to_vec())),
+            redirect_uri: None,
+            scopes: None,
+            subject: subject.map(str::to_owned),
+        },
+    }
+}
+
+/// The status of a credential names the subject that its client asserts,
+/// which is not a secret, from the result of its submission on, so that a
+/// re-authentication keeps it.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(unsafe_code)]
+async fn the_status_of_a_credential_names_the_subject_of_its_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = crate::ENV_LOCK.lock().await;
+    let home = std::fs::canonicalize(dir.path()).unwrap();
+    unsafe {
+        std::env::set_var("OMNIFS_HOME", &home);
+    }
+    let runtime = test_daemon(&dir).await;
+    let mut c = client(&home.join("control.sock")).await;
+    let provider = import_test_provider(&mut c, provider_wasm()).await;
+    let key = omnifs_api::CredentialKey {
+        provider_name: "demo".to_owned(),
+        scheme: "service-account".to_owned(),
+        account_label: "default".to_owned(),
+    };
+    for (byte, subject) in [(1, Some("ada@demo.test")), (2, None)] {
+        let id = omnifs_core::MutationId::from_bytes([byte; 16]);
+        c.begin_mutation(begin_request(id)).await.unwrap();
+        let response = c
+            .apply_mutation(apply_request(
+                id,
+                &[omnifs_api::MutationOp::SubmitCredential(
+                    service_account_submission(provider, subject),
+                )],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let submitted = match grpc::mutation_op_result(&response.results[0]).unwrap() {
+            omnifs_api::MutationOpResult::Credential(status) => status,
+            other @ omnifs_api::MutationOpResult::Mount(_) => {
+                panic!("expected a credential result, got {other:?}")
+            },
+        };
+        assert_eq!(submitted.subject.as_deref(), subject);
+        let status = c
+            .get_credential_status(wire::GetCredentialStatusRequest {
+                key: Some(grpc::to_credential_key(&key)),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .status
+            .unwrap();
+        assert_eq!(grpc::credential_status(&status).unwrap(), submitted);
+    }
+    runtime.shutdown().await;
 }
 
 #[test]
