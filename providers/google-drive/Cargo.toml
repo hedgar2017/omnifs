@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "omnifs provider for browsing the files and folders of a Google Drive"
+description = "omnifs provider for browsing the items of a Google Drive"
 categories = ["filesystem", "wasm"]
 keywords = ["omnifs", "google-drive", "filesystem", "wasm"]
 
@@ -21,7 +21,6 @@ omnifs-sdk = { workspace = true }
 http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
-time = { workspace = true, features = ["formatting", "serde"] }
 
 [lints.rust]
 unsafe_code = "allow"
