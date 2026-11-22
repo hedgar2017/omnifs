@@ -225,10 +225,11 @@ struct NodeRecord {
 }
 
 /// The body of a file in the projection, of `length` bytes, with the
-/// attributes that an answer gave for it.
+/// attributes that an answer gave for it. The store keeps the body while a
+/// reader may take it.
 #[derive(Clone)]
 struct Told {
-    body: crate::view::BodyId,
+    body: crate::cache::body::BodyHold,
     length: u64,
     attrs: Option<FileAttrsCache>,
 }
@@ -991,7 +992,7 @@ impl EngineNamespace {
         // from its first byte is the version that the reader takes.
         let current = self.file_version(node, attrs.as_ref());
         if let (Some(told), Some(current)) = (&told, &current)
-            && current.body != told.body
+            && current.body.id() != told.body.id()
             && offset == 0
             && current.length == told.length
             && let Some(mut record) = self.ids.get_mut(id)
@@ -999,14 +1000,17 @@ impl EngineNamespace {
             record.told = Some(current.clone());
         }
         if let (Some(told), Some(current)) = (told, current)
-            && current.body != told.body
+            && current.body.id() != told.body.id()
             && (offset != 0 || current.length != told.length)
         {
             let resources = self.entry_for(node.mount())?.resources()?;
             let bytes = resources
-                .read_body_range(told.body, told.length, offset, len)
+                .held_body_range(told.body.id(), told.length, offset, len)
                 .map_err(|error| NsError::Internal {
                     message: error.to_string(),
+                })?
+                .ok_or_else(|| NsError::Internal {
+                    message: format!("the store lacks a body that it holds for {id}"),
                 })?;
             let eof = offset.saturating_add(bytes.len() as u64) >= told.length;
             let attrs = read_attrs(
@@ -1292,7 +1296,7 @@ impl EngineNamespace {
         };
         let (body, length) = resources.file_body(node.fact(), aux.as_deref()).ok()??;
         Some(Told {
-            body,
+            body: resources.body.hold(body),
             length,
             attrs: attrs.cloned(),
         })

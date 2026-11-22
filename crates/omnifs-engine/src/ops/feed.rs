@@ -289,11 +289,17 @@ impl ProjectionReads {
         let Some((body, length)) = self.resources.file_body(&path, None).map_err(internal)? else {
             return Ok(None);
         };
+        // The file whose body left since the read of its fact is the file of
+        // another answer: none, as for a path without one.
+        let Some(bytes) = self
+            .resources
+            .held_body_range(body, length, offset, len)
+            .map_err(internal)?
+        else {
+            return Ok(None);
+        };
         Ok(Some(wit_types::FileRange {
-            bytes: self
-                .resources
-                .read_body_range(body, length, offset, len)
-                .map_err(internal)?,
+            bytes,
             length,
             until: self.resources.fed_until(&path).map_err(internal)?,
         }))
