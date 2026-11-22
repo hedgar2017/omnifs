@@ -24,10 +24,10 @@ const EARLIEST: &str = "2026-11-21T08:00:00.000Z";
 /// A later `last_edited_time` than `EDITED`.
 const EDITED_LATER: &str = "2026-11-21T10:05:00.000Z";
 
-/// A `Date` five seconds before the end of the minute of `EDITED`.
+/// A `Date` within the minute of `EDITED`.
 const WITHIN: &str = "Sat, 21 Nov 2026 10:00:55 GMT";
 
-/// The `Date` of the end of the minute of `EDITED`.
+/// The `Date` of the first second after the minute of `EDITED`.
 const AT_END: &str = "Sat, 21 Nov 2026 10:01:00 GMT";
 
 fn names_of(ids: &[u32]) -> Vec<String> {
@@ -106,8 +106,8 @@ fn markdown_of(id: &str) -> String {
 /// search by `next_cursor`, with pages, rows, and data sources, taken at each
 /// answer; a `429` and a failure of the network in it give each read of
 /// `pages/` and `databases/` their error while the files that it took are
-/// served, and the next read after the window of the stop continues from the
-/// next request; then each page and data source of the projection that it
+/// served, and the next read after the `Retry-After` of the stop continues
+/// from the next request; then each page and data source of the projection that it
 /// lacks by its ID, with the removal for `404` and for `in_trash`, of a
 /// result of the search too, and the error of the read for the answer of
 /// another object.
@@ -262,9 +262,8 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
             "{gone}"
         );
     }
-    // The page that the first answer of the search removed is past the
-    // deadline of its feed after the window of the stop: its lookup takes
-    // its `GET`.
+    // In a sync, the lookup of the page that the first answer of the search
+    // removed takes its `GET`.
     let in_trash = trashed(page(10, "Trashed in the search", EDITED));
     assert!(
         by_id(&harness, "pages", 10, ok(&in_trash))
@@ -274,13 +273,15 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
     );
 }
 
-/// A full listing again at a read of `pages/` and of `databases/` past the
-/// deadline of its last answer, taken after its last part, with the removal
-/// of what it lacks after its `GET`, the stopped content of a removed page
-/// too, and from its first request after a `400` to its `start_cursor`.
+/// A full listing again at a read of `pages/` and of `databases/` in a sync,
+/// taken after its last part, with the removal of what it lacks after its
+/// `GET`, the stopped content of a removed page too, and from its first
+/// request after a `400` to its `start_cursor`; a page that Notion refuses to
+/// its `GET` stays, the sweep goes on, and the next sync takes it by its own
+/// feed, whose error a read of its paths gets.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
+async fn a_full_listing_again_in_a_sync_is_taken_after_its_last_part() {
     let harness = notion_harness();
     first_full_listing(
         &harness,
@@ -421,11 +422,46 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
     .await;
     assert_eq!(body.unwrap(), "Two again body");
     expect(&requests[0], "GET", &markdown_of(&id(2)), None);
+
+    // A page that Notion refuses to the sweep stays as the projection has
+    // it, and the sweep goes on.
+    harness.begin_sync();
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "/notion/pages"),
+        vec![
+            ok(&list(&[], None)),
+            failure(403, "restricted_resource"),
+            failure(404, "object_not_found"),
+        ],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), names_of(&[1]));
+    expect_search(&requests[0], 100, None);
+    expect(&requests[1], "GET", &format!("/v1/pages/{}", id(1)), None);
+    expect(&requests[2], "GET", &format!("/v1/pages/{}", id(2)), None);
+    let title = format!("/notion/pages/{}/title", id(1));
+    assert_eq!(
+        served(&harness, read(&harness, &title)).await.unwrap(),
+        "One again"
+    );
+    // The next sync takes it by its own feed, and a read of its paths gets
+    // the error of Notion.
+    harness.begin_sync();
+    let (refused, requests) = answering(
+        &harness,
+        read(&harness, &title),
+        vec![failure(403, "restricted_resource")],
+    )
+    .await;
+    assert!(matches!(refused, Err(NsError::Permission)), "{refused:?}");
+    expect(&requests[0], "GET", &format!("/v1/pages/{}", id(1)), None);
 }
 
-/// The changes at a read of a file of a page in a sync: the `page_size` of the count of the latest time and one more, then
-/// `100` by `next_cursor`, until an older result, from their next request
-/// after the window of a failure, whose read is served; a page with another
+/// The changes at a read of a file of a page in a sync: the `page_size` of
+/// the count of the latest time and one more, then `100` by `next_cursor`,
+/// until an older result, from their next request in the next sync after a
+/// failure, whose read is served; a page with another
 /// `last_edited_time` takes its `body.md` and its `comments/` once more at
 /// their next first read, and a page in the trash is removed.
 #[tokio::test(flavor = "multi_thread")]
@@ -458,7 +494,7 @@ async fn the_changes_take_the_search_until_an_older_result() {
     assert_eq!(comments.unwrap(), names_of(&[11]));
     expect(&requests[0], "GET", &comments_of(1, None), None);
     // A content and comments stopped after their first parts: each read
-    // after the window of a stop takes what it asks for, from the next
+    // after the `Retry-After` of a stop takes what it asks for, from the next
     // request of its own.
     let body = format!("/notion/pages/{}/body.md", id(3));
     let comments = format!("/notion/pages/{}/comments", id(3));
@@ -630,10 +666,10 @@ async fn the_changes_take_the_search_until_an_older_result() {
 
 /// An object by its ID of 32 lowercase hexadecimal digits, a page or a data
 /// source: its `GET` at its first lookup without a listing, again at a read
-/// past its deadline before the end of the first full listing, none after it,
-/// but for one that the projection lacks at its lookup past its deadline, as
-/// after a `404` or in the trash; its folder in its listing. A result of the
-/// search with an earlier `last_edited_time` leaves it.
+/// in a sync before the end of the first full listing, none after it, but
+/// for one that the projection lacks at its lookup in a sync, as after a
+/// `404` or in the trash; its folder in its listing. A result of the search
+/// with an earlier `last_edited_time` leaves it.
 #[allow(clippy::too_many_lines)]
 async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value) {
     let harness = notion_harness();
@@ -715,7 +751,7 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
     assert_eq!(title.unwrap(), "First renamed");
     expect_search(&requests[0], 3, None);
 
-    // One that the projection lacks, at its lookup past its deadline.
+    // One that the projection lacks, at its lookup in a sync.
     let found = by_id(&harness, folder, 5, failure(404, "object_not_found")).await;
     assert!(found.unwrap().is_missing());
     let in_trash = trashed(object(6, "Sixth", EDITED));
@@ -766,9 +802,9 @@ async fn a_data_source_by_its_id() {
 /// The content at the first read of `body.md`, by a lookup and by its path
 /// alone: the markdown of the page and of its unknown blocks in turn, each
 /// once, a block with `404` without its markdown, and the removal of the
-/// page for its `404`; a content that Notion may have read within the minute of its
-/// `last_edited_time`, by its `Date` less the time of its request, taken once
-/// more at the first read after the end of that minute.
+/// page for its `404`; a content that Notion answered within the minute of
+/// its `last_edited_time`, by its `Date`, is unsettled and taken once more in
+/// the next sync, and one that Notion answered after that minute is not.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() {
@@ -840,10 +876,8 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
     assert!(matches!(body, Err(NsError::Invalid)), "{body:?}");
     expect(&requests[0], "GET", &markdown_of(&id(5)), None);
 
-    // A content of a `Date` at the end of the minute of its
-    // `last_edited_time`, which Notion may have read within that minute, is
-    // unsettled: it serves until the next sync, which takes it once more,
-    // as the content of the `Date` `WITHIN` below.
+    // A content of a `Date` after the minute of its `last_edited_time` is
+    // settled: the next sync takes the page alone, below.
     let (body, requests) = answering(
         &harness,
         read(&harness, &format!("/notion/pages/{}/body.md", id(6))),
@@ -911,9 +945,17 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
         .unwrap(),
         "Page 4 body, edited in its minute"
     );
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("/notion/pages/{}/body.md", id(6))),
+        vec![ok(&page(6, "Page 6", EDITED))],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Page 6 body");
+    expect(&requests[0], "GET", &format!("/v1/pages/{}", id(6)), None);
 
-    // Past its deadline, a read by its path alone of the content of a page
-    // with another `last_edited_time` takes the page and then its content.
+    // In a sync, a read by its path alone of the content of a page with
+    // another `last_edited_time` takes the page and then its content.
     let (body, requests) = answering(
         &harness,
         read_at(&harness, &format!("/notion/pages/{}/body.md", id(2))),
@@ -954,9 +996,9 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
 /// The comments at the first read of `comments/` and of a file of a comment
 /// by its path alone: their answers by `next_cursor`, the files of each
 /// comment, an empty `author` for `resolved_name` `null`, the removal of the
-/// page for `404`, and the comments once more after the end of the minute of
-/// the `last_edited_time` of the page, as the content; a read takes what it
-/// asks for after another stopped.
+/// page for `404`, and the comments once more in the next sync after an answer
+/// within the minute of the `last_edited_time` of the page, as the content;
+/// a read takes what it asks for after another stopped.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_comments_take_their_answers_by_next_cursor() {
@@ -1170,8 +1212,8 @@ async fn the_comments_take_their_answers_by_next_cursor() {
     expect(&requests[0], "GET", &format!("/v1/pages/{}", id(4)), None);
     expect(&requests[1], "GET", &comments_of(4, None), None);
 
-    // Past its deadline, a read by its path alone of a comment of a page with
-    // another `last_edited_time` takes the page and then its comments.
+    // In a sync, a read by its path alone of a comment of a page with another
+    // `last_edited_time` takes the page and then its comments.
     let (body, requests) = answering(
         &harness,
         read_at(

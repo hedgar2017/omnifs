@@ -15,7 +15,7 @@ pub const EDITED: &str = "2026-11-21T10:00:00.000Z";
 /// The `Notion-Version` of each request of the provider.
 pub const VERSION: &str = "2026-03-11";
 
-/// A `Date` of an answer of Notion later than the minute of `EDITED`.
+/// A `Date` of an answer of Notion after the minute of `EDITED`.
 pub const LATER: &str = "Sat, 21 Nov 2026 11:00:00 GMT";
 
 pub fn notion_harness() -> RuntimeHarness {
@@ -96,7 +96,7 @@ pub fn answer(status: u16, headers: &[(&str, &str)], body: &Value) -> Answer {
     }))
 }
 
-/// An answer `200` with `body`, of a `Date` past the minute of `EDITED`.
+/// An answer `200` with `body`, of a `Date` after the minute of `EDITED`.
 pub fn ok(body: &Value) -> Answer {
     answer(200, &[("Date", LATER)], body)
 }
