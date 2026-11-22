@@ -13,9 +13,9 @@ use omnifs_itest::RuntimeHarness;
 use omnifs_wit::host::types::CalloutResult;
 use serde_json::{Value, json};
 use support::{
-    EDITED, PAST_DEADLINE, answer, answering, comment, data_source, expect, expect_search, failure,
-    id, list, lookup, markdown, names, network, notion_harness, notion_id, ok, page, read, read_at,
-    row, served, trashed,
+    EDITED, PAST_DEADLINE, VERSION, answer, answering, comment, data_source, expect, expect_search,
+    failure, id, list, lookup, markdown, names, network, notion_harness, notion_id, ok, page,
+    rate_limited, read, read_at, row, served, trashed,
 };
 
 /// Earlier `last_edited_time`s than `EDITED`, from the latest.
@@ -113,7 +113,7 @@ fn markdown_of(id: &str) -> String {
 /// `pages/` and `databases/` their error while the files that it took are
 /// served, and the next read continues from the next request; then each page
 /// and data source of the projection that it lacks by its ID, with the
-/// removal for `404` and for `in_trash`.
+/// removal for `404` and for `in_trash`, of a result of the search too.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
@@ -122,6 +122,8 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
         ("pages", 7, page(7, "Deleted page", EDITED)),
         ("pages", 8, page(8, "Trashed page", EDITED)),
         ("databases", 9, data_source(9, "Unsearched", EDITED)),
+        ("pages", 10, page(10, "Trashed in the search", EDITED)),
+        ("databases", 11, data_source(11, "Trashed too", EDITED)),
     ] {
         assert!(found_by_id(&harness, folder, n, &object).await, "{n}");
     }
@@ -129,22 +131,17 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
     let first = list(
         &[
             page(1, "Plans", EDITED),
+            trashed(page(10, "Trashed in the search", EDITED)),
             row(2, 3, "A task", EARLIER),
             data_source(3, "Tasks", EARLIER),
+            trashed(data_source(11, "Trashed too", EARLIER)),
         ],
         Some("cursor-2"),
     );
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "pages"),
-        vec![
-            ok(&first),
-            answer(
-                429,
-                &[("Retry-After", "1")],
-                &json!({ "object": "error", "status": 429, "code": "rate_limited", "message": "slow down" }),
-            ),
-        ],
+        vec![ok(&first), rate_limited()],
     )
     .await;
     assert!(
@@ -233,7 +230,7 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
     )
     .unwrap();
     assert_eq!(schema, data_source(9, "Unsearched", EDITED));
-    for gone in [7, 8] {
+    for gone in [7, 8, 10] {
         assert!(
             served(&harness, lookup(&harness, &format!("pages/{}", id(gone))))
                 .await
@@ -246,8 +243,10 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
 
 /// A full listing again at a read of `pages/` and of `databases/` past the
 /// deadline of its last answer, taken after its last part, with the removal
-/// of what it lacks after its `GET`.
+/// of what it lacks after its `GET`, the stopped content of a removed page
+/// too, and from its first request after a `400` to its `start_cursor`.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
     let harness = notion_harness();
     first_full_listing(
@@ -276,12 +275,11 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
         &harness,
         names(&harness, "pages"),
         vec![
-            ok(&list(&[page(1, "One again", EDITED_LATER)], Some("cursor-2"))),
-            answer(
-                429,
-                &[("Retry-After", "1")],
-                &json!({ "object": "error", "status": 429, "code": "rate_limited", "message": "slow down" }),
-            ),
+            ok(&list(
+                &[page(1, "One again", EDITED_LATER)],
+                Some("cursor-2"),
+            )),
+            rate_limited(),
         ],
     )
     .await;
@@ -330,7 +328,24 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
             .is_missing()
     );
 
+    // A later full listing whose cursor Notion refuses begins again from its
+    // first request.
     tokio::time::sleep(PAST_DEADLINE).await;
+    let (stopped, requests) = answering(
+        &harness,
+        names(&harness, "databases"),
+        vec![
+            ok(&list(
+                &[page(2, "Two again", EDITED_LATER)],
+                Some("cursor-2"),
+            )),
+            failure(400, "validation_error"),
+        ],
+    )
+    .await;
+    assert!(matches!(stopped, Err(NsError::Invalid)), "{stopped:?}");
+    expect_search(&requests[0], 100, None);
+    expect_search(&requests[1], 100, Some("cursor-2"));
     let (listing, requests) = answering(
         &harness,
         names(&harness, "databases"),
@@ -368,9 +383,10 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
 
 /// The changes at a read of a file of a page past the deadline of the last
 /// answer: the `page_size` of the count of the latest time and one more, then
-/// `100` by `next_cursor`, until an older result; a page with another
-/// `last_edited_time` takes its `body.md` and its `comments/` once more at
-/// their next first read.
+/// `100` by `next_cursor`, until an older result, from their next request
+/// after a failure; a page with another `last_edited_time` takes its `body.md`
+/// and its `comments/` once more at their next first read, and a page in the
+/// trash is removed.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_changes_take_the_search_until_an_older_result() {
@@ -450,14 +466,7 @@ async fn the_changes_take_the_search_until_an_older_result() {
     let (stopped, requests) = answering(
         &harness,
         read(&harness, &format!("pages/{}/body.md", id(2))),
-        vec![
-            ok(&markdown("Two body", &[21])),
-            answer(
-                429,
-                &[("Retry-After", "1")],
-                &json!({ "object": "error", "status": 429, "code": "rate_limited", "message": "slow down" }),
-            ),
-        ],
+        vec![ok(&markdown("Two body", &[21])), rate_limited()],
     )
     .await;
     assert!(
@@ -468,7 +477,7 @@ async fn the_changes_take_the_search_until_an_older_result() {
     expect(&requests[1], "GET", &markdown_of(&id(21)), None);
 
     tokio::time::sleep(PAST_DEADLINE).await;
-    let (title, requests) = answering(
+    let (stopped, requests) = answering(
         &harness,
         read(&harness, &format!("pages/{}/title", id(2))),
         vec![
@@ -480,16 +489,24 @@ async fn the_changes_take_the_search_until_an_older_result() {
                 ],
                 Some("cursor-2"),
             )),
-            ok(&list(
-                &[page(5, "Five", EDITED), page(3, "Three", EARLIER)],
-                Some("cursor-3"),
-            )),
+            network(),
         ],
     )
     .await;
-    assert_eq!(title.unwrap(), "Two edited");
+    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
     expect_search(&requests[0], 3, None);
     expect_search(&requests[1], 100, Some("cursor-2"));
+    let (title, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/title", id(2))),
+        vec![ok(&list(
+            &[page(5, "Five", EDITED), page(3, "Three", EARLIER)],
+            Some("cursor-3"),
+        ))],
+    )
+    .await;
+    assert_eq!(title.unwrap(), "Two edited");
+    expect_search(&requests[0], 100, Some("cursor-2"));
     assert_eq!(
         served(&harness, names(&harness, "pages")).await.unwrap(),
         names_of(&[1, 2, 3, 4, 5])
@@ -534,22 +551,27 @@ async fn the_changes_take_the_search_until_an_older_result() {
         read(&harness, &format!("pages/{}/title", id(2))),
         vec![ok(&list(
             &[
+                trashed(page(5, "Five", EDITED_LATER)),
                 page(1, "One edited", EDITED_LATER),
                 page(2, "Two edited", EDITED_LATER),
-                page(4, "Four", EDITED),
             ],
-            Some("cursor-2"),
+            None,
         ))],
     )
     .await;
     expect_search(&requests[0], 3, None);
+    assert_eq!(
+        served(&harness, names(&harness, "pages")).await.unwrap(),
+        names_of(&[1, 2, 3, 4])
+    );
 }
 
 /// An object by its ID of 32 lowercase hexadecimal digits, a page or a data
-/// source: its `GET` at its first lookup without a listing, again at a read past its deadline before the end
-/// of the first full listing, none after it, but for one that the projection
-/// lacks at its lookup past its deadline, as after a `404`; its folder in its
-/// listing.
+/// source: its `GET` at its first lookup without a listing, again at a read
+/// past its deadline before the end of the first full listing, none after it,
+/// but for one that the projection lacks at its lookup past its deadline, as
+/// after a `404` or in the trash; its folder in its listing. A result of the
+/// search with an earlier `last_edited_time` leaves it.
 async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value) {
     let harness = notion_harness();
     let at = |n: u32| format!("{folder}/{}", id(n));
@@ -622,6 +644,8 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
     // One that the projection lacks, at its lookup past its deadline.
     let found = by_id(&harness, folder, 5, failure(404, "object_not_found")).await;
     assert!(found.unwrap().is_missing());
+    let in_trash = trashed(object(6, "Sixth", EDITED));
+    assert!(!found_by_id(&harness, folder, 6, &in_trash).await);
     assert!(
         served(&harness, lookup(&harness, &at(5)))
             .await
@@ -855,7 +879,7 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
 #[allow(clippy::too_many_lines)]
 async fn the_comments_take_their_answers_by_next_cursor() {
     let harness = notion_harness();
-    for n in [1, 2, 3, 4, 5, 6] {
+    for n in [1, 2, 3, 4, 5, 6, 7] {
         assert!(found_by_id(&harness, "pages", n, &page(n, &format!("Page {n}"), EDITED)).await);
     }
 
@@ -975,19 +999,34 @@ async fn the_comments_take_their_answers_by_next_cursor() {
     assert!(matches!(comments, Err(NsError::Permission)), "{comments:?}");
     expect(&requests[0], "GET", &comments_of(6, None), None);
 
+    for n in [4, 7] {
+        let (comments, requests) = answering(
+            &harness,
+            names(&harness, &format!("pages/{}/comments", id(n))),
+            vec![answer(
+                200,
+                &[("Date", WITHIN)],
+                &list(&[comment(41, Some("Ada"), "Early")], None),
+            )],
+        )
+        .await;
+        assert_eq!(comments.unwrap(), names_of(&[41]), "{n}");
+        expect(&requests[0], "GET", &comments_of(n, None), None);
+    }
+    tokio::time::sleep(PAST_WITHIN).await;
+    // The comments that Notion restricts once more are no comments.
     let (comments, requests) = answering(
         &harness,
-        names(&harness, &format!("pages/{}/comments", id(4))),
-        vec![answer(
-            200,
-            &[("Date", WITHIN)],
-            &list(&[comment(41, Some("Ada"), "Early")], None),
-        )],
+        names(&harness, &format!("pages/{}/comments", id(7))),
+        vec![
+            ok(&page(7, "Page 7", EDITED)),
+            failure(403, "restricted_resource"),
+        ],
     )
     .await;
-    assert_eq!(comments.unwrap(), names_of(&[41]));
-    expect(&requests[0], "GET", &comments_of(4, None), None);
-    tokio::time::sleep(PAST_WITHIN).await;
+    assert_eq!(comments.unwrap(), Vec::<String>::new());
+    expect(&requests[0], "GET", &format!("/v1/pages/{}", id(7)), None);
+    expect(&requests[1], "GET", &comments_of(7, None), None);
     let (comments, requests) = answering(
         &harness,
         names(&harness, &format!("pages/{}/comments", id(4))),
@@ -1086,8 +1125,8 @@ async fn a_529_waits_its_retry_after_and_a_blocked_connection_does_not() {
 }
 
 /// A `400` to a request with a `start_cursor` of a full listing, of the
-/// changes, and of the comments, and a `404` to one of the comments, gives its
-/// read its error, and the next read begins from the first request, a read of
+/// changes, and of the comments, and a `404` or a `restricted_resource` to one
+/// of the comments, gives its read its error, and the next read begins from the first request, a read of
 /// `pages/` after that of the changes with a full listing.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
@@ -1171,11 +1210,12 @@ async fn a_refused_cursor_begins_again_from_the_first_request() {
         }
     }
 
-    // A `404` to a `start_cursor` of the comments refuses the cursor too, and
-    // the page stays.
+    // A `404` and a `restricted_resource` to a `start_cursor` of the comments
+    // refuse the cursor too, and the page stays.
     for (n, refusal) in [
         (1, failure(400, "validation_error")),
         (2, failure(404, "object_not_found")),
+        (3, failure(403, "restricted_resource")),
     ] {
         let comments = format!("pages/{}/comments", id(n));
         let (stopped, requests) = answering(
@@ -1191,7 +1231,10 @@ async fn a_refused_cursor_begins_again_from_the_first_request() {
         )
         .await;
         assert!(
-            matches!(stopped, Err(NsError::Invalid | NsError::NotFound)),
+            matches!(
+                stopped,
+                Err(NsError::Invalid | NsError::NotFound | NsError::Permission)
+            ),
             "{n}: {stopped:?}"
         );
         expect(&requests[0], "GET", &comments_of(n, None), None);
@@ -1205,4 +1248,53 @@ async fn a_refused_cursor_begins_again_from_the_first_request() {
         assert_eq!(listing.unwrap(), names_of(&[11]), "{n}");
         expect(&requests[0], "GET", &comments_of(n, None), None);
     }
+}
+
+/// The first request of the changes has the `page_size` `1` without a latest
+/// time, and at most `100`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_request_of_the_changes_has_a_page_size_from_1_to_100() {
+    let harness = notion_harness();
+    first_full_listing(&harness, Vec::new()).await;
+    let pages = (1..=100)
+        .map(|n| page(n, "Page", EDITED))
+        .collect::<Vec<_>>();
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (found, requests) = answering(
+        &harness,
+        lookup(&harness, &format!("pages/{}", id(1))),
+        vec![
+            ok(&list(&pages[..1], Some("cursor-2"))),
+            ok(&list(&pages[1..], None)),
+        ],
+    )
+    .await;
+    assert!(!found.unwrap().is_missing());
+    expect_search(&requests[0], 1, None);
+    expect_search(&requests[1], 100, Some("cursor-2"));
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (title, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/title", id(1))),
+        vec![ok(&list(&pages, None))],
+    )
+    .await;
+    assert_eq!(title.unwrap(), "Page");
+    expect_search(&requests[0], 100, None);
+}
+
+/// The validation of the token of the manifest sends the `Notion-Version` of
+/// the requests.
+#[test]
+fn the_validation_of_the_token_has_the_version_of_the_requests() {
+    let file = "omnifs_provider_notion.wasm";
+    let wasm = std::fs::read(omnifs_itest::provider_wasm_path(file)).unwrap();
+    let (_, manifest) = omnifs_provider::Artifact::from_bytes_with_manifest(file, wasm).unwrap();
+    let manifest = serde_json::to_value(manifest).unwrap();
+    assert_eq!(
+        manifest.pointer("/auth/schemes/0/staticToken/validation/headers/Notion-Version"),
+        Some(&json!(VERSION))
+    );
 }

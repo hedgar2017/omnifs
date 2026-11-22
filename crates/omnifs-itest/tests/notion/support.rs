@@ -17,6 +17,9 @@ pub const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
 /// The `last_edited_time` of a fixture, by the minute as Notion gives it.
 pub const EDITED: &str = "2026-11-21T10:00:00.000Z";
 
+/// The `Notion-Version` of each request of the provider.
+pub const VERSION: &str = "2026-03-11";
+
 /// A `Date` of an answer of Notion later than the minute of `EDITED`.
 pub const LATER: &str = "Sat, 21 Nov 2026 11:00:00 GMT";
 
@@ -94,7 +97,7 @@ pub fn expect(request: &HttpRequest, method: &str, path: &str, body: Option<&Val
     );
     assert_eq!(
         request_header(request, "notion-version"),
-        Some("2026-03-11"),
+        Some(VERSION),
         "{}",
         request.url
     );
@@ -148,6 +151,15 @@ pub fn failure(status: u16, code: &str) -> CalloutResult {
             "code": code,
             "message": format!("the {code} of a fixture"),
         }),
+    )
+}
+
+/// An answer `429` of a rate limit, with a `Retry-After` of one second.
+pub fn rate_limited() -> CalloutResult {
+    answer(
+        429,
+        &[("Retry-After", "1")],
+        &json!({ "object": "error", "status": 429, "code": "rate_limited", "message": "slow down" }),
     )
 }
 
