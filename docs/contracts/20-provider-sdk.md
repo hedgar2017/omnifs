@@ -15,14 +15,16 @@ A provider is one `#[omnifs_sdk::provider]` implementation with synchronous `fn 
 
 Git and blob callouts carry request facts only. The host validates those facts
 and owns opaque cache identities, body publication, and rehydration; provider
-APIs must not expose cache-key or filesystem-entry parameters. A blob request
-names the identity of its bytes, by their `md5` or their `version`, for the
-host to answer it from the projection: the host asks the upstream for a request
-without one each time. The host follows the redirects of a `GET` or a `HEAD`
-to a URL that the authority of the mount approves, the answer of a status
-other than 2xx is no content of a file, and `error_for_status` of the SDK
-takes each such status as an error, but the `304` of a conditional request
-that is no blob fetch.
+APIs must not expose cache-key or filesystem-entry parameters.
+`docs/contracts/10-system.md` owns the HTTP transport, the redirects that a
+request asks the host to follow, the identity of a blob request, and the answer
+that the host keeps for it. On the SDK side, `follow_redirects()` of a request
+builder asks for redirects, `url()` and `redirected()` of an answer name the
+URL that answered, a blob fetch resolves to a `BlobAnswer` of any status whose
+`error_for_status` gives the `BlobRef` of a successful one, and
+`ProviderError::from_http_answer` is the one mapping of a status and its
+`Retry-After` to an error, for an inline answer, for a blob, and for a provider
+that reads a status of its own.
 
 Repeated provider boilerplate is evidence of a missing SDK construct. Fix the shared construct rather than normalizing local scaffolding across providers.
 

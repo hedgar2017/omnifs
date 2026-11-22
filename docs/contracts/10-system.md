@@ -18,7 +18,8 @@ Keep credential storage, credential injection, callout execution, cache storage,
 Host-owned blob and projection identities come only from validated mount-scoped
 request facts. Providers may request a remote, reference, or HTTP payload, but
 they never choose a filesystem/cache entry name, and injected credentials are
-excluded from those identities. Mount definitions, credentials, provider
+excluded from those identities. [Blob fetches](#blob-fetches) owns the facts of
+a blob request and their validation. Mount definitions, credentials, provider
 artifacts, SQLite state, and cache storage belong to the daemon; the CLI reaches
 them only through typed local RPC.
 
@@ -37,6 +38,42 @@ Async host imports do not reduce this gate. A provider may suspend on a host imp
 Provider manifest `capabilities` declare authority needs only: domains, git repos, unix sockets, and preopened paths. Scalar resource ceilings such as memory and blob byte budgets are manifest `limits` and mount-spec `limits`; they must not be described as provider authority or callout grants.
 
 Dynamic domain needs resolve from a provider config field named `domains`, whose string array becomes the mount's concrete HTTP allowlist at startup. Do not use a wildcard domain grant to stand in for this per-mount enumeration.
+
+### HTTP transport
+
+The host sends each provider HTTP request, inline or of a blob, through one transport (`HttpStack`): it approves the URL against the authority of the mount, injects the credential that the mount declares for that URL after the request left the provider, and returns the answer of any status. A successful status is `2xx` (`successful` in the host, `is_success` in the SDK, the one owner each): the body of each other answer is no content of a file, and the checked terminals of the SDK take each other status as an error, but the `304` that answers a conditional inline request.
+
+Redirects are a gated transport decision, and this is the whole of it. The answer of a redirect status is the answer of the request, unless the request asks the host to follow it (`follow-redirects` of the WIT request, `follow_redirects()` of the SDK builders). The host then follows each `301`, `302`, `303`, `307`, and `308` with a `Location`, under these rules:
+
+- Only a `GET` or a `HEAD` over HTTPS follows redirects: the host refuses another request that asks for it, before it goes out. A hop is to an HTTPS URL alone, so no redirect leaves HTTPS and none reaches a Unix socket.
+- The authority of the mount approves the URL of each hop, as it approves the URL of a request.
+- The host follows at most `MAX_REDIRECTS` hops for one request.
+- A hop that the host refuses, and one too many, is the `denied` error of the request, which is not retryable and names the host of the hop. A redirect that the request asked to follow is never its answer.
+- Each hop has the credential that the mount declares for its own URL, and none for a URL without one. A credential that a hop rejects is refreshed for that hop.
+- The headers and the body that the provider wrote go to the origin of the request alone: the same scheme, host, and port. A hop to another origin has none of them.
+- The answer names the URL that answered when it is another than the one of the request (`redirected` of the WIT response and of the blob answer, `url()` and `redirected()` of the SDK). The provider decides what the answer of another URL means, and the rate-limit breaker of the SDK records an answer for the authority that answered it.
+
+The timeout of an inline request bounds the whole of it, redirects included.
+
+### Blob fetches
+
+A blob fetch is an HTTP request whose body stays in the host. The host validates its facts and derives its identity from them alone: the credential partition, the method, the canonical URL, the headers and the body of the provider, whether it follows redirects, `md5`, and `version`. `md5` is 32 lowercase hexadecimal digits, the MD5 of the bytes that the provider asks for, and `version` is 1 to 256 bytes without a control character, the version of those bytes that the provider read from its upstream: a statement of the provider that the host compares for equality alone. The host refuses a request whose `md5` or `version` is not valid before it asks the upstream.
+
+The host stores the body of a successful answer alone, in the content-addressed body store, and hashes it once, as it arrives. With `md5`, other bytes are the `version-mismatch` error of the fetch, which is not retryable, and store nothing. The answer of another status has no body in the host and answers no other request.
+
+This is the one keep rule. The answer that the host keeps is of the request, not of the operation: the host commits it at the end of the fetch, whatever its operation does after.
+
+- A request with `md5` or `version` names the identity of its bytes, so it has one answer: the host keeps each successful one and answers the request from its projection from then on, without the upstream.
+- A request without either has no identity of its bytes. For a `GET` whose provider wrote no condition and no range, the host keeps a `200` answer that has an `ETag` or a `Last-Modified`, and asks the URL that answered again with them as `If-None-Match` and `If-Modified-Since`: `304` is the kept answer, and another answer replaces it. That is one request without a body in place of a download.
+- The host asks each other request each time, and its body is of its operation alone.
+
+The answer tells whether the upstream answered this fetch (`upstream`): an answer from the projection says nothing of the upstream now, so the breaker of the SDK ignores it.
+
+A blob handle is of the operation of its fetch alone, and holds its body in the store until the end of that operation. A body leaves the store with the collection after no fact of a projection refers to it and no hold holds it. The host cannot know whether a provider asks a request again, so the files bound the kept answers: an answer leaves at the second collection in a row that finds no file with its body. A collection runs at the start of the store and once the store took as many bytes as the collection before left, never for an operation; `crates/omnifs-engine/src/cache/collect.rs` owns its soundness.
+
+These bound a fetch: the connect timeout, the idle bound of two minutes for the status of each hop and for each next bytes of the body, `MAX_REDIRECTS`, the `fetch_blob_bytes` limit that the mount declares, and the disk. Nothing bounds the whole time or the size of a fetch of a mount without a declared limit, by design: a bound of the whole time is a bound of the size at a given rate. An upstream that sends a byte within each idle bound holds a fetch open. Only a declared number can close that, such as a least rate in the limits of a manifest: the host has no number of its own that is right for each upstream.
+
+The host runs the disk work and the digests of a fetch off the thread of the provider instance.
 
 ### Auth and credentials
 

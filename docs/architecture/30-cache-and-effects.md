@@ -7,7 +7,7 @@ The host owns storage, but not provider meaning. It stores validated paths, attr
 
 ## Durable owners
 
-`Caches` opens one global Fjall database and one global append-only `BodyStore`. `BodyStore` publishes complete bodies by BLAKE3 identity before any projection row can reference them. Inline file bytes, canonical object bytes, and streamed blob bodies all use that store.
+`Caches` opens one global Fjall database and one global content-addressed `BodyStore`, which a collection sweeps of the bodies that no fact of a projection refers to and no `BodyHold` holds (`docs/contracts/10-system.md` owns the rule, `cache/collect.rs` its soundness). `BodyStore` publishes complete bodies by BLAKE3 identity before any projection row can reference them. Inline file bytes, canonical object bytes, and streamed blob bodies all use that store.
 
 Each mount selects one `ProjectionStore` by `ProjectionId`, which hashes the number of the projection of its provider, its canonical mount without the content ID and the version of its provider artifact, and its credential generation, so that a mount that moves to another artifact of its provider with the same number keeps its facts, tokens, and validators, and one with another number starts an empty projection. Its strict manifest records the mount and the digest of that source. One tagged fact keyspace owns object relations, typed lookup/attr/file/listing records, definitive negatives, expiry, blob request references, and Git identities. Runtime blob handles, runtime Git handles, absolute checkout paths, and invalidation epochs are never durable.
 
@@ -15,7 +15,7 @@ Each mount selects one `ProjectionStore` by `ProjectionId`, which hashes the num
 
 ## Publication
 
-A provider operation validates and lowers its effects plus its operation-specific typed result into one `ProjectionTransition`. Body publication happens first because bodies are immutable and may remain unreferenced after a fence. The short projection transaction then applies object and path relations, records, listing mutations, freshness, and invalidations with `SyncAll` durability. It updates or evicts the derived memory tier only after commit, emits events after that eviction, and exposes the typed operation result last.
+A provider operation validates and lowers its effects plus its operation-specific typed result into one `ProjectionTransition`. Body publication happens first because bodies are immutable and may remain unreferenced after a fence, until the next collection. The transition holds the publication gate of the body store from its first body to its commit, which is what lets a collection begin without a body that waits for its fact. The short projection transaction then applies object and path relations, records, listing mutations, freshness, and invalidations with `SyncAll` durability. It updates or evicts the derived memory tier only after commit, emits events after that eviction, and exposes the typed operation result last.
 
 The process-local invalidation epoch fences the complete transition. Every operation captures the epoch before reading cache-derived inputs. Any committed object or listing invalidation advances the epoch exactly once, and a terminal captured before that invalidation fails instead of republishing stale facts.
 

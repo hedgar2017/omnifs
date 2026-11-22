@@ -80,7 +80,7 @@ The SDK owns no custom executor. The provider macro emits async namespace and no
 `CalloutHost` is the single host import implementation for provider effects. It maps each WIT callout to the existing executor:
 
 - HTTP fetches go through `HttpStack`.
-- Blob fetches and reads go through `BlobExecutor`.
+- Blob fetches go through `BlobExecutor`, which runs their disk work and digests on the blocking pool. A file of a blob is read by the tree from the body store, without a callout.
 - Git opens go through `GitExecutor`.
 
 Tracing is preserved at the callout boundary. Namespace requests, provider
@@ -116,7 +116,7 @@ unless the operation recorded a more specific result first.
 The driver runs one provider instance on a single event-loop thread, so same-instance concurrency depends on every suspension point yielding that thread rather than blocking it.
 
 - **Async callouts yield.** HTTP callouts are `async` and return control to the event loop while the host does the work, so other in-flight ops keep progressing.
-- **Synchronous executors are offloaded.** `GitExecutor::open_repo` (which shells out to `git`) is synchronous. `CalloutHost::run` runs it on the Tokio blocking pool via `spawn_blocking`, so a slow clone suspends only its own op, not the whole instance. Without this, the blocking call would run inside the host-task future's poll on the event-loop thread and stall every concurrent op.
+- **Synchronous executors are offloaded.** `GitExecutor::open_repo` (which shells out to `git`) is synchronous. `CalloutHost::run` runs it on the Tokio blocking pool via `spawn_blocking`, so a slow clone suspends only its own op, not the whole instance. `BlobExecutor` does the same for the writes, the digests, and the facts of a fetch, and awaits only the network on the event-loop thread. Without this, the blocking call would run inside the host-task future's poll on the event-loop thread and stall every concurrent op.
 - **WASI Preview 2 imports still block the instance.** `wasmtime_wasi::p2::add_to_linker_async` binds WASI functions on the legacy `func_wrap_async` path, which holds the store exclusively across the await (Wasmtime `StoreFiberYield::KeepStore`). A provider that blocks on WASI I/O (a preopened-file read, `wasi:io/poll`) therefore serializes the instance for the duration of that wait, unlike an omnifs callout. This is inherent to WASI p2; only a move to WASI p3 (concurrent host bindings) would change it. Providers do upstream work through omnifs callouts, not WASI, so this is rarely on the hot path.
 
 ## Test harness

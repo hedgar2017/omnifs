@@ -27,7 +27,7 @@ Identity is layered. The provider computes a logical id from object kind and nor
 
 ## Callouts and effects
 
-Provider namespace and notify calls are async component exports that return terminal results. When provider code awaits host work, it calls an async WIT import. The host executes callouts such as HTTP fetches, blob fetches, git clone/open operations, and blob reads, then the component future resumes with the typed result.
+Provider namespace and notify calls are async component exports that return terminal results. When provider code awaits host work, it calls an async WIT import. The host executes callouts such as HTTP fetches, blob fetches, and git clone/open operations, then the component future resumes with the typed result.
 
 One provider instance can serve multiple concurrent filesystem operations. Wasmtime's component async runtime owns suspension while the host owns the callout executors, auth injection, capability checks, tracing, and cache-visible effects.
 
@@ -43,8 +43,8 @@ The operation owner validates and lowers the complete terminal into one projecti
 
 The host owns storage as opaque facts and bytes.
 
-- One global `BodyStore` stores every complete body by BLAKE3 identity.
-- One projection keyspace stores object relations, typed lookup/attr/file/listing facts, blob request references, Git identities, and freshness for the canonical mount without its provider artifact, the number of the projection of its provider, and its credential generation.
+- One global `BodyStore` stores every complete body by BLAKE3 identity, while a fact of a projection refers to it or an operation holds it.
+- One projection keyspace stores object relations, typed lookup/attr/file/listing facts, the kept answers of blob requests, Git identities, and freshness for the canonical mount without its provider artifact, the number of the projection of its provider, and its credential generation.
 - Each projection has a derived process-local memory tier. Provider blob handles and Git tree handles never enter durable rows.
 
 On a warm object read, the host pushes cached canonical bytes into the provider's read operation. The provider decodes and renders from those bytes. There is no provider-to-host canonical-read callout and no host-side render operation.
