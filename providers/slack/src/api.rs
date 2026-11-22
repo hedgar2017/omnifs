@@ -110,18 +110,54 @@ pub(crate) fn page(response: &HttpResponse) -> std::result::Result<Page, Refusal
     })
 }
 
-/// The refusal of a request that Slack answered with the error `error`.
+/// The refusal of a request that Slack answered with the error `error`, with
+/// the kind of that error: not found for a channel or a thread that the bot
+/// sees no more, a timeout for a cursor that Slack takes no more, a rate
+/// limit, a permission error for a token that Slack takes no more, a denial
+/// for a token without the right of the request, a failure of the network for
+/// a failure of Slack itself, an invalid input for a request that Slack does
+/// not take, and an internal error for each other one.
 fn refusal(error: &str) -> Refusal {
-    let of = match error {
-        "channel_not_found" | "not_in_channel" => Refused::Channel,
-        "thread_not_found" => Refused::Thread,
-        "invalid_cursor" => Refused::Cursor,
-        _ => Refused::Request,
+    let message = format!("Slack answered the error {error}");
+    let (of, error) = match error {
+        "channel_not_found" | "not_in_channel" => {
+            (Refused::Channel, ProviderError::not_found(message))
+        },
+        "thread_not_found" => (Refused::Thread, ProviderError::not_found(message)),
+        "invalid_cursor" => (Refused::Cursor, ProviderError::timeout(message)),
+        "ratelimited" => (Refused::Request, ProviderError::rate_limited(message)),
+        "invalid_auth" | "not_authed" | "account_inactive" | "token_revoked" | "token_expired" => {
+            (Refused::Request, ProviderError::permission_denied(message))
+        },
+        "missing_scope"
+        | "no_permission"
+        | "not_allowed_token_type"
+        | "access_denied"
+        | "ekm_access_denied"
+        | "org_login_required"
+        | "team_access_not_granted"
+        | "enterprise_is_restricted"
+        | "two_factor_setup_required" => (Refused::Request, ProviderError::denied(message)),
+        "internal_error" | "fatal_error" | "service_unavailable" | "team_added_to_org" => {
+            (Refused::Request, ProviderError::network(message))
+        },
+        "request_timeout" => (Refused::Request, ProviderError::timeout(message)),
+        "invalid_arguments"
+        | "invalid_arg_name"
+        | "invalid_array_arg"
+        | "invalid_charset"
+        | "invalid_form_data"
+        | "invalid_post_type"
+        | "missing_post_type"
+        | "invalid_limit"
+        | "invalid_ts_latest"
+        | "invalid_ts_oldest"
+        | "invalid_types"
+        | "method_deprecated"
+        | "deprecated_endpoint" => (Refused::Request, ProviderError::invalid_input(message)),
+        _ => (Refused::Request, ProviderError::internal(message)),
     };
-    Refusal {
-        of,
-        error: ProviderError::denied(format!("Slack answered the error {error}")),
-    }
+    Refusal { of, error }
 }
 
 /// The rate-limited error of an answer `429` with the seconds of its
