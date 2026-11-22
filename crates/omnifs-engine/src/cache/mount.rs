@@ -1401,6 +1401,8 @@ impl MountResources {
             if let Some(feed) = &feed
                 && let Some(lacked) = &feed.lacked
                 && !matches!(&feed.answer, FeedAnswerWrite::Part(part) if part.more)
+                && !prepared_records.iter().any(|record| record.path == *lacked)
+                && !dirents.iter().any(|mutation| mutation.path() == lacked)
                 && let Some(mark) = read_fed_mark(tx, facts, lacked)?
                 && mark.until.is_some_and(|until| until <= feed.now)
             {
@@ -4402,6 +4404,15 @@ mod tests {
         assert_eq!(store.fed_until(&title).unwrap(), Some(5));
         publish_from_state(&store, unchanged(Some(&title), 9));
         assert_eq!(store.fed_until(&title).unwrap(), None);
+
+        // An answer that writes the fact again gives it its own time.
+        let mut written = fed_file(b"book", &title, "again");
+        let feed = written.feed.as_mut().unwrap();
+        feed.until = HashMap::from([(title.clone(), 9)]);
+        feed.lacked = Some(title.clone());
+        feed.now = 9;
+        publish_from_state(&store, written);
+        assert_eq!(store.fed_until(&title).unwrap(), Some(9));
 
         // A part that says that no inventory above its feed has its object
         // makes its feed unlisted, until a feed above it brings its state.
