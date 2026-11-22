@@ -30,6 +30,12 @@ pub(crate) enum FedFact {
 /// complete listing, or under one at or above that anchor, keeps the rules
 /// below. A feed with kept parts of a later answer continues that
 /// answer, whatever its deadline, outside the rate-limit window of the mount.
+/// Else, after the end of the first answer of a feed of full listings, only a
+/// listing of its anchor and a lookup of an entry of that listing, on a
+/// starting path of the feed, without its positive lookup take an answer,
+/// once the feed is past its deadline, outside the rate-limit window of the
+/// mount, with `due` and their path for an operation on a starting path of
+/// the feed, and each other operation is served from the projection.
 /// Else a read or a listing that starts that feed without its fact in the
 /// projection, and a lookup that starts it without its positive lookup before
 /// the end of the first answer of the feed, or below the anchor of an own
@@ -89,6 +95,11 @@ pub(crate) async fn answer_claims(
         let below_own = claim.own && path.segments().count() > claim.object.path.segments().count();
         let start = if kept {
             runtime.rate_limited_until().is_none().then_some(None)
+        } else if claim.full_listings && !first_answer {
+            (runtime.rate_limited_until().is_none()
+                && past_deadline(state.as_ref())
+                && asks_listing(runtime, path, fact, at, claim)?)
+            .then(|| claim.starts.then(|| FeedStart::Due(under_anchor.clone())))
         } else if claim.starts
             && (first_answer || below_own || !matches!(fact, FedFact::Lookup))
             && !has_fact(runtime, at, fact)?
@@ -162,6 +173,30 @@ async fn answer_own(
 /// Whether a feed has no state or is past its deadline.
 fn past_deadline(state: Option<&FeedState>) -> bool {
     state.is_none_or(|state| state.deadline <= now_millis())
+}
+
+/// Whether the operation on `path`, with its fact at `at`, asks the feed of
+/// full listings of `claim` after the end of its first answer: a listing of
+/// its anchor, or a lookup of an entry of that listing, on a starting path of
+/// the feed, without its positive lookup.
+fn asks_listing(
+    runtime: &Runtime,
+    path: &Path,
+    fact: FedFact,
+    at: &Path,
+    claim: &FeedClaim,
+) -> Result<bool> {
+    let anchor = &claim.object.path;
+    let under_anchor = under(anchor, path)?;
+    Ok(match fact {
+        FedFact::Listing => under_anchor == *anchor,
+        FedFact::Lookup => {
+            claim.starts
+                && under_anchor.parent().as_ref() == Some(anchor)
+                && !has_fact(runtime, at, FedFact::Lookup)?
+        },
+        FedFact::File => false,
+    })
 }
 
 /// The path of the fact of an operation on `path` in the projection, for

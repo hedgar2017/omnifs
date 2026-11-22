@@ -32,14 +32,18 @@ pub(crate) struct FeedObject {
 }
 
 /// A feed that answers for the path of an operation; `starts` marks an
-/// operation on one of its starting paths, and `own` an own feed, which the
+/// operation on one of its starting paths, `own` an own feed, which the
 /// operation asks for the facts of its own starting paths after the
-/// answering feed of an outer object.
+/// answering feed of an outer object, and `full_listings` a feed of full
+/// listings, which an operation asks after the end of its first answer only
+/// for a listing of its anchor and for a lookup of an entry of that listing,
+/// on a starting path, without its positive lookup.
 #[derive(Debug, Clone)]
 pub struct FeedClaim {
     pub(crate) object: FeedObject,
     pub(crate) starts: bool,
     pub(crate) own: bool,
+    pub(crate) full_listings: bool,
 }
 
 impl FeedClaim {
@@ -51,6 +55,7 @@ impl FeedClaim {
             },
             starts: claim.starts,
             own: claim.own,
+            full_listings: claim.full_listings,
         })
     }
 }

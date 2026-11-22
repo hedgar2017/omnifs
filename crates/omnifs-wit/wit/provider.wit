@@ -307,13 +307,17 @@ interface types {
     }
 
     /// A feed that answers for the path of an operation. `starts` marks an
-    /// operation on a starting path of the feed, and `own` a feed that the
+    /// operation on a starting path of the feed, `own` a feed that the
     /// operation asks for the facts of its own starting paths after the
-    /// answering feed of an outer object.
+    /// answering feed of an outer object, and `full-listings` a feed of full
+    /// listings, which an operation asks after the end of its first answer
+    /// only for a listing of its anchor and for a lookup of an entry of that
+    /// listing, on a starting path, without its positive lookup.
     record feed-claim {
         object: feed-object,
         starts: bool,
         %own: bool,
+        full-listings: bool,
     }
 
     /// The operation on a starting path of a feed that starts an answer:

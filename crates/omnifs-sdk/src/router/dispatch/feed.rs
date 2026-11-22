@@ -193,6 +193,7 @@ impl<S> Shape<'_, S> {
                     .map_err(|error| ProviderError::internal(error.to_string()))?,
                 starts: on_face && spec.starts,
                 own: feed.own,
+                full_listings: feed.full_listings,
             });
         }
         if claims.is_empty() {

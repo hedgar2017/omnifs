@@ -29,6 +29,13 @@
 //! only when the feed has no state or is past its deadline outside the
 //! rate-limit window of the mount.
 //!
+//! `o.feed(method).full_listings().starts([...])` makes a feed of full
+//! listings: after the end of its first answer, the host asks it past its
+//! deadline only for a listing of its anchor and for a lookup of an entry of
+//! that listing, on a starting path, without its positive lookup, and serves
+//! each other operation from the projection; the kept parts of a later
+//! answer continue as for each feed.
+//!
 //! The host calls the feed `method` once per part of an answer with a
 //! [`FeedCx`]: the anchor path and the key of the object, the token the feed
 //! returned last, the declared starting path an operation without its fact

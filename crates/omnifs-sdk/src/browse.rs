@@ -321,13 +321,15 @@ impl From<ListingWrite> for wit_types::ListingWrite {
 
 /// A feed that answers for the path of an operation on a fed face: the
 /// logical id and the anchor path of its object, whether the operation is on
-/// one of the feed's starting paths, and whether the feed is an own feed.
+/// one of the feed's starting paths, whether the feed is an own feed, and
+/// whether it is a feed of full listings.
 #[derive(Clone, Debug)]
 pub struct FeedClaim {
     pub(crate) id: LogicalId,
     pub(crate) path: Path,
     pub(crate) starts: bool,
     pub(crate) own: bool,
+    pub(crate) full_listings: bool,
 }
 
 impl From<FeedClaim> for wit_types::FeedClaim {
@@ -339,6 +341,7 @@ impl From<FeedClaim> for wit_types::FeedClaim {
             },
             starts: claim.starts,
             own: claim.own,
+            full_listings: claim.full_listings,
         }
     }
 }

@@ -75,11 +75,13 @@ pub(in crate::router) struct ObjectDefinition<O: Object> {
 }
 
 /// An object's feed: its boxed method, its starting paths, relative to the
-/// object (`""` for the anchor itself), and whether it is an own feed.
+/// object (`""` for the anchor itself), whether it is an own feed, and
+/// whether it is a feed of full listings.
 pub(in crate::router) struct FeedDeclaration<S> {
     pub handler: std::rc::Rc<crate::feed::FeedHandlerFn<S>>,
     pub starts: Vec<&'static str>,
     pub own: bool,
+    pub full_listings: bool,
 }
 
 impl<S> Clone for FeedDeclaration<S> {
@@ -88,6 +90,7 @@ impl<S> Clone for FeedDeclaration<S> {
             handler: self.handler.clone(),
             starts: self.starts.clone(),
             own: self.own,
+            full_listings: self.full_listings,
         }
     }
 }
@@ -295,6 +298,7 @@ impl<O: Object> ObjectBlock<O> {
             block: self,
             handler: crate::feed::feed_handler::<O, Fut>(method),
             own: false,
+            full_listings: false,
         }
     }
 
@@ -461,6 +465,7 @@ pub struct FeedFace<'a, O: Object> {
     block: &'a mut ObjectBlock<O>,
     handler: std::rc::Rc<crate::feed::FeedHandlerFn<O::State>>,
     own: bool,
+    full_listings: bool,
 }
 
 impl<'a, O: Object> FeedFace<'a, O> {
@@ -472,6 +477,17 @@ impl<'a, O: Object> FeedFace<'a, O> {
     #[must_use]
     pub fn own(mut self) -> Self {
         self.own = true;
+        self
+    }
+
+    /// A feed of full listings: after the end of its first answer, an
+    /// operation asks it past its deadline only for a listing of its anchor
+    /// and for a lookup of an entry of that listing, on a starting path,
+    /// without its positive lookup, and each other operation is served from
+    /// the projection (see [`crate::feed`]).
+    #[must_use]
+    pub fn full_listings(mut self) -> Self {
+        self.full_listings = true;
         self
     }
 
@@ -493,6 +509,7 @@ impl<'a, O: Object> FeedFace<'a, O> {
             handler: self.handler,
             starts: starts.into_iter().collect(),
             own: self.own,
+            full_listings: self.full_listings,
         });
         Ok(self.block)
     }
