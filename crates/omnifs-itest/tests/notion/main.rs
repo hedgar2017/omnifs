@@ -111,7 +111,8 @@ fn markdown_of(id: &str) -> String {
 /// search by `next_cursor`, with pages, rows, and data sources, taken at each
 /// answer; a `429` and a failure of the network in it give each read of
 /// `pages/` and `databases/` their error while the files that it took are
-/// served, and the next read continues from the next request; then each page
+/// served, and the next read after the window of the stop continues from the
+/// next request; then each page
 /// and data source of the projection that it lacks by its ID, with the
 /// removal for `404` and for `in_trash`, of a result of the search too.
 #[tokio::test(flavor = "multi_thread")]
@@ -176,6 +177,7 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
     assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
     expect_search(&requests[0], 100, Some("cursor-2"));
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "pages"),
@@ -230,7 +232,7 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
     )
     .unwrap();
     assert_eq!(schema, data_source(9, "Unsearched", EDITED));
-    for gone in [7, 8, 10] {
+    for gone in [7, 8] {
         assert!(
             served(&harness, lookup(&harness, &format!("pages/{}", id(gone))))
                 .await
@@ -239,6 +241,16 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
             "{gone}"
         );
     }
+    // The page that the first answer of the search removed is past the
+    // deadline of its feed after the window of the stop: its lookup takes
+    // its `GET`.
+    let in_trash = trashed(page(10, "Trashed in the search", EDITED));
+    assert!(
+        by_id(&harness, "pages", 10, ok(&in_trash))
+            .await
+            .unwrap()
+            .is_missing()
+    );
 }
 
 /// A full listing again at a read of `pages/` and of `databases/` past the
@@ -283,10 +295,8 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
         ],
     )
     .await;
-    assert!(
-        matches!(stopped, Err(NsError::RateLimited { .. })),
-        "{stopped:?}"
-    );
+    // The read of the rate limit is served what the projection has.
+    assert_eq!(stopped.unwrap(), names_of(&[1, 2]));
     expect_search(&requests[0], 100, None);
     expect_search(&requests[1], 100, Some("cursor-2"));
     // The kept part waits for the last part of its answer.
@@ -384,9 +394,9 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
 /// The changes at a read of a file of a page past the deadline of the last
 /// answer: the `page_size` of the count of the latest time and one more, then
 /// `100` by `next_cursor`, until an older result, from their next request
-/// after a failure; a page with another `last_edited_time` takes its `body.md`
-/// and its `comments/` once more at their next first read, and a page in the
-/// trash is removed.
+/// after the window of a failure, whose read is served; a page with another
+/// `last_edited_time` takes its `body.md` and its `comments/` once more at
+/// their next first read, and a page in the trash is removed.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_changes_take_the_search_until_an_older_result() {
@@ -416,19 +426,24 @@ async fn the_changes_take_the_search_until_an_older_result() {
     .await;
     assert_eq!(comments.unwrap(), names_of(&[11]));
     expect(&requests[0], "GET", &comments_of(1, None), None);
-    // A content and comments stopped after their first parts: each read takes
-    // what it asks for, from the next request of its own.
+    // A content and comments stopped after their first parts: each read
+    // after the window of a stop takes what it asks for, from the next
+    // request of its own.
     let body = format!("pages/{}/body.md", id(3));
     let comments = format!("pages/{}/comments", id(3));
     let (stopped, requests) = answering(
         &harness,
         read(&harness, &body),
-        vec![ok(&markdown("Three body", &[31])), network()],
+        vec![ok(&markdown("Three body", &[31])), rate_limited()],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert!(
+        matches!(stopped, Err(NsError::RateLimited { .. })),
+        "{stopped:?}"
+    );
     expect(&requests[0], "GET", &markdown_of(&id(3)), None);
     expect(&requests[1], "GET", &markdown_of(&id(31)), None);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     let (stopped, requests) = answering(
         &harness,
         names(&harness, &comments),
@@ -437,13 +452,17 @@ async fn the_changes_take_the_search_until_an_older_result() {
                 &[comment(33, Some("Ada"), "First")],
                 Some("cursor-2"),
             )),
-            network(),
+            rate_limited(),
         ],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert!(
+        matches!(stopped, Err(NsError::RateLimited { .. })),
+        "{stopped:?}"
+    );
     expect(&requests[0], "GET", &comments_of(3, None), None);
     expect(&requests[1], "GET", &comments_of(3, Some("cursor-2")), None);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     let (read_body, requests) = answering(
         &harness,
         read(&harness, &body),
@@ -493,9 +512,11 @@ async fn the_changes_take_the_search_until_an_older_result() {
         ],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    // The read of the failure is served what the projection has.
+    assert_eq!(stopped.unwrap(), "Two");
     expect_search(&requests[0], 3, None);
     expect_search(&requests[1], 100, Some("cursor-2"));
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (title, requests) = answering(
         &harness,
         read(&harness, &format!("pages/{}/title", id(2))),
@@ -818,7 +839,9 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
         ],
     )
     .await;
-    assert_eq!(body.unwrap(), "Page 4 body, edited in its minute");
+    // The read gives the content whose size its lookup told, and the next
+    // one, after its lookup, the content that it took.
+    assert_eq!(body.unwrap(), "Page 4 body");
     expect(&requests[0], "GET", &format!("/v1/pages/{}", id(4)), None);
     expect(&requests[1], "GET", &markdown_of(&id(4)), None);
     assert_eq!(
@@ -1060,9 +1083,23 @@ async fn the_comments_take_their_answers_by_next_cursor() {
         ],
     )
     .await;
-    assert_eq!(body.unwrap(), "Second, edited");
+    // The read gives the body whose size the lookup before told, and the
+    // next one, after its lookup, the body that it took.
+    assert_eq!(body.unwrap(), "Second");
     expect(&requests[0], "GET", &format!("/v1/pages/{}", id(1)), None);
     expect(&requests[1], "GET", &comments_of(1, None), None);
+    assert_eq!(
+        served(
+            &harness,
+            read(
+                &harness,
+                &format!("pages/{}/comments/{}/body.md", id(1), id(13))
+            )
+        )
+        .await
+        .unwrap(),
+        "Second, edited"
+    );
     assert_eq!(
         served(
             &harness,
