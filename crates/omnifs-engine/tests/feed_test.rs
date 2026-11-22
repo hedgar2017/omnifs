@@ -444,6 +444,10 @@ async fn an_answer_that_writes_a_file_as_it_was_changes_nothing_for_a_filesystem
         assert!(
             !matches!(&event, omnifs_engine::NsEvent::AttrsChanged { path, .. } if *path == title),
             "{event:?}"
+        );
+    }
+}
+
 // The tests below take the shared helpers of a provider test, by the path
 // of a node from the root of the namespace.
 use omnifs_itest::support;
