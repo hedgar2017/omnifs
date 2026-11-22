@@ -12,8 +12,7 @@ use omnifs_wit::host::types::{
     PageValidator, ReadFileOutcome, Stability,
 };
 use support::{
-    TestOpExt, fetched, github_harness, http, not_modified, project_file_stability, project_paths,
-    request_header, resolve_namespace,
+    TestOpExt, fetched, github_harness, http, not_modified, request_header, resolve_namespace,
 };
 
 #[test]
@@ -37,7 +36,7 @@ fn github_provider_routes_namespace_and_numeric_paths() {
     let harness = github_harness();
     // listing a repo dir triggers repo_gate, which fetches /repos/{owner}/{repo}
     // to gate existence. Stub a 200 to confirm the repo exists, then the router
-    // merges the literal children (repo/issues/pulls/actions).
+    // merges the literal children (repo/issues/pulls).
     let mut repo_listing = harness.list("/octocat/Hello-World").unwrap();
     let gate_fetch = repo_listing.expect_single_fetch();
     assert!(
@@ -61,199 +60,9 @@ fn github_provider_routes_namespace_and_numeric_paths() {
                 .map(|entry| entry.name.as_str())
                 .collect();
             names.sort_unstable();
-            assert_eq!(
-                names,
-                vec!["actions", "issues", "pulls", "repo", "repo.json"]
-            );
+            assert_eq!(names, vec!["issues", "pulls", "repo", "repo.json"]);
         },
         other => panic!("expected repo namespace listing, got {other:?}"),
-    }
-    // lookup of `runs` under `actions` is structural (no fetch). The path
-    // `actions/runs` is an implicit prefix dir because dir routes extend under it.
-    let runs_lookup = harness
-        .lookup("/octocat/Hello-World/actions", "runs")
-        .unwrap();
-    match runs_lookup.result().unwrap() {
-        Ok(LookupChildResult::Entry(result)) => {
-            assert_eq!(result.target.name, "runs");
-            assert!(
-                matches!(result.target.kind, EntryKind::Directory),
-                "runs should resolve as directory"
-            );
-        },
-        other => panic!("expected structural runs dir lookup, got {other:?}"),
-    }
-
-    // Listing `runs` DOES fetch from GitHub.
-    let mut runs_listed = harness.list("/octocat/Hello-World/actions/runs").unwrap();
-    let runs_fetch = runs_listed.expect_single_fetch();
-    assert!(
-        runs_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/actions/runs?per_page=30&page=1"),
-        "unexpected action runs listing URL: {}",
-        runs_fetch.url
-    );
-
-    runs_listed
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""page-1""#)],
-            body: br#"{
-                "workflow_runs": [
-                    {"id":123,"status":"completed","conclusion":"success"}
-                ]
-            }"#
-            .to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match runs_listed.result().unwrap() {
-        Ok(ListChildrenResult::Entries(listing)) => {
-            let names: Vec<&str> = listing
-                .entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect();
-            assert_eq!(names, vec!["123"]);
-        },
-        other => panic!("expected runs listing, got {other:?}"),
-    }
-}
-
-#[test]
-fn github_action_run_list_projects_files() {
-    use omnifs_wit::host::types::{Callout, CalloutResult, HttpResponse};
-
-    let harness = github_harness();
-    let mut response = harness.list("/octocat/Hello-World/actions/runs").unwrap();
-    assert!(
-        response.is_waiting_for_callouts(),
-        "expected callout wait, got {response:?}"
-    );
-    let [Callout::Fetch(fetch)] = response.callouts() else {
-        panic!("expected fetch callout, got {:?}", response.callouts());
-    };
-    assert!(
-        fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/actions/runs?per_page=30&page=1"),
-        "unexpected action runs URL: {}",
-        fetch.url
-    );
-
-    response
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""page-1""#)],
-            body: br#"{
-                "workflow_runs":[
-                    {
-                        "id":123,
-                        "status":"completed",
-                        "conclusion":"success"
-                    }
-                ]
-            }"#
-            .to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-
-    assert!(
-        response.callouts().is_empty(),
-        "list terminal should carry no callouts, got {:?}",
-        response.callouts()
-    );
-    match response.result().unwrap() {
-        Ok(ListChildrenResult::Entries(listing)) => {
-            // Each row of the list is the canonical bytes of its run, from
-            // which its files render without a request.
-            let effects = response.effects().unwrap();
-            assert_eq!(canonical_bytes(effects).len(), 1);
-            assert!(
-                std::str::from_utf8(canonical_bytes(effects)[0])
-                    .unwrap()
-                    .contains(r#""id":123"#)
-            );
-            let names: Vec<&str> = listing
-                .entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect();
-            assert_eq!(names, vec!["123"]);
-        },
-        other => panic!("expected action run listing terminal, got {other:?}"),
-    }
-}
-
-#[test]
-fn github_provider_action_run_lookup_validates_and_listing_validates() {
-    use omnifs_wit::host::types::{CalloutResult, Header, HttpResponse};
-
-    let harness = github_harness();
-    // lookup_child on a run id is structural (no fetch). The run id path is
-    // an implicit literal-prefix dir (because `/{run_id}/log` is a registered
-    // file route under it), so it resolves immediately as a directory.
-    let lookup = harness
-        .lookup("/octocat/Hello-World/actions/runs", "123")
-        .unwrap();
-    match lookup.result().unwrap() {
-        Ok(LookupChildResult::Entry(result)) => {
-            let entry = &result.target;
-            assert_eq!(entry.name, "123");
-            assert!(matches!(entry.kind, EntryKind::Directory));
-        },
-        other => panic!("expected structural run dir lookup, got {other:?}"),
-    }
-
-    // Listing the run dir DOES fetch the run to resolve status/conclusion.
-    let mut issued = harness
-        .list("/octocat/Hello-World/actions/runs/123")
-        .unwrap();
-    assert!(
-        issued.is_waiting_for_callouts(),
-        "expected action run listing to dispatch validation, got {issued:?}"
-    );
-
-    issued
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: Vec::<Header>::new(),
-            body: br#"{"id":123,"status":"completed","conclusion":"success"}"#.to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-
-    match issued.result().unwrap() {
-        Ok(ListChildrenResult::Entries(result)) => {
-            let names: Vec<&str> = result
-                .entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect();
-            assert!(names.contains(&"status"), "missing status in {names:?}");
-            assert!(
-                names.contains(&"conclusion"),
-                "missing conclusion in {names:?}"
-            );
-            assert!(names.contains(&"logs.zip"), "missing logs.zip in {names:?}");
-            assert!(
-                !names.contains(&"comments"),
-                "unexpected item comments route leaked into action run listing: {names:?}"
-            );
-            // status and conclusion are preloaded via preload_file on the dir listing.
-            let preloaded = project_paths(issued.effects().unwrap());
-            assert!(
-                preloaded.contains(&"/octocat/Hello-World/actions/runs/123/status"),
-                "missing status preload in {preloaded:?}"
-            );
-            assert!(
-                preloaded.contains(&"/octocat/Hello-World/actions/runs/123/conclusion"),
-                "missing conclusion preload in {preloaded:?}"
-            );
-        },
-        other => panic!("expected list entries(123) after 200, got {other:?}"),
     }
 }
 
@@ -344,10 +153,13 @@ fn github_owner_listing_tracks_browsed_repos() {
     owner_listing
         .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
             status: 200,
-            headers: vec![Header {
-                name: "ETag".to_string(),
-                value: r#""repos-1""#.to_string(),
-            }],
+            headers: vec![
+                header("ETag", r#""repos-1""#),
+                header(
+                    "Link",
+                    r#"<https://api.github.com/user/1/repos?page=2>; rel="next""#,
+                ),
+            ],
             body: format!("[{repo_page}]").into_bytes(),
             redirected: None,
         })])
@@ -475,18 +287,22 @@ fn github_owner_listing_tracks_browsed_repos() {
                 name: "ETag".to_string(),
                 value: r#""repos-page-2""#.to_string(),
             }],
-            body: br#"[{"name":"z-last"}]"#.to_vec(),
+            body: format!(
+                "[{}]",
+                (0..100)
+                    .map(|index| format!(r#"{{"name":"z-{index:03}"}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .into_bytes(),
             redirected: None,
         })])
         .unwrap();
+    // A full page without the link `next` of a page after it is the last.
     match page_two.result().unwrap() {
         Ok(ListChildrenResult::Entries(listing)) => {
-            let names: Vec<&str> = listing
-                .entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect();
-            assert_eq!(names, ["z-last"]);
+            assert_eq!(listing.entries.len(), 100);
+            assert!(listing.next_cursor.is_none(), "{:?}", listing.next_cursor);
         },
         other => panic!("expected the second owner page, got {other:?}"),
     }
@@ -711,7 +527,6 @@ fn github_pr_lookup_is_fed_and_exposes_diff() {
                 names,
                 vec![
                     "body",
-                    "checks",
                     "comments",
                     "diff.patch",
                     "files",
@@ -1042,234 +857,6 @@ fn github_pr_reviews_and_review_comments_list_and_read_objects() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
-    use omnifs_wit::host::types::{CalloutResult, HttpResponse};
-
-    let harness = github_harness();
-    let mut checks = harness
-        .list("/octocat/Hello-World/pulls/open/7/checks")
-        .unwrap();
-    let pull_fetch = checks.expect_single_fetch();
-    assert!(
-        pull_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/pulls/7"),
-        "unexpected PR head URL: {}",
-        pull_fetch.url
-    );
-    checks
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""pull-1""#)],
-            body: br#"{"base":{"sha":"base123"},"head":{"sha":"abc123"}}"#.to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    let check_fetch = checks.expect_single_fetch();
-    assert!(
-        check_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/commits/abc123/check-runs?per_page=100&page=1"),
-        "unexpected check runs URL: {}",
-        check_fetch.url
-    );
-    let first_page = (700..800)
-        .map(|id| {
-            let output = if id == 700 {
-                r#"{"title":"CI","summary":"All green","text":null}"#
-            } else {
-                r#"{"title":null,"summary":null,"text":null}"#
-            };
-            format!(
-                r#"{{
-                    "id":{id},
-                    "name":"ci-{id}",
-                    "status":"completed",
-                    "conclusion":"success",
-                    "output":{output}
-                }}"#
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    checks
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""runs-1""#)],
-            body: format!(r#"{{"check_runs":[{first_page}]}}"#).into_bytes(),
-            redirected: None,
-        })])
-        .unwrap();
-    // The first page's validator carries the ETag and the head SHA of the pull
-    // request, so the page asked for again makes conditional requests alone.
-    let validator = r#"{"pull":{"etag":"\"pull-1\"","sha":"abc123"},"runs":"\"runs-1\""}"#;
-    match checks.result().unwrap() {
-        Ok(ListChildrenResult::Entries(listing)) => {
-            let names: Vec<&str> = listing
-                .entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect();
-            assert_eq!(names.len(), 100);
-            assert!(names.contains(&"700"));
-            assert!(matches!(
-                listing.next_cursor,
-                Some(Cursor::Opaque(ref cursor))
-                    if cursor == r#"{"sha":"abc123","page":2}"#
-            ));
-            assert_eq!(
-                canonical_bytes(checks.effects().unwrap()).len(),
-                100,
-                "the row of a check run is its canonical bytes"
-            );
-            assert_eq!(
-                listing
-                    .validator
-                    .as_ref()
-                    .map(|validator| validator.token.as_str()),
-                Some(validator)
-            );
-        },
-        other => panic!("expected check runs listing, got {other:?}"),
-    }
-
-    let mut first_again = harness
-        .list_page(
-            "/octocat/Hello-World/pulls/open/7/checks",
-            None,
-            Some(validator),
-        )
-        .unwrap();
-    let pull_again = first_again.expect_single_fetch();
-    assert_eq!(
-        request_header(pull_again, "if-none-match"),
-        Some(r#""pull-1""#)
-    );
-    first_again
-        .answer_callouts(vec![CalloutResult::HttpResponse(not_modified())])
-        .unwrap();
-    let runs_again = first_again.expect_single_fetch();
-    assert!(
-        runs_again
-            .url
-            .ends_with("/repos/octocat/Hello-World/commits/abc123/check-runs?per_page=100&page=1")
-    );
-    assert_eq!(
-        request_header(runs_again, "if-none-match"),
-        Some(r#""runs-1""#)
-    );
-    first_again
-        .answer_callouts(vec![CalloutResult::HttpResponse(not_modified())])
-        .unwrap();
-    assert!(matches!(
-        first_again.result().unwrap(),
-        Ok(ListChildrenResult::Unchanged(Some(PageValidator { token, interval: None })))
-            if token == validator
-    ));
-
-    // A changed pull request with the same head asks for its check runs with
-    // their `ETag`, and their `304` keeps the page with the new `ETag` of the
-    // pull request.
-    let mut changed_pull = harness
-        .list_page(
-            "/octocat/Hello-World/pulls/open/7/checks",
-            None,
-            Some(validator),
-        )
-        .unwrap();
-    changed_pull
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""pull-2""#)],
-            body: br#"{"base":{"sha":"base123"},"head":{"sha":"abc123"}}"#.to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    assert_eq!(
-        request_header(changed_pull.expect_single_fetch(), "if-none-match"),
-        Some(r#""runs-1""#)
-    );
-    changed_pull
-        .answer_callouts(vec![CalloutResult::HttpResponse(not_modified())])
-        .unwrap();
-    assert!(matches!(
-        changed_pull.result().unwrap(),
-        Ok(ListChildrenResult::Unchanged(Some(PageValidator { token, interval: None })))
-            if token == r#"{"pull":{"etag":"\"pull-2\"","sha":"abc123"},"runs":"\"runs-1\""}"#
-    ));
-
-    let cursor = r#"{"sha":"abc123","page":2}"#.to_string();
-    let mut page_two = harness
-        .list_page(
-            "/octocat/Hello-World/pulls/open/7/checks",
-            Some(&Cursor::Opaque(cursor)),
-            None,
-        )
-        .unwrap();
-    let continuation_fetch = page_two.expect_single_fetch();
-    assert!(
-        continuation_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/commits/abc123/check-runs?per_page=100&page=2"),
-        "continuation must reuse the captured head without refetching the pull: {}",
-        continuation_fetch.url
-    );
-    page_two
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""page-1""#)],
-            body: br#"{"check_runs":[]}"#.to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match page_two.result().unwrap() {
-        Ok(ListChildrenResult::Entries(listing)) => {
-            assert!(listing.entries.is_empty());
-            assert!(listing.exhaustive);
-            assert!(listing.next_cursor.is_none());
-        },
-        other => panic!("expected completed check continuation, got {other:?}"),
-    }
-
-    let mut check_md = harness
-        .read("/octocat/Hello-World/pulls/open/7/checks/700/check.md")
-        .unwrap();
-    let read_fetch = check_md.expect_single_fetch();
-    assert!(
-        read_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/check-runs/700"),
-        "unexpected check run read URL: {}",
-        read_fetch.url
-    );
-    check_md
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: br#"{
-                "id":700,
-                "name":"ci",
-                "status":"completed",
-                "conclusion":"success",
-                "html_url":"https://github.com/octocat/Hello-World/runs/700",
-                "output":{"title":"CI","summary":"All green"}
-            }"#
-            .to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match check_md.result().unwrap() {
-        Ok(ReadFileOutcome::Found(file)) => {
-            let body = std::str::from_utf8(omnifs_itest::expect_inline(file)).unwrap();
-            assert!(body.contains("# ci"), "unexpected check.md: {body}");
-            assert!(body.contains("All green"), "unexpected check.md: {body}");
-        },
-        other => panic!("expected check run markdown read, got {other:?}"),
-    }
-}
-
-#[test]
 fn github_notifications_list_and_read_thread_objects() {
     use omnifs_wit::host::types::{CalloutResult, HttpResponse};
 
@@ -1354,91 +941,6 @@ fn github_notifications_list_and_read_thread_objects() {
 }
 
 #[test]
-fn github_projected_resource_reads_return_all_fetched_siblings() {
-    // per-field files (title, body, state, user, status, conclusion) are
-    // descoped; sibling preloads happen at listing time via run_dir and runs_list.
-    //
-    // This test verifies that listing a specific run directory fetches the run
-    // and preloads its status and conclusion alongside the listing (so the host
-    // can cache them without a second round-trip).
-    use omnifs_wit::host::types::{CalloutResult, HttpResponse};
-
-    let harness = github_harness();
-
-    // list_children on a run dir fetches the run and preloads status/conclusion.
-    let mut run_listed = harness
-        .list("/octocat/Hello-World/actions/runs/123")
-        .unwrap();
-    let run_fetch = run_listed.expect_single_fetch();
-    assert!(
-        run_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/actions/runs/123"),
-        "unexpected action run dir URL: {}",
-        run_fetch.url
-    );
-
-    run_listed
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: br#"{"id":123,"status":"completed","conclusion":"success"}"#.to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match run_listed.result().unwrap() {
-        Ok(ListChildrenResult::Entries(_)) => {
-            let effects = run_listed.effects().unwrap();
-            let preloaded = project_paths(effects);
-            assert!(
-                preloaded.contains(&"/octocat/Hello-World/actions/runs/123/status"),
-                "missing status preload in {preloaded:?}"
-            );
-            assert!(
-                preloaded.contains(&"/octocat/Hello-World/actions/runs/123/conclusion"),
-                "missing conclusion preload in {preloaded:?}"
-            );
-            assert_eq!(
-                project_file_stability(effects, "/octocat/Hello-World/actions/runs/123/conclusion"),
-                Some(Stability::Dynamic),
-                "conclusion should be Dynamic"
-            );
-        },
-        other => panic!("expected run dir listing with preloads, got {other:?}"),
-    }
-
-    // list_children on the runs directory also preloads at the full mount-relative path.
-    let mut index_listed = harness.list("/octocat/Hello-World/actions/runs").unwrap();
-    let index_fetch = index_listed.expect_single_fetch();
-    assert!(
-        index_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/actions/runs?per_page=30&page=1"),
-        "unexpected runs listing URL: {}",
-        index_fetch.url
-    );
-
-    index_listed
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""page-1""#)],
-            body: br#"{"workflow_runs":[{"id":42,"status":"in_progress","conclusion":null}]}"#
-                .to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match index_listed.result().unwrap() {
-        Ok(ListChildrenResult::Entries(_)) => {
-            assert_eq!(
-                canonical_bytes(index_listed.effects().unwrap()),
-                [br#"{"id":42,"status":"in_progress","conclusion":null}"#.as_slice()]
-            );
-        },
-        other => panic!("expected runs listing with its canonical rows, got {other:?}"),
-    }
-}
-
-#[test]
 #[allow(clippy::too_many_lines)]
 fn github_provider_resource_reads_do_not_fall_back_to_provider_cache() {
     use omnifs_wit::host::types::{CalloutError, CalloutResult, ErrorKind, Header, HttpResponse};
@@ -1458,35 +960,19 @@ fn github_provider_resource_reads_do_not_fall_back_to_provider_cache() {
     // Object field files are covered by item-specific tests. These structural
     // file routes must still work from a cold read path without relying on a
     // previous directory listing to preload content into the host cache.
-    let cases = [
-        Case {
-            // A comment is a `{comment_id}` object dir; `comment.md` renders the
-            // standalone comment GET. Reading it fetches the comment from
-            // upstream rather than serving a provider-side cache.
-            name: "issue comment",
-            path: "/octocat/Hello-World/issues/open/1/comments/1/comment.md",
-            ok_headers: vec![Header {
-                name: "etag".to_string(),
-                value: "\"comment-1\"".to_string(),
-            }],
-            ok_body: br#"{"id":1,"user":{"login":"octocat"},"body":"A comment"}"#,
-            expected_content: b"octocat:\nA comment\n",
-        },
-        Case {
-            name: "action status",
-            path: "/octocat/Hello-World/actions/runs/99/status",
-            ok_headers: Vec::new(),
-            ok_body: br#"{"id":99,"status":"completed","conclusion":"success"}"#,
-            expected_content: b"completed",
-        },
-        Case {
-            name: "action conclusion",
-            path: "/octocat/Hello-World/actions/runs/99/conclusion",
-            ok_headers: Vec::new(),
-            ok_body: br#"{"id":99,"status":"completed","conclusion":"success"}"#,
-            expected_content: b"success",
-        },
-    ];
+    let cases = [Case {
+        // A comment is a `{comment_id}` object dir; `comment.md` renders the
+        // standalone comment GET. Reading it fetches the comment from
+        // upstream rather than serving a provider-side cache.
+        name: "issue comment",
+        path: "/octocat/Hello-World/issues/open/1/comments/1/comment.md",
+        ok_headers: vec![Header {
+            name: "etag".to_string(),
+            value: "\"comment-1\"".to_string(),
+        }],
+        ok_body: br#"{"id":1,"user":{"login":"octocat"},"body":"A comment"}"#,
+        expected_content: b"octocat:\nA comment\n",
+    }];
 
     let harness = github_harness();
     for case in &cases {
@@ -1545,70 +1031,6 @@ fn github_provider_resource_reads_do_not_fall_back_to_provider_cache() {
                 case.name
             ),
         }
-    }
-}
-
-/// `actions/runs/{id}/logs.zip` is the archive of the logs of the run as a
-/// blob that the host holds, so that no size bounds it: its fetch follows the
-/// redirect of GitHub to the storage of the archive, and a status that is no
-/// success is the error of the read.
-#[test]
-fn github_action_logs_are_the_archive_that_the_host_holds() {
-    use omnifs_wit::host::types::{BlobContent, BlobFetched, ByteSource, Callout, ErrorKind};
-
-    const LOGS: &str = "/octocat/Hello-World/actions/runs/99/logs.zip";
-    let harness = github_harness();
-    let fetch = |status: u16, content: Option<BlobContent>| {
-        let mut read = harness.read(LOGS).unwrap();
-        let [Callout::FetchBlob(request)] = read.callouts() else {
-            panic!(
-                "expected the blob fetch of the logs, got {:?}",
-                read.callouts()
-            );
-        };
-        assert!(
-            request
-                .url
-                .ends_with("/repos/octocat/Hello-World/actions/runs/99/logs"),
-            "unexpected logs URL: {}",
-            request.url
-        );
-        assert!(request.follow_redirects);
-        assert_eq!(request.version, None);
-        read.answer_callouts(vec![CalloutResult::BlobFetched(BlobFetched {
-            status,
-            response_headers: Vec::new(),
-            redirected: Some("https://storage.example/logs.zip".to_string()),
-            upstream: true,
-            content,
-        })])
-        .unwrap();
-        read.into_ok()
-    };
-    match fetch(
-        200,
-        Some(BlobContent {
-            blob: 9,
-            size: 4_096,
-        }),
-    )
-    .unwrap()
-    {
-        ReadFileOutcome::Found(file) => {
-            assert!(
-                matches!(file.bytes, ByteSource::Blob(9)),
-                "{:?}",
-                file.bytes
-            );
-            assert_eq!(file.attrs.stability, Stability::Dynamic);
-        },
-        other => panic!("expected the archive, got {other:?}"),
-    }
-    match fetch(410, None) {
-        Err(omnifs_engine::EngineError::ProviderError(error)) => {
-            assert_eq!(error.kind, ErrorKind::InvalidInput);
-        },
-        other => panic!("expected the error of a gone archive, got {other:?}"),
     }
 }
 
@@ -1860,51 +1282,18 @@ fn github_owner_listing_asks_for_the_profile_once_and_the_repos_of_an_organizati
 }
 
 #[test]
-fn github_provider_polls_events_and_invalidates_caches() {
-    // State is empty and timer ticks are no-ops. This test verifies both the
-    // comment read path and the absence of timer callouts or invalidations.
-    let harness = github_harness();
-    // Read a comment object face: a `{comment_id}` dir's `comment.json` loads the
-    // standalone comment GET.
-    let comment_path = "/octocat/Hello-World/issues/open/1/comments/1/comment.json";
-
-    let mut issue_cached = harness.read(comment_path).unwrap();
-    let issue_fetch = issue_cached.expect_single_fetch();
-    assert!(
-        issue_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/issues/comments/1"),
-        "unexpected comment fetch URL: {}",
-        issue_fetch.url
-    );
-    issue_cached
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![Header {
-                name: "etag".to_string(),
-                value: "\"comment-1\"".to_string(),
-            }],
-            body: br#"{"id":1,"user":{"login":"octocat"},"body":"A comment"}"#.to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match issue_cached.result().unwrap() {
-        Ok(_) => {},
-        other => panic!("expected comment ReadFile result, got {other:?}"),
-    }
-}
-
-#[test]
 fn github_provider_list_routes_preserve_typed_http_errors() {
     use omnifs_wit::host::types::{CalloutResult, ErrorKind, Header, HttpResponse};
 
     let harness = github_harness();
-    let mut op = harness.list("/octocat/Hello-World/actions/runs").unwrap();
+    let mut op = harness
+        .list("/octocat/Hello-World/pulls/open/7/files")
+        .unwrap();
     let fetch = op.expect_single_fetch();
     assert!(
         fetch
             .url
-            .ends_with("/repos/octocat/Hello-World/actions/runs?per_page=30&page=1"),
+            .ends_with("/repos/octocat/Hello-World/pulls/7/files?per_page=100&page=1"),
         "unexpected URL {}",
         fetch.url
     );
@@ -2018,98 +1407,25 @@ fn entry_names(page: &omnifs_engine::DirPage) -> Vec<&str> {
         .collect()
 }
 
-/// A page of `actions/runs/` with the `ETag` of its answer serves from cache
-/// outside a sync, and is asked for again with `If-None-Match` in a sync;
-/// `304` keeps it, a
-/// rate limit is the error of the listing, and a read in the window of the
-/// rate limit takes the cached entries without a request.
-#[tokio::test(flavor = "multi_thread")]
-async fn github_action_runs_page_is_asked_again_with_its_etag_in_a_sync() {
-    let harness = github_harness();
-    let runs = resolve_namespace(
-        harness.namespace.as_ref(),
-        "/github/octocat/Hello-World/actions/runs",
-    )
-    .await;
-    let readdir = || {
-        harness
-            .namespace
-            .readdir(runs.path.clone(), omnifs_engine::DirCursor::start(), 0)
-    };
-
-    let (first, requests) = answering(
-        &harness,
-        readdir(),
-        [fetched(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""runs-1""#)],
-            body: br#"{"workflow_runs":[{"id":123,"status":"completed","conclusion":"success"}]}"#
-                .to_vec(),
-            redirected: None,
-        })],
-    )
-    .await;
-    assert_eq!(entry_names(&first.unwrap()), ["123"]);
-    assert!(
-        http(&requests[0])
-            .url
-            .ends_with("/actions/runs?per_page=30&page=1")
-    );
-    assert_eq!(request_header(http(&requests[0]), "if-none-match"), None);
-
-    let (cached, requests) = answering(&harness, readdir(), []).await;
-    assert_eq!(entry_names(&cached.unwrap()), ["123"]);
-    assert!(requests.is_empty(), "the page serves outside a sync");
-
-    harness.begin_sync();
-    let (kept, requests) = answering(&harness, readdir(), [fetched(not_modified())]).await;
-    assert_eq!(entry_names(&kept.unwrap()), ["123"]);
-    assert_eq!(
-        request_header(http(&requests[0]), "if-none-match"),
-        Some(r#""runs-1""#)
-    );
-
-    harness.begin_sync();
-    let (limited, _) = answering(
-        &harness,
-        readdir(),
-        [fetched(HttpResponse {
-            status: 429,
-            headers: vec![header("Retry-After", "60")],
-            body: br#"{"message":"API rate limit exceeded"}"#.to_vec(),
-            redirected: None,
-        })],
-    )
-    .await;
-    assert!(matches!(
-        limited,
-        Err(omnifs_engine::NsError::RateLimited { .. })
-    ));
-
-    let (windowed, requests) = answering(&harness, readdir(), []).await;
-    assert_eq!(entry_names(&windowed.unwrap()), ["123"]);
-    assert!(
-        requests.is_empty(),
-        "a read in the window of the rate limit asks GitHub nothing"
-    );
-}
-
 /// A page answer without an `ETag` has no validator to be asked for again
 /// with, and `notifications/` takes the seconds of `X-Poll-Interval` only as
 /// a number: each is an error of the listing.
 #[test]
 fn github_page_answers_without_an_etag_or_with_another_poll_interval_fail() {
     let harness = github_harness();
-    let mut runs = harness.list("/octocat/Hello-World/actions/runs").unwrap();
-    runs.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-        status: 200,
-        headers: Vec::new(),
-        body: br#"{"workflow_runs":[]}"#.to_vec(),
-        redirected: None,
-    })])
-    .unwrap();
+    let mut files = harness
+        .list("/octocat/Hello-World/pulls/open/7/files")
+        .unwrap();
+    files
+        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"[]".to_vec(),
+            redirected: None,
+        })])
+        .unwrap();
     assert!(matches!(
-        runs.result().unwrap(),
+        files.result().unwrap(),
         Err(error) if error.message.contains("without an ETag")
     ));
 
@@ -2327,8 +1643,8 @@ async fn github_pr_review_comments_page_is_asked_again_with_its_etag_in_a_sync()
 }
 
 /// The files of an entry of a listing render from the row that the listing
-/// brought, without a request of their own: the files, the reviews, and the
-/// check runs of a pull request, and the workflow runs of a repository.
+/// brought, without a request of their own: the files and the reviews of a
+/// pull request.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_files_of_a_listed_entry_render_from_its_row_without_a_request() {
     use omnifs_itest::support::{names, read, served};
@@ -2346,8 +1662,6 @@ async fn the_files_of_a_listed_entry_render_from_its_row_without_a_request() {
     let file =
         r#"{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"changes":2}"#;
     let review = r#"{"id":80,"state":"APPROVED","body":"ok","user":{"login":"reviewer"}}"#;
-    let check = r#"{"id":700,"name":"ci","status":"completed","conclusion":"success","output":{"title":null,"summary":null,"text":null}}"#;
-    let run = r#"{"id":123,"status":"completed","conclusion":"success"}"#;
     let (listing, _) = answering(
         &harness,
         names(&harness, &format!("{pull}/files")),
@@ -2362,39 +1676,11 @@ async fn the_files_of_a_listed_entry_render_from_its_row_without_a_request() {
     )
     .await;
     assert_eq!(listing.unwrap(), ["80"]);
-    let (listing, _) = answering(
-        &harness,
-        names(&harness, &format!("{pull}/checks")),
-        [
-            page(r#"{"base":{"sha":"base1"},"head":{"sha":"abc123"}}"#),
-            page(&format!(r#"{{"check_runs":[{check}]}}"#)),
-        ],
-    )
-    .await;
-    assert_eq!(listing.unwrap(), ["700"]);
-    let (listing, _) = answering(
-        &harness,
-        names(&harness, "/github/octocat/Hello-World/actions/runs"),
-        [page(&format!(r#"{{"workflow_runs":[{run}]}}"#))],
-    )
-    .await;
-    assert_eq!(listing.unwrap(), ["123"]);
-
     for (path, expected) in [
         (format!("{pull}/files/src%2Flib.rs/status"), "modified"),
         (format!("{pull}/files/src%2Flib.rs/file.json"), file),
         (format!("{pull}/reviews/80/state"), "APPROVED"),
         (format!("{pull}/reviews/80/review.json"), review),
-        (format!("{pull}/checks/700/name"), "ci"),
-        (format!("{pull}/checks/700/check.json"), check),
-        (
-            "/github/octocat/Hello-World/actions/runs/123/conclusion".to_owned(),
-            "success",
-        ),
-        (
-            "/github/octocat/Hello-World/actions/runs/123/run.json".to_owned(),
-            run,
-        ),
     ] {
         assert_eq!(
             served(&harness, read(&harness, &path)).await.unwrap(),
@@ -2437,4 +1723,95 @@ fn an_object_that_moved_is_not_at_its_path() {
             "{path}"
         );
     }
+}
+
+/// The load of a changed file of a pull request takes the pages of its
+/// files by their link `next` until the file, however many pages that is.
+#[test]
+fn a_changed_file_loads_from_the_pages_of_the_files_by_their_link_next() {
+    use omnifs_wit::host::types::{CalloutResult, HttpResponse, ReadFileOutcome};
+
+    let harness = github_harness();
+    let mut read = harness
+        .read("/octocat/Hello-World/pulls/all/7/files/src%2Flib.rs/file.json")
+        .unwrap();
+    for (page, body, link) in [
+        (
+            1,
+            r#"[{"filename":"README.md","status":"added","additions":1,"deletions":0,"changes":1}]"#,
+            Some(r#"<https://api.github.com/repositories/1/pulls/7/files?page=2>; rel="next""#),
+        ),
+        (
+            2,
+            r#"[{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"changes":2}]"#,
+            None,
+        ),
+    ] {
+        let fetch = read.expect_single_fetch();
+        assert!(
+            fetch.url.ends_with(&format!(
+                "/repos/octocat/Hello-World/pulls/7/files?per_page=100&page={page}"
+            )),
+            "{}",
+            fetch.url
+        );
+        read.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status: 200,
+            headers: link.map(|link| header("Link", link)).into_iter().collect(),
+            body: body.as_bytes().to_vec(),
+            redirected: None,
+        })])
+        .unwrap();
+    }
+    assert!(matches!(
+        read.result().unwrap(),
+        Ok(ReadFileOutcome::Found(_))
+    ));
+}
+
+/// A name that GitHub gives that is no segment of a path, and a comment
+/// without its body, are the error of their answer, never an entry left out
+/// or an empty file.
+#[test]
+fn an_answer_with_a_name_that_is_no_segment_or_without_a_body_is_its_error() {
+    use omnifs_wit::host::types::{CalloutResult, ErrorKind, HttpResponse, ReadFileOutcome};
+
+    let harness = github_harness();
+    let mut repos = harness
+        .list_page(
+            "/octocat",
+            Some(&Cursor::Opaque(r#"{"kind":"user","page":2}"#.to_string())),
+            None,
+        )
+        .unwrap();
+    repos.expect_single_fetch();
+    repos
+        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status: 200,
+            headers: vec![header("ETag", r#""repos-2""#)],
+            body: br#"[{"name":"hello"},{"name":".."}]"#.to_vec(),
+            redirected: None,
+        })])
+        .unwrap();
+    match repos.result().unwrap() {
+        Err(error) => assert_eq!(error.kind, ErrorKind::InvalidInput),
+        other => panic!("expected the error of the page, got {other:?}"),
+    }
+
+    let mut comment = harness
+        .read("/octocat/Hello-World/issues/all/1/comments/10/comment.json")
+        .unwrap();
+    comment.expect_single_fetch();
+    comment
+        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: br#"{"id":10,"user":{"login":"hubot"}}"#.to_vec(),
+            redirected: None,
+        })])
+        .unwrap();
+    assert!(
+        !matches!(comment.result().unwrap(), Ok(ReadFileOutcome::Found(_))),
+        "a comment without its body is no file"
+    );
 }

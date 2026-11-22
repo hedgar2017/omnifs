@@ -4,11 +4,9 @@ use omnifs_core::path::Path;
 use omnifs_engine::{LookupAnswer, Namespace};
 use omnifs_itest::support::{Answer, Request};
 use omnifs_itest::{RuntimeHarness, make_initialized_runtime};
-use omnifs_wit::host::types::{
-    CalloutResult, Effects, FsKind, HttpRequest, HttpResponse, Stability,
-};
+use omnifs_wit::host::types::{CalloutResult, HttpRequest, HttpResponse};
 
-pub use omnifs_itest::{TestOpExt, project_paths};
+pub use omnifs_itest::TestOpExt;
 
 pub async fn resolve_namespace(namespace: &dyn Namespace, path: &str) -> LookupAnswer {
     let attrs = namespace.getattr(Path::root()).await.unwrap();
@@ -32,18 +30,6 @@ pub fn github_harness() -> RuntimeHarness {
         }
     "#,
     )
-}
-
-pub fn project_file_stability(effects: &Effects, path: &str) -> Option<Stability> {
-    effects.fs.iter().find_map(|write| {
-        if write.path != path {
-            return None;
-        }
-        match &write.kind {
-            FsKind::File(file) => Some(file.attrs.stability),
-            FsKind::Directory(_) => None,
-        }
-    })
 }
 
 /// The request of a fetch that `answering` answered.

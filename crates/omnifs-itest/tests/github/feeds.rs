@@ -263,9 +263,10 @@ fn no_rows(issues: u64, pulls: u64) -> Answer {
 /// `next`, then the counts of the comments: an item with another count than
 /// its `comments/` takes its IDs, and a comment that the comments lack comes
 /// by its ID before the next page of the IDs; then the REST count of the
-/// comments. `item.json` and `item.md` are of the node that the listing took,
-/// served without a request, and an author that GitHub deleted is an empty
-/// `user` or `author`.
+/// comments. `item.json` and `item.md` are of the node, and `comment.json`
+/// and `comment.md` of the row, that the listing took, served without a
+/// request, and an author that GitHub deleted is an empty `user` or
+/// `author`.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_counts() {
@@ -278,6 +279,7 @@ async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_count
     let mut ten = comment(10, 1, false, "first", "2026-11-18T08:10:00Z");
     ten["user"] = Value::Null;
     let eleven = comment(11, 1, false, "second", "2026-11-18T08:15:00Z");
+    let twelve = comment(12, 1, false, "third", "2026-11-18T08:30:00Z");
     let next = r#"<https://api.github.com/repositories/1/issues/comments?page=2>; rel="next""#;
     let (listing, requests) = answering(
         &harness,
@@ -291,7 +293,7 @@ async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_count
                 &[("Link", next)],
                 &json!([ten, comment(50, 2, true, "on the pull", "2026-11-18T08:20:00Z")]),
             ),
-            ok(&json!([comment(12, 1, false, "third", "2026-11-18T08:30:00Z")])),
+            ok(&json!([twelve.clone()])),
             graphql(&counted(&[(3, 0), (1, 3), (4, 0)], None)),
             graphql(&json!({ "item": ids(1, &[(10, "2026-11-18T08:10:00Z"), (11, "2026-11-18T08:15:00Z")], Some("c-2")) })),
             ok(&eleven),
@@ -368,6 +370,16 @@ async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_count
         ("pulls/open/2/item.json", two.to_string()),
         ("issues/all/1/comments/10/author", String::new()),
         ("issues/all/1/comments/11/body.md", "second".to_owned()),
+        ("issues/all/1/comments/11/comment.json", eleven.to_string()),
+        ("issues/open/1/comments/12/comment.json", twelve.to_string()),
+        (
+            "pulls/all/2/comments/50/comment.md",
+            "hubot:\non the pull\n".to_owned(),
+        ),
+        (
+            "issues/all/1/comments/10/comment.md",
+            ":\nfirst\n".to_owned(),
+        ),
     ] {
         assert_eq!(
             served(&harness, read(&harness, &at(file))).await.unwrap(),
@@ -1455,8 +1467,8 @@ async fn a_check_asks_github_graphql_for_a_hundred_changed_items_a_post() {
 /// A rate limit of GitHub whose window does not parse fails as an invalid
 /// answer, at the REST API and at GitHub GraphQL, as does a primary limit
 /// without its reset; one whose reset passed has a window of zero, and a
-/// secondary one without `Retry-After` has a window of a minute, whatever the
-/// reset of the primary limit.
+/// secondary one without `Retry-After` has no window, whatever the reset of
+/// the primary limit: GitHub states none for it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rate_limit_whose_window_does_not_parse_fails_as_an_invalid_answer() {
     let harness = github_harness();
@@ -1517,9 +1529,7 @@ async fn a_rate_limit_whose_window_does_not_parse_fails_as_an_invalid_answer() {
                 ],
                 &json!({ "message": "You have exceeded a secondary rate limit." }),
             ),
-            Err(NsError::RateLimited {
-                retry_after: Some(Duration::from_secs(60)),
-            }),
+            Err(NsError::RateLimited { retry_after: None }),
         ),
     ] {
         let harness = github_harness();
