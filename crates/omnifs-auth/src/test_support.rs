@@ -345,12 +345,13 @@ impl FakeAuthServer {
         write_fake_response(stream, "200 OK", "application/json", &body).await;
     }
 
-    /// An access token for an assertion of `client-id` with a subject and
-    /// this token endpoint as its audience, signed with the key of
+    /// An access token for an assertion of `client-id`, with or without a
+    /// subject, and this token endpoint as its audience, signed with the key of
     /// [`ASSERTION_KEY`], and with the scopes of the scheme either as the
     /// parameter `scope` of the request or as the claim `scope` of the
     /// assertion; the error `invalid_grant` for another. The token names the
-    /// subject, and the claim for scopes of one.
+    /// subject, `client` for an assertion without one, and the claim for
+    /// scopes of one.
     async fn handle_assertion(
         &self,
         stream: &mut tokio::net::TcpStream,
@@ -358,7 +359,7 @@ impl FakeAuthServer {
     ) {
         #[derive(serde::Deserialize)]
         struct Claims {
-            sub: String,
+            sub: Option<String>,
             scope: Option<String>,
             iat: i64,
             exp: i64,
@@ -366,7 +367,7 @@ impl FakeAuthServer {
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
         validation.set_issuer(&["client-id"]);
         validation.set_audience(&[self.endpoint("/token")]);
-        validation.set_required_spec_claims(&["iss", "sub", "aud", "exp"]);
+        validation.set_required_spec_claims(&["iss", "aud", "exp"]);
         let key = jsonwebtoken::DecodingKey::from_rsa_pem(ASSERTION_PUBLIC_KEY.as_bytes()).unwrap();
         let Ok(token) = jsonwebtoken::decode::<Claims>(&params["assertion"], &key, &validation)
         else {
@@ -391,7 +392,7 @@ impl FakeAuthServer {
         };
         assert_eq!(token.claims.exp - token.claims.iat, 3600);
         let id = self.state.next_token.fetch_add(1, Ordering::SeqCst);
-        let subject = token.claims.sub;
+        let subject = token.claims.sub.unwrap_or_else(|| "client".to_owned());
         let mut body = serde_json::json!({
             "access_token": format!("assertion-access-{id}-of-{subject}{scopes}"),
             "token_type": "Bearer",

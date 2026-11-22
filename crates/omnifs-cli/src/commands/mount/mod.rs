@@ -873,7 +873,7 @@ mod tests {
 
     /// Without a stored credential, as after `omnifs credential rm`, a
     /// re-authentication requests the scopes that the manifest of the
-    /// provider declares, never none, and asserts the client itself.
+    /// provider declares, never none, and asserts no subject.
     #[tokio::test]
     async fn a_reauthentication_without_a_stored_credential_takes_the_scopes_of_the_manifest() {
         let deleted = CredentialStatus {
@@ -884,7 +884,7 @@ mod tests {
             let (submission, assertion) =
                 reauthenticate(reauth_args(), serde_json::json!("jwtBearer"), stored).await;
             assert_eq!(assertion.form["scope"], "declared");
-            assert_eq!(assertion.claims["sub"], "robot@demo.test");
+            assert!(assertion.claims.get("sub").is_none());
             assert_eq!(submission.overrides.scopes, None);
             assert_eq!(submission.overrides.subject, None);
 

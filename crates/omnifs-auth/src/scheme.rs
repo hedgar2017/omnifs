@@ -175,9 +175,9 @@ pub enum OAuthFlow {
     /// its own key and the token endpoint answers it with an access token.
     /// No user signs in and no refresh token exists; the client ID is the
     /// issuer of the assertion and the client secret is the PEM of its RSA
-    /// private key. The subject of the assertion is the one of the
-    /// credential, and the client itself for a credential without one. The
-    /// scopes are the `scope` parameter of the token request.
+    /// private key. The assertion names the subject of a credential with
+    /// one, and no subject without one. The scopes are the `scope` parameter
+    /// of the token request.
     JwtBearer,
     /// The JWT bearer grant of an authorization server that takes the scopes
     /// from a claim of the assertion, in place of the `scope` parameter of

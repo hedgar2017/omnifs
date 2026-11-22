@@ -1,7 +1,7 @@
 //! The JWT bearer grant of RFC 7523: an access token for an assertion that
 //! the client signs with its own key, without a sign-in and without a
-//! refresh token. The client asserts its subject: the subject of its
-//! credential, or itself.
+//! refresh token. The assertion names a subject only for a credential with
+//! one, as a user whose data a delegated client reads.
 
 use crate::CredentialEntry;
 use crate::OAuthFlow;
@@ -18,21 +18,10 @@ use time::{Duration, OffsetDateTime};
 
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
-/// The time an assertion is valid for after the time of its issue, the
-/// longest that an authorization server as the one of Google takes.
+/// The time an assertion is valid for after the time of its issue: RFC 7523
+/// section 3 requires an `exp`, and the authorization server of Google takes
+/// no later one.
 const ASSERTION_LIFETIME: Duration = Duration::HOUR;
-
-/// The time before its signature that an assertion names as the time of its
-/// issue. RFC 7523 section 3 has an authorization server take `exp` and `iat`
-/// "subject to allowable clock skew between systems" and refuse an assertion
-/// that its own clock has as issued in the future, so that the allowance of
-/// a client whose clock runs ahead is an earlier `iat`, with `exp` the
-/// lifetime after it: a later `exp` in its place is past the lifetime that
-/// the server takes. Ten seconds are the allowance of the client of Google
-/// itself (`golang.org/x/oauth2/jws`), within the "few minutes" of leeway of
-/// RFC 7519 section 4.1.4, and a clock that a time service sets is within
-/// them.
-const ASSERTION_CLOCK_SKEW: Duration = Duration::seconds(10);
 
 impl OAuthClient {
     /// The first access token of a client by its assertion, of the scopes of
@@ -100,11 +89,10 @@ impl OAuthClient {
 }
 
 /// The assertion of the client at `now`, signed with RS256: its ID as the
-/// issuer; the subject of its credential, or itself, as the subject; the
-/// token endpoint as the audience; the time of its issue,
-/// [`ASSERTION_CLOCK_SKEW`] before `now`, and its expiry,
-/// [`ASSERTION_LIFETIME`] after that; and its scopes in the claim of a flow
-/// that declares one.
+/// issuer; the subject of a credential with one as the subject, and no
+/// subject without one; the token endpoint as the audience; `now` as the
+/// time of its issue, and its expiry [`ASSERTION_LIFETIME`] after that; and
+/// its scopes in the claim of a flow that declares one.
 fn assertion(request: &OAuthRequest, now: OffsetDateTime) -> Result<String, AuthError> {
     let issuer = request.effective_client_id()?;
     let key = request
@@ -119,20 +107,18 @@ fn assertion(request: &OAuthRequest, now: OffsetDateTime) -> Result<String, Auth
             Value::from(request.scheme.default_scopes.join(" ")),
         );
     }
-    claims.insert(
-        "sub".to_owned(),
-        Value::from(request.subject().unwrap_or(&issuer)),
-    );
+    if let Some(subject) = request.subject() {
+        claims.insert("sub".to_owned(), Value::from(subject));
+    }
     claims.insert("iss".to_owned(), Value::from(issuer));
     claims.insert(
         "aud".to_owned(),
         Value::from(request.scheme.token_endpoint.as_str()),
     );
-    let issue_time = now - ASSERTION_CLOCK_SKEW;
-    claims.insert("iat".to_owned(), Value::from(issue_time.unix_timestamp()));
+    claims.insert("iat".to_owned(), Value::from(now.unix_timestamp()));
     claims.insert(
         "exp".to_owned(),
-        Value::from((issue_time + ASSERTION_LIFETIME).unix_timestamp()),
+        Value::from((now + ASSERTION_LIFETIME).unix_timestamp()),
     );
     jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key)
         .map_err(|error| AuthError::AssertionSignature(error.to_string()))
@@ -176,15 +162,16 @@ mod tests {
         .unwrap()
     }
 
-    /// An assertion names a time of its issue before its signature, the
-    /// allowance for a client whose clock runs ahead of the one of the
-    /// authorization server, and expires its lifetime after that time.
+    /// An assertion names the time of its signature as the time of its
+    /// issue, expires its lifetime after it, and names no subject for a
+    /// credential without one.
     #[test]
-    fn an_assertion_is_issued_the_clock_skew_before_its_signature() {
+    fn an_assertion_is_issued_at_its_signature_without_a_subject_of_its_own() {
         #[derive(serde::Deserialize)]
         struct Times {
             iat: i64,
             exp: i64,
+            sub: Option<String>,
         }
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
         let assertion = assertion(&request("https://auth.example.test/token"), now).unwrap();
@@ -200,8 +187,9 @@ mod tests {
         )
         .unwrap()
         .claims;
-        assert_eq!(times.iat, 1_800_000_000 - 10);
+        assert_eq!(times.iat, 1_800_000_000);
         assert_eq!(times.exp, times.iat + 3600);
+        assert_eq!(times.sub, None);
     }
 
     /// The error of a token endpoint that fails without an OAuth error, as

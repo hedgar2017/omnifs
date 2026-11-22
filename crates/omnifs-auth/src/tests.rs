@@ -407,7 +407,7 @@ async fn jwt_bearer_login_takes_an_access_token_for_the_assertion_of_the_client(
     // itself is the subject of the assertion.
     assert_eq!(
         entry.access_token().expose_secret(),
-        "assertion-access-1-of-client-id"
+        "assertion-access-1-of-client"
     );
     assert!(entry.refresh_token().is_none());
     assert_eq!(entry.scopes(), ["read", "write"]);
@@ -433,7 +433,7 @@ async fn jwt_bearer_login_has_the_scopes_in_the_claim_that_the_flow_declares() {
         .unwrap();
     assert_eq!(
         entry.access_token().expose_secret(),
-        "assertion-access-1-of-client-id-with-scope-claim"
+        "assertion-access-1-of-client-with-scope-claim"
     );
     assert_eq!(entry.scopes(), ["read", "write"]);
 }
@@ -467,14 +467,14 @@ async fn jwt_bearer_login_takes_no_expiry_of_an_answer_without_one_and_refuses_o
     assert!(matches!(error, AuthError::TokenAnswer(_)), "{error}");
 }
 
-/// The subject of an assertion is the subject of the credential, and the
-/// client itself for a credential without one.
+/// The subject of an assertion is the subject of the credential, and an
+/// assertion of a credential without one names no subject.
 #[tokio::test]
-async fn jwt_bearer_login_asserts_the_subject_of_the_credential_or_the_client_itself() {
+async fn jwt_bearer_login_asserts_the_subject_of_a_credential_with_one_alone() {
     let fake = FakeAuthServer::start(FakeBehavior::default()).await;
     let client = OAuthClient::new().unwrap();
     for (subject, token) in [
-        (None, "assertion-access-1-of-client-id"),
+        (None, "assertion-access-1-of-client"),
         (
             Some("ada@example.test"),
             "assertion-access-2-of-ada@example.test",
@@ -567,7 +567,7 @@ async fn jwt_bearer_binding_renews_an_expired_token_without_a_refresh_token() {
         header,
         Some((
             "Authorization".to_owned(),
-            "Bearer assertion-access-1-of-client-id".to_owned()
+            "Bearer assertion-access-1-of-client".to_owned()
         ))
     );
     assert_eq!(binding.health(), crate::CredentialHealth::Ready);
