@@ -410,6 +410,7 @@ impl Shelf {
         core::future::ready(Self::answer(&cx))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn answer(cx: &FeedCx<ShelfKey, State>) -> Result<Feed> {
         let shelf = cx.key().shelf.clone();
         let token = cx.token::<ShelfToken>()?;
@@ -827,11 +828,14 @@ impl Memo {
     /// The memo as the projection holds it, by the value of its object and
     /// without a load or a request of its own: `none` before its canonical
     /// bytes are stored.
-    async fn echo(cx: Cx<State>, key: MemoKey) -> Result<FileProjection> {
-        let text = cx
-            .object::<Memo>(&key)?
-            .map_or_else(|| "none".to_owned(), |memo| format!("echo {}", memo.memo));
-        Ok(FileProjection::body(text.into_bytes()).dynamic().build())
+    fn echo(
+        cx: Cx<State>,
+        key: MemoKey,
+    ) -> impl core::future::Future<Output = Result<FileProjection>> {
+        core::future::ready(cx.object::<Memo>(&key).map(|memo| {
+            let text = memo.map_or_else(|| "none".to_owned(), |memo| format!("echo {}", memo.memo));
+            FileProjection::body(text.into_bytes()).dynamic().build()
+        }))
     }
 }
 
