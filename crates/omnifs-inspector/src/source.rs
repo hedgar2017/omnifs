@@ -11,12 +11,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use omnifs_api::{CONTROL_REQUEST_TIMEOUT_SECS, events::InspectorLine};
+use omnifs_api::events::InspectorLine;
 use tokio::net::UnixStream;
 
 const SOURCE_QUEUE_CAPACITY: usize = 1024;
 const MESSAGES_PER_FRAME: usize = 256;
-const INSPECTOR_SETUP_TIMEOUT: Duration = Duration::from_secs(CONTROL_REQUEST_TIMEOUT_SECS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReplaySpeed {
@@ -145,38 +144,34 @@ impl EventsClient {
         self.rt.block_on(async {
             let endpoint = tonic::transport::Endpoint::from_static("http://[::]:50051");
             let socket = self.socket.clone();
-            let Ok(Ok(channel)) = tokio::time::timeout(
-                INSPECTOR_SETUP_TIMEOUT,
-                endpoint.connect_with_connector(tower::service_fn(move |_| {
+            // No time bounds the attach: the connection of the daemon ends
+            // it, by its answer, its refusal, or its close.
+            let Ok(channel) = endpoint
+                .connect_with_connector(tower::service_fn(move |_| {
                     let socket = socket.clone();
                     async move {
                         UnixStream::connect(socket)
                             .await
                             .map(hyper_util::rt::TokioIo::new)
                     }
-                })),
-            )
-            .await
+                }))
+                .await
             else {
                 return Ok(AttachOutcome::Unreachable);
             };
-            let Ok(Ok(response)) = tokio::time::timeout(
-                INSPECTOR_SETUP_TIMEOUT,
-                omnifs_api::grpc::wire::control_client::ControlClient::new(channel)
-                    .subscribe_inspector(tonic::Request::new(
-                        omnifs_api::grpc::wire::InspectorRequest {},
-                    )),
-            )
-            .await
+            let Ok(response) = omnifs_api::grpc::wire::control_client::ControlClient::new(channel)
+                .subscribe_inspector(tonic::Request::new(
+                    omnifs_api::grpc::wire::InspectorRequest {},
+                ))
+                .await
             else {
                 return Ok(AttachOutcome::Unreachable);
             };
             let mut stream = response.into_inner();
-            let first = match tokio::time::timeout(INSPECTOR_SETUP_TIMEOUT, stream.message()).await
-            {
-                Ok(Ok(Some(item))) => item,
-                Ok(Ok(None)) | Err(_) => return Ok(AttachOutcome::Unreachable),
-                Ok(Err(error)) => return Ok(AttachOutcome::Failed(error.to_string())),
+            let first = match stream.message().await {
+                Ok(Some(item)) => item,
+                Ok(None) => return Ok(AttachOutcome::Unreachable),
+                Err(error) => return Ok(AttachOutcome::Failed(error.to_string())),
             };
             let Some(omnifs_api::grpc::wire::inspector_stream_item::Value::Ready(ready)) =
                 first.value

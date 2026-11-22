@@ -5,15 +5,13 @@ use bytes::Bytes;
 use hyper_util::rt::TokioIo;
 use omnifs_api::grpc::{self, wire};
 use omnifs_api::{
-    CONTROL_LOG_TAIL_MAX_LINES, CONTROL_MUTATION_TIMEOUT_SECS, CONTROL_PROTOCOL,
-    CONTROL_REQUEST_TIMEOUT_SECS, CONTROL_SHUTDOWN_TIMEOUT_SECS, CONTROL_STREAM_PAYLOAD_MAX_BYTES,
-    CredentialKey, CredentialStatus, DaemonInventory, MountRecord, MutationOp, MutationOpResult,
-    PhaseEvent, ProviderImportReceipt, ProviderMetadata, ServingOutcome,
+    CONTROL_LOG_TAIL_MAX_LINES, CONTROL_PROTOCOL, CONTROL_STREAM_PAYLOAD_MAX_BYTES, CredentialKey,
+    CredentialStatus, DaemonInventory, MountRecord, MutationOp, MutationOpResult, PhaseEvent,
+    ProviderImportReceipt, ProviderMetadata, ServingOutcome,
 };
 use omnifs_bootstrap::{Bootstrap, Client};
 use omnifs_core::{MountName, MutationId, ProviderId};
 use prost::Message as _;
-use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::OnceCell;
 use tokio_stream::StreamExt as _;
@@ -22,32 +20,22 @@ use tonic::{Code, Request};
 
 use crate::error::{ExitCode, WithExitCode, WithHint};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(CONTROL_REQUEST_TIMEOUT_SECS);
-const MUTATION_TIMEOUT: Duration = Duration::from_secs(CONTROL_MUTATION_TIMEOUT_SECS);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(CONTROL_SHUTDOWN_TIMEOUT_SECS);
-const PROVIDER_IMPORT_TIMEOUT: Duration = Duration::from_mins(3);
-
-fn unary<T>(message: T, timeout: Duration) -> Request<T> {
-    let mut request = Request::new(message);
-    request.set_timeout(timeout);
-    request
-}
-
+/// One unary control request. No time bounds it: the answer of the daemon
+/// ends it, or the end of its connection, the close or the reset of the
+/// socket at the exit of the daemon (`docs/contracts/10-system.md` names a
+/// daemon that holds the connection and never answers).
 macro_rules! bounded_unary {
-    ($client:expr, $method:ident, $request:expr) => {{ bounded_unary!($client, $method, $request, REQUEST_TIMEOUT) }};
-    ($client:expr, $method:ident, $request:expr, $timeout:expr) => {{
-        let timeout = $timeout;
-        tokio::time::timeout(timeout, async {
-            $client
-                .client()
-                .await?
-                .$method(unary($request, timeout))
-                .await
-                .map_err(|status| status_error(&status))
-        })
-        .await
-        .context("daemon control request timed out")
-        .with_exit_code(ExitCode::DaemonUnavailable)??
+    ($client:expr, $method:ident, $request:expr) => {{
+        $client
+            .client()
+            .await?
+            .$method(Request::new($request))
+            .await
+            .map_err(|status| status_error(&status))?
+    }};
+    ($client:expr, $method:ident, $request:expr, $unbounded:expr) => {{
+        let () = $unbounded;
+        bounded_unary!($client, $method, $request)
     }};
 }
 
@@ -60,21 +48,15 @@ pub(crate) struct ShutdownResult {
 pub(crate) struct RpcClient {
     endpoint: Bootstrap<Client>,
     channel: OnceCell<Channel>,
-    setup_timeout: Duration,
 }
 
 type ControlClient = wire::control_client::ControlClient<Channel>;
 
 impl RpcClient {
     pub(crate) fn from_endpoint(endpoint: Bootstrap<Client>) -> Self {
-        Self::with_setup_timeout(endpoint, REQUEST_TIMEOUT)
-    }
-
-    fn with_setup_timeout(endpoint: Bootstrap<Client>, setup_timeout: Duration) -> Self {
         Self {
             endpoint,
             channel: OnceCell::new(),
-            setup_timeout,
         }
     }
 
@@ -82,7 +64,6 @@ impl RpcClient {
         Ok(Self {
             endpoint: Bootstrap::<Client>::for_client()?,
             channel: OnceCell::new(),
-            setup_timeout: REQUEST_TIMEOUT,
         })
     }
 
@@ -154,7 +135,7 @@ impl RpcClient {
             self,
             shutdown,
             wire::ShutdownRequest { stop_filesystems },
-            SHUTDOWN_TIMEOUT
+            ()
         )
         .into_inner();
         Ok(Some(ShutdownResult {
@@ -173,7 +154,7 @@ impl RpcClient {
             (1..=CONTROL_LOG_TAIL_MAX_LINES).contains(&tail_lines),
             "tail_lines must be between 1 and {CONTROL_LOG_TAIL_MAX_LINES}"
         );
-        tokio::time::timeout(self.setup_timeout, async {
+        async {
             let response = self
                 .client()
                 .await?
@@ -190,10 +171,9 @@ impl RpcClient {
                 "daemon returned an invalid log stream prelude"
             );
             Ok(stream)
-        })
+        }
         .await
-        .context("timed out starting daemon log stream")
-        .with_exit_code(ExitCode::DaemonUnavailable)?
+        .with_exit_code(ExitCode::DaemonUnavailable)
     }
 
     /// Whether a daemon listens on the control socket: the socket is missing
@@ -325,7 +305,7 @@ impl RpcClient {
             "provider artifact must contain at least one byte"
         );
         let digest = ProviderId::from_wasm_bytes(bytes);
-        tokio::time::timeout(PROVIDER_IMPORT_TIMEOUT, async {
+        async {
             let owned = Bytes::copy_from_slice(bytes);
             let start = grpc::to_provider_upload_start(&file_name, total_length, &digest);
             let mut requests = Vec::new();
@@ -354,15 +334,8 @@ impl RpcClient {
                     .context("missing provider receipt")?,
             )
             .map_err(anyhow::Error::from)
-        })
+        }
         .await
-        .with_context(|| {
-            format!(
-                "provider import to {} timed out after {} seconds",
-                self.endpoint.control_socket().display(),
-                PROVIDER_IMPORT_TIMEOUT.as_secs()
-            )
-        })?
     }
 
     pub(crate) async fn import_embedded_provider(
@@ -373,7 +346,7 @@ impl RpcClient {
             self,
             import_embedded_provider,
             wire::ImportEmbeddedProviderRequest { name },
-            MUTATION_TIMEOUT
+            ()
         )
         .into_inner();
         grpc::provider_import_receipt(
@@ -444,7 +417,7 @@ impl RpcClient {
             wire::BeginMutationRequest {
                 mutation_id: id.as_bytes().to_vec().into(),
             },
-            MUTATION_TIMEOUT
+            ()
         )
         .into_inner();
         Ok(response.lease_deadline_unix_ms)
@@ -466,7 +439,7 @@ impl RpcClient {
                 mutation_id: id.as_bytes().to_vec().into(),
                 ops: wire_ops,
             },
-            MUTATION_TIMEOUT
+            ()
         )
         .into_inner();
         let results = response
@@ -492,7 +465,7 @@ impl RpcClient {
             wire::DropMutationRequest {
                 mutation_id: id.as_bytes().to_vec().into(),
             },
-            MUTATION_TIMEOUT
+            ()
         );
         Ok(())
     }
@@ -500,27 +473,18 @@ impl RpcClient {
     async fn client(&self) -> anyhow::Result<ControlClient> {
         let socket = self.endpoint.control_socket().clone();
         let socket_display = socket.display().to_string();
-        let setup_timeout = self.setup_timeout;
         let channel = self
             .channel
             .get_or_try_init(|| async move {
-                let endpoint =
-                    Endpoint::from_static("http://[::]:50051").connect_timeout(setup_timeout);
-                let connected = tokio::time::timeout(
-                    setup_timeout,
-                    endpoint.connect_with_connector(tower::service_fn(move |_| {
+                let endpoint = Endpoint::from_static("http://[::]:50051");
+                let connected = endpoint
+                    .connect_with_connector(tower::service_fn(move |_| {
                         let socket = socket.clone();
                         async move { UnixStream::connect(socket).await.map(TokioIo::new) }
-                    })),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "connect to daemon at {socket_display} timed out after {setup_timeout:?}"
-                    )
-                })?
-                .map_err(|error| connect_error(&error))
-                .with_context(|| format!("connect to daemon at {socket_display}"))?;
+                    }))
+                    .await
+                    .map_err(|error| connect_error(&error))
+                    .with_context(|| format!("connect to daemon at {socket_display}"))?;
                 Ok::<_, anyhow::Error>(connected)
             })
             .await
@@ -715,7 +679,7 @@ mod tests {
         .unwrap();
         assert!(
             tokio::time::timeout(
-                Duration::from_millis(50),
+                std::time::Duration::from_millis(50),
                 settle(open_phases(vec![PhaseEvent::Starting]))
             )
             .await
@@ -917,28 +881,43 @@ mod tests {
         );
     }
 
+    /// A control request carries no deadline of the client to the daemon.
     #[tokio::test]
-    async fn stalled_rpc_setup_respects_setup_timeout() {
+    async fn a_control_request_carries_no_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Bootstrap::<Client>::under_root(dir.path());
+        let daemon = crate::fake_daemon::FakeDaemon::start(
+            &endpoint,
+            crate::fake_daemon::Answers {
+                info: crate::fake_daemon::info(CONTROL_PROTOCOL),
+                inventory: Err(omnifs_api::ControlError::new(
+                    omnifs_api::ControlErrorCode::NotReady,
+                    "starting",
+                )),
+            },
+        );
+        let rpc = RpcClient::from_endpoint(endpoint);
+        assert!(rpc.inventory().await.is_err());
+        assert_eq!(daemon.deadlines(), 0);
+    }
+
+    /// A control request has no deadline of its own: the end of the
+    /// connection of the daemon ends it, as a daemon that accepts and then
+    /// closes its socket at its exit.
+    #[tokio::test]
+    async fn a_control_request_ends_with_the_connection_of_the_daemon() {
         let dir = tempfile::tempdir().expect("tempdir");
         let endpoint = Bootstrap::<Client>::under_root(dir.path());
         let listener =
             tokio::net::UnixListener::bind(endpoint.control_socket()).expect("bind control socket");
         tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.expect("accept client");
-            std::future::pending::<()>().await;
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept client");
+                drop(stream);
+            }
         });
-
-        let rpc = RpcClient::with_setup_timeout(endpoint, Duration::from_millis(20));
-        let result = tokio::time::timeout(Duration::from_secs(1), rpc.stream_logs(false, 1)).await;
-        let error = match result {
-            Ok(Err(error)) => error,
-            Ok(Ok(_)) => panic!("RPC setup unexpectedly succeeded"),
-            Err(elapsed) => panic!("outer test timeout elapsed: {elapsed}"),
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("timed out starting daemon log stream")
-        );
+        let rpc = RpcClient::from_endpoint(endpoint);
+        assert!(rpc.stream_logs(false, 1).await.is_err());
+        assert!(rpc.inventory().await.is_err());
     }
 }

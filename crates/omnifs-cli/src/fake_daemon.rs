@@ -21,6 +21,7 @@ pub(crate) struct Answers {
 
 pub(crate) struct FakeDaemon {
     begun: Arc<AtomicUsize>,
+    deadlines: Arc<AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -30,9 +31,11 @@ impl FakeDaemon {
         let socket = endpoint.control_socket();
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind the control socket");
         let begun = Arc::new(AtomicUsize::new(0));
+        let deadlines = Arc::new(AtomicUsize::new(0));
         let service = wire::control_server::ControlServer::new(Service {
             answers,
             begun: Arc::clone(&begun),
+            deadlines: Arc::clone(&deadlines),
         });
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -41,12 +44,21 @@ impl FakeDaemon {
                 .await
                 .expect("serve the control socket");
         });
-        Self { begun, server }
+        Self {
+            begun,
+            deadlines,
+            server,
+        }
     }
 
     /// The number of mutations that began.
     pub(crate) fn begun(&self) -> usize {
         self.begun.load(Ordering::SeqCst)
+    }
+
+    /// The number of requests that came with a deadline of the client.
+    pub(crate) fn deadlines(&self) -> usize {
+        self.deadlines.load(Ordering::SeqCst)
     }
 }
 
@@ -73,6 +85,7 @@ pub(crate) fn info(protocol: u32) -> DaemonInfo {
 struct Service {
     answers: Answers,
     begun: Arc<AtomicUsize>,
+    deadlines: Arc<AtomicUsize>,
 }
 
 fn control_status(error: &ControlError) -> Status {
@@ -125,8 +138,11 @@ impl wire::control_server::Control for Service {
 
     async fn get_inventory(
         &self,
-        _request: Request<wire::Empty>,
+        request: Request<wire::Empty>,
     ) -> Result<Response<wire::InventoryResponse>, Status> {
+        if request.metadata().contains_key("grpc-timeout") {
+            self.deadlines.fetch_add(1, Ordering::SeqCst);
+        }
         match &self.answers.inventory {
             Ok(inventory) => Ok(Response::new(wire::InventoryResponse {
                 inventory: Some(grpc::to_daemon_inventory(inventory)),
