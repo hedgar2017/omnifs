@@ -319,7 +319,9 @@ fn response_from_wit(resp: HttpResponse) -> Result<Response<Vec<u8>>> {
         .map_err(|e| ProviderError::internal(format!("response builder: {e}")))
 }
 
-/// Default 4xx/5xx mapping to `ProviderError`.
+/// The mapping of each status other than a successful one to
+/// `ProviderError`: the body of an informational, redirect, or failing
+/// answer is no content.
 pub trait ResponseExt: Sized {
     fn error_for_status(self) -> Result<Self>;
     /// Same check as `error_for_status` without consuming the response.
@@ -335,11 +337,10 @@ impl ResponseExt for Response<Vec<u8>> {
     }
 
     fn error_for_status_ref(&self) -> Result<()> {
-        let status = self.status();
-        if status.is_client_error() || status.is_server_error() {
-            Err(status_error(self))
-        } else {
+        if self.status().is_success() {
             Ok(())
+        } else {
+            Err(status_error(self))
         }
     }
 }
@@ -556,6 +557,23 @@ mod tests {
         assert!(error.is_retryable());
         assert_eq!(error.message(), "HTTP 429; retry_after=3");
         assert_eq!(error.retry_after(), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn response_ext_takes_a_successful_status_alone_as_content() {
+        let status = |status: u16| {
+            Response::builder()
+                .status(status)
+                .body(Vec::new())
+                .expect("response builder")
+                .error_for_status_ref()
+        };
+        for successful in [200, 204, 299] {
+            assert!(status(successful).is_ok(), "{successful}");
+        }
+        for other in [101, 301, 302, 304, 400, 503] {
+            assert!(status(other).is_err(), "{other}");
+        }
     }
 }
 

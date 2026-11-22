@@ -487,9 +487,7 @@ fn load_from_response<T>(
     match resp.status() {
         StatusCode::NOT_MODIFIED => Ok(Load::Unchanged),
         StatusCode::NOT_FOUND => Ok(Load::NotFound),
-        status if status.is_client_error() || status.is_server_error() => {
-            Err(resp.error_for_status().unwrap_err())
-        },
+        status if !status.is_success() => Err(resp.error_for_status().unwrap_err()),
         _ => {
             // The canonical is the raw response body verbatim (JSON, Atom, XML,
             // or opaque). `parse` only produces the in-memory value for
@@ -647,6 +645,22 @@ mod tests {
         }
     }
     impl EndpointHooks for TestEp {}
+
+    #[test]
+    fn a_load_takes_no_redirect_as_a_fresh_object() {
+        let load = |status: u16| {
+            let response = Response::builder()
+                .status(status)
+                .body(br#"{"message":"Moved Permanently"}"#.to_vec())
+                .expect("response builder");
+            load_from_response(response, |bytes| Ok(bytes.to_vec()))
+        };
+        assert!(matches!(load(200), Ok(Load::Fresh { .. })));
+        assert!(matches!(load(304), Ok(Load::Unchanged)));
+        assert!(matches!(load(404), Ok(Load::NotFound)));
+        assert!(load(301).is_err());
+        assert!(load(302).is_err());
+    }
 
     struct TestEpOff;
 

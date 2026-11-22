@@ -50,14 +50,44 @@ pub struct BlobRef {
 }
 
 impl BlobRef {
-    /// Default 4xx/5xx mapping. Mirrors the inline-HTTP `error_for_status`
-    /// so blob fetches participate in the same error flow.
+    /// The blob of a successful status, and the error of any other: the
+    /// body of an informational, redirect, or failing answer is no content.
+    /// Mirrors the inline-HTTP `error_for_status` so blob fetches participate
+    /// in the same error flow.
     pub fn error_for_status(self) -> Result<Self> {
-        if (400..600).contains(&self.status) {
-            Err(ProviderError::from_http_status(self.status))
-        } else {
+        if (200..300).contains(&self.status) {
             Ok(self)
+        } else {
+            Err(ProviderError::from_http_status(self.status))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlobId, BlobRef};
+    use crate::error::ProviderErrorKind;
+
+    #[test]
+    fn a_blob_of_a_successful_status_alone_is_content() {
+        let blob = |status| BlobRef {
+            id: BlobId(1),
+            size: 0,
+            content_type: None,
+            etag: None,
+            status,
+            response_headers: Vec::new(),
+        };
+        for status in [200, 206, 299] {
+            assert!(blob(status).error_for_status().is_ok(), "{status}");
+        }
+        for status in [100, 199, 300, 302, 304, 399, 404, 500] {
+            assert!(blob(status).error_for_status().is_err(), "{status}");
+        }
+        assert_eq!(
+            blob(404).error_for_status().unwrap_err().kind(),
+            ProviderErrorKind::NotFound
+        );
     }
 }
 
