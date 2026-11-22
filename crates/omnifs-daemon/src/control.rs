@@ -106,6 +106,9 @@ pub(crate) struct ControlServer {
     connection_permits: Arc<tokio::sync::Semaphore>,
     stream_permits: Arc<tokio::sync::Semaphore>,
     preface_timeout: std::time::Duration,
+    /// How long a provider upload may send no bytes before it fails:
+    /// [`omnifs_core::SILENT_PEER_TIMEOUT`].
+    pub(crate) upload_silence: std::time::Duration,
 }
 
 impl ControlServer {
@@ -120,6 +123,7 @@ impl ControlServer {
             shutdown_tx,
             CONTROL_CONNECTION_LIMIT,
             CONTROL_PREFACE_TIMEOUT,
+            omnifs_core::SILENT_PEER_TIMEOUT,
         )
     }
 
@@ -129,6 +133,7 @@ impl ControlServer {
         shutdown_tx: tokio::sync::watch::Sender<bool>,
         connection_limit: usize,
         preface_timeout: std::time::Duration,
+        upload_silence: std::time::Duration,
     ) -> (Arc<Self>, tokio::sync::mpsc::Receiver<RepairCommand>) {
         let (repair_tx, repair_rx) = tokio::sync::mpsc::channel(1);
         (
@@ -141,6 +146,7 @@ impl ControlServer {
                 connection_permits: Arc::new(tokio::sync::Semaphore::new(connection_limit)),
                 stream_permits: Arc::new(tokio::sync::Semaphore::new(CONTROL_CONNECTION_LIMIT)),
                 preface_timeout,
+                upload_silence,
             }),
             repair_rx,
         )

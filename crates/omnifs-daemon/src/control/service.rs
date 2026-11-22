@@ -92,15 +92,31 @@ impl GrpcControlService {
 /// Read one provider upload stream to completion and hand back the staged,
 /// validated artifact. No mutation identity is involved: content-digest
 /// dedup inside the durable write is the only idempotency layer.
+/// The next item of the upload `stream`, or the error of a client that sent
+/// nothing for `silence`.
+async fn next_upload_item(
+    stream: &mut tonic::Streaming<wire::ImportProviderRequest>,
+    silence: std::time::Duration,
+) -> Result<Option<wire::ImportProviderRequest>, Status> {
+    tokio::time::timeout(silence, stream.message())
+        .await
+        .map_err(|_| {
+            grpc_invalid(format!(
+                "the provider upload sent no bytes for {} seconds",
+                silence.as_secs()
+            ))
+        })?
+        .map_err(grpc_invalid)
+}
+
 async fn import_provider_inner(
     daemon: &Daemon,
     request: Request<tonic::Streaming<wire::ImportProviderRequest>>,
+    silence: std::time::Duration,
 ) -> Result<omnifs_state::ValidatedProviderUpload, Status> {
     let mut stream = request.into_inner();
-    let first = stream
-        .message()
-        .await
-        .map_err(grpc_invalid)?
+    let first = next_upload_item(&mut stream, silence)
+        .await?
         .ok_or_else(|| grpc_invalid("provider upload is missing start"))?;
     let start = match first.value {
         Some(wire::import_provider_request::Value::Start(start)) => start,
@@ -117,7 +133,7 @@ async fn import_provider_inner(
         .await
         .map_err(grpc_invalid)?;
     let mut received = 0_u64;
-    while let Some(item) = stream.message().await.map_err(grpc_invalid)? {
+    while let Some(item) = next_upload_item(&mut stream, silence).await? {
         let chunk = match item.value {
             Some(wire::import_provider_request::Value::Chunk(chunk)) => chunk,
             Some(wire::import_provider_request::Value::Start(_)) => {
@@ -389,8 +405,9 @@ impl wire::control_server::Control for GrpcControlService {
     ) -> Result<Response<wire::ImportProviderResponse>, Status> {
         let daemon = self.daemon()?;
         // The end of the stream of the client ends the upload, its last
-        // chunk or the close of its connection, without a time of its own.
-        let upload = import_provider_inner(&daemon, request).await?;
+        // chunk or the close of its connection; a client that holds the
+        // stream open fails it after the silence of an upload without bytes.
+        let upload = import_provider_inner(&daemon, request, self.control.upload_silence).await?;
         let outcome = daemon
             .state
             .import_provider(upload)

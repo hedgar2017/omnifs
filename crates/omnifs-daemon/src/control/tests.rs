@@ -297,6 +297,25 @@ async fn test_runtime(
     preface_timeout: std::time::Duration,
     lease: Duration,
 ) -> TestRuntime {
+    test_runtime_with_upload_silence(
+        dir,
+        connection_limit,
+        preface_timeout,
+        lease,
+        omnifs_core::SILENT_PEER_TIMEOUT,
+    )
+    .await
+}
+
+/// [`test_runtime`] whose provider upload fails after `upload_silence`
+/// without bytes.
+async fn test_runtime_with_upload_silence(
+    dir: &tempfile::TempDir,
+    connection_limit: usize,
+    preface_timeout: std::time::Duration,
+    lease: Duration,
+    upload_silence: Duration,
+) -> TestRuntime {
     let _ = dir;
     let context = Arc::new(crate::context::DaemonContext::resolve().unwrap());
     context.prepare_startup_dirs().unwrap();
@@ -349,6 +368,7 @@ async fn test_runtime(
         shutdown.clone(),
         connection_limit,
         preface_timeout,
+        upload_silence,
     );
     let control_task = tokio::spawn(Arc::clone(&control).run(listener));
     TestRuntime {
@@ -1147,5 +1167,47 @@ async fn batch_second_op_failure_leaves_no_first_op_row_behind() {
     // The lease released on failure too: a fresh mutation can begin.
     let next = omnifs_core::MutationId::from_bytes([8; 16]);
     c.begin_mutation(begin_request(next)).await.unwrap();
+    runtime.shutdown().await;
+}
+
+/// A provider upload whose client sends its start and then holds its stream
+/// open without bytes fails after the silence of an upload, with the error
+/// that it sent no bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(unsafe_code)]
+async fn a_provider_upload_without_bytes_fails_after_its_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = crate::ENV_LOCK.lock().await;
+    let home = std::fs::canonicalize(dir.path()).unwrap();
+    unsafe {
+        std::env::set_var("OMNIFS_HOME", &home);
+    }
+    let runtime = test_runtime_with_upload_silence(
+        &dir,
+        CONTROL_CONNECTION_LIMIT,
+        CONTROL_PREFACE_TIMEOUT,
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+    )
+    .await;
+    runtime.control.set_ready(Arc::clone(&runtime.daemon));
+    let mut c = client(&home.join("control.sock")).await;
+    let bytes = provider_wasm();
+    let digest = omnifs_core::ProviderId::from_wasm_bytes(&bytes);
+    let start = grpc::to_provider_upload_start("demo.wasm", bytes.len() as u64, &digest);
+    let first = wire::ImportProviderRequest {
+        value: Some(wire::import_provider_request::Value::Start(start)),
+    };
+    // The start, then a stream that stays open and sends nothing more.
+    let held = tokio_stream::StreamExt::chain(
+        tokio_stream::iter([first]),
+        tokio_stream::pending::<wire::ImportProviderRequest>(),
+    );
+    let status = c.import_provider(held).await.unwrap_err();
+    assert!(
+        status.message().contains("sent no bytes for"),
+        "{}",
+        status.message()
+    );
     runtime.shutdown().await;
 }
