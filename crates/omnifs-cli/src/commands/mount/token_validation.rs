@@ -13,8 +13,9 @@ pub(super) struct ValidationOutcome {
 
 /// Probes `token` as the validation of its scheme declares: one request of
 /// its method to its URL with the token in its header and each declared
-/// header beside it. The token is valid with the declared status and with a
-/// value at the declared JSON pointer that [`holds`].
+/// header beside it, which follows no redirect, so that the token reaches the
+/// declared URL alone. The token is valid with the declared status and with
+/// a value at the declared JSON pointer that [`holds`].
 pub(super) async fn validate_static_token(
     validation: &TokenValidation,
     header_name: &str,
@@ -24,6 +25,7 @@ pub(super) async fn validate_static_token(
 ) -> anyhow::Result<ValidationOutcome> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("omnifs-cli/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build HTTP client")?;
@@ -46,6 +48,13 @@ pub(super) async fn validate_static_token(
     output.narrate(format!("validating against {}", validation.url));
     let response = req.send().await.context("validation request failed")?;
     let status = response.status();
+    if status.is_redirection() {
+        anyhow::bail!(
+            "validation failed: {} answered the redirect {}, and the probe of a token follows none",
+            validation.url,
+            status.as_u16()
+        );
+    }
     if status.as_u16() != validation.expect_status {
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!(
@@ -312,6 +321,38 @@ mod tests {
         assert!(
             error.to_string().contains("the response is not JSON"),
             "{error:#}"
+        );
+    }
+
+    /// The probe follows no redirect: the token reaches the declared URL
+    /// alone, and a redirect is a failed validation.
+    #[tokio::test]
+    async fn the_probe_of_a_token_follows_no_redirect() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = target.local_addr().unwrap();
+        for status in [
+            "301 Moved Permanently",
+            "302 Found",
+            "307 Temporary Redirect",
+        ] {
+            let (address, request) = serve(format!(
+                "HTTP/1.1 {status}\r\nlocation: http://{location}/api/auth.test\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            ))
+            .await;
+            let error = submit(&manifest(address, None)).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("the probe of a token follows none"),
+                "{status}: {error:#}"
+            );
+            request.await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), target.accept())
+                .await
+                .is_err(),
+            "the target of a redirect takes no request"
         );
     }
 

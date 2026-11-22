@@ -279,7 +279,8 @@ pub struct KeyValue {
 
 /// Token self-validation probe, carried by a provider's static-token scheme.
 ///
-/// The host uses this to verify a newly-entered token before storing it.
+/// The host uses this to verify a newly-entered token before storing it: one
+/// request to `url` that follows no redirect.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TokenValidation {
@@ -291,6 +292,8 @@ pub struct TokenValidation {
     pub headers: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// The status of the answer for a valid token, which is no redirect:
+    /// the probe follows none.
     pub expect_status: u16,
     /// The JSON pointer of a value of the answer that holds for a valid
     /// token: each value but `null`, `false`, and the empty string.

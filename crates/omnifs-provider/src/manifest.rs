@@ -407,6 +407,16 @@ fn validate_scheme(key: &str, scheme: &AuthScheme) -> Result<(), ProviderMetadat
                     "auth.schemes.{key}.validation.headers must not contain {header}, the header of the token"
                 )));
             }
+            // The probe of a token follows no redirect, so that a redirect
+            // is no status of a valid token.
+            if let Some(validation) = &static_token.validation
+                && (300..400).contains(&validation.expect_status)
+            {
+                return Err(ProviderMetadataError::Validation(format!(
+                    "auth.schemes.{key}.validation.expectStatus must not be {}, a redirect, which the probe of a token does not follow",
+                    validation.expect_status
+                )));
+            }
         },
         AuthScheme::Oauth(oauth) => {
             validate_non_empty(
@@ -1069,6 +1079,32 @@ mod tests {
             matches!(&error, ProviderMetadataError::Validation(message) if message.contains("validation.headers must not contain authorization")),
             "{error}"
         );
+    }
+
+    /// The probe of a static token follows no redirect: a redirect is no
+    /// status of a valid token.
+    #[test]
+    fn a_token_validation_expects_no_redirect() {
+        let expecting = |status: u16| {
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(GUIDANCE_MANIFEST).unwrap();
+            manifest["auth"]["schemes"][0]["staticToken"]["validation"] = serde_json::json!({
+                "method": "GET",
+                "url": "https://api.demo.test/me",
+                "expectStatus": status
+            });
+            ProviderManifest::from_bytes(&json(&manifest))
+        };
+        expecting(200).expect("a status of a valid token");
+        expecting(204).expect("another status of a valid token");
+        for redirect in [300, 302, 399] {
+            assert_eq!(
+                validation_error(expecting(redirect)),
+                format!(
+                    "auth.schemes.pat.validation.expectStatus must not be {redirect}, a redirect, which the probe of a token does not follow"
+                )
+            );
+        }
     }
 
     #[test]

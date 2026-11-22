@@ -959,7 +959,7 @@
       ]
     },
     "TokenValidation": {
-      "description": "Token self-validation probe, carried by a provider's static-token scheme.\n\nThe host uses this to verify a newly-entered token before storing it.",
+      "description": "Token self-validation probe, carried by a provider's static-token scheme.\n\nThe host uses this to verify a newly-entered token before storing it: one\nrequest to `url` that follows no redirect.",
       "type": "object",
       "properties": {
         "body": {
@@ -969,6 +969,7 @@
           ]
         },
         "expectStatus": {
+          "description": "The status of the answer for a valid token, which is no redirect:\nthe probe follows none.",
           "type": "integer",
           "format": "uint16",
           "maximum": 65535,
