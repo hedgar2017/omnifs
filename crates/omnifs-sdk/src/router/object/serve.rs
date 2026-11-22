@@ -93,10 +93,12 @@ where
     }
 
     /// The effects of `canonical`, which a feed part writes for the object
-    /// anchored at `anchor`: its store, with each face that serves canonical
-    /// bytes as a view leaf, and each of those leaves as a file of the
-    /// object without bytes of its own, which the host keeps as a fed fact
-    /// of the part.
+    /// anchored at `anchor`: its store, with each face under that anchor
+    /// alone that serves canonical bytes as a view leaf, and each of those
+    /// leaves as a file of the object without bytes of its own, which the
+    /// host keeps as a fed fact of the part. The feed chooses the facets of
+    /// its anchor, as the state of an issue: a leaf under another choice of
+    /// a facet would keep the object where the feed no longer writes it.
     fn store(
         &self,
         caps: &Captures,
@@ -111,7 +113,7 @@ where
         }
         let key = O::Key::from_captures(caps)?;
         let id = key.anchor(O::kind());
-        let view_leaves = self.view_leaves_for_base(anchor)?;
+        let view_leaves = self.view_leaves_at(anchor);
         let mut effects = Effects::new();
         for leaf in &view_leaves {
             effects.fed_view_leaf(leaf, &id)?;
@@ -287,18 +289,24 @@ where
     /// across facet choices. For a file-shaped anchor `base` IS the single
     /// canonical-view file (there is no leaf to append).
     fn view_leaves_for_base(&self, base: &str) -> Result<Vec<String>> {
-        if self.shape == AnchorShape::File {
-            return self.facet_expansion.expand_view_leaves(base);
-        }
         let mut view_leaves = Vec::new();
-        for leaf in &self.leaves {
-            if !leaf.is_canonical_view() {
-                continue;
-            }
-            let leaf_path = format!("{base}/{}", leaf.leaf_name());
-            view_leaves.extend(self.facet_expansion.expand_view_leaves(&leaf_path)?);
+        for leaf in self.view_leaves_at(base) {
+            view_leaves.extend(self.facet_expansion.expand_view_leaves(&leaf)?);
         }
         Ok(view_leaves)
+    }
+
+    /// The paths that map to this object's canonical bytes under the anchor
+    /// at `base` alone, with its facets as `base` has them.
+    fn view_leaves_at(&self, base: &str) -> Vec<String> {
+        if self.shape == AnchorShape::File {
+            return vec![base.to_owned()];
+        }
+        self.leaves
+            .iter()
+            .filter(|leaf| leaf.is_canonical_view())
+            .map(|leaf| format!("{base}/{}", leaf.leaf_name()))
+            .collect()
     }
 
     fn project_eager_fields(

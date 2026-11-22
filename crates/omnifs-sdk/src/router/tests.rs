@@ -514,6 +514,84 @@ fn facet_excluded_from_identity() {
     );
 }
 
+/// An issue of the faceted demo route, whose feed writes its canonical
+/// bytes at the anchor of the state that it gives the issue.
+struct FacetObj;
+
+impl Object for FacetObj {
+    type Key = FacetedKey;
+    type State = ();
+    type Canonical = Json;
+
+    #[allow(
+        clippy::manual_async_fn,
+        reason = "the signature of the trait method"
+    )]
+    fn load(
+        _cx: &Cx<()>,
+        _key: &FacetedKey,
+        _since: Option<Validator>,
+    ) -> impl Future<Output = Result<Load<Self>>> {
+        async { Err(ProviderError::not_found("a fed object has no load")) }
+    }
+
+    fn decode(_bytes: &[u8]) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn kind() -> ObjectKind {
+        ObjectKind("demo.issue")
+    }
+}
+
+/// A part that writes the canonical bytes of issue 7 as a closed issue, at
+/// its anchor under `all`.
+#[allow(clippy::unused_async)]
+async fn closed_issue_feed(
+    cx: crate::feed::FeedCx<FacetedKey, ()>,
+) -> Result<crate::feed::Feed> {
+    cx.canonical::<FacetObj>(
+        "/acme/issues/all/7",
+        Canonical::new(br#"{"state":"closed"}"#.to_vec(), None),
+    );
+    Ok(crate::feed::Feed::part(&1_u32)?.into())
+}
+
+/// The canonical bytes that a feed writes for an object are its view leaves
+/// under the anchor that the feed gives alone: a closed issue written under
+/// `all` has no leaf under `open`.
+#[test]
+fn a_fed_canonical_has_its_view_leaves_under_its_anchor_alone() {
+    let mut router = Router::<()>::new();
+    router
+        .object::<FacetObj>("/{owner}/issues/{filter}/{number}", |o| {
+            o.dynamic();
+            o.file("item.json").canonical::<Json>()?;
+            o.file("summary").fed()?;
+            o.feed(closed_issue_feed).starts(["summary"])?;
+            Ok(())
+        })
+        .unwrap();
+    let router = router.compile().unwrap();
+    let cx = Cx::new(1, Rc::new(RefCell::new(())));
+    let start = Some(wit_types::FeedStart::Lacks(
+        "/acme/issues/all/7/summary".to_string(),
+    ));
+    let (_, effects, _) =
+        poll_ready(router.feed(&cx, "/acme/issues/all/7", None, start)).unwrap();
+    let effects = effects.into_wit();
+    assert_eq!(effects.canonical.len(), 1);
+    assert_eq!(
+        effects.canonical[0].view_leaves,
+        ["/acme/issues/all/7/item.json"]
+    );
+    assert!(
+        effects.fs.iter().all(|write| !write.path.contains("/open/")),
+        "{:?}",
+        effects.fs.iter().map(|write| &write.path).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn facet_view_leaves_expand_across_aliases() {
     let pattern = super::pattern::Pattern::parse("/{owner}/issues/{filter}/{number}").unwrap();
