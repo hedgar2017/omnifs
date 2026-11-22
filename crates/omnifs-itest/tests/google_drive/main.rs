@@ -806,9 +806,17 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
         ],
     )
     .await;
-    assert_eq!(found.unwrap(), "moved.md");
+    // The read gives the name whose size its lookup told, and the next one,
+    // after its lookup, the name that it took.
+    assert_eq!(found.unwrap(), "shared.md");
     expect_changes(&requests[0], "changes-1");
     expect_item(&requests[1], "file-5");
+    assert_eq!(
+        served(&harness, read(&harness, "files/file-5/name"))
+            .await
+            .unwrap(),
+        "moved.md"
+    );
     for (path, id, answer) in [
         ("files/file-6/name", "file-6", failure(404, "notFound")),
         (
