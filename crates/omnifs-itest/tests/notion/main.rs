@@ -794,10 +794,21 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
         ],
     )
     .await;
-    assert_eq!(body.unwrap(), "Page 6 body, edited");
+    // The read gives the version whose size its lookup told, and the next
+    // one the version that the read took.
+    assert_eq!(body.unwrap(), "Page 6 body");
     for request in &requests {
         expect(request, "GET", &markdown_of(&id(6)), None);
     }
+    assert_eq!(
+        served(
+            &harness,
+            read(&harness, &format!("pages/{}/body.md", id(6)))
+        )
+        .await
+        .unwrap(),
+        "Page 6 body, edited"
+    );
     assert_eq!(
         served(
             &harness,
