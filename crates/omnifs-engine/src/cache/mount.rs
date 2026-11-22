@@ -1591,6 +1591,18 @@ impl MountResources {
         }))
     }
 
+    /// The canonical bytes of the object `id`, none for an object without
+    /// a row.
+    pub(crate) fn canonical_of_object(
+        &self,
+        id: &[u8],
+    ) -> Result<Option<Vec<u8>>, ProjectionError> {
+        let Some((body, length, _)) = read_object_row_direct(&self.projection, id)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.body.read(body, Some(length))?))
+    }
+
     /// Forward index: path → object id bytes.
     pub(crate) fn id_of_path(&self, path: &Path) -> Result<Option<Vec<u8>>, ProjectionError> {
         Ok(self.projection.get(&index_key(path))?)

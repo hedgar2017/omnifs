@@ -381,6 +381,17 @@ impl ProjectionReads {
         })
     }
 
+    /// The canonical bytes of `object` in the projection, for any operation
+    /// of the provider: none for an object without them.
+    pub(crate) fn object(
+        &self,
+        object: &wit_types::LogicalId,
+    ) -> std::result::Result<Option<Vec<u8>>, wit_types::ProviderError> {
+        self.resources
+            .canonical_of_object(ObjectId::from_wit(object).as_bytes())
+            .map_err(internal)
+    }
+
     /// The listing of `path` in the projection, for the feed operation `id`
     /// and a path in the subtree of its object: its names, whether it is
     /// complete, and whether its fed mark says that it is unsettled; none

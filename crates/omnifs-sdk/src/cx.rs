@@ -97,6 +97,22 @@ impl<S> Cx<S> {
     }
 
     #[doc(hidden)]
+    /// The value of the object of type `O` with `key` as the projection
+    /// holds it, decoded from the canonical bytes that its load or a feed
+    /// stored; `None` for an object that the projection has no canonical
+    /// bytes of. A face, a collection or a dir handler uses it in place of a
+    /// request of its own for what the object already holds.
+    pub fn object<O: crate::object::Object>(
+        &self,
+        key: &O::Key,
+    ) -> crate::error::Result<Option<O>> {
+        let id: omnifs_wit::provider::types::LogicalId =
+            crate::object::Key::anchor(key, O::kind()).into();
+        crate::omnifs::provider::projection::object(self.id(), &id)?
+            .map(|bytes| O::decode(&bytes))
+            .transpose()
+    }
+
     pub fn id(&self) -> u64 {
         self.shared.id
     }

@@ -589,7 +589,7 @@ interface log {
 
 /// Reads of the projection the host keeps, for a feed operation.
 interface projection {
-    use types.{correlation-id, file-range, kept-names, listing-count, listing-names, provider-error};
+    use types.{correlation-id, file-range, kept-names, listing-count, listing-names, logical-id, provider-error};
 
     /// The names of the listing of `path` in the projection, for a path in
     /// the subtree of the object of the feed operation `id`; none for a path
@@ -610,6 +610,11 @@ interface projection {
     /// the feed of the operation `id` wrote and removed, for the paths of
     /// `names`: empty lists before a kept part.
     kept: func(id: correlation-id, path: string) -> result<kept-names, provider-error>;
+    /// The canonical bytes of the object `object` in the projection, which
+    /// its load or a feed stored, for any operation `id`; none for an object
+    /// that the projection has no canonical bytes of. A face or a collection
+    /// uses what the object holds without a request of its own.
+    object: func(id: correlation-id, object: logical-id) -> result<option<list<u8>>, provider-error>;
 }
 
 interface callouts {

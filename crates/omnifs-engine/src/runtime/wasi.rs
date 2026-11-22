@@ -137,4 +137,12 @@ impl ProjectionHost for HostState {
     ) -> Result<wit_types::KeptNames, wit_types::ProviderError> {
         self.projection()?.kept(id, &path)
     }
+
+    fn object(
+        &mut self,
+        _id: u64,
+        object: wit_types::LogicalId,
+    ) -> Result<Option<Vec<u8>>, wit_types::ProviderError> {
+        self.projection()?.object(&object)
+    }
 }

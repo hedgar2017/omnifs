@@ -111,13 +111,30 @@ async fn concurrent_reads_of_two_representations_take_the_bytes_of_their_own_pat
     assert_eq!(read(&markdown).await, b"# Memo 7\n");
     assert_eq!(read(&json).await, br#"{"memo":7}"#);
     for round in 0..3 {
-        // Past the deadline of the object, each read asks the provider: the
-        // second joins the flight of the first.
-        tokio::time::sleep(std::time::Duration::from_millis(3_200)).await;
+        // In a sync, each read asks the provider: the second joins the
+        // flight of the first.
+        harness.begin_sync();
         let (first, second) = tokio::join!(read(&markdown), read(&json));
         assert_eq!(first, b"# Memo 7\n", "round {round}");
         assert_eq!(second, br#"{"memo":7}"#, "round {round}");
     }
+}
+
+/// A face of an object takes the value of the object that the projection
+/// holds, without a load of its own: none before the canonical bytes are
+/// stored, and the stored object after a read of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_face_takes_the_value_of_its_object_from_the_projection() {
+    let harness = make_runtime();
+    let namespace = harness.namespace.as_ref();
+    let echo = resolve(namespace, "/test/memos/8/echo").await;
+    let read = |path: omnifs_core::path::Path| async move {
+        namespace.read(path, 0, u32::MAX).await.unwrap().bytes
+    };
+    assert_eq!(read(echo.path.clone()).await, b"none");
+    let json = resolve(namespace, "/test/memos/8/memo.json").await;
+    assert_eq!(read(json.path).await, br#"{"memo":8}"#);
+    assert_eq!(read(echo.path).await, b"echo 8");
 }
 
 /// Run `read` of a file of the test provider that fetches a blob, and answer

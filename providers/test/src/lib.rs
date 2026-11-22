@@ -823,6 +823,18 @@ impl Memo {
     }
 }
 
+impl Memo {
+    /// The memo as the projection holds it, by the value of its object and
+    /// without a load or a request of its own: `none` before its canonical
+    /// bytes are stored.
+    async fn echo(cx: Cx<State>, key: MemoKey) -> Result<FileProjection> {
+        let text = cx
+            .object::<Memo>(&key)?
+            .map_or_else(|| "none".to_owned(), |memo| format!("echo {}", memo.memo));
+        Ok(FileProjection::body(text.into_bytes()).dynamic().build())
+    }
+}
+
 impl Representable<Markdown> for Memo {
     fn represent(&self) -> Vec<u8> {
         format!("# Memo {}\n", self.memo).into_bytes()
@@ -1653,6 +1665,7 @@ fn fed_objects(r: &mut Router<State>) -> Result<()> {
         o.dynamic();
         o.file("memo.json").canonical::<Json>()?;
         o.file("memo.md").representation::<Markdown>()?;
+        o.file("echo").direct(Memo::echo)?;
         Ok(())
     })?;
     r.object::<Card>("/shelves/{shelf}/cards/{card}", |o| {
