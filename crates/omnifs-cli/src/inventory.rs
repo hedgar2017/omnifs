@@ -38,6 +38,32 @@ pub(crate) struct DaemonFacts {
     /// Whether the daemon runs the program of this command; none without the
     /// status of a daemon.
     pub(crate) current_program: Option<bool>,
+    /// The daemon process that the record of the profile names, whatever the
+    /// probe: none without a record.
+    pub(crate) recorded: Option<RecordedDaemon>,
+}
+
+/// The process of the record of a daemon in the profile, `process.json`:
+/// its process ID and whether that process still runs, the same process by
+/// its start and its executable, not another one with its ID. An installer
+/// tells a daemon that holds its socket and has not answered yet, which
+/// runs, from the stale record of one that ended, which does not.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub(crate) struct RecordedDaemon {
+    pub(crate) pid: u32,
+    pub(crate) running: bool,
+}
+
+impl RecordedDaemon {
+    /// The recorded daemon of the profile of `endpoint`, none without a
+    /// readable record.
+    fn of(endpoint: &Bootstrap<Client>) -> Option<Self> {
+        let instance = endpoint.read_process_identity().ok()??;
+        Some(Self {
+            pid: instance.pid(),
+            running: instance.still_identifies_running_process(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -151,6 +177,7 @@ impl DaemonFacts {
             status,
             probe,
             current_program: None,
+            recorded: None,
         }
     }
 }
@@ -189,11 +216,13 @@ impl From<Result<Option<DaemonInventory>, anyhow::Error>> for DaemonFacts {
                 status: Some(status),
                 probe: DaemonProbe::Responding,
                 current_program: None,
+                recorded: None,
             },
             Ok(None) => Self {
                 status: None,
                 probe: DaemonProbe::Stopped,
                 current_program: None,
+                recorded: None,
             },
             Err(error) => Self {
                 status: None,
@@ -201,6 +230,7 @@ impl From<Result<Option<DaemonInventory>, anyhow::Error>> for DaemonFacts {
                     message: format!("{error:#}"),
                 },
                 current_program: None,
+                recorded: None,
             },
         }
     }
@@ -606,6 +636,7 @@ impl Inventory {
                 .map(|status| status.info.program.as_deref() == Some(program.as_str())),
             status: daemon_status.clone(),
             probe,
+            recorded: RecordedDaemon::of(&endpoint),
         };
         let mount_count = mounts.len();
         let filesystems = filesystem_statuses(
@@ -910,6 +941,48 @@ mod tests {
         assert_eq!(state(&endpoint).await, "stopped");
         record_daemon(&endpoint);
         assert_eq!(state(&endpoint).await, "unreachable");
+    }
+
+    /// The record of a daemon names its process and whether that process
+    /// runs: a live daemon runs, and the stale record of one that ended,
+    /// whose process ID no process has, does not.
+    #[test]
+    fn the_recorded_daemon_is_its_process_and_whether_it_runs() {
+        let (_dir, endpoint) = profile();
+        assert_eq!(RecordedDaemon::of(&endpoint), None);
+        record_daemon(&endpoint);
+        assert_eq!(
+            RecordedDaemon::of(&endpoint),
+            Some(RecordedDaemon {
+                pid: std::process::id(),
+                running: true,
+            })
+        );
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        let pid = ended.id();
+        ended.wait().unwrap();
+        let path = endpoint.process_identity_path();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["pid"] = pid.into();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(
+            RecordedDaemon::of(&endpoint),
+            Some(RecordedDaemon {
+                pid,
+                running: false,
+            })
+        );
+        let facts = DaemonFacts {
+            status: None,
+            probe: DaemonProbe::Stopped,
+            current_program: None,
+            recorded: RecordedDaemon::of(&endpoint),
+        };
+        assert_eq!(
+            serde_json::to_value(facts).unwrap()["recorded"],
+            serde_json::json!({ "pid": pid, "running": false })
+        );
     }
 
     /// A profile without a daemon on its control socket, one that is missing
