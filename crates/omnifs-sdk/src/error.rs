@@ -312,7 +312,7 @@ impl From<CalloutError> for ProviderError {
     }
 }
 
-/// A host import's error, such as a `projection.listing` refusal.
+/// A host import's error, such as a `projection.names` refusal.
 impl From<WitProviderError> for ProviderError {
     fn from(error: WitProviderError) -> Self {
         Self::from_wit_kind(error.kind, error.message).with_retry_after(

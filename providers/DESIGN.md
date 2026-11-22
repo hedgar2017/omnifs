@@ -90,8 +90,8 @@ changes:
   should not cross the provider/WIT boundary. A blob can still carry exact size,
   content type, stability, and ETag/version evidence;
 - preserve the blob toolchain as a host-owned capability: `fetch-blob` stores a
-  body host-side and returns a runtime-local handle for file projection;
-- `BlobId` is runtime-local. The host derives durable blob request and body
+  body host-side and returns a handle of its operation for file projection;
+- `BlobId` is of one operation. The host derives durable blob request and body
   identities from validated request facts; providers never name cache entries;
 - stream and tree stay behaviors under file and directory faces;
 - stability, mutability, and authority are separate axes. The current object SDK

@@ -44,8 +44,7 @@ fn wasm_artifact_path(file_name: &str) -> PathBuf {
         .expect("host crate must have a workspace parent")
         .parent()
         .expect("workspace root must exist");
-    workspace_root
-        .join("target")
+    omnifs_engine::test_support::cargo_target_dir(workspace_root)
         .join("wasm32-wasip2")
         .join("release")
         .join(file_name)

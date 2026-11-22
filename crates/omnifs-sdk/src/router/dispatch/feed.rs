@@ -94,43 +94,9 @@ impl<S> CompiledRouter<S> {
         match answer {
             Feed::Unchanged => Ok((wit_types::FeedAnswer::Unchanged, effects, None)),
             Feed::Part(part) => {
-                let crate::feed::FeedPartParts {
-                    token,
-                    more,
-                    inner,
-                    until,
-                    unlisted,
-                    anew,
-                } = part.into_parts();
-                let inner = inner
-                    .into_iter()
-                    .map(|state| wit_types::FeedState {
-                        id: LogicalId::new(state.kind, state.identity).into(),
-                        token: state.token,
-                    })
-                    .collect();
-                let until = until
-                    .map(|until| {
-                        let since = until
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_err(|error| ProviderError::internal(error.to_string()))?;
-                        u64::try_from(since.as_millis())
-                            .map_err(|error| ProviderError::internal(error.to_string()))
-                    })
-                    .transpose()?;
                 let anchors = shape.facet_anchors(&effects)?;
-                Ok((
-                    wit_types::FeedAnswer::Part(wit_types::FeedPart {
-                        token,
-                        more,
-                        inner,
-                        anchors,
-                        unlisted,
-                        anew,
-                    }),
-                    effects,
-                    until,
-                ))
+                let (part, until) = wit_part(part, anchors)?;
+                Ok((wit_types::FeedAnswer::Part(part), effects, until))
             },
             Feed::Restart { token, error } => Ok((
                 wit_types::FeedAnswer::Restart(wit_types::FeedRestart {
@@ -240,4 +206,47 @@ fn leading_segments(path: &Path, count: usize) -> Result<Path> {
     let segments = path.segments().take(count).collect::<Vec<_>>();
     Path::parse(&format!("/{}", segments.join("/")))
         .map_err(|error| ProviderError::internal(error.to_string()))
+}
+
+/// `part` for the host, with the facet `anchors` that its effects write, and
+/// its `until` in milliseconds.
+fn wit_part(
+    part: crate::feed::FeedPart,
+    anchors: Vec<wit_types::FacetAnchor>,
+) -> Result<(wit_types::FeedPart, Option<u64>)> {
+    let crate::feed::FeedPartParts {
+        token,
+        more,
+        inner,
+        until,
+        unlisted,
+        anew,
+    } = part.into_parts();
+    let inner = inner
+        .into_iter()
+        .map(|state| wit_types::FeedState {
+            id: LogicalId::new(state.kind, state.identity).into(),
+            token: state.token,
+        })
+        .collect();
+    let until = until
+        .map(|until| {
+            let since = until
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| ProviderError::internal(error.to_string()))?;
+            u64::try_from(since.as_millis())
+                .map_err(|error| ProviderError::internal(error.to_string()))
+        })
+        .transpose()?;
+    Ok((
+        wit_types::FeedPart {
+            token,
+            more,
+            inner,
+            anchors,
+            unlisted,
+            anew,
+        },
+        until,
+    ))
 }

@@ -17,6 +17,7 @@ async fn an_operation_takes_the_answers_of_its_callouts_and_gives_their_requests
             status: 200,
             headers: Vec::new(),
             body: b"answered".to_vec(),
+            redirected: None,
         }))],
     )
     .await;
