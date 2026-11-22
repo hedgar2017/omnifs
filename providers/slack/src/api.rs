@@ -209,23 +209,17 @@ pub(crate) fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(|error| undecoded(&error))
 }
 
-/// What the provider reads of a user.
+/// What the provider reads of a user: its `id` and the `real_name` of its
+/// `profile`.
 #[derive(Deserialize)]
 pub(crate) struct UserObject {
     pub(crate) id: Id,
-    profile: Profile,
+    pub(crate) profile: Profile,
 }
 
 #[derive(Deserialize)]
-struct Profile {
-    real_name: Option<String>,
-}
-
-impl UserObject {
-    /// The `real_name` of its `profile`, empty for a user without one.
-    pub(crate) fn name(&self) -> &str {
-        self.profile.real_name.as_deref().unwrap_or_default()
-    }
+pub(crate) struct Profile {
+    pub(crate) real_name: Option<String>,
 }
 
 /// What the provider reads of a conversation.

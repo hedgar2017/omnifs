@@ -10,11 +10,13 @@
 //! `replies/{ts}/` with `author`, `text`, and `message.json` of each reply of
 //! its thread, and `files/{id}/` with `name` and `content` of each file of a
 //! message or a reply, by the ID of Slack of a user, a channel, or a file,
-//! and the `ts` of a message or a reply. Their facts come from feeds alone:
-//! the feeds of full listings of the users and of the channels, the feed of
-//! the history of each channel, which sweeps its pages, and the own feeds of
-//! a message, which takes it by its `ts` and its replies, and of a file,
-//! which takes its content.
+//! and the `ts` of a message or a reply. Their facts come from feeds alone,
+//! each asked once in a sync and at the first read of a fact that the
+//! projection lacks: the feeds of full listings of the users and of the
+//! channels, the feed of the history of each channel, which sweeps its
+//! pages, and the own feeds of a message, which takes a message that the
+//! projection lacks by its `ts` and its replies, and of a file, which takes
+//! its content.
 
 use omnifs_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -171,7 +173,7 @@ pub(crate) struct ReplyFile;
     display_name = "Slack",
     description = "users, channels, messages, and files from your workspace",
     mount = "slack",
-    projection = 3,
+    projection = 4,
     capabilities(
         domain(
             "slack.com",
@@ -182,7 +184,6 @@ pub(crate) struct ReplyFile;
             "Fetch the content of the files of the messages and the replies of a workspace of Slack."
         ),
     ),
-    limits(memory_mb(256, "Leave room for a page of 999 objects of Slack."),),
     auth = r#"{"default":"token","schemes":[{"staticToken":{"key":"token","valuePrefix":"Bearer ","description":"Slack bot token","injectDomains":["slack.com","files.slack.com"],"validation":{"method":"POST","url":"https://slack.com/api/auth.test","expectStatus":200,"jsonPointer":"/bot_id"}}}]}"#
 )]
 impl SlackProvider {

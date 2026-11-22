@@ -7,26 +7,22 @@
 //! writes the listing complete and removes each other entry of it.
 //!
 //! The feed of the history of a channel answers from `conversations.history`
-//! alone, which owns the files of each message. Its first answer and each
-//! answer of a read of `messages/` past the deadline of the feed sweep the
-//! pages of the history, the newest first: each page writes each of its
-//! messages as it came, and the last page writes `messages/` complete,
-//! empty for a channel without a message, without each message of the
-//! projection that the pages lack. Each other answer past that deadline asks
-//! for the messages after the latest one that the feed took (`oldest`), one
-//! page unless more than a page of them came. A message without replies has
-//! `replies/` complete and empty; the `replies/` of a message whose
-//! `reply_count` or `latest_reply` are not those of the replies that the
-//! projection has complete leave the projection, for their next read to
-//! take them once more. The first sweep gives the feed of each message that
-//! it writes its state, so that the feed of a message takes it by its `ts`
-//! past its deadline before the end of that sweep. A sweep begins again from
-//! its first page for a channel that the feed of the channels writes again
-//! after its removal, which gives it the token of a channel before its first
-//! sweep, without the kept pages of an answer from another token.
+//! alone, which owns the files of each message: each answer sweeps the
+//! pages of the history, the newest first, once in a sync and at the first
+//! read of the channel. Each page writes each of its messages as it came, and
+//! the last page writes `messages/` complete, empty for a channel without a
+//! message, without each message of the projection that the pages lack. A
+//! message without replies has `replies/` complete and empty; the `replies/`
+//! of a message whose `reply_count` or `latest_reply` are not those of the
+//! replies that the projection has complete leave the projection, for their
+//! next read to take them once more. The first sweep gives the feed of each
+//! message that it writes its state. A channel that the feed of the channels
+//! writes and that the projection did not list before, as after its
+//! removal, begins its history again with the token of a channel before its
+//! first sweep, without the kept pages of an answer from another token.
 //!
-//! The own feed of a message takes it by its `ts` before the end of the
-//! first sweep of its channel, and the replies of a `replies/` that the
+//! The own feed of a message takes a message that the projection lacks by
+//! its `ts` before the end of the first sweep of its channel, and the replies of a `replies/` that the
 //! projection has not complete from the pages of `conversations.replies`,
 //! each page at its answer, without the message itself, whose files the
 //! feed of the history owns. The own feed of a file of a message or a reply
@@ -56,9 +52,6 @@ const PAGE: usize = 999;
 /// gives.
 const REPLIES: usize = 1000;
 
-/// The bytes of a range of a read of a fed file of the projection.
-const RANGE: u32 = 64 * 1024;
-
 // ===========================================================================
 // Tokens
 // ===========================================================================
@@ -77,62 +70,30 @@ struct ListingPage {
     before: Option<BTreeSet<Id>>,
 }
 
-/// The token of the feed of the history of a channel: the `ts` of the latest
-/// message that it took, none for a channel without one, whether a sweep of
-/// the history ended, and the stage of an unfinished answer.
+/// The token of the feed of the history of a channel: whether a sweep of
+/// the history ended, and the next page of an unfinished sweep.
 #[derive(Serialize, Deserialize)]
 struct HistoryToken {
-    latest: Option<Ts>,
     swept: bool,
-    stage: Option<Stage>,
+    sweep: Option<Sweep>,
 }
 
 impl HistoryToken {
     /// The token of a channel before its first sweep.
     fn unswept() -> Self {
         Self {
-            latest: None,
             swept: false,
-            stage: None,
+            sweep: None,
         }
     }
 }
 
-/// The stage of an unfinished answer of the history of a channel.
+/// The next page of an unfinished sweep: the cursor of that page, and the
+/// `ts` of the messages of the pages so far.
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Stage {
-    /// A sweep at the cursor of its next page, none for its first one, with
-    /// the `ts` of the messages of its pages so far.
-    Sweep {
-        cursor: Option<String>,
-        messages: BTreeSet<Ts>,
-    },
-    /// The messages after the latest one of the token at the cursor of their
-    /// next page, none for their first one, with the newest `ts` of their
-    /// pages so far.
-    New {
-        cursor: Option<String>,
-        newest: Option<Ts>,
-    },
-}
-
-impl Stage {
-    /// The first page of a sweep.
-    fn sweep() -> Self {
-        Self::Sweep {
-            cursor: None,
-            messages: BTreeSet::new(),
-        }
-    }
-
-    /// The first page of the new messages.
-    fn new_messages() -> Self {
-        Self::New {
-            cursor: None,
-            newest: None,
-        }
-    }
+struct Sweep {
+    cursor: String,
+    messages: BTreeSet<Ts>,
 }
 
 /// The token of the feed of a message: the replies of an unfinished answer.
@@ -193,21 +154,16 @@ fn listed<K>(cx: &FeedCx<K>, path: &str) -> Result<BTreeSet<Ts>> {
         .unwrap_or_default())
 }
 
-/// The whole of the fed file at `path` in the projection, read by its
-/// ranges, none without one.
+/// The whole of the fed file at `path` in the projection, by a range of its
+/// length, none without one.
 fn read_whole<K>(cx: &FeedCx<K>, path: &str) -> Result<Option<Vec<u8>>> {
-    let Some(first) = cx.read_range(path, 0, RANGE)? else {
+    let Some(file) = cx.read_range(path, 0, 0)? else {
         return Ok(None);
     };
-    let mut bytes = first.bytes;
-    while (bytes.len() as u64) < first.length {
-        let next = cx
-            .read_range(path, bytes.len() as u64, RANGE)?
-            .filter(|next| !next.bytes.is_empty() && next.length == first.length)
-            .ok_or_else(|| ProviderError::internal(format!("{path} changed while it was read")))?;
-        bytes.extend(next.bytes);
-    }
-    Ok(Some(bytes))
+    let length = u32::try_from(file.length).map_err(|_| {
+        ProviderError::too_large(format!("{path} has more bytes than a read gives"))
+    })?;
+    Ok(cx.read_range(path, 0, length)?.map(|file| file.bytes))
 }
 
 /// The `message.json` of the message or the reply at `at` in the
@@ -358,25 +314,23 @@ fn take<K>(
 /// The `replies/` of the message `message` at `at`: complete and empty for a
 /// message without replies, and their removal for replies complete in the
 /// projection whose count or latest `ts` are not the `reply_count` or the
-/// `latest_reply` of the message. Whether it removed them.
-fn take_replies<K>(cx: &FeedCx<K>, at: &str, message: &MessageObject) -> Result<bool> {
+/// `latest_reply` of the message.
+fn take_replies<K>(cx: &FeedCx<K>, at: &str, message: &MessageObject) -> Result<()> {
     let replies = format!("{at}/replies");
     let Some(thread) = message.thread() else {
-        complete_replies(cx, &replies, &BTreeSet::new())?;
-        return Ok(false);
+        return complete_replies(cx, &replies, &BTreeSet::new());
     };
     let Some(listed) = cx.names::<Ts>(&replies)?.filter(|listed| listed.complete) else {
-        return Ok(false);
+        return Ok(());
     };
     let has = Thread {
         count: listed.names.len() as u64,
         latest: listed.names.iter().max(),
     };
-    if has == thread {
-        return Ok(false);
+    if has != thread {
+        cx.remove(replies)?;
     }
-    cx.remove(replies)?;
-    Ok(true)
+    Ok(())
 }
 
 /// Write `at`, the `replies/` of a message, complete with `replies`, which
@@ -426,24 +380,24 @@ impl Listing {
         })
     }
 
-    /// Write the folder of an object of the listing in `folder` with `name`
-    /// and the object, and give its ID.
+    /// Write the folder of an object of the listing in `folder` with its
+    /// `name`, empty for a user without a `real_name`, and the object, and
+    /// give its ID.
     fn write<K>(self, cx: &FeedCx<K>, folder: &Path, object: &RawValue) -> Result<Id> {
         let bytes = object.get().as_bytes();
         let (id, name, json) = match self {
             Self::Users => {
                 let user: UserObject = decode(bytes)?;
-                let name = user.name().to_owned();
-                (user.id, name, "user.json")
+                (user.id, user.profile.real_name, "user.json")
             },
             Self::Channels => {
                 let channel: ConversationObject = decode(bytes)?;
-                (channel.id, channel.name, "channel.json")
+                (channel.id, Some(channel.name), "channel.json")
             },
         };
         let at = format!("{folder}/{id}");
         cx.dir(&at, ListingWrite::Partial)?;
-        cx.file(format!("{at}/name"), name)?;
+        cx.file(format!("{at}/name"), name.unwrap_or_default())?;
         cx.file(format!("{at}/{json}"), bytes)?;
         Ok(id)
     }
@@ -537,91 +491,13 @@ async fn full_listing(cx: &FeedCx<WorkspaceKey>, listing: Listing) -> Result<Fee
 // ===========================================================================
 
 impl History {
-    /// The feed of the history of a channel: a sweep from its first page,
-    /// without the kept pages of the answer, in place of an unfinished answer
-    /// of the new messages for a read of `messages/`; else the next page of
-    /// the stage of its token; else a sweep for the first answer, for a read
-    /// of `messages/`, and for a channel without a message; else the new
-    /// messages after the latest one. The feed of the channels gives a
-    /// channel that comes back the token of a channel before its first
-    /// sweep.
+    /// The feed of the history of a channel: the next page of the sweep of
+    /// its token, else the first one.
     pub(crate) async fn feed(cx: FeedCx<ChannelKey>) -> Result<Feed> {
         let token = cx
             .token::<HistoryToken>()?
             .unwrap_or_else(HistoryToken::unswept);
-        let listing = [cx.start(), cx.due()].contains(&Some(""));
-        let (stage, anew) = match token.stage {
-            Some(Stage::New { .. }) if listing => (Stage::sweep(), true),
-            Some(stage) => (stage, false),
-            None if listing || token.latest.is_none() => (Stage::sweep(), false),
-            None => (Stage::new_messages(), false),
-        };
-        let token = HistoryToken {
-            stage: None,
-            ..token
-        };
-        let part = match stage {
-            Stage::Sweep { cursor, messages } => sweep(&cx, token, cursor, messages).await?,
-            Stage::New { cursor, newest } => new_messages(&cx, token, cursor, newest).await?,
-        };
-        Ok(match part {
-            Answered::Part(part) if anew => part.anew().into(),
-            Answered::Part(part) => part.into(),
-            Answered::Restart(restart) => restart,
-        })
-    }
-}
-
-/// The answer of a call of the feed of the history: a part, or a restart.
-enum Answered {
-    Part(FeedPart),
-    Restart(Feed),
-}
-
-/// The request of the page of `conversations.history` of the channel of
-/// `cx` at `cursor`, after `oldest`, and its answer; `channel_not_found` and
-/// `not_in_channel` remove the channel with the token of a channel before
-/// its first sweep, and `invalid_cursor` restarts the stage `restart`.
-async fn history_page(
-    cx: &FeedCx<ChannelKey>,
-    token: &HistoryToken,
-    oldest: Option<&Ts>,
-    cursor: Option<&String>,
-    restart: Stage,
-) -> Result<std::result::Result<crate::api::Page, Answered>> {
-    let mut request = cx
-        .endpoint(SlackApi)
-        .get("/api/conversations.history")
-        .query("channel", &cx.key().id);
-    if let Some(oldest) = oldest {
-        request = request.query("oldest", oldest);
-    }
-    request = request.query("limit", PAGE);
-    if let Some(cursor) = cursor {
-        request = request.query("cursor", cursor);
-    }
-    match page::<ConversationsMessages>(&request.send().await?) {
-        Ok(page) => Ok(Ok(page)),
-        Err(Refusal {
-            of: Refused::Channel,
-            ..
-        }) => {
-            cx.remove(folder(cx.path())?)?;
-            let part = Feed::part(&HistoryToken::unswept())?.anew();
-            Ok(Err(Answered::Part(part)))
-        },
-        Err(Refusal {
-            of: Refused::Cursor,
-            error,
-        }) if cursor.is_some() => {
-            let token = HistoryToken {
-                stage: Some(restart),
-                latest: token.latest.clone(),
-                ..*token
-            };
-            Ok(Err(Answered::Restart(Feed::restart(&token, error)?)))
-        },
-        Err(refusal) => Err(refusal.error),
+        sweep(&cx, token).await
     }
 }
 
@@ -648,20 +524,44 @@ fn take_message(
     Ok(ts)
 }
 
-/// A page of a sweep, with the `ts` of the messages of its pages before it.
-/// The last page writes `messages/` complete and removes each message of the
-/// projection that the pages lack, and, in the first sweep, older than the
-/// newest message of the pages alone: the feed of a message took a newer one
-/// meanwhile.
-async fn sweep(
-    cx: &FeedCx<ChannelKey>,
-    token: HistoryToken,
-    cursor: Option<String>,
-    mut messages: BTreeSet<Ts>,
-) -> Result<Answered> {
-    let page = match history_page(cx, &token, None, cursor.as_ref(), Stage::sweep()).await? {
+/// A page of `conversations.history` of the sweep of `token`. The last page
+/// writes `messages/` complete and removes each message of the projection
+/// that the pages lack, and, in the first sweep, older than the newest
+/// message of the pages alone: the feed of a message took a newer one by its
+/// `ts` meanwhile. `channel_not_found` and `not_in_channel` remove the
+/// channel with the token of a channel before its first sweep, and
+/// `invalid_cursor` restarts the sweep.
+async fn sweep(cx: &FeedCx<ChannelKey>, token: HistoryToken) -> Result<Feed> {
+    let (cursor, mut messages) = match token.sweep {
+        Some(Sweep { cursor, messages }) => (Some(cursor), messages),
+        None => (None, BTreeSet::new()),
+    };
+    let token = HistoryToken {
+        sweep: None,
+        ..token
+    };
+    let mut request = cx
+        .endpoint(SlackApi)
+        .get("/api/conversations.history")
+        .query("channel", &cx.key().id)
+        .query("limit", PAGE);
+    if let Some(cursor) = &cursor {
+        request = request.query("cursor", cursor);
+    }
+    let page = match page::<ConversationsMessages>(&request.send().await?) {
         Ok(page) => page,
-        Err(answered) => return Ok(answered),
+        Err(Refusal {
+            of: Refused::Channel,
+            ..
+        }) => {
+            cx.remove(folder(cx.path())?)?;
+            return Ok(Feed::part(&HistoryToken::unswept())?.anew().into());
+        },
+        Err(Refusal {
+            of: Refused::Cursor,
+            error,
+        }) if cursor.is_some() => return Feed::restart(&token, error),
+        Err(refusal) => return Err(refusal.error),
     };
     let at = cx.path().as_str();
     let mut inner = Vec::new();
@@ -671,13 +571,10 @@ async fn sweep(
     if let Some(cursor) = page.next {
         cx.dir(at, ListingWrite::Partial)?;
         let token = HistoryToken {
-            stage: Some(Stage::Sweep {
-                cursor: Some(cursor),
-                messages,
-            }),
+            sweep: Some(Sweep { cursor, messages }),
             ..token
         };
-        return Ok(Answered::Part(feed_part(&token, true, inner)?));
+        return Ok(feed_part(&token, true, inner)?.into());
     }
     cx.dir(at, ListingWrite::Complete)?;
     let newest = messages.last();
@@ -687,56 +584,10 @@ async fn sweep(
         }
     }
     let token = HistoryToken {
-        latest: messages.last().cloned(),
         swept: true,
-        stage: None,
+        sweep: None,
     };
-    Ok(Answered::Part(feed_part(&token, false, inner)?))
-}
-
-/// A page of the messages after the latest one of `token`, with the newest
-/// `ts` of the pages before it, each joining `messages/`; the last page makes
-/// the newest of them the latest message.
-async fn new_messages(
-    cx: &FeedCx<ChannelKey>,
-    token: HistoryToken,
-    cursor: Option<String>,
-    mut newest: Option<Ts>,
-) -> Result<Answered> {
-    let oldest = token.latest.clone();
-    let page = match history_page(
-        cx,
-        &token,
-        oldest.as_ref(),
-        cursor.as_ref(),
-        Stage::new_messages(),
-    )
-    .await?
-    {
-        Ok(page) => page,
-        Err(answered) => return Ok(answered),
-    };
-    cx.dir(cx.path(), ListingWrite::Join)?;
-    let mut inner = Vec::new();
-    for object in &page.objects {
-        let ts = take_message(cx, &token, object, &mut inner)?;
-        newest = newest.max(Some(ts));
-    }
-    if let Some(cursor) = page.next {
-        let token = HistoryToken {
-            stage: Some(Stage::New {
-                cursor: Some(cursor),
-                newest,
-            }),
-            ..token
-        };
-        return Ok(Answered::Part(feed_part(&token, true, inner)?));
-    }
-    let token = HistoryToken {
-        latest: token.latest.max(newest),
-        ..token
-    };
-    Ok(Answered::Part(feed_part(&token, false, inner)?))
+    Ok(feed_part(&token, false, inner)?.into())
 }
 
 // ===========================================================================
@@ -754,9 +605,7 @@ struct MessageFeed<'a> {
 impl Message {
     /// The feed of a message: the next page of the replies of its token;
     /// else, for a start, each in `replies`, its replies; else the message
-    /// by its `ts`, and after it, in the same answer, its replies for a due
-    /// start, each in `replies`, of a message whose replies left the
-    /// projection.
+    /// by its `ts` for a message that the projection lacks.
     pub(crate) async fn feed(cx: FeedCx<MessageKey>) -> Result<Feed> {
         let token = cx.token::<MessageToken>()?.flatten();
         let mut feed = MessageFeed {
@@ -770,7 +619,7 @@ impl Message {
         if cx.start().is_some() {
             return feed.thread().await;
         }
-        feed.message(cx.due().is_some()).await
+        feed.message().await
     }
 }
 
@@ -800,11 +649,14 @@ impl MessageFeed<'_> {
         }
     }
 
-    /// The message by its `ts`: its take, its folder joining `messages/` as
-    /// complete as it was, or its removal for an answer without it; then,
-    /// for `due`, a message whose replies left the projection takes them in
-    /// the same answer.
-    async fn message(&mut self, due: bool) -> Result<Feed> {
+    /// The message by its `ts` for a message that the projection lacks: its
+    /// take, its folder joining `messages/` as complete as it was, or its
+    /// removal for an answer without it; nothing for a message that the
+    /// projection has, which the sweep of its channel takes.
+    async fn message(&mut self) -> Result<Feed> {
+        if projected(self.cx, self.cx.path().as_str())?.is_some() {
+            return self.part(None);
+        }
         let key = self.cx.key();
         let response = self
             .cx
@@ -842,10 +694,7 @@ impl MessageFeed<'_> {
             object,
             &mut self.inner,
         )?;
-        let removed = take_replies(self.cx, self.cx.path().as_str(), &taken.message)?;
-        if due && removed {
-            return self.part(Some(Replies::first()));
-        }
+        take_replies(self.cx, self.cx.path().as_str(), &taken.message)?;
         self.part(None)
     }
 
