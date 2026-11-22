@@ -15,14 +15,11 @@ use crate::User;
 pub(crate) struct ItemData {
     pub(crate) number: u64,
     pub(crate) title: String,
-    #[serde(default)]
     pub(crate) body: Option<String>,
     pub(crate) state: String,
-    #[serde(default)]
     pub(crate) user: Option<User>,
     /// Set on the issues that are pull requests: `Issue::load` keeps the
     /// kinds disjoint and the feeds read the kind of a row from it.
-    #[serde(default)]
     pub(crate) pull_request: Option<IgnoredAny>,
 }
 
@@ -81,15 +78,10 @@ impl Representable<Markdown> for PullRequest {
 pub(crate) struct ChangedFile {
     pub(crate) filename: String,
     pub(crate) status: String,
-    #[serde(default)]
     pub(crate) additions: u64,
-    #[serde(default)]
     pub(crate) deletions: u64,
-    #[serde(default)]
     pub(crate) changes: u64,
-    #[serde(default)]
     pub(crate) patch: Option<String>,
-    #[serde(default)]
     pub(crate) previous_filename: Option<String>,
 }
 
@@ -130,19 +122,15 @@ impl Representable<Markdown> for ChangedFile {
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Review {
     pub(crate) id: u64,
-    #[serde(default)]
     pub(crate) user: Option<User>,
-    #[serde(default)]
-    pub(crate) body: Option<String>,
-    #[serde(default)]
-    pub(crate) state: Option<String>,
-    #[serde(default)]
+    pub(crate) body: String,
+    pub(crate) state: String,
     pub(crate) submitted_at: Option<String>,
 }
 
 impl Review {
     pub(crate) fn state(&self, _key: &crate::item::ReviewKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.state.clone().unwrap_or_default(), TextFormat::Raw).build())
+        Ok(FileProjection::text(self.state.clone(), TextFormat::Raw).build())
     }
 
     pub(crate) fn user(&self, _key: &crate::item::ReviewKey) -> Result<FileProjection> {
@@ -151,8 +139,7 @@ impl Review {
     }
 
     pub(crate) fn body_md(&self, _key: &crate::item::ReviewKey) -> Result<FileProjection> {
-        let body = self.body.as_deref().unwrap_or("");
-        Ok(FileProjection::body(body.to_owned())
+        Ok(FileProjection::body(self.body.clone())
             .content_type(ContentType::Markdown)
             .build())
     }
@@ -161,12 +148,12 @@ impl Review {
 impl Representable<Markdown> for Review {
     fn represent(&self) -> Vec<u8> {
         let user = self.user.as_ref().map_or("", |u| u.login.as_str());
-        let state = self.state.as_deref().unwrap_or("");
+        let Self {
+            id, state, body, ..
+        } = self;
         let submitted = self.submitted_at.as_deref().unwrap_or("");
-        let body = self.body.as_deref().unwrap_or("");
         format!(
-            "# Review {}\n\n- State: {state}\n- User: {user}\n- Submitted: {submitted}\n\n{body}\n",
-            self.id
+            "# Review {id}\n\n- State: {state}\n- User: {user}\n- Submitted: {submitted}\n\n{body}\n"
         )
         .into_bytes()
     }
@@ -176,20 +163,15 @@ impl Representable<Markdown> for Review {
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ReviewComment {
     pub(crate) id: u64,
-    #[serde(default)]
     pub(crate) user: Option<User>,
-    #[serde(default)]
-    pub(crate) body: Option<String>,
-    #[serde(default)]
-    pub(crate) path: Option<String>,
-    #[serde(default)]
-    pub(crate) diff_hunk: Option<String>,
+    pub(crate) body: String,
+    pub(crate) path: String,
+    pub(crate) diff_hunk: String,
 }
 
 impl ReviewComment {
     pub(crate) fn body_md(&self, _key: &crate::item::ReviewCommentKey) -> Result<FileProjection> {
-        let body = self.body.as_deref().unwrap_or("");
-        Ok(FileProjection::body(body.to_owned())
+        Ok(FileProjection::body(self.body.clone())
             .content_type(ContentType::Markdown)
             .build())
     }
@@ -200,17 +182,20 @@ impl ReviewComment {
     }
 
     pub(crate) fn path(&self, _key: &crate::item::ReviewCommentKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.path.clone().unwrap_or_default(), TextFormat::Raw).build())
+        Ok(FileProjection::text(self.path.clone(), TextFormat::Raw).build())
     }
 }
 
 impl Representable<Markdown> for ReviewComment {
     fn represent(&self) -> Vec<u8> {
         let user = self.user.as_ref().map_or("", |u| u.login.as_str());
-        let path = self.path.as_deref().unwrap_or("");
-        let body = self.body.as_deref().unwrap_or("");
-        let diff = self.diff_hunk.as_deref().unwrap_or("");
-        format!("{user} on `{path}`:\n\n{body}\n\n```diff\n{diff}\n```\n").into_bytes()
+        let Self {
+            path,
+            body,
+            diff_hunk,
+            ..
+        } = self;
+        format!("{user} on `{path}`:\n\n{body}\n\n```diff\n{diff_hunk}\n```\n").into_bytes()
     }
 }
 
@@ -220,21 +205,15 @@ pub(crate) struct CheckRun {
     pub(crate) id: u64,
     pub(crate) name: String,
     pub(crate) status: String,
-    #[serde(default)]
     pub(crate) conclusion: Option<String>,
-    #[serde(default)]
     pub(crate) html_url: Option<String>,
-    #[serde(default)]
-    pub(crate) output: Option<CheckOutput>,
+    pub(crate) output: CheckOutput,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CheckOutput {
-    #[serde(default)]
     pub(crate) title: Option<String>,
-    #[serde(default)]
     pub(crate) summary: Option<String>,
-    #[serde(default)]
     pub(crate) text: Option<String>,
 }
 
@@ -261,9 +240,7 @@ impl CheckRun {
     }
 
     fn summary_markdown(&self) -> String {
-        let Some(output) = &self.output else {
-            return String::new();
-        };
+        let output = &self.output;
         let mut summary = String::new();
         if let Some(title) = &output.title {
             summary.push_str("## ");
@@ -304,20 +281,16 @@ impl Representable<Markdown> for CheckRun {
 #[omnifs_sdk::object(kind = "github.owner", key = crate::item::OwnerKey)]
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Owner {
-    #[serde(default)]
-    pub(crate) login: Option<String>,
-    #[serde(rename = "type", default)]
-    pub(crate) kind: Option<String>,
-    #[serde(default)]
+    pub(crate) login: String,
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
     pub(crate) name: Option<String>,
-    #[serde(default)]
     pub(crate) bio: Option<String>,
 }
 
 impl Representable<Markdown> for Owner {
     fn represent(&self) -> Vec<u8> {
-        let login = self.login.as_deref().unwrap_or("");
-        let kind = self.kind.as_deref().unwrap_or("User");
+        let Self { login, kind, .. } = self;
         let name = self.name.as_deref().unwrap_or("");
         let bio = self.bio.as_deref().unwrap_or("");
         format!("# {login}\n\n- Type: {kind}\n- Name: {name}\n\n{bio}\n").into_bytes()
@@ -333,12 +306,16 @@ pub(crate) struct Repo {}
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Comment {
     pub(crate) id: u64,
-    pub(crate) user: User,
-    #[serde(default)]
+    pub(crate) user: Option<User>,
     pub(crate) body: Option<String>,
 }
 
 impl Comment {
+    /// The login of the author, empty for a comment without one.
+    pub(crate) fn login(&self) -> &str {
+        self.user.as_ref().map_or("", |user| user.login.as_str())
+    }
+
     /// The body, empty for a comment without one.
     pub(crate) fn body_text(&self) -> &str {
         self.body.as_deref().unwrap_or("")
@@ -347,7 +324,7 @@ impl Comment {
 
 impl Representable<Markdown> for Comment {
     fn represent(&self) -> Vec<u8> {
-        format!("{}:\n{}\n", self.user.login, self.body_text()).into_bytes()
+        format!("{}:\n{}\n", self.login(), self.body_text()).into_bytes()
     }
 }
 
@@ -355,15 +332,11 @@ impl Representable<Markdown> for Comment {
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Notification {
     pub(crate) id: String,
-    #[serde(default)]
     pub(crate) unread: bool,
-    #[serde(default)]
-    pub(crate) reason: Option<String>,
-    #[serde(default)]
-    pub(crate) updated_at: Option<String>,
+    pub(crate) reason: String,
+    pub(crate) updated_at: String,
     pub(crate) subject: NotificationSubject,
-    #[serde(default)]
-    pub(crate) repository: Option<NotificationRepo>,
+    pub(crate) repository: NotificationRepo,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -375,13 +348,12 @@ pub(crate) struct NotificationSubject {
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct NotificationRepo {
-    #[serde(default)]
-    pub(crate) full_name: Option<String>,
+    pub(crate) full_name: String,
 }
 
 impl Notification {
     pub(crate) fn reason(&self, _key: &crate::item::NotificationKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.reason.clone().unwrap_or_default(), TextFormat::Raw).build())
+        Ok(FileProjection::text(self.reason.clone(), TextFormat::Raw).build())
     }
 
     pub(crate) fn subject(&self, _key: &crate::item::NotificationKey) -> Result<FileProjection> {
@@ -389,16 +361,14 @@ impl Notification {
     }
 
     pub(crate) fn item_markdown(&self) -> Vec<u8> {
-        let repo = self
-            .repository
-            .as_ref()
-            .and_then(|repo| repo.full_name.as_deref())
-            .unwrap_or("");
-        let reason = self.reason.as_deref().unwrap_or("");
-        let updated = self.updated_at.as_deref().unwrap_or("");
         format!(
-            "# {}\n\n- Type: {}\n- Repository: {repo}\n- Reason: {reason}\n- Unread: {}\n- Updated: {updated}\n",
-            self.subject.title, self.subject.kind, self.unread
+            "# {}\n\n- Type: {}\n- Repository: {}\n- Reason: {}\n- Unread: {}\n- Updated: {}\n",
+            self.subject.title,
+            self.subject.kind,
+            self.repository.full_name,
+            self.reason,
+            self.unread,
+            self.updated_at
         )
         .into_bytes()
     }
@@ -415,7 +385,6 @@ impl Representable<Markdown> for Notification {
 pub(crate) struct WorkflowRun {
     pub(crate) id: u64,
     pub(crate) status: String,
-    #[serde(default)]
     pub(crate) conclusion: Option<String>,
 }
 

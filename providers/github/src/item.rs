@@ -16,7 +16,7 @@ use crate::objects::{
 use crate::{
     CHECK_RUN_PAGE_SIZE, CheckRunsResponse, FILE_PAGE_SIZE, FilePath, NOTIFICATION_PAGE_SIZE,
     OwnerKind, OwnerName, REVIEW_PAGE_SIZE, RepoId, RepoName, StateFilter, ThreadId,
-    WorkflowRunsResponse, resolve_owner_kind,
+    WORKFLOW_RUN_PAGE_SIZE, WorkflowRunsResponse,
 };
 
 /// Identity discriminator for the comment anchor's `{item_kind}` segment. A
@@ -159,20 +159,9 @@ impl Owner {
         key: &OwnerKey,
         since: Option<Validator>,
     ) -> Result<Load<Self>> {
-        // GitHub serves user and org profiles at distinct paths; probe the user
-        // endpoint first, then orgs, mirroring `resolve_owner_kind`.
-        match cx
-            .endpoint(GitHubApi)
-            .get(format!("/users/{}", key.owner))
-            .maybe_if_none_match(since.as_ref())
-            .load_with(decode_json::<Self>)
-            .await
-        {
-            Ok(Load::NotFound) => {},
-            other => return other,
-        }
+        // `/users/{login}` answers the profile of an organization too.
         cx.endpoint(GitHubApi)
-            .get(format!("/orgs/{}", key.owner))
+            .get(format!("/users/{}", key.owner))
             .maybe_if_none_match(since.as_ref())
             .load_with(decode_json::<Self>)
             .await
@@ -391,31 +380,40 @@ impl Owner {
     /// Anchor-topology collection: the repo names listed under `/{owner}` ARE
     /// the child `Repo` anchors (`/{owner}/{repo}`). The repo listing carries
     /// only the name, not the single-repo canonical, so entries are `key`.
+    ///
+    /// A page with a cursor or a validator asks the repos of their owner
+    /// kind. The first page without them asks the repos of an organization,
+    /// which answer `404` for a user, and then the repos of that user.
     pub(crate) async fn repos(
         key: OwnerKey,
         cx: ListCx<RepoCursor>,
     ) -> Result<Collection<Repo, RepoCursor>> {
         let since: Option<RepoValidator> = cx.validator().map(decode_validator).transpose()?;
         let (kind, page) = match (cx.cursor(), &since) {
-            (Some(cursor), _) => (cursor.kind, cursor.page),
-            (None, Some(since)) => (since.kind, 1),
-            (None, None) => (
-                resolve_owner_kind(&cx, &key.owner)
-                    .await?
-                    .ok_or_else(|| ProviderError::not_found("owner not found"))?,
-                1,
-            ),
+            (Some(cursor), _) => (Some(cursor.kind), cursor.page),
+            (None, Some(since)) => (Some(since.kind), 1),
+            (None, None) => (None, 1),
         };
-        let answer = cx
-            .endpoint(GitHubApi)
-            .get(format!(
-                "/{}/{}/repos?sort=full_name&direction=asc&per_page=100&page={page}",
-                kind.scope(),
-                key.owner
-            ))
-            .maybe_if_none_match(since.map(|since| VersionToken(since.etag)).as_ref())
-            .page::<Vec<RepoListing>>()
-            .await?;
+        let etag = since.map(|since| VersionToken(since.etag));
+        let repos = |kind: OwnerKind| {
+            cx.endpoint(GitHubApi)
+                .get(format!(
+                    "/{}/{}/repos?sort=full_name&direction=asc&per_page=100&page={page}",
+                    kind.scope(),
+                    key.owner
+                ))
+                .maybe_if_none_match(etag.as_ref())
+                .page::<Vec<RepoListing>>()
+        };
+        let (kind, answer) = match kind {
+            Some(kind) => (kind, repos(kind).await?),
+            None => match repos(OwnerKind::Org).await {
+                Err(error) if error.kind() == ProviderErrorKind::NotFound => {
+                    (OwnerKind::User, repos(OwnerKind::User).await?)
+                },
+                answer => (OwnerKind::Org, answer?),
+            },
+        };
         let PageAnswer::Fresh {
             value: repos,
             validator,
@@ -465,7 +463,7 @@ impl Repo {
         let answer = cx
             .endpoint(GitHubApi)
             .get(format!(
-                "/repos/{repo_id}/actions/runs?per_page=30&page={page}"
+                "/repos/{repo_id}/actions/runs?per_page={WORKFLOW_RUN_PAGE_SIZE}&page={page}"
             ))
             .maybe_if_none_match(cx.validator())
             .page::<WorkflowRunsResponse>()
@@ -501,7 +499,7 @@ impl Repo {
             })
             .collect();
         Ok(with_page_validator(
-            page_or_complete(entries, len, 30, PageCursor(page + 1))?,
+            page_or_complete(entries, len, WORKFLOW_RUN_PAGE_SIZE, PageCursor(page + 1))?,
             page_etag(validator)?,
         ))
     }
@@ -626,7 +624,7 @@ impl PullRequest {
                         .map(|(pull, _)| VersionToken(pull.etag.clone()))
                         .as_ref(),
                 )
-                .page::<PullHeadResponse>()
+                .page::<PullCommits>()
                 .await?;
             match (answer, known) {
                 (
@@ -851,19 +849,37 @@ impl Notification {
 // ===========================================================================
 
 impl PullRequest {
-    pub(crate) async fn diff(cx: Cx, key: PullKey) -> Result<BlobFile<omnifs_sdk::repr::Json>> {
-        let repo_id = RepoId::new(&key.owner, &key.repo);
+    /// The diff of the pull request between its base and its head, which
+    /// `GET /repos/{owner}/{repo}/pulls/{number}` names: the host holds the
+    /// diff of each pair of commits and asks GitHub for it once.
+    pub(crate) async fn diff(cx: Cx, key: PullKey) -> Result<BlobFile<Diff>> {
+        let path = format!(
+            "/repos/{}/pulls/{}",
+            RepoId::new(&key.owner, &key.repo),
+            key.number
+        );
+        let pull: PullCommits = cx.endpoint(GitHubApi).get(path.as_str()).json().await?;
+        let version = format!("{}..{}", pull.base.sha, pull.head.sha);
         let blob = cx
             .endpoint(GitHubApi)
-            .get(format!("/repos/{repo_id}/pulls/{}", key.number))
+            .get(path)
             .header("Accept", "application/vnd.github.diff")
             .into_blob()
+            .version(version.as_str())
             .fetch()
             .await?;
         Ok(BlobFile::new(blob.id)
             .size(FileSize::Exact(blob.size))
-            .content_type(ContentType::Custom("text/x-diff")))
+            .stability(Stability::Dynamic)
+            .version(version))
     }
+}
+
+/// The format of a diff.
+pub(crate) struct Diff;
+
+impl Format for Diff {
+    const CT: ContentType = ContentType::Custom("text/x-diff");
 }
 
 impl Repo {
@@ -905,7 +921,12 @@ impl WorkflowRun {
             .get(format!("/repos/{repo}/actions/runs/{}/logs", key.run_id))
             .send_checked()
             .await?;
-        Ok(FileProjection::body(unzip_logs(resp.body()))
+        // GitHub answers the archive with a redirect to its storage, which
+        // the host does not follow: only `200` has the archive.
+        if resp.status() != 200 {
+            return Err(ProviderError::from_http_status(resp.status()));
+        }
+        Ok(FileProjection::body(unzip_logs(resp.body())?)
             .dynamic()
             .build())
     }
@@ -934,10 +955,7 @@ impl Review {
     fn eager_leaves(&self) -> Vec<(String, FileProjection)> {
         let login = self.user.as_ref().map_or("", |user| user.login.as_str());
         vec![
-            (
-                "state".to_string(),
-                inline_text(self.state.as_deref().unwrap_or("")),
-            ),
+            ("state".to_string(), inline_text(&self.state)),
             ("user".to_string(), inline_text(login)),
         ]
     }
@@ -948,10 +966,7 @@ impl ReviewComment {
         let login = self.user.as_ref().map_or("", |user| user.login.as_str());
         vec![
             ("author".to_string(), inline_text(login)),
-            (
-                "path".to_string(),
-                inline_text(self.path.as_deref().unwrap_or("")),
-            ),
+            ("path".to_string(), inline_text(&self.path)),
         ]
     }
 }
@@ -1088,37 +1103,34 @@ async fn find_pull_file(
     Ok(None)
 }
 
+/// The commits of a pull request: its base and its head.
 #[derive(Debug, Deserialize)]
-struct PullHeadResponse {
-    head: PullHead,
+struct PullCommits {
+    base: Commit,
+    head: Commit,
 }
 
 #[derive(Debug, Deserialize)]
-struct PullHead {
+struct Commit {
     sha: String,
 }
 
-pub(crate) fn unzip_logs(bytes: &[u8]) -> Vec<u8> {
-    let Ok(archive) = bytes.read_zip() else {
-        return bytes.to_vec();
+/// The files of the archive of the logs of a run, each under its name.
+fn unzip_logs(bytes: &[u8]) -> Result<Vec<u8>> {
+    let invalid = |error: &dyn std::fmt::Display| {
+        ProviderError::invalid_input(format!("the archive of the logs: {error}"))
     };
+    let archive = bytes.read_zip().map_err(|error| invalid(&error))?;
     let mut output = Vec::new();
     for entry in archive.entries() {
         if entry.name.ends_with('/') {
             continue;
         }
         output.extend_from_slice(format!("=== {} ===\n", entry.name).as_bytes());
-        if let Ok(data) = entry.bytes() {
-            output.extend_from_slice(&data);
-        }
+        output.extend_from_slice(&entry.bytes().map_err(|error| invalid(&error))?);
         if !output.ends_with(b"\n") {
             output.push(b'\n');
         }
-        if output.len() >= 10 * 1024 * 1024 {
-            output.truncate(10 * 1024 * 1024);
-            output.extend_from_slice(b"\n[truncated at 10MB]\n");
-            return output;
-        }
     }
-    output
+    Ok(output)
 }

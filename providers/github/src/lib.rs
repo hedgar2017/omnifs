@@ -12,7 +12,6 @@ mod feed;
 mod item;
 mod objects;
 
-use api::GitHubApi;
 use objects::{
     ChangedFile, CheckRun, Comment, Issue, Notification, Owner, PullRequest, Repo, Review,
     ReviewComment, WorkflowRun,
@@ -50,7 +49,7 @@ pub enum StateFilter {
     display_name = "GitHub",
     description = "repos, issues, and pull requests",
     mount = "github",
-    projection = 1,
+    projection = 2,
     capabilities(
         domain(
             "api.github.com",
@@ -217,7 +216,7 @@ impl GithubProvider {
     }
 }
 
-#[omnifs_sdk::path_segment(validate = is_safe_owner, normalize = str::to_ascii_lowercase)]
+#[omnifs_sdk::path_segment(validate = is_safe_owner)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OwnerName(String);
 
@@ -371,57 +370,18 @@ pub fn is_safe_owner(s: &str) -> bool {
     !s.eq_ignore_ascii_case("notifications") && !s.starts_with('.') && is_safe_segment(s)
 }
 
-#[derive(Debug, Deserialize)]
-struct UserProfile {
-    #[serde(rename = "type")]
-    kind: String,
-}
-
-pub(crate) async fn resolve_owner_kind(cx: &Cx, owner: &OwnerName) -> Result<Option<OwnerKind>> {
-    use omnifs_sdk::error::ProviderErrorKind;
-
-    match cx
-        .endpoint(GitHubApi)
-        .get(format!("/users/{owner}"))
-        .json::<UserProfile>()
-        .await
-    {
-        Ok(profile) => {
-            return Ok(Some(if profile.kind == "Organization" {
-                OwnerKind::Org
-            } else {
-                OwnerKind::User
-            }));
-        },
-        Err(error) if matches!(error.kind(), ProviderErrorKind::NotFound) => {},
-        Err(error) => return Err(error),
-    }
-
-    match cx
-        .endpoint(GitHubApi)
-        .get(format!("/orgs/{owner}"))
-        .json::<serde::de::IgnoredAny>()
-        .await
-    {
-        Ok(_) => Ok(Some(OwnerKind::Org)),
-        Err(error) if matches!(error.kind(), ProviderErrorKind::NotFound) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 pub(crate) const FILE_PAGE_SIZE: u64 = 100;
 pub(crate) const REVIEW_PAGE_SIZE: u64 = 100;
 pub(crate) const CHECK_RUN_PAGE_SIZE: u64 = 100;
 pub(crate) const NOTIFICATION_PAGE_SIZE: u64 = 50;
+pub(crate) const WORKFLOW_RUN_PAGE_SIZE: u64 = 30;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CheckRunsResponse {
-    #[serde(default)]
     pub(crate) check_runs: Vec<CheckRun>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkflowRunsResponse {
-    #[serde(default)]
     pub(crate) workflow_runs: Vec<WorkflowRun>,
 }
