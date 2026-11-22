@@ -3,6 +3,9 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+#[path = "../omnifs-engine/src/target_dir.rs"]
+mod target_dir;
+
 const FIXTURE_PROVIDER_DIRS: &[&str] = &["test"];
 const PROVIDER_BUNDLE_ARCHIVE: &str = "provider-bundle.tar.zst";
 const PROVIDER_BUNDLE_DIR_ENV: &str = "OMNIFS_PROVIDER_BUNDLE_DIR";
@@ -148,16 +151,7 @@ fn artifact_source(workspace_root: &std::path::Path, files: &[String]) -> (PathB
     if let Some(path) = env::var_os(PROVIDER_BUNDLE_DIR_ENV) {
         dirs.push(PathBuf::from(path));
     }
-    if let Some(path) = env::var_os("CARGO_TARGET_DIR") {
-        let path = PathBuf::from(path);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            workspace_root.join(path)
-        };
-        dirs.push(path.join("wasm32-wasip2/release"));
-    }
-    dirs.push(workspace_root.join("target/wasm32-wasip2/release"));
+    dirs.push(target_dir::cargo_target_dir(workspace_root).join("wasm32-wasip2/release"));
     dirs.dedup();
     for dir in &dirs {
         let index_path = dir.join("index.json");

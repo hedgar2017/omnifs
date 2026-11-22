@@ -44,7 +44,10 @@ schema:
     set -euo pipefail
     cargo build -q --release -p omnifs-provider --example write_provider
     schema=crates/omnifs-provider/schema/omnifs.provider.schema.json
-    "${CARGO_TARGET_DIR:-target}/release/examples/write_provider" > "$schema.new"
+    target_dir="$(bash scripts/ci/target-dir.sh)"
+    # A schema that did not come whole replaces nothing and leaves nothing.
+    trap 'rm -f "$schema.new"' EXIT
+    "$target_dir/release/examples/write_provider" > "$schema.new"
     mv "$schema.new" "$schema"
 
 # Build provider artifacts and launch the supported contributor runtime.
@@ -73,12 +76,15 @@ guest-image:
 # manifest, and licenses beside the debug CLI. macOS Apple Silicon only.
 [group('dev')]
 libkrun-runtime:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo build -p omnifs-cli -p omnifs-libkrun
-    bash scripts/ci/build-libkrun-runtime.sh target/debug
-    codesign --force --sign - target/debug/libexec/omnifs/libkrun.1.dylib
+    debug_dir="$(bash scripts/ci/target-dir.sh)/debug"
+    bash scripts/ci/build-libkrun-runtime.sh "$debug_dir"
+    codesign --force --sign - "$debug_dir/libexec/omnifs/libkrun.1.dylib"
     codesign --force --sign - \
         --entitlements scripts/ci/omnifs-libkrun.entitlements.plist \
-        target/debug/omnifs-libkrun
+        "$debug_dir/omnifs-libkrun"
 
 # Boot the guest image once with a throwaway seed ISO and check the serial
 # console for a successful boot and the filesystem runner starting. See

@@ -22,15 +22,12 @@ pub use crate::{ComponentEngine, Engine, EngineError, GitCloner, HostOnline};
 /// Wasmtime's content-addressed compilation artifacts are shared here.
 #[must_use]
 pub fn wasm_cache_dir() -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-        || {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join("target/wasm-cache")
-        },
-        |target_dir| PathBuf::from(target_dir).join("wasm-cache"),
-    )
+    cargo_target_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")).join("wasm-cache")
 }
+
+#[path = "target_dir.rs"]
+mod target_dir;
+pub use target_dir::cargo_target_dir;
 
 /// Open a runtime [`HostOnline`] for tests, using the shared Wasmtime cache.
 pub fn open_test_host(

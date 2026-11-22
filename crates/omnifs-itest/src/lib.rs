@@ -264,8 +264,7 @@ pub fn into_inline(result: ReadFileResult) -> Vec<u8> {
 }
 
 pub fn provider_artifact_dir() -> PathBuf {
-    workspace_root()
-        .join("target")
+    omnifs_engine::test_support::cargo_target_dir(&workspace_root())
         .join("wasm32-wasip2")
         .join("release")
 }

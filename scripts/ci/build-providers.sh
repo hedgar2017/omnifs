@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The directory that cargo builds into: each artifact is read from where this
-# build wrote it.
-target_dir="${CARGO_TARGET_DIR:-target}"
+# Each artifact is read from where this build writes it.
+target_dir="$(bash "$(dirname "${BASH_SOURCE[0]}")/target-dir.sh")"
 wasm_dir="$target_dir/wasm32-wasip2/release"
 
 cargo build --target wasm32-wasip2 --release \

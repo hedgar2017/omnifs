@@ -543,12 +543,12 @@ mod tests {
     use std::time::Duration;
 
     fn wasm_artifact_path(file_name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("host crate must have a workspace parent")
             .parent()
-            .expect("workspace root must exist")
-            .join("target")
+            .expect("workspace root must exist");
+        crate::test_support::cargo_target_dir(workspace)
             .join("wasm32-wasip2")
             .join("release")
             .join(file_name)

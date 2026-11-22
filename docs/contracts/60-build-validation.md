@@ -11,7 +11,9 @@ Read this before touching CI, `just` recipes, provider artifact generation, wasi
 
 ### Provider build artifacts
 
-Provider WASM artifacts are built with the pinned wasi-sdk. `just build providers` compiles providers whose macros emit one `omnifs.provider-metadata.v1` custom section directly into each component, then emits `target/omnifs-provider-store` with content-addressed WASM files plus `index.json`. `just dev` runs `scripts/dev.ts`, so dev mount pinning and the dev image both consume the same provider-store bundle.
+Provider WASM artifacts are built with the pinned wasi-sdk. `just build providers` compiles providers whose macros emit one `omnifs.provider-metadata.v1` custom section directly into each component, then emits `omnifs-provider-store` in the target directory of cargo, with content-addressed WASM files plus `index.json`. `just dev` runs `scripts/dev.ts`, so dev mount pinning and the dev image both consume the same provider-store bundle.
+
+Cargo owns where it builds: `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, and `build.target-dir` of its configuration each move it, and `target` of the workspace is only its default. Everything that reads a build artifact asks cargo, through one of two owners: `scripts/ci/target-dir.sh` for a script or a recipe, and `omnifs_engine::test_support::cargo_target_dir` for the daemon build script and the test harnesses. Provider components are in `wasm32-wasip2/release` of that directory and the provider store beside it; a job that downloads them places them there. The daemon build script also takes a directory of prebuilt components from `OMNIFS_PROVIDER_BUNDLE_DIR`. A job without cargo, such as the native filesystem smoke, names its inputs itself (`PROVIDER_STORE`).
 
 Provider build and check recipes install the pinned wasi-sdk when needed. Run `just build providers` before host tests that need generated provider artifacts. Use `OMNIFS_ITEST_SKIP_PROVIDER_BUILD=1` after prebuilding providers for nextest runs that would otherwise contend (`just test host` sets it for you).
 

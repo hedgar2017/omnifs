@@ -148,11 +148,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist-wasm dist-provider-store
-          cp target/wasm32-wasip2/release/*.wasm dist-wasm/
+          target_dir="$(bash scripts/ci/target-dir.sh)"
+          cp "$target_dir"/wasm32-wasip2/release/*.wasm dist-wasm/
           test -n "$(find dist-wasm -maxdepth 1 -name 'omnifs_provider_*.wasm' -print -quit)"
           test -f dist-wasm/test_provider.wasm
-          cp target/omnifs-provider-store/index.json dist-provider-store/
-          cp target/omnifs-provider-store/*.wasm dist-provider-store/
+          cp "$target_dir/omnifs-provider-store/index.json" dist-provider-store/
+          cp "$target_dir"/omnifs-provider-store/*.wasm dist-provider-store/
           test -n "$(find dist-provider-store -maxdepth 1 -name '*.wasm' -print -quit)"
 
       - name: Attest WASM components
@@ -205,13 +206,13 @@ jobs:
           tool: nextest@0.9.132
 
       - name: Prepare WASM sidecar directory
-        run: rm -rf target/wasm32-wasip2/release
+        run: rm -rf "$CARGO_TARGET_DIR/wasm32-wasip2/release"
 
       - name: Download WASM sidecar inputs
         uses: actions/download-artifact@v8
         with:
           name: omnifs-wasm
-          path: target/wasm32-wasip2/release
+          path: ${{ env.CARGO_TARGET_DIR }}/wasm32-wasip2/release
 
       - name: Lint host tests
         run: just check host
@@ -275,7 +276,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: omnifs-wasm
-          path: target/wasm32-wasip2/release
+          path: ${{ env.CARGO_TARGET_DIR }}/wasm32-wasip2/release
 
       - name: Download Linux x64 omnifs-thin binary
         uses: actions/download-artifact@v8
@@ -427,7 +428,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: omnifs-wasm
-          path: target/wasm32-wasip2/release
+          path: ${{ env.CARGO_TARGET_DIR }}/wasm32-wasip2/release
 
       - name: Download Linux arm64 omnifs-thin binary
         uses: actions/download-artifact@v8
@@ -507,7 +508,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: omnifs-wasm
-          path: target/wasm32-wasip2/release
+          path: ${{ env.CARGO_TARGET_DIR }}/wasm32-wasip2/release
 
       - name: Build Darwin ${{ matrix.arch }} CLI binaries
         id: build
@@ -568,11 +569,11 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: omnifs-wasm
-          path: target/wasm32-wasip2/release
+          path: ${{ env.CARGO_TARGET_DIR }}/wasm32-wasip2/release
 
       - name: Build native Darwin arm64 binaries
         env:
-          OMNIFS_PROVIDER_BUNDLE_DIR: ${{ github.workspace }}/target/wasm32-wasip2/release
+          OMNIFS_PROVIDER_BUNDLE_DIR: ${{ env.CARGO_TARGET_DIR }}/wasm32-wasip2/release
           OMNIFS_RELEASE: "1"
         run: |
           set -euo pipefail
@@ -947,6 +948,7 @@ jobs:
       - name: Run native+filesystem smoke test
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          PROVIDER_STORE: target/omnifs-provider-store
         run: scripts/ci/smoke-native-filesystem.sh
 
   smoke-arm64:
@@ -995,6 +997,7 @@ jobs:
       - name: Run native+filesystem smoke test
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          PROVIDER_STORE: target/omnifs-provider-store
         run: scripts/ci/smoke-native-filesystem.sh
 
   # The filesystem image needs no daemon, no dev home, and no provider store: it

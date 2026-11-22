@@ -94,7 +94,12 @@ pub fn omnifs_bin() -> PathBuf {
         return path;
     }
     ensure_omnifs_built();
-    crate::workspace_root().join("target/debug/omnifs")
+    cargo_debug_dir().join("omnifs")
+}
+
+/// The directory of the debug binaries that cargo builds.
+fn cargo_debug_dir() -> PathBuf {
+    omnifs_engine::test_support::cargo_target_dir(&crate::workspace_root()).join("debug")
 }
 
 /// Resolve a workspace binary that nextest built for another package.
@@ -104,11 +109,7 @@ pub fn omnifs_bin() -> PathBuf {
 /// binaries in the target directory before any test starts.
 fn nextest_workspace_binary(name: &str) -> Option<PathBuf> {
     std::env::var_os("NEXTEST").and_then(|_| {
-        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-            .map_or_else(|| crate::workspace_root().join("target"), PathBuf::from);
-        let path = target_dir
-            .join("debug")
-            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        let path = cargo_debug_dir().join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         path.is_file().then_some(path)
     })
 }
@@ -151,7 +152,7 @@ pub fn thin_runner_bin() -> PathBuf {
         return path;
     }
     ensure_thin_runner_built();
-    crate::workspace_root().join("target/debug/omnifs-thin")
+    cargo_debug_dir().join("omnifs-thin")
 }
 
 /// Build the flat internal argv for a directly spawned host runner.

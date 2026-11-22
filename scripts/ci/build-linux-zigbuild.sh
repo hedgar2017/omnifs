@@ -6,11 +6,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 target="${1:-x86_64-unknown-linux-gnu.2.17}"
 package="${OMNIFS_PACKAGE:-omnifs-cli}"
 bin="${OMNIFS_BIN:-omnifs}"
-target_root="${CARGO_TARGET_DIR:-$root/target}"
-case "$target_root" in
-  /*) ;;
-  *) target_root="$root/$target_root" ;;
-esac
+target_root="$(bash "$root/scripts/ci/target-dir.sh")"
 
 cargo_zigbuild_version="0.22.3"
 zig_version="0.15.2"
@@ -44,9 +40,7 @@ find_artifact() {
   local candidate
   for candidate in \
     "$target_root/$target/release/$artifact_bin" \
-    "$target_root/$base_target/release/$artifact_bin" \
-    "$root/target/$target/release/$artifact_bin" \
-    "$root/target/$base_target/release/$artifact_bin"
+    "$target_root/$base_target/release/$artifact_bin"
   do
     if [[ -f "$candidate" ]]; then
       artifact="$candidate"

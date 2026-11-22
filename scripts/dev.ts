@@ -137,6 +137,11 @@ main().catch((error) => {
   process.exit(1);
 });
 
+// The directory that cargo builds into, from the one shell owner of it.
+async function cargoTargetDir(): Promise<string> {
+  return (await $`bash scripts/ci/target-dir.sh`.text()).trim();
+}
+
 async function main() {
   const options = parseArgs(Bun.argv.slice(2));
   await checkPrerequisites(options);
@@ -146,7 +151,7 @@ async function main() {
   const profileMounts = readProfile(options.profile);
   const filesystemImage = options.filesystemImage || `omnifs-filesystem:${await gitShortHead()}-dev`;
   const providerStore = resolve(
-    options.providerStore || join(workspace, "target/omnifs-provider-store"),
+    options.providerStore || join(await cargoTargetDir(), "omnifs-provider-store"),
   );
 
   console.log(`Workspace: ${workspace}`);
@@ -354,7 +359,7 @@ function resolveCli(): string {
     }
     throw new Error(`configured omnifs CLI does not exist at ${configured}`);
   }
-  const built = join(workspace, "target/debug/omnifs");
+  const built = join(await cargoTargetDir(), "debug/omnifs");
   if (existsSync(built)) {
     return built;
   }

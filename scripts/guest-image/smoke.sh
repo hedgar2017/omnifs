@@ -11,13 +11,13 @@
 # startup only; it does not exercise a live attach.
 #
 # Requires target/guest-image/omnifs-guest.raw (`just guest-image`) and the
-# staged helper payload under target/debug (`just libkrun-runtime`).
+# staged helper payload under the debug directory of cargo (`just libkrun-runtime`).
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 image="${GUEST_IMAGE:-$root/target/guest-image/omnifs-guest.raw}"
 boot_timeout="${BOOT_TIMEOUT_SECONDS:-90}"
-payload_root="${OMNIFS_LIBKRUN_PAYLOAD:-$root/target/debug}"
+payload_root="${OMNIFS_LIBKRUN_PAYLOAD:-$(bash "$root/scripts/ci/target-dir.sh")/debug}"
 helper="$payload_root/omnifs-libkrun"
 libkrun="$payload_root/libexec/omnifs/libkrun.1.dylib"
 firmware="$payload_root/libexec/omnifs/KRUN_EFI.silent.fd"

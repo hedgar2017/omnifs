@@ -63,7 +63,7 @@ build_release_stage_image() {
     *) echo "unsupported runtime platform: $platform" >&2; return 1 ;;
   esac
 
-  local binary="${OMNIFS_BINARY:-$root/target/$target/release/omnifs-thin}"
+  local binary="${OMNIFS_BINARY:-$(bash "$root/scripts/ci/target-dir.sh")/$target/release/omnifs-thin}"
   if [[ ! -x "$binary" ]]; then
     echo "missing native Linux binary: $binary" >&2
     return 1

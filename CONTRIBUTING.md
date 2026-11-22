@@ -4,6 +4,8 @@ Reference for the contributor workflow, build and validation commands, runtime d
 
 ## Getting started
 
+The commands below name `target/debug`, the default of cargo. With another target directory (`CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, or `build.target-dir`), `bash scripts/ci/target-dir.sh` prints the directory that every script and recipe of this repository reads.
+
 The primary contributor workflow is `just dev`, which runs `scripts/dev.ts`. The script builds providers and the native CLI, starts a host daemon, ensures the `dev-host` and `dev-docker` filesystem specs, attaches them, and opens a shell inside `dev-docker` at `/omnifs`.
 
 ```bash

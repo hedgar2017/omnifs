@@ -7,12 +7,14 @@
 # GitHub data through both surfaces it serves: the host filesystem mount path
 # and a `docker exec` into the filesystem container.
 #
-# Requires FILESYSTEM_IMAGE (filesystem container image ref), GITHUB_TOKEN, an
-# `omnifs` CLI on PATH (the omnifs-install-cli action), bun, jq, and
-# target/omnifs-provider-store from the components job.
+# Requires FILESYSTEM_IMAGE (filesystem container image ref), PROVIDER_STORE
+# (the provider store of the components job: this job builds nothing, so no
+# cargo names where one is), GITHUB_TOKEN, an `omnifs` CLI on PATH (the
+# omnifs-install-cli action), bun, and jq.
 set -euo pipefail
 
 : "${FILESYSTEM_IMAGE:?FILESYSTEM_IMAGE must be set to the filesystem image ref}"
+: "${PROVIDER_STORE:?PROVIDER_STORE must be set to the provider store directory}"
 OMNIFS_CLI="${OMNIFS_CLI:-$(command -v omnifs || true)}"
 test -x "$OMNIFS_CLI" || {
   echo "omnifs CLI not found; set OMNIFS_CLI or install it on PATH" >&2
@@ -51,7 +53,7 @@ bun scripts/dev.ts \
   --no-shell \
   --profile smoke \
   --filesystem-image "$FILESYSTEM_IMAGE" \
-  --provider-store target/omnifs-provider-store \
+  --provider-store "$PROVIDER_STORE" \
   --skip-cli-build
 
 # A live GitHub API list-then-read, not a static synthetic file: proves the
