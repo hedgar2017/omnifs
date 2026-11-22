@@ -2,7 +2,7 @@
 
 use anyhow::{Context as _, ensure};
 use omnifs_api::DaemonPhase;
-use omnifs_bootstrap::{Bootstrap, Client, FolderChange};
+use omnifs_bootstrap::{Bootstrap, Client, DaemonOwner, FolderChange};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::Interest;
@@ -24,21 +24,44 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// operator does not already know about. With `--wait-for-daemon`, it waits
 /// for a daemon that another process starts, without starting one.
 pub(crate) async fn start(output: &Output) -> anyhow::Result<()> {
-    let endpoint = Bootstrap::<Client>::for_client()?;
+    start_in(&Bootstrap::<Client>::for_client()?, output).await
+}
+
+/// Starts the daemon of the profile of `endpoint` as the process of this
+/// command, or waits for the one that another process starts: with
+/// `--wait-for-daemon`, and in a profile whose last daemon recorded another
+/// parent than a command as the one that started it, as a service manager,
+/// which starts the next one too.
+async fn start_in(endpoint: &Bootstrap<Client>, output: &Output) -> anyhow::Result<()> {
     if output.wait_for_daemon() {
-        return wait_for_daemon(&endpoint).await;
+        return wait_for_daemon(endpoint).await;
     }
-    let _spawn_lock = endpoint
+    let spawn_lock = endpoint
         .acquire_spawn_lock()
         .context("acquire daemon spawn lock")?;
-    let rpc = RpcClient::resolve()?;
-    let mut child = if rpc.control_reachable().await? {
-        None
-    } else {
-        output.narrate("Starting the daemon");
-        Some(spawn()?)
-    };
-    wait_until_ready(&rpc, child.as_mut()).await
+    let rpc = RpcClient::from_endpoint(endpoint.clone());
+    if rpc.control_reachable().await? {
+        return wait_until_ready(&rpc, None).await;
+    }
+    let owner = endpoint
+        .read_daemon_owner()
+        .with_context(|| format!("read {}", endpoint.daemon_owner_path().display()))?;
+    match owner {
+        Some(DaemonOwner::Service) => {
+            // The wait has no bound: no other command waits on this one.
+            drop(spawn_lock);
+            output.narrate(format!(
+                "Waiting for the daemon, which a service manager starts for this profile ({})",
+                endpoint.daemon_owner_path().display()
+            ));
+            wait_for_daemon(endpoint).await
+        },
+        Some(DaemonOwner::Command) | None => {
+            output.narrate("Starting the daemon");
+            let mut child = spawn(endpoint)?;
+            wait_until_ready(&rpc, Some(&mut child)).await
+        },
+    }
 }
 
 /// Waits for a daemon of the profile of `endpoint` that another process
@@ -94,11 +117,15 @@ async fn wait_for_daemon(endpoint: &Bootstrap<Client>) -> anyhow::Result<()> {
         .await
 }
 
-fn spawn() -> anyhow::Result<Child> {
+/// The daemon of the profile of `endpoint` as a process of this command,
+/// which the daemon records by its flag.
+fn spawn(endpoint: &Bootstrap<Client>) -> anyhow::Result<Child> {
     let binary = std::env::current_exe().context("resolve the omnifs executable")?;
     let mut command = Command::new(&binary);
     command
         .arg("daemon")
+        .arg(crate::cli::DaemonArgs::STARTED_BY_COMMAND)
+        .env(omnifs_bootstrap::OMNIFS_HOME_ENV, endpoint.bootstrap_dir())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

@@ -480,6 +480,111 @@ async fn wait_for_daemon_ends_with_the_daemon_of_another_process_once_it_is_read
     daemon.stop().await;
 }
 
+/// The record of who starts the daemon of the profile of `fixture`.
+fn daemon_owner(fixture: &Fixture) -> Option<omnifs_bootstrap::DaemonOwner> {
+    fixture
+        .endpoint()
+        .read_daemon_owner()
+        .expect("the record of the owner of the daemon")
+}
+
+/// The pid of the daemon of the profile of `fixture`.
+async fn daemon_pid(fixture: &Fixture) -> u32 {
+    wait_until_ready(&fixture.endpoint()).await.info.pid
+}
+
+/// A daemon that a command starts as its own process records a command as
+/// its owner, past its end, so that the next command that finds none starts
+/// one again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_starts_the_daemon_of_a_profile_that_a_command_owns() {
+    let fixture = Fixture::new();
+    assert_eq!(daemon_owner(&fixture), None);
+    let needs_daemon = ["--output", "json", "mount", "rm", "absent", "--dry-run"];
+    assert_success(&fixture.run(&needs_daemon), "mount rm --dry-run");
+    assert_eq!(
+        daemon_owner(&fixture),
+        Some(omnifs_bootstrap::DaemonOwner::Command)
+    );
+    let first = daemon_pid(&fixture).await;
+
+    assert_success(&fixture.run(&["--yes", "down"]), "down");
+    assert!(!fixture.endpoint().control_socket().exists());
+    assert_eq!(
+        daemon_owner(&fixture),
+        Some(omnifs_bootstrap::DaemonOwner::Command),
+        "the record stays past the end of the daemon"
+    );
+
+    assert_success(&fixture.run(&needs_daemon), "mount rm --dry-run");
+    assert_ne!(daemon_pid(&fixture).await, first);
+    assert_success(&fixture.run(&["--yes", "down"]), "down");
+}
+
+/// A daemon that another parent runs, as a service manager, records a
+/// service as its owner, past its end: a command that finds no daemon in its
+/// profile starts none, and ends with the daemon that its owner starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_waits_for_the_daemon_of_a_profile_that_a_service_owns() {
+    let fixture = Fixture::new();
+    let mut daemon = fixture.start_daemon().await;
+    assert_eq!(
+        daemon_owner(&fixture),
+        Some(omnifs_bootstrap::DaemonOwner::Service)
+    );
+    daemon.stop().await;
+    drop(daemon);
+    assert!(!fixture.endpoint().control_socket().exists());
+    assert_eq!(
+        daemon_owner(&fixture),
+        Some(omnifs_bootstrap::DaemonOwner::Service),
+        "the record stays past the end of the daemon"
+    );
+
+    let mut command = Command::new(omnifs_bin())
+        .args(["mount", "rm", "absent", "--dry-run"])
+        .env("OMNIFS_HOME", fixture.home_path())
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn omnifs mount rm");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        command.try_wait().expect("poll the command").is_none(),
+        "the command waits for the daemon of the service"
+    );
+    assert!(
+        !fixture.endpoint().control_socket().exists(),
+        "the command starts no daemon"
+    );
+
+    let mut daemon = fixture.spawn_daemon();
+    let pid = daemon.child.as_ref().expect("daemon child").id();
+    let output = tokio::time::timeout(
+        STARTUP_TIMEOUT,
+        tokio::task::spawn_blocking(move || command.wait_with_output()),
+    )
+    .await
+    .expect("the command ends with the daemon")
+    .expect("join the command")
+    .expect("wait for the command");
+    assert_success(&output, "mount rm --dry-run in the profile of a service");
+    let narration = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        narration.contains("Waiting for the daemon, which a service manager starts"),
+        "{narration}"
+    );
+    assert_eq!(
+        daemon_pid(&fixture).await,
+        pid,
+        "the daemon is the one of the service"
+    );
+    daemon.stop().await;
+}
+
 /// `status --ready` without a daemon gives the status at once and starts
 /// none.
 #[tokio::test(flavor = "multi_thread")]

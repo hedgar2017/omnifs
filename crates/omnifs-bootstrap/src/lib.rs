@@ -15,7 +15,9 @@ const DEFAULT_HOME_SUBDIR: &str = ".omnifs";
 const CONTROL_SOCKET_FILE: &str = "control.sock";
 const PROCESS_IDENTITY_FILE: &str = "process.json";
 const SPAWN_LOCK_FILE: &str = "spawn.lock";
+const DAEMON_OWNER_FILE: &str = "owner.json";
 const PROCESS_IDENTITY_VERSION: u32 = 1;
+const DAEMON_OWNER_VERSION: u32 = 1;
 
 /// Environment variable selecting the Omnifs profile root.
 pub const OMNIFS_HOME_ENV: &str = "OMNIFS_HOME";
@@ -79,6 +81,37 @@ impl<R> Bootstrap<R> {
         self.bootstrap_dir.join(SPAWN_LOCK_FILE)
     }
 
+    #[must_use]
+    pub fn daemon_owner_path(&self) -> PathBuf {
+        self.bootstrap_dir.join(DAEMON_OWNER_FILE)
+    }
+
+    fn read_daemon_owner_inner(&self) -> io::Result<Option<DaemonOwner>> {
+        let path = self.daemon_owner_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let record: DaemonOwnerRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parse daemon owner {}: {error}", path.display()),
+            )
+        })?;
+        if record.version != DAEMON_OWNER_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "daemon owner {} has the version {}, and this omnifs reads {DAEMON_OWNER_VERSION}",
+                    path.display(),
+                    record.version
+                ),
+            ));
+        }
+        Ok(Some(record.owner))
+    }
+
     fn read_process_identity_inner(&self) -> io::Result<Option<Instance>> {
         let path = self.process_identity_path();
         let bytes = match std::fs::read(&path) {
@@ -140,6 +173,12 @@ impl Bootstrap<Client> {
         self.read_process_identity_inner()
     }
 
+    /// Who starts the daemon of the profile, as its last daemon recorded it
+    /// at its start; none for a profile that no daemon recorded an owner of.
+    pub fn read_daemon_owner(&self) -> io::Result<Option<DaemonOwner>> {
+        self.read_daemon_owner_inner()
+    }
+
     /// Serialize CLI processes that may start or replace the daemon.
     pub fn acquire_spawn_lock(&self) -> io::Result<SpawnLock> {
         self.acquire_spawn_lock_inner()
@@ -199,6 +238,22 @@ impl Bootstrap<Daemon> {
         file.commit()
     }
 
+    /// Record who started this daemon, which stays past its end: the next
+    /// start of a daemon of the profile alone writes it again.
+    pub fn write_daemon_owner(&self, owner: DaemonOwner) -> io::Result<()> {
+        self.prepare_dir()?;
+        let bytes = serde_json::to_vec(&DaemonOwnerRecord {
+            version: DAEMON_OWNER_VERSION,
+            owner,
+        })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut options = AtomicOpenOptions::new();
+        options.preserve_mode(false).mode(0o600);
+        let mut file = options.open(self.daemon_owner_path())?;
+        file.write_all(&bytes)?;
+        file.commit()
+    }
+
     /// Remove the identity and socket published by this daemon on shutdown.
     /// The full identity is checked while holding the spawn lock so a
     /// replacement daemon's files are never removed.
@@ -222,6 +277,28 @@ impl Bootstrap<Daemon> {
 /// Held for the full daemon start or replacement decision.
 pub struct SpawnLock {
     _file: File,
+}
+
+/// Who starts the daemon of a profile. The daemon records it at its start
+/// from how it was started, and the record stays past the end of the
+/// daemon, so that a command that finds no daemon knows whether to start
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonOwner {
+    /// A command of omnifs, which starts the daemon as its own process when
+    /// it finds none.
+    Command,
+    /// Another parent, as a service manager, which starts the daemon itself:
+    /// a command waits for that daemon and starts none.
+    Service,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonOwnerRecord {
+    version: u32,
+    owner: DaemonOwner,
 }
 
 /// Narrow daemon process identity used only when RPC cannot answer.
@@ -483,6 +560,42 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::NotFound
+        );
+    }
+
+    /// The owner of the daemon of a profile is the one that its last daemon
+    /// recorded, in a file of the owner alone, and none before a record.
+    #[test]
+    fn the_owner_of_the_daemon_is_the_one_that_its_last_daemon_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Bootstrap::<Client>::under_root(dir.path());
+        let daemon = Bootstrap::<Daemon>::under_root(dir.path());
+        assert_eq!(client.read_daemon_owner().unwrap(), None);
+        for owner in [DaemonOwner::Service, DaemonOwner::Command] {
+            daemon.write_daemon_owner(owner).unwrap();
+            assert_eq!(client.read_daemon_owner().unwrap(), Some(owner));
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("owner.json")).unwrap(),
+            br#"{"version":1,"owner":"command"}"#
+        );
+        assert_eq!(
+            std::fs::metadata(client.daemon_owner_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        std::fs::write(
+            client.daemon_owner_path(),
+            br#"{"version":2,"owner":"command"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            client.read_daemon_owner().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
     }
 
