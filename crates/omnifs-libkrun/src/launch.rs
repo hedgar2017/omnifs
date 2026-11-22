@@ -296,6 +296,13 @@ impl Control {
         while !stop.load(Ordering::Acquire) {
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
+                    // A stream that a nonblocking listener accepts is
+                    // nonblocking on BSD systems: its read would refuse a
+                    // request that has not arrived yet, in place of waiting
+                    // for it within its timeout.
+                    stream.set_nonblocking(false).map_err(|error| {
+                        Error::io("set control request blocking for", &self.path, error)
+                    })?;
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .map_err(|error| {
@@ -749,6 +756,44 @@ mod tests {
         client.request_shutdown(&record).unwrap();
         let mut signal = [0_u8; 8];
         signal_reader.read_exact(&mut signal).unwrap();
+
+        stop.store(true, Ordering::Release);
+        thread.join().unwrap().unwrap();
+        drop(signal_writer);
+    }
+
+    /// A request that arrives after its connection is answered: the control
+    /// waits for it within its timeout.
+    #[test]
+    fn helper_control_waits_for_a_request_after_its_connection() {
+        use std::io::{BufRead, Write};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(crate::CONTROL_SOCKET_NAME);
+        let instance = "0123456789abcdef0123456789abcdef";
+        let spec = omnifs_core::fs::Spec::new(
+            "demo".parse().unwrap(),
+            omnifs_core::fs::Protocol::Fuse,
+            omnifs_core::fs::Runtime::Libkrun,
+            omnifs_core::fs::GUEST_LOCATION.into(),
+        )
+        .unwrap();
+        let control = Control::bind(&path, &spec, instance).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_signal_reader, signal_writer) = UnixStream::pair().unwrap();
+        let thread = control.spawn(
+            ShutdownFd::from_raw(signal_writer.as_raw_fd()),
+            Arc::clone(&stop),
+        );
+        let mut stream = UnixStream::connect(&path).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        stream
+            .write_all(format!("ping {} {instance}\n", spec.id()).as_bytes())
+            .unwrap();
+        let mut reply = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut reply)
+            .unwrap();
+        assert!(reply.starts_with("pong "), "{reply:?}");
 
         stop.store(true, Ordering::Release);
         thread.join().unwrap().unwrap();
