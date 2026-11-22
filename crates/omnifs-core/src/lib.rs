@@ -13,6 +13,15 @@ mod provider;
 mod provider_id;
 mod state_version;
 
+/// How long a peer that is alive and silent may make no progress before
+/// its wait fails: a daemon that holds a control request and never answers,
+/// a client that holds a provider upload open and sends no bytes, a
+/// revocation endpoint that holds its connection, and an NFS client that
+/// reads none of a reply that the server writes. It is measured from the
+/// last progress of the wait, never as a total time, and it bounds these
+/// waits alone (`docs/contracts/10-system.md`).
+pub const SILENT_PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub use auth_fingerprint::{AuthRuntimeFingerprint, AuthRuntimeFingerprintParseError};
 pub use client_owner_id::{ClientOwnerId, ClientOwnerIdError};
 pub use content_type::ContentType;

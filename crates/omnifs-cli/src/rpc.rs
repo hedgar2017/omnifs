@@ -20,18 +20,23 @@ use tonic::{Code, Request};
 
 use crate::error::{ExitCode, WithExitCode, WithHint};
 
-/// One unary control request. No time bounds it: the answer of the daemon
-/// ends it, or the end of its connection, the close or the reset of the
-/// socket at the exit of the daemon (`docs/contracts/10-system.md` names a
-/// daemon that holds the connection and never answers).
+/// One unary control request: the answer of the daemon ends it, or the end
+/// of its connection, the close or the reset of the socket at the exit of
+/// the daemon, and a daemon that holds the connection without an answer
+/// fails it after the silence of the client (`docs/contracts/10-system.md`).
 macro_rules! bounded_unary {
     ($client:expr, $method:ident, $request:expr) => {{
-        $client
-            .client()
-            .await?
-            .$method(Request::new($request))
-            .await
-            .map_err(|status| status_error(&status))?
+        let client = &$client;
+        let request = $request;
+        Box::pin(client.answered(async move {
+            client
+                .client()
+                .await?
+                .$method(Request::new(request))
+                .await
+                .map_err(|status| status_error(&status))
+        }))
+        .await?
     }};
     ($client:expr, $method:ident, $request:expr, $unbounded:expr) => {{
         let () = $unbounded;
@@ -48,15 +53,41 @@ pub(crate) struct ShutdownResult {
 pub(crate) struct RpcClient {
     endpoint: Bootstrap<Client>,
     channel: OnceCell<Channel>,
+    /// How long a request may wait for the answer of a daemon that holds its
+    /// connection: [`omnifs_core::SILENT_PEER_TIMEOUT`].
+    silence: std::time::Duration,
 }
 
 type ControlClient = wire::control_client::ControlClient<Channel>;
 
 impl RpcClient {
     pub(crate) fn from_endpoint(endpoint: Bootstrap<Client>) -> Self {
+        Self::with_silence(endpoint, omnifs_core::SILENT_PEER_TIMEOUT)
+    }
+
+    /// A client whose requests fail after `silence` without an answer.
+    fn with_silence(endpoint: Bootstrap<Client>, silence: std::time::Duration) -> Self {
         Self {
             endpoint,
             channel: OnceCell::new(),
+            silence,
+        }
+    }
+
+    /// The answer of `request`, or the error of a daemon that does not
+    /// answer within the silence of this client.
+    async fn answered<T>(
+        &self,
+        request: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        match tokio::time::timeout(self.silence, Box::pin(request)).await {
+            Ok(answer) => answer,
+            Err(_) => Err(anyhow::anyhow!(
+                "the daemon at {} holds its connection and did not answer within {} seconds",
+                self.endpoint.control_socket().display(),
+                self.silence.as_secs()
+            ))
+            .with_exit_code(ExitCode::DaemonUnavailable),
         }
     }
 
@@ -64,6 +95,7 @@ impl RpcClient {
         Ok(Self {
             endpoint: Bootstrap::<Client>::for_client()?,
             channel: OnceCell::new(),
+            silence: omnifs_core::SILENT_PEER_TIMEOUT,
         })
     }
 
@@ -877,6 +909,27 @@ mod tests {
         let error = long.settled_phase().await.unwrap_err();
         assert!(
             format!("{error:#}").contains("connect to daemon at"),
+            "{error:#}"
+        );
+    }
+
+    /// A control request to a daemon that takes the connection and never
+    /// answers fails after the silence of its client, with the error that
+    /// the daemon does not answer.
+    #[tokio::test]
+    async fn a_control_request_to_a_silent_daemon_fails_after_its_silence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Bootstrap::<Client>::under_root(dir.path());
+        let listener =
+            tokio::net::UnixListener::bind(endpoint.control_socket()).expect("bind control socket");
+        tokio::spawn(async move {
+            let (_held, _) = listener.accept().await.expect("accept client");
+            std::future::pending::<()>().await;
+        });
+        let rpc = RpcClient::with_silence(endpoint, std::time::Duration::from_millis(50));
+        let error = rpc.inventory().await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("did not answer within"),
             "{error:#}"
         );
     }
