@@ -89,6 +89,18 @@
     "captures": []
   },
   {
+    "template": "/desks/{desk}/notes",
+    "kind": "Dir",
+    "object_kind": null,
+    "captures": [
+      {
+        "name": "desk",
+        "type_name": "String",
+        "choices": null
+      }
+    ]
+  },
+  {
     "template": "/shelves/{shelf}/books",
     "kind": "Dir",
     "object_kind": null,
@@ -345,6 +357,35 @@
       },
       {
         "name": "idx",
+        "type_name": "u64",
+        "choices": null
+      }
+    ]
+  },
+  {
+    "template": "/desks/{desk}",
+    "kind": "Object",
+    "object_kind": "test.desk",
+    "captures": [
+      {
+        "name": "desk",
+        "type_name": "String",
+        "choices": null
+      }
+    ]
+  },
+  {
+    "template": "/desks/{desk}/notes/{note}",
+    "kind": "Object",
+    "object_kind": "test.note",
+    "captures": [
+      {
+        "name": "desk",
+        "type_name": "String",
+        "choices": null
+      },
+      {
+        "name": "note",
         "type_name": "u64",
         "choices": null
       }

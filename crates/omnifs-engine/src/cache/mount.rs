@@ -4542,6 +4542,24 @@ mod tests {
         assert_eq!(listing.entries().count(), 20_000);
     }
 
+    /// The token of a feed is apart from its state, which each operation
+    /// reads: no size bounds the token, and no operation pays for it.
+    #[test]
+    fn the_state_of_a_feed_is_of_its_size_whatever_its_token() {
+        let (_dir, _caches, store) = open_store("token");
+        let token = "t".repeat(4 * 1024 * 1024);
+        publish_from_state(
+            &store,
+            ProjectionTransition {
+                feed: Some(fed_part(&token, HashMap::new())),
+                ..ProjectionTransition::default()
+            },
+        );
+        let state = store.projection.get(&feed_key(b"feed")).unwrap().unwrap();
+        assert!(state.len() < 128, "{}", state.len());
+        assert_eq!(store.feed_token(b"feed").unwrap(), Some(token));
+    }
+
     #[test]
     fn a_publication_without_a_change_commits_nothing() {
         let (_dir, _caches, store) = open_store("unchanged");

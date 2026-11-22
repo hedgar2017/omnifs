@@ -686,6 +686,105 @@ struct PrintKey {
     print: u64,
 }
 
+/// A desk, whose feed lists note 1 alone: a note that the desk does not list
+/// is an item of its own feed alone.
+#[omnifs_sdk::object(kind = "test.desk", key = DeskKey)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Desk {
+    desk: String,
+}
+
+impl Desk {
+    fn load(
+        _cx: &Cx<State>,
+        key: &DeskKey,
+        _since: Option<Validator>,
+    ) -> impl core::future::Future<Output = Result<Load<Self>>> {
+        let bytes = format!(r#"{{"desk":"{}"}}"#, key.desk).into_bytes();
+        core::future::ready(
+            Self::decode(&bytes).map(|desk| Load::fresh(desk, Canonical::new(bytes, None))),
+        )
+    }
+
+    /// The feed of a desk: its first answer lists note 1 alone, with the
+    /// inner state of note 1; each answer after it is `unchanged`.
+    fn feed(cx: FeedCx<DeskKey, State>) -> impl core::future::Future<Output = Result<Feed>> {
+        core::future::ready(Self::answer(&cx))
+    }
+
+    fn answer(cx: &FeedCx<DeskKey, State>) -> Result<Feed> {
+        let desk = cx.key().desk.clone();
+        let token = cx.token::<u64>()?;
+        cx.state_mut(|state| {
+            state.shelf_log.push(format!(
+                "{desk} {} {}",
+                token.map_or_else(|| "-".to_owned(), |token| token.to_string()),
+                asked(cx.start(), cx.due())
+            ));
+        });
+        if token.is_some() {
+            return Ok(Feed::unchanged());
+        }
+        let notes = format!("/desks/{desk}/notes");
+        cx.dir(&notes, ListingWrite::Complete)?;
+        cx.dir(format!("{notes}/1"), ListingWrite::Partial)?;
+        cx.file(format!("{notes}/1/text"), b"Note 1".to_vec())?;
+        Ok(Feed::part(&1_u64)?
+            .inner::<Note>(&NoteKey { desk, note: 1 }, &0_u64)?
+            .into())
+    }
+}
+
+#[omnifs_sdk::path_captures]
+struct DeskKey {
+    desk: String,
+}
+
+/// A note of a desk, of an own feed: it joins the listing of the notes of
+/// its desk, says that the desk does not list it for a note other than 1,
+/// and gives its facts a time of a second on the `dated` desk.
+#[omnifs_sdk::object(kind = "test.note", key = NoteKey, no_load)]
+struct Note;
+
+impl Note {
+    fn feed(cx: FeedCx<NoteKey, State>) -> impl core::future::Future<Output = Result<Feed>> {
+        core::future::ready(Self::answer(&cx))
+    }
+
+    fn answer(cx: &FeedCx<NoteKey, State>) -> Result<Feed> {
+        let NoteKey { desk, note } = cx.key();
+        let token = cx.token::<u64>()?;
+        cx.state_mut(|state| {
+            state.shelf_log.push(format!(
+                "{desk}/{note} {} {}",
+                token.map_or_else(|| "-".to_owned(), |token| token.to_string()),
+                asked(cx.start(), cx.due())
+            ));
+        });
+        let notes = format!("/desks/{desk}/notes");
+        cx.dir(&notes, ListingWrite::Join)?;
+        cx.dir(format!("{notes}/{note}"), ListingWrite::Partial)?;
+        cx.file(
+            format!("{notes}/{note}/text"),
+            format!("Note {note}").into_bytes(),
+        )?;
+        let mut part = Feed::part(&token.map_or(1, |token| token + 1))?;
+        if desk == "dated" {
+            part = part.until(std::time::SystemTime::now() + Duration::from_secs(1));
+        }
+        if *note != 1 {
+            part = part.unlisted();
+        }
+        Ok(part.into())
+    }
+}
+
+#[omnifs_sdk::path_captures]
+struct NoteKey {
+    desk: String,
+    note: u64,
+}
+
 /// A memo, a dynamic object that its load gives, with two representations of
 /// its canonical bytes: past its deadline a read of either loads it again.
 #[omnifs_sdk::object(kind = "test.memo", key = MemoKey)]
@@ -1487,6 +1586,20 @@ impl RangeReader for LargeRangedReader {
 /// The objects with fed faces: a shelf, its prints, cards and books, and a
 /// memo beside them.
 fn fed_objects(r: &mut Router<State>) -> Result<()> {
+    r.object::<Desk>("/desks/{desk}", |o| {
+        o.stable();
+        o.file("desk.json").canonical::<Json>()?;
+        o.dir("notes").fed()?;
+        o.feed(Desk::feed).starts(["notes"])?;
+        Ok(())
+    })?;
+    r.object::<Note>("/desks/{desk}/notes/{note}", |o| {
+        o.stable();
+        o.fed();
+        o.file("text").fed()?;
+        o.feed(Note::feed).own().starts(["", "text"])?;
+        Ok(())
+    })?;
     r.object::<Shelf>("/shelves/{shelf}", |o| {
         o.stable();
         o.file("shelf.json").canonical::<Json>()?;

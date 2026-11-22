@@ -467,6 +467,65 @@ async fn a_part_that_declines_the_kept_parts_of_its_answer_publishes_alone() {
     );
 }
 
+/// The `until` of a part marks the facts under the anchor of its own object
+/// alone: the listing that a note joins is of the feed of its desk, and stays
+/// complete past the time of the note.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_until_of_a_part_marks_no_listing_that_its_object_joins() {
+    let harness = make_initialized_runtime(CONFIG);
+    let notes = ["desks", "dated", "notes"];
+    assert_eq!(names(&harness, &notes).await.unwrap(), ["1"]);
+    assert_eq!(
+        read(&harness, &["desks", "dated", "notes", "2", "text"]).await,
+        "Note 2"
+    );
+    let calls = log(&harness).await.len();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(names(&harness, &notes).await.unwrap(), ["1", "2"]);
+    assert_eq!(log(&harness).await.len(), calls, "the listing asks no feed");
+}
+
+/// An own feed whose object no inventory above it has answers for its paths
+/// itself, past its own deadline: the desk that lists note 1 alone is not
+/// asked for note 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unlisted_own_feed_is_asked_past_its_deadline_for_its_paths() {
+    let harness = make_initialized_runtime(CONFIG);
+    let text = ["desks", "oak", "notes", "2", "text"];
+    assert_eq!(
+        names(&harness, &["desks", "oak", "notes"]).await.unwrap(),
+        ["1"]
+    );
+    assert_eq!(read(&harness, &text).await, "Note 2");
+    tokio::time::sleep(PAST_DEADLINE).await;
+    assert_eq!(read(&harness, &text).await, "Note 2");
+    let log = log(&harness).await;
+    // The lookup of the anchor of the note on the way to its text, a
+    // starting path of the feed, asks it past its deadline.
+    assert_eq!(log.last().unwrap(), "oak/2 1 ~", "{log:?}");
+    assert!(!log.iter().any(|line| line == "oak 1 -"), "{log:?}");
+}
+
+/// A read that continues a fed file whose feed wrote another version since
+/// the attributes that its reader has gives the rest of the version that it
+/// began: no reader takes the bytes of two versions.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_that_continues_a_fed_file_gives_the_version_that_it_began() {
+    let harness = make_initialized_runtime(CONFIG);
+    let segments = ["shelves", "oak", "books", "1", "title"];
+    assert_eq!(
+        names(&harness, &["shelves", "oak", "books"]).await.unwrap(),
+        ["1", "2"]
+    );
+    let title = path(&harness, &segments).await;
+    read(&harness, &["hello", "shelf-change"]).await;
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let rest = harness.namespace.read(title, 4, 64).await.unwrap();
+    assert_eq!(rest.bytes, b" 1");
+    assert!(rest.eof);
+    assert_eq!(read(&harness, &segments).await, "Book 1 v1");
+}
+
 // The tests below take the shared helpers of a provider test, by the path
 // of a node from the root of the namespace.
 use omnifs_itest::support;
