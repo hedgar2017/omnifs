@@ -201,6 +201,7 @@ impl Runtime {
             &headers,
             request.body.as_deref(),
             request.md5.as_deref(),
+            request.version.as_deref(),
         );
         let stored = self
             .resources

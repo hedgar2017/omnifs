@@ -405,6 +405,7 @@ impl<'a, E: EndpointHooks, S> RequestBuilder<'a, E, S> {
         BlobRequestBuilder {
             inner: self,
             md5: None,
+            version: None,
         }
     }
 }
@@ -568,6 +569,7 @@ impl HttpResponse {
 pub struct BlobRequestBuilder<'a, E, S = ()> {
     inner: RequestBuilder<'a, E, S>,
     md5: Option<String>,
+    version: Option<String>,
 }
 
 impl<'a, E: EndpointHooks, S> BlobRequestBuilder<'a, E, S> {
@@ -577,6 +579,15 @@ impl<'a, E: EndpointHooks, S> BlobRequestBuilder<'a, E, S> {
     #[must_use]
     pub fn md5(mut self, md5: impl Into<String>) -> Self {
         self.md5 = Some(md5.into());
+        self
+    }
+
+    /// The version of the bytes that the request asks for, for a request
+    /// that is the same for each version: the bytes of another version are
+    /// the blob of another request.
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
         self
     }
 
@@ -590,6 +601,9 @@ impl<'a, E: EndpointHooks, S> BlobRequestBuilder<'a, E, S> {
         let mut blob: BlobRequest<'a, S> = request.into_blob();
         if let Some(md5) = self.md5 {
             blob = blob.md5(md5);
+        }
+        if let Some(version) = self.version {
+            blob = blob.version(version);
         }
         let blob_ref = blob.send().await?;
         let mut answer = Response::builder().status(blob_ref.status);

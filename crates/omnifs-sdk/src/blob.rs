@@ -84,6 +84,7 @@ pub(crate) fn blob_fetch_callout(
     headers: Vec<Header>,
     body: Option<Vec<u8>>,
     md5: Option<String>,
+    version: Option<String>,
 ) -> Callout {
     Callout::FetchBlob(BlobFetchRequest {
         method,
@@ -91,6 +92,7 @@ pub(crate) fn blob_fetch_callout(
         headers,
         body,
         md5,
+        version,
     })
 }
 

@@ -155,6 +155,7 @@ impl BlobExecutor {
                     let request_id = request.blob_request_id(
                         self.http.auth_binding_for_url(request.original_url()),
                         req.md5.as_deref(),
+                        req.version.as_deref(),
                     );
                     let lock = self.resources.blob_request_lock(request_id);
                     let _guard = lock.lock().await;

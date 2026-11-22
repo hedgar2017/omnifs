@@ -32,10 +32,12 @@ impl ProjectionId {
 }
 
 impl BlobRequestId {
-    /// Hash validated request material plus the stable credential partition
-    /// and the MD5 of the bytes that the provider asks for, as the request
-    /// of each content without one. Token bytes and refresh
-    /// generations never enter this identity.
+    /// Hash validated request material plus the stable credential partition,
+    /// the MD5 of the bytes that the provider asks for, as the request of
+    /// each content without one, and the version of the bytes of a request
+    /// that is the same for each version, as a part that no MD5 gives, with
+    /// nothing for a request without one, which keeps its identity. Token
+    /// bytes and refresh generations never enter this identity.
     pub(crate) fn new(
         auth: Option<&CredentialId>,
         method: &str,
@@ -43,6 +45,7 @@ impl BlobRequestId {
         headers: &[(String, String)],
         body: Option<&[u8]>,
         md5: Option<&str>,
+        version: Option<&str>,
     ) -> Self {
         let mut body_material = Vec::new();
         match body {
@@ -54,6 +57,8 @@ impl BlobRequestId {
         }
         let auth_partition = auth.map(ToString::to_string);
         let headers = encode_headers(headers);
+        // An MD5 has lowercase hexadecimal digits alone.
+        let version = version.map(|version| [b"version:".as_slice(), version.as_bytes()].concat());
         let mut parts = vec![
             auth_partition
                 .as_deref()
@@ -65,6 +70,7 @@ impl BlobRequestId {
             &body_material,
         ];
         parts.extend(md5.map(str::as_bytes));
+        parts.extend(version.as_deref());
         Self(hash_parts(b"omnifs/blob-request/v1", &parts))
     }
 
@@ -149,12 +155,20 @@ mod tests {
     #[test]
     fn identities_are_unambiguous_and_mount_scoped() {
         assert_ne!(
-            BlobRequestId::new(None, "GET", "https://example.test/A", &[], None, None),
-            BlobRequestId::new(None, "GET", "https://example.test/a", &[], None, None),
+            BlobRequestId::new(None, "GET", "https://example.test/A", &[], None, None, None),
+            BlobRequestId::new(None, "GET", "https://example.test/a", &[], None, None, None),
         );
         assert_ne!(
-            BlobRequestId::new(None, "POST", "https://example.test", &[], None, None),
-            BlobRequestId::new(None, "POST", "https://example.test", &[], Some(b""), None),
+            BlobRequestId::new(None, "POST", "https://example.test", &[], None, None, None),
+            BlobRequestId::new(
+                None,
+                "POST",
+                "https://example.test",
+                &[],
+                Some(b""),
+                None,
+                None,
+            ),
         );
         assert_ne!(
             GitId::new("mount-a", "remote", Some("main")),
@@ -178,12 +192,69 @@ mod tests {
                 &[],
                 None,
                 None,
+                None,
             )
         };
 
         assert_eq!(same_request(Some(&first)), same_request(Some(&first)));
         assert_ne!(same_request(Some(&first)), same_request(Some(&second)));
         assert_ne!(same_request(None), same_request(Some(&first)));
+    }
+
+    /// The version of a request is a part of its identity that no MD5
+    /// gives: each version is the identity of another request.
+    #[test]
+    fn a_version_is_a_part_of_the_identity_that_no_md5_gives() {
+        let request = |md5, version| {
+            BlobRequestId::new(
+                None,
+                "GET",
+                "https://files.example.test/file",
+                &[],
+                None,
+                md5,
+                version,
+            )
+        };
+
+        assert_ne!(request(None, Some("1700000000")), request(None, None));
+        assert_ne!(
+            request(None, Some("1700000000")),
+            request(None, Some("1700000001"))
+        );
+        assert_ne!(
+            request(None, Some("3d93da86c9045cb1b17e96790cd19789")),
+            request(Some("3d93da86c9045cb1b17e96790cd19789"), None)
+        );
+        assert_ne!(
+            request(Some("3d93da86c9045cb1b17e96790cd19789"), Some("1700000000")),
+            request(Some("3d93da86c9045cb1b17e96790cd19789"), None)
+        );
+    }
+
+    /// A request without a version has the identity of its parts alone, as
+    /// before the version.
+    #[test]
+    fn a_request_without_a_version_keeps_its_identity() {
+        let url = "https://files.example.test/file";
+        let md5 = "3d93da86c9045cb1b17e96790cd19789";
+        let parts: [&[u8]; 5] = [b"unauthenticated", b"GET", url.as_bytes(), b"", &[0]];
+        assert_eq!(
+            BlobRequestId::new(None, "GET", url, &[], None, None, None),
+            BlobRequestId(hash_parts(b"omnifs/blob-request/v1", &parts)),
+        );
+        let parts: [&[u8]; 6] = [
+            b"unauthenticated",
+            b"GET",
+            url.as_bytes(),
+            b"",
+            &[0],
+            md5.as_bytes(),
+        ];
+        assert_eq!(
+            BlobRequestId::new(None, "GET", url, &[], None, Some(md5), None),
+            BlobRequestId(hash_parts(b"omnifs/blob-request/v1", &parts)),
+        );
     }
 
     #[test]

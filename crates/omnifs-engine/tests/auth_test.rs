@@ -330,6 +330,7 @@ async fn fetch_blob_uses_same_oauth_retry_path() {
                 headers: Vec::new(),
                 body: None,
                 md5: None,
+                version: None,
             },
             0,
         )
@@ -371,6 +372,7 @@ async fn fetch_blob_answers_the_bytes_of_the_md5_that_the_provider_asks_for() {
             headers: Vec::new(),
             body: None,
             md5: Some(md5.to_string()),
+            version: None,
         };
         let executor = &executor;
         async move { executor.fetch(&request, 0).await }

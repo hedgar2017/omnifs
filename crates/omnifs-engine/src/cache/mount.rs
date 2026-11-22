@@ -3572,7 +3572,15 @@ mod tests {
     fn blob_publication_rehydrates_and_scopes_reused_hits() {
         let (_dir, _caches, store) = open_store("m");
         let body = store.body.publish(b"body").unwrap();
-        let request = BlobRequestId::new(None, "GET", "https://example.test/body", &[], None, None);
+        let request = BlobRequestId::new(
+            None,
+            "GET",
+            "https://example.test/body",
+            &[],
+            None,
+            None,
+            None,
+        );
         let metadata = BlobMetadata {
             size: 4,
             content_type: None,
@@ -3606,8 +3614,15 @@ mod tests {
         assert_eq!(reopened.body, body);
         assert_eq!(reopened.size, 4);
 
-        let corrupt =
-            BlobRequestId::new(None, "GET", "https://example.test/corrupt", &[], None, None);
+        let corrupt = BlobRequestId::new(
+            None,
+            "GET",
+            "https://example.test/corrupt",
+            &[],
+            None,
+            None,
+            None,
+        );
         let corrupt_fact = DurableFact::Blob(BlobFact {
             body_id: [0; 32],
             length: 4,

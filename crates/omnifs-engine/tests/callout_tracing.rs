@@ -152,6 +152,7 @@ fn blob_fetch_request() -> wit_types::BlobFetchRequest {
         }],
         body: None,
         md5: None,
+        version: None,
     }
 }
 

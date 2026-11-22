@@ -60,6 +60,7 @@ impl ValidatedRequest {
         &self,
         auth: Option<&AuthBinding>,
         md5: Option<&str>,
+        version: Option<&str>,
     ) -> BlobRequestId {
         BlobRequestId::new(
             auth.map(omnifs_auth::AuthBinding::credential_id),
@@ -68,6 +69,7 @@ impl ValidatedRequest {
             &self.headers,
             self.body.as_deref(),
             md5,
+            version,
         )
     }
 
