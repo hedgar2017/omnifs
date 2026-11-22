@@ -389,6 +389,15 @@ interface types {
         until: option<u64>,
     }
 
+    /// A range of the body of a fed file of the projection: at most the
+    /// bytes asked for, the length of the whole body, and the time after
+    /// which the file counts as lacking, as of `listing-names`.
+    record file-range {
+        bytes: list<u8>,
+        length: u64,
+        until: option<u64>,
+    }
+
     /// Opened ranged-read handle. `open-file` is only valid for files
     /// projected with `proj-bytes::deferred(read-mode::ranged)`.
     record open-file-result {
@@ -552,7 +561,7 @@ interface log {
 
 /// Reads of the projection the host keeps, for a feed operation.
 interface projection {
-    use types.{correlation-id, listing-count, listing-names, provider-error};
+    use types.{correlation-id, file-range, listing-count, listing-names, provider-error};
 
     /// The names of the listing of `path` in the projection, for a path in
     /// the subtree of the object of the feed operation `id`; none for a path
@@ -563,11 +572,12 @@ interface projection {
     /// for the paths of `names`.
     count: func(id: correlation-id, path: string)
         -> result<option<listing-count>, provider-error>;
-    /// The bytes of the fed file at `path` in the projection, for a path in
-    /// the subtree of the object of the feed operation `id`; none for a path
-    /// without one.
-    file: func(id: correlation-id, path: string)
-        -> result<option<list<u8>>, provider-error>;
+    /// At most `len` bytes from `offset` of the body of the fed file at
+    /// `path` in the projection, without the kept parts of an answer, for
+    /// the paths of `names`; none for a path without a fed file. The host
+    /// reads no more of the body than the range.
+    file: func(id: correlation-id, path: string, offset: u64, len: u32)
+        -> result<option<file-range>, provider-error>;
 }
 
 interface callouts {

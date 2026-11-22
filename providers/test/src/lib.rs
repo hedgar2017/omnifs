@@ -398,7 +398,9 @@ impl Shelf {
     /// shelf version moves, and then renames book 1, adds book 3, and records
     /// in `seen` the names the host listed for `books` and in `listed` the
     /// completeness, the time and the count of that listing in a part, and removes
-    /// book 2 in its last part; the `wobbly` shelf stops once at a rate limit
+    /// book 2 in its last part. The last part of the first answer writes
+    /// `catalog`, with a time for the `dated` shelf, and the part of a change
+    /// records in `catalog-read` what it reads of the fed files; the `wobbly` shelf stops once at a rate limit
     /// of a second before that last part.
     fn feed(cx: FeedCx<ShelfKey, State>) -> impl core::future::Future<Output = Result<Feed>> {
         core::future::ready(Self::answer(&cx))
@@ -448,6 +450,7 @@ impl Shelf {
             },
             Some(ShelfToken::Page(_)) => {
                 cx.dir(&books, ListingWrite::Complete)?;
+                cx.file(format!("/shelves/{shelf}/catalog"), catalog())?;
                 let part = Feed::part(&ShelfToken::Version(version))?;
                 Ok(if shelf == "dated" {
                     part.until(dated_until())
@@ -492,6 +495,10 @@ impl Shelf {
                     )
                     .into_bytes(),
                 )?;
+                cx.file(
+                    format!("/shelves/{shelf}/catalog-read"),
+                    Self::catalog_read(cx, &shelf)?.into_bytes(),
+                )?;
                 cx.dir(&books, ListingWrite::Complete)?;
                 book(1, &format!("Book 1 v{version}"))?;
                 book(3, "Book 3")?;
@@ -499,6 +506,50 @@ impl Shelf {
             },
         }
     }
+}
+
+impl Shelf {
+    /// What a feed reads of the fed files of the projection: the catalog by
+    /// its ranges of [`CATALOG_RANGE`] bytes, the catalog as a record of one
+    /// range, which it is too large for, and the title of book 1 as a
+    /// record.
+    fn catalog_read(cx: &FeedCx<ShelfKey, State>, shelf: &str) -> Result<String> {
+        let at = format!("/shelves/{shelf}/catalog");
+        let mut read = Vec::new();
+        let mut ranges = 0;
+        let (length, until) = loop {
+            let offset = u64::try_from(read.len())
+                .map_err(|error| ProviderError::internal(error.to_string()))?;
+            let Some(range) = cx.read_range(&at, offset, CATALOG_RANGE)? else {
+                return Err(ProviderError::internal(format!("no fed file at {at}")));
+            };
+            ranges += 1;
+            let ended = range.bytes.len() < CATALOG_RANGE as usize;
+            read.extend(range.bytes);
+            if ended {
+                break (range.length, range.until);
+            }
+        };
+        let record = cx
+            .read_record(&at, CATALOG_RANGE)
+            .map_or_else(|error| format!("{:?}", error.kind()), |_| "a record".to_owned());
+        let title = cx
+            .read_record(format!("/shelves/{shelf}/books/1/title"), CATALOG_RANGE)?
+            .map(|record| String::from_utf8_lossy(&record.bytes).into_owned());
+        Ok(format!(
+            "{length} bytes in {ranges} ranges, {}, until {:?}; as a record: {record}; title {title:?}",
+            if read == catalog() { "same" } else { "other" },
+            until.map(epoch_seconds),
+        ))
+    }
+}
+
+/// The bytes of a range that the shelf feed reads of its catalog.
+const CATALOG_RANGE: u32 = 64 * 1024;
+
+/// The catalog of a shelf: a fed file of more than two ranges.
+fn catalog() -> Vec<u8> {
+    (0..150_000_u32).map(|at| (at % 251) as u8).collect()
 }
 
 /// The time until which the listing of the books of the `dated` shelf
@@ -792,6 +843,8 @@ impl TestProvider {
             o.file("shelf.json").canonical::<Json>()?;
             o.file("seen").fed()?;
             o.file("listed").fed()?;
+            o.file("catalog").fed()?;
+            o.file("catalog-read").fed()?;
             o.dir("books").fed()?;
             o.feed(Shelf::feed).starts(["books"])?;
             Ok(())

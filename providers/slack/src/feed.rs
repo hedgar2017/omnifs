@@ -280,7 +280,10 @@ fn take<K>(
     let bytes = object.get().as_bytes();
     let message: MessageObject = decode(bytes)?;
     let at = format!("{listing}/{}", message.ts);
-    let projected = match cx.read(format!("{at}/message.json"))? {
+    let projected = match cx
+        .read_record(format!("{at}/message.json"), u32::MAX)?
+        .map(|record| record.bytes)
+    {
         None => Projected::Absent,
         Some(projected) if projected == bytes => {
             return Ok(Taken {
@@ -694,8 +697,8 @@ impl MessageFeed<'_> {
         }
         let projected = self
             .cx
-            .read(format!("{}/message.json", self.cx.path()))?
-            .map(|bytes| decode::<MessageObject>(&bytes))
+            .read_record(format!("{}/message.json", self.cx.path()), u32::MAX)?
+            .map(|record| decode::<MessageObject>(&record.bytes))
             .transpose()?;
         if projected.is_some_and(|message| !message.has_replies()) {
             complete_replies(self.cx, &at, &BTreeSet::new())?;

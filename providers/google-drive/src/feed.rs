@@ -142,10 +142,11 @@ fn write_facts<K>(
 /// What changes with the content of the file `id` of the projection, by its
 /// `file.json`; none for a file that the projection has not.
 fn projected_revision<K>(cx: &FeedCx<K>, id: &Id) -> Result<Option<String>> {
-    let Some(object) = cx.read(format!("{}/file.json", path(Kind::File, id)))? else {
+    let Some(object) = cx.read_record(format!("{}/file.json", path(Kind::File, id)), u32::MAX)?
+    else {
         return Ok(None);
     };
-    let item: Item = decode(&object)?;
+    let item: Item = decode(&object.bytes)?;
     let content = item
         .content()
         .ok_or_else(|| ProviderError::internal(format!("the file.json of {id} is of no file")))?;

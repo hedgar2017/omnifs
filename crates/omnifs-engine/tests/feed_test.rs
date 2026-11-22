@@ -470,3 +470,26 @@ async fn a_feed_reads_the_names_and_the_count_of_a_listing_with_its_completeness
         );
     }
 }
+
+/// A feed reads a fed file of the projection by its ranges, each with the
+/// length of the whole file and the time of its facts, and a file that is
+/// one record whole within the bytes it names: a longer file is too large.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_feed_reads_a_fed_file_by_its_ranges_and_a_record_whole_within_its_bytes() {
+    let harness = make_initialized_runtime(CONFIG);
+    for shelf in ["oak", "dated"] {
+        names(&harness, &["shelves", shelf, "books"]).await.unwrap();
+    }
+    read(&harness, &["hello", "shelf-change"]).await;
+    tokio::time::sleep(PAST_DEADLINE).await;
+    for (shelf, until) in [("oak", "None"), ("dated", "Some(4102444800)")] {
+        names(&harness, &["shelves", shelf, "books"]).await.unwrap();
+        assert_eq!(
+            read(&harness, &["shelves", shelf, "catalog-read"]).await,
+            format!(
+                "150000 bytes in 3 ranges, same, until {until}; \
+                 as a record: TooLarge; title Some(\"Book 1\")"
+            )
+        );
+    }
+}

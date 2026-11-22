@@ -120,7 +120,13 @@ impl ProjectionHost for HostState {
         self.projection()?.count(id, &path)
     }
 
-    fn file(&mut self, id: u64, path: String) -> Result<Option<Vec<u8>>, wit_types::ProviderError> {
-        self.projection()?.file(id, &path)
+    fn file(
+        &mut self,
+        id: u64,
+        path: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Option<wit_types::FileRange>, wit_types::ProviderError> {
+        self.projection()?.file(id, &path, offset, len)
     }
 }

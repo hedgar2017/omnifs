@@ -213,15 +213,51 @@ impl<K, S> FeedCx<K, S> {
         )
     }
 
-    /// The bytes of the fed file at the mount-absolute `path` in the host
-    /// projection, without the kept parts of an answer; `None` for a path
-    /// without one. The host answers only for a path in the subtree of the
+    /// At most `len` bytes from `offset` of the fed file at the
+    /// mount-absolute `path` in the host projection, without the kept parts
+    /// of an answer, with the length of the whole file; `None` for a path
+    /// without one. No more of the file than the range reaches the memory
+    /// of the host or of the provider: a file of any size is read by its
+    /// ranges. The host answers only for a path in the subtree of the
     /// feed's object.
-    pub fn read(&self, path: impl AsRef<str>) -> Result<Option<Vec<u8>>> {
-        Ok(crate::omnifs::provider::projection::file(
-            self.cx.id(),
-            path.as_ref(),
-        )?)
+    pub fn read_range(
+        &self,
+        path: impl AsRef<str>,
+        offset: u64,
+        len: u32,
+    ) -> Result<Option<FedRange>> {
+        Ok(
+            crate::omnifs::provider::projection::file(self.cx.id(), path.as_ref(), offset, len)?
+                .map(|range| FedRange {
+                    bytes: range.bytes,
+                    length: range.length,
+                    until: range.until.map(time),
+                }),
+        )
+    }
+
+    /// The whole of the fed file at the mount-absolute `path` in the host
+    /// projection, for a file that is one record of at most `max` bytes,
+    /// such as the JSON of an object; `None` for a path without one. A
+    /// longer file is the `too-large` error of the call, with no more than
+    /// `max` bytes of it read: [`Self::read_range`] reads a file of any
+    /// size.
+    pub fn read_record(&self, path: impl AsRef<str>, max: u32) -> Result<Option<FedRecord>> {
+        let path = path.as_ref();
+        self.read_range(path, 0, max)?
+            .map(|range| {
+                if range.length > u64::from(max) {
+                    return Err(ProviderError::too_large(format!(
+                        "{path} has {} bytes, more than the {max} of a record",
+                        range.length
+                    )));
+                }
+                Ok(FedRecord {
+                    bytes: range.bytes,
+                    until: range.until,
+                })
+            })
+            .transpose()
     }
 
     /// Write a stable inline file at the mount-absolute `path` as a fact of
@@ -288,6 +324,27 @@ pub struct ListedCount {
     /// Whether the listing is complete.
     pub complete: bool,
     /// The time after which the listing counts as lacking, as of
+    /// [`ListedNames::until`].
+    pub until: Option<SystemTime>,
+}
+
+/// A range of a fed file of the host projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FedRange {
+    /// The bytes of the range: fewer than asked for at the end of the file.
+    pub bytes: Vec<u8>,
+    /// The length of the whole file.
+    pub length: u64,
+    /// The time after which the file counts as lacking, as of
+    /// [`ListedNames::until`].
+    pub until: Option<SystemTime>,
+}
+
+/// The whole of a fed file of the host projection that is one record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FedRecord {
+    pub bytes: Vec<u8>,
+    /// The time after which the file counts as lacking, as of
     /// [`ListedNames::until`].
     pub until: Option<SystemTime>,
 }

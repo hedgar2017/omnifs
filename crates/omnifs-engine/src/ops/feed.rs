@@ -9,13 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::EngineError;
 use crate::Runtime;
-use crate::cache::{FeedState, KeptWrite, MountResources, ProjectionTransition, RecordKind};
+use crate::cache::{FeedState, KeptWrite, MountResources, ProjectionTransition};
 use crate::clock;
 use crate::effect_apply::EffectApplier;
 use crate::inspector;
 use crate::object_id::ObjectId;
 use crate::runtime::Result;
-use crate::view::FilePayload;
 use omnifs_api::events::InspectorOutcome;
 use omnifs_core::path::Path;
 use omnifs_wit::host::types as wit_types;
@@ -258,32 +257,33 @@ impl ProjectionReads {
         Ok(path)
     }
 
-    /// The bytes of the fed file at `path` in the projection, for the feed
-    /// operation `id` and a path in the subtree of its object; none for a
-    /// path without one.
+    /// At most `len` bytes from `offset` of the body of the fed file at
+    /// `path` in the projection, with the length of the body and the time of
+    /// its fed mark, for the feed operation `id` and a path in the subtree
+    /// of its object; none for a path without a fed file. The body stays in
+    /// its store but for the range.
     pub(crate) fn file(
         &self,
         id: u64,
         path: &str,
-    ) -> std::result::Result<Option<Vec<u8>>, wit_types::ProviderError> {
+        offset: u64,
+        len: u32,
+    ) -> std::result::Result<Option<wit_types::FileRange>, wit_types::ProviderError> {
         let path = self.feed_path(id, path)?;
         if !self.resources.is_fed(&path).map_err(internal)? {
             return Ok(None);
         }
-        let Some(record) = self
-            .resources
-            .cache_get(&path, RecordKind::File, None)
-            .map_err(internal)?
-        else {
+        let Some((body, length)) = self.resources.file_body(&path, None).map_err(internal)? else {
             return Ok(None);
         };
-        let file = FilePayload::deserialize(&record.payload).ok_or_else(|| {
-            refusal(
-                wit_types::ErrorKind::Internal,
-                format!("the file fact of {path} does not decode"),
-            )
-        })?;
-        Ok(Some(file.content))
+        Ok(Some(wit_types::FileRange {
+            bytes: self
+                .resources
+                .read_body_range(body, length, offset, len)
+                .map_err(internal)?,
+            length,
+            until: self.resources.fed_until(&path).map_err(internal)?,
+        }))
     }
 
     /// The names of the listing of `path` in the projection, for the feed

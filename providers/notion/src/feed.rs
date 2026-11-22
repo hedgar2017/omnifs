@@ -425,11 +425,14 @@ impl WorkspaceFeed<'_> {
         }
         let projected = self
             .cx
-            .read(match found.object {
-                Kind::Page => format!("{}/page.json", page_path(&id)),
-                Kind::DataSource => format!("{}/schema.json", data_source_path(&id)),
-            })?
-            .map(|projected| decode::<Found>(&projected))
+            .read_record(
+                match found.object {
+                    Kind::Page => format!("{}/page.json", page_path(&id)),
+                    Kind::DataSource => format!("{}/schema.json", data_source_path(&id)),
+                },
+                u32::MAX,
+            )?
+            .map(|projected| decode::<Found>(&projected.bytes))
             .transpose()?
             .map(|projected| projected.last_edited_time);
         if projected.is_some_and(|projected| projected > found.last_edited_time) {
