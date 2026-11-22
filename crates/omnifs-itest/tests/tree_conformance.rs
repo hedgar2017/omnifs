@@ -2,41 +2,18 @@
 
 #![cfg(not(target_os = "wasi"))]
 
-use omnifs_core::path::Path;
-use omnifs_engine::{DirCursor, LookupAnswer, Namespace};
+use omnifs_engine::{DirCursor, Namespace};
 use omnifs_itest::RuntimeHarness;
-
-async fn resolve(harness: &RuntimeHarness, value: &str) -> LookupAnswer {
-    let namespace = harness.namespace.as_ref();
-    let attrs = namespace.getattr(Path::root()).await.unwrap();
-    let mut answer = LookupAnswer::found(Path::root(), attrs);
-    for segment in Path::parse(value).unwrap().segments() {
-        answer = namespace.lookup(answer.path, segment).await.unwrap();
-    }
-    answer
-}
-
-async fn names(harness: &RuntimeHarness, value: &str) -> Vec<String> {
-    let node = resolve(harness, value).await;
-    harness
-        .namespace
-        .readdir(node.path, DirCursor::start(), 0)
-        .await
-        .unwrap()
-        .entries
-        .into_iter()
-        .map(|entry| entry.name)
-        .collect()
-}
+use omnifs_itest::support::{lookup, names};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lists_root_and_nested_directories() {
     let harness = RuntimeHarness::new(omnifs_itest::TEST_PROVIDER_CONFIG).unwrap();
-    let root = names(&harness, "/test").await;
+    let root = names(&harness, "/test").await.unwrap();
     for expected in ["README.md", "items", "hello", "scoped", "dynamic"] {
         assert!(root.iter().any(|name| name == expected));
     }
-    let hello = names(&harness, "/test/hello").await;
+    let hello = names(&harness, "/test/hello").await.unwrap();
     for expected in ["message", "greeting", "ranged", "bundle", "feed"] {
         assert!(hello.iter().any(|name| name == expected));
     }
@@ -45,7 +22,7 @@ async fn lists_root_and_nested_directories() {
 #[tokio::test(flavor = "multi_thread")]
 async fn generated_readmes_are_visible_and_hidden_by_root_ignore_patterns() {
     let harness = RuntimeHarness::new(omnifs_itest::TEST_PROVIDER_CONFIG).unwrap();
-    let root = resolve(&harness, "/test/README.md").await;
+    let root = lookup(&harness, "/test/README.md").await.unwrap();
     let root_bytes = harness
         .namespace
         .read(root.path, 0, u32::MAX)
@@ -54,7 +31,7 @@ async fn generated_readmes_are_visible_and_hidden_by_root_ignore_patterns() {
         .bytes;
     let root_text = String::from_utf8(root_bytes).unwrap();
     assert!(root_text.contains("The keying schema is the path grammar below."));
-    let ignore = resolve(&harness, "/test/.gitignore").await;
+    let ignore = lookup(&harness, "/test/.gitignore").await.unwrap();
     assert_eq!(ignore.attrs().unwrap().kind, omnifs_engine::EntryKind::File);
     let bytes = harness
         .namespace
@@ -68,7 +45,7 @@ async fn generated_readmes_are_visible_and_hidden_by_root_ignore_patterns() {
 #[tokio::test(flavor = "multi_thread")]
 async fn lazy_derived_face_returns_the_declared_leaf_bytes() {
     let harness = RuntimeHarness::new(omnifs_itest::TEST_PROVIDER_CONFIG).unwrap();
-    let item = resolve(&harness, "/test/items/open/7").await;
+    let item = lookup(&harness, "/test/items/open/7").await.unwrap();
     harness
         .namespace
         .readdir(item.path, DirCursor::start(), 0)
@@ -78,7 +55,10 @@ async fn lazy_derived_face_returns_the_declared_leaf_bytes() {
         harness
             .namespace
             .read(
-                resolve(&harness, "/test/items/open/7/state").await.path,
+                lookup(&harness, "/test/items/open/7/state")
+                    .await
+                    .unwrap()
+                    .path,
                 0,
                 u32::MAX
             )
@@ -91,7 +71,10 @@ async fn lazy_derived_face_returns_the_declared_leaf_bytes() {
         harness
             .namespace
             .read(
-                resolve(&harness, "/test/items/open/7/title").await.path,
+                lookup(&harness, "/test/items/open/7/title")
+                    .await
+                    .unwrap()
+                    .path,
                 0,
                 u32::MAX
             )
@@ -105,7 +88,7 @@ async fn lazy_derived_face_returns_the_declared_leaf_bytes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn lists_cursored_pages() {
     let harness = RuntimeHarness::new(omnifs_itest::TEST_PROVIDER_CONFIG).unwrap();
-    let feed = resolve(&harness, "/test/hello/feed").await;
+    let feed = lookup(&harness, "/test/hello/feed").await.unwrap();
     let first = harness
         .namespace
         .readdir(feed.path.clone(), DirCursor::start(), 0)

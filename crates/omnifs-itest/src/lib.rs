@@ -1,5 +1,6 @@
 pub mod live;
 pub mod matrix;
+pub mod support;
 
 use omnifs_core::ProviderRef;
 use omnifs_core::path::{Path, Segment};

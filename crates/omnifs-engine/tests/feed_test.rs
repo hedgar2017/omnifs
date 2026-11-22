@@ -444,6 +444,10 @@ async fn an_answer_that_writes_a_file_as_it_was_changes_nothing_for_a_filesystem
         assert!(
             !matches!(&event, omnifs_engine::NsEvent::AttrsChanged { path, .. } if *path == title),
             "{event:?}"
+// The tests below take the shared helpers of a provider test, by the path
+// of a node from the root of the namespace.
+use omnifs_itest::support;
+
 /// A feed reads a listing of the projection as its names, each parsed as a
 /// key, or as its count, each with whether the listing is complete and with
 /// the time that the part that wrote the listing gave its facts.
@@ -452,20 +456,33 @@ async fn a_feed_reads_the_names_and_the_count_of_a_listing_with_its_completeness
     let harness = make_initialized_runtime(CONFIG);
     for shelf in ["oak", "dated"] {
         assert_eq!(
-            names(&harness, &["shelves", shelf, "books"]).await.unwrap(),
+            support::names(&harness, &format!("/test/shelves/{shelf}/books"))
+                .await
+                .unwrap(),
             ["1", "2"]
         );
     }
-    read(&harness, &["hello", "shelf-change"]).await;
+    support::read(&harness, "/test/hello/shelf-change")
+        .await
+        .unwrap();
     tokio::time::sleep(PAST_DEADLINE).await;
     for (shelf, until) in [("oak", "None"), ("dated", "Some(4102444800)")] {
         assert_eq!(
-            names(&harness, &["shelves", shelf, "books"]).await.unwrap(),
+            support::names(&harness, &format!("/test/shelves/{shelf}/books"))
+                .await
+                .unwrap(),
             ["1", "3"]
         );
-        assert_eq!(read(&harness, &["shelves", shelf, "seen"]).await, "1,2");
         assert_eq!(
-            read(&harness, &["shelves", shelf, "listed"]).await,
+            support::read(&harness, &format!("/test/shelves/{shelf}/seen"))
+                .await
+                .unwrap(),
+            "1,2"
+        );
+        assert_eq!(
+            support::read(&harness, &format!("/test/shelves/{shelf}/listed"))
+                .await
+                .unwrap(),
             format!("names true {until}, count 2 true {until}")
         );
     }
@@ -478,14 +495,22 @@ async fn a_feed_reads_the_names_and_the_count_of_a_listing_with_its_completeness
 async fn a_feed_reads_a_fed_file_by_its_ranges_and_a_record_whole_within_its_bytes() {
     let harness = make_initialized_runtime(CONFIG);
     for shelf in ["oak", "dated"] {
-        names(&harness, &["shelves", shelf, "books"]).await.unwrap();
+        support::names(&harness, &format!("/test/shelves/{shelf}/books"))
+            .await
+            .unwrap();
     }
-    read(&harness, &["hello", "shelf-change"]).await;
+    support::read(&harness, "/test/hello/shelf-change")
+        .await
+        .unwrap();
     tokio::time::sleep(PAST_DEADLINE).await;
     for (shelf, until) in [("oak", "None"), ("dated", "Some(4102444800)")] {
-        names(&harness, &["shelves", shelf, "books"]).await.unwrap();
+        support::names(&harness, &format!("/test/shelves/{shelf}/books"))
+            .await
+            .unwrap();
         assert_eq!(
-            read(&harness, &["shelves", shelf, "catalog-read"]).await,
+            support::read(&harness, &format!("/test/shelves/{shelf}/catalog-read"))
+                .await
+                .unwrap(),
             format!(
                 "150000 bytes in 3 ranges, same, until {until}; \
                  as a record: TooLarge; title Some(\"Book 1\")"
@@ -500,17 +525,21 @@ async fn a_feed_reads_a_fed_file_by_its_ranges_and_a_record_whole_within_its_byt
 async fn an_object_without_a_load_serves_its_fed_faces() {
     let harness = make_initialized_runtime(CONFIG);
     assert_eq!(
-        names(&harness, &["shelves", "oak", "cards"]).await.unwrap(),
+        support::names(&harness, "/test/shelves/oak/cards")
+            .await
+            .unwrap(),
         ["1"]
     );
     assert_eq!(
-        names(&harness, &["shelves", "oak", "cards", "1"])
+        support::names(&harness, "/test/shelves/oak/cards/1")
             .await
             .unwrap(),
         ["text"]
     );
     assert_eq!(
-        read(&harness, &["shelves", "oak", "cards", "1", "text"]).await,
+        support::read(&harness, "/test/shelves/oak/cards/1/text")
+            .await
+            .unwrap(),
         "Card 1"
     );
 }
@@ -521,40 +550,76 @@ async fn an_object_without_a_load_serves_its_fed_faces() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_faces_of_an_object_render_from_the_canonical_bytes_of_a_feed_without_a_load() {
     let harness = &make_initialized_runtime(CONFIG);
-    let print = ["shelves", "oak", "prints", "1"];
     let faces = |version: u64| async move {
         assert_eq!(
-            read(harness, &[&print[..], &["print.json"]].concat()).await,
+            support::read(harness, "/test/shelves/oak/prints/1/print.json")
+                .await
+                .unwrap(),
             format!(r#"{{"print":1,"version":{version}}}"#)
         );
         assert_eq!(
-            read(harness, &[&print[..], &["print.md"]].concat()).await,
+            support::read(harness, "/test/shelves/oak/prints/1/print.md")
+                .await
+                .unwrap(),
             format!("# Print 1 v{version}\n")
         );
-        let log = read(harness, &["hello", "shelf-log"]).await;
+        let log = support::read(harness, "/test/hello/shelf-log")
+            .await
+            .unwrap();
         assert!(!log.contains("load"), "no load of the print: {log}");
     };
     assert_eq!(
-        names(harness, &["shelves", "oak", "prints"]).await.unwrap(),
+        support::names(harness, "/test/shelves/oak/prints")
+            .await
+            .unwrap(),
         ["1"]
     );
     assert_eq!(
-        names(harness, &print).await.unwrap(),
+        support::names(harness, "/test/shelves/oak/prints/1")
+            .await
+            .unwrap(),
         ["print.json", "print.md"]
     );
     faces(0).await;
+    let json = support::lookup(harness, "/test/shelves/oak/prints/1/print.json")
+        .await
+        .unwrap()
+        .path;
+    let change = || async {
+        harness
+            .namespace
+            .getattr(json.clone())
+            .await
+            .unwrap()
+            .change
+    };
+    let written = change().await;
 
-    // Past the deadline of a loaded object, the bytes of the feed stand.
+    // Past the deadline of a loaded object, the bytes of the feed stand, and
+    // an answer of the feed that writes none leaves the faces as they were.
     tokio::time::sleep(PAST_DEADLINE).await;
     faces(0).await;
     faces(0).await;
+    support::names(harness, "/test/shelves/oak/prints")
+        .await
+        .unwrap();
+    assert_eq!(change().await, written);
 
     // The next answer of the feed writes other bytes.
-    read(harness, &["hello", "shelf-change"]).await;
+    support::read(harness, "/test/hello/shelf-change")
+        .await
+        .unwrap();
     tokio::time::sleep(PAST_DEADLINE).await;
     assert_eq!(
-        names(harness, &["shelves", "oak", "prints"]).await.unwrap(),
+        support::names(harness, "/test/shelves/oak/prints")
+            .await
+            .unwrap(),
         ["1"]
     );
     faces(1).await;
+    assert_ne!(
+        change().await,
+        written,
+        "other bytes of the same length change the attributes of a face"
+    );
 }
