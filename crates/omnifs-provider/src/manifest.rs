@@ -391,6 +391,22 @@ fn validate_scheme(key: &str, scheme: &AuthScheme) -> Result<(), ProviderMetadat
                 &format!("auth.schemes.{key}.description"),
                 &static_token.description,
             )?;
+            // The probe of a token has one value of the header of the token:
+            // the token itself.
+            let token_header = static_token
+                .header_name
+                .as_deref()
+                .unwrap_or("Authorization");
+            if let Some(header) = static_token.validation.iter().find_map(|validation| {
+                validation
+                    .headers
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(token_header))
+            }) {
+                return Err(ProviderMetadataError::Validation(format!(
+                    "auth.schemes.{key}.validation.headers must not contain {header}, the header of the token"
+                )));
+            }
         },
         AuthScheme::Oauth(oauth) => {
             validate_non_empty(
@@ -918,6 +934,29 @@ mod tests {
         let error = encode_provider_manifest(&rejected).unwrap_err();
         assert!(
             matches!(error, ProviderMetadataError::Validation(message) if message.contains("http://localhost:<port>"))
+        );
+    }
+
+    /// The probe of a static token sends no second value of the header of
+    /// the token.
+    #[test]
+    fn a_token_validation_declares_no_header_of_the_token() {
+        let with_header = |name: &str| {
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(GUIDANCE_MANIFEST).unwrap();
+            manifest["auth"]["schemes"][0]["staticToken"]["validation"] = serde_json::json!({
+                "method": "GET",
+                "url": "https://api.demo.test/me",
+                "headers": { name: "1" },
+                "expectStatus": 200
+            });
+            ProviderManifest::from_bytes(&json(&manifest))
+        };
+        with_header("Demo-Version").expect("another header");
+        let error = with_header("authorization").unwrap_err();
+        assert!(
+            matches!(&error, ProviderMetadataError::Validation(message) if message.contains("validation.headers must not contain authorization")),
+            "{error}"
         );
     }
 
