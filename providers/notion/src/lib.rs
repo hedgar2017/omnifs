@@ -104,7 +104,7 @@ pub(crate) struct DataSource {}
     display_name = "Notion",
     description = "pages, data sources, and comments from your workspace",
     mount = "notion",
-    projection = 3,
+    projection = 4,
     capabilities(domain(
         "api.notion.com",
         "Fetch the pages, data sources, page content, and comments of a Notion workspace."

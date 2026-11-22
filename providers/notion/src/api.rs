@@ -8,10 +8,10 @@
 //! [`EndpointHooks::classify`] for both; every other status falls through to
 //! the SDK's default handling.
 
-use http::{HeaderMap, Response};
+use http::Response;
 use omnifs_sdk::endpoint::{EndpointHooks, HttpResponse};
 use omnifs_sdk::error::ProviderError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
@@ -34,7 +34,10 @@ impl EndpointHooks for NotionApi {
         match response.status().as_u16() {
             529 => Some(ProviderError::from_http_answer(
                 429,
-                headers(response.headers()),
+                response
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?))),
             )),
             429 => serde_json::from_slice::<Failure>(response.body())
                 .ok()
@@ -49,19 +52,6 @@ impl EndpointHooks for NotionApi {
             _ => None,
         }
     }
-}
-
-/// The headers of an answer as names and values, without a value that is no
-/// text.
-fn headers(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)))
-}
-
-/// The error of an answer of Notion with a failing status.
-pub(crate) fn refusal(response: &HttpResponse) -> ProviderError {
-    ProviderError::from_http_answer(response.status(), headers(response.headers()))
 }
 
 /// The error object of an answer of Notion.
@@ -115,7 +105,7 @@ impl List {
 
 /// What the search of Notion gives: a page, a row of a data source too, or a
 /// data source.
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Kind {
     Page,
