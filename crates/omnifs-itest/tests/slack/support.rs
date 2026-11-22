@@ -171,17 +171,14 @@ pub fn expect_channels(request: &HttpRequest, cursor: Option<&str>) {
 }
 
 /// Check that `request` is that of the page of the history of `channel` from
-/// `cursor`, of its new messages after `oldest`.
-pub fn expect_history(
-    request: &HttpRequest,
-    channel: &str,
-    oldest: Option<&str>,
-    cursor: Option<&str>,
-) {
-    let mut query = vec![("channel", channel)];
-    query.extend(oldest.map(|oldest| ("oldest", oldest)));
-    query.push(("limit", "999"));
-    expect(request, "conversations.history", &query, cursor);
+/// `cursor`.
+pub fn expect_history(request: &HttpRequest, channel: &str, cursor: Option<&str>) {
+    expect(
+        request,
+        "conversations.history",
+        &[("channel", channel), ("limit", "999")],
+        cursor,
+    );
 }
 
 /// Check that `request` is that of the message `ts` of `channel` by its
@@ -357,6 +354,13 @@ pub fn file(id: &str, name: &str, edited: u64) -> Value {
         "url_private_download": download(id, name),
         "edit_timestamp": edited,
     })
+}
+
+/// A file `id` with `name`, without an `edit_timestamp`.
+pub fn unedited(id: &str, name: &str) -> Value {
+    let mut file = file(id, name, 0);
+    file.as_object_mut().unwrap().remove("edit_timestamp");
+    file
 }
 
 /// A file `id` that the workspace hides, without its bytes.
