@@ -34,7 +34,7 @@ use dashmap::DashMap;
 use omnifs_core::path::{Path, Segment};
 use omnifs_vfs::{
     Attrs, DirCursor, DirEntry as NsDirEntry, EntryKind, EventStream, LookupAnswer, LookupState,
-    Namespace, NsError, NsEvent,
+    Namespace, NsError, NsEvent, Stability,
 };
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -310,8 +310,11 @@ impl Export {
                 NsEvent::AttrsChanged { path, attrs } => {
                     self.replies.invalidate(&path);
                     // Live growth is monotonic; never let a stale event shrink it.
-                    let mut entry = self.grown_sizes.entry(path).or_insert(0);
-                    *entry = (*entry).max(attrs.size);
+                    // The attributes of any other node have no grown size.
+                    if matches!(attrs.stability, Stability::Live) {
+                        let mut entry = self.grown_sizes.entry(path).or_insert(0);
+                        *entry = (*entry).max(attrs.size);
+                    }
                 },
             }
         }
@@ -605,11 +608,16 @@ impl ReadOnlyExport for Export {
                     // of that open (even `fstat` on the open fd serves the pinned
                     // value), so learning at OPEN is too late and the first `cat` of
                     // a cold file would be clamped to the 1-byte sentinel.
+                    // A probe that fails is the error of the lookup: the
+                    // sentinel is the size of no file.
                     if matches!(NodeKind::from(&attrs.kind), NodeKind::File)
-                        && let Ok(exact) = self.node_attrs(answer_path.clone(), true)
-                        && exact.size <= 1
+                        && self
+                            .node_attrs(answer_path.clone(), true)
+                            .map_err(|error| Status::from(&error))?
+                            .size
+                            <= 1
                     {
-                        let _ = self.read_node_chunk(id, answer_path, 0, 1);
+                        self.read_node_chunk(id, answer_path, 0, 1)?;
                     }
                     self.apply_pending_events();
                     Ok(id)
@@ -886,6 +894,8 @@ mod tests {
         getattrs: AtomicU64,
         reads: AtomicU64,
         last_read: Mutex<Option<(u64, u32)>>,
+        /// Whether each read fails at a rate limit.
+        rate_limited: AtomicBool,
     }
 
     fn stub_attrs(kind: EntryKind) -> Attrs {
@@ -1008,6 +1018,9 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<ReadAnswer, NsError>> + Send + '_>> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             *self.last_read.lock().expect("lock last_read") = Some((offset, len));
+            if self.rate_limited.load(Ordering::Relaxed) {
+                return Box::pin(async { Err(NsError::RateLimited { retry_after: None }) });
+            }
             if self.deferred_node.as_ref() == Some(&node) {
                 self.materialized.store(true, Ordering::Relaxed);
             }
@@ -1057,6 +1070,7 @@ mod tests {
             getattrs: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             last_read: Mutex::new(None),
+            rate_limited: AtomicBool::new(false),
         }
     }
 
@@ -1285,6 +1299,28 @@ mod tests {
             attr.size, 5,
             "attrs served after lookup must reflect the size learned by the probe"
         );
+    }
+
+    #[test]
+    fn a_failed_probe_of_an_unknown_size_file_is_the_error_of_its_lookup() {
+        let runtime = TokioRuntime::new().expect("tokio runtime");
+        let namespace = Arc::new(stub_tree_with_deferred_file());
+        let export = Export::new(
+            runtime.handle().clone(),
+            Arc::clone(&namespace) as Arc<dyn Namespace>,
+        );
+        let test_dir = export.lookup(export.root(), "test").expect("lookup test");
+
+        namespace.rate_limited.store(true, Ordering::Relaxed);
+        assert_eq!(
+            export.lookup(test_dir, "message"),
+            Err(Status::from(&NsError::RateLimited { retry_after: None })),
+            "no lookup answers the one-byte sentinel as the size of the file"
+        );
+
+        namespace.rate_limited.store(false, Ordering::Relaxed);
+        let message = export.lookup(test_dir, "message").expect("lookup message");
+        assert_eq!(export.attr(message).expect("attr").size, 5);
     }
 
     #[test]

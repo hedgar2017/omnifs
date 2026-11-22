@@ -185,9 +185,11 @@ impl FuseAdapter {
             NsEvent::InvalidateSubtree { path } => self.invalidate_node(path),
             NsEvent::AttrsChanged { path, attrs } => {
                 // Live growth is monotonic; never let a stale event shrink it.
-                let mut entry = self.grown_sizes.entry(path.clone()).or_insert(0);
-                *entry = (*entry).max(attrs.size);
-                drop(entry);
+                // The attributes of any other node have no grown size.
+                if matches!(attrs.stability, omnifs_vfs::Stability::Live) {
+                    let mut entry = self.grown_sizes.entry(path.clone()).or_insert(0);
+                    *entry = (*entry).max(attrs.size);
+                }
                 if let Some(ino) = self.by_node.get(path).map(|r| *r) {
                     self.notify_inode_changed(ino);
                 }

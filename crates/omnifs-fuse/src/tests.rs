@@ -459,3 +459,31 @@ async fn ranged_handle_keeps_path_through_invalidation() {
     assert_eq!(fs.by_node.get(&file_path).map(|entry| *entry), Some(file));
     fs.do_release(fh);
 }
+
+/// The changed attributes of a live file alone record a grown size: each
+/// other changed node, as a fed file or a listing, leaves no entry.
+#[tokio::test]
+async fn changed_attrs_record_the_grown_size_of_a_live_file_alone() {
+    let namespace = PathNamespace::new();
+    let fs = FuseAdapter::new(
+        tokio::runtime::Handle::current(),
+        Arc::clone(&namespace) as Arc<dyn Namespace>,
+        new_notifier_handle(),
+    );
+    let fed = Path::parse("/test/fed").unwrap();
+    fs.apply_event(&omnifs_vfs::NsEvent::AttrsChanged {
+        path: fed.clone(),
+        attrs: PathNamespace::attrs(EntryKind::File, 7),
+    });
+    assert!(fs.grown_sizes.is_empty());
+
+    let live = Path::parse("/test/live").unwrap();
+    fs.apply_event(&omnifs_vfs::NsEvent::AttrsChanged {
+        path: live.clone(),
+        attrs: Attrs {
+            stability: Stability::Live,
+            ..PathNamespace::attrs(EntryKind::File, 7)
+        },
+    });
+    assert_eq!(fs.grown_sizes.get(&live).map(|size| *size), Some(7));
+}
