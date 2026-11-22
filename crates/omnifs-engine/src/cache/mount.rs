@@ -313,8 +313,8 @@ pub(crate) struct FeedState {
 /// `unchanged` answer, advanced by a part, or moved to the token of a
 /// restart, a part and a restart dropping its kept parts, and the inner
 /// states the part brought, each a token whose first answer ended, which
-/// drops the kept parts of its feed. Every state but that of a restart gets
-/// `deadline`. `anchors` pairs each anchor
+/// drops the kept parts of its feed unless it is the token that the feed
+/// has. Every state but that of a restart gets `deadline`. `anchors` pairs each anchor
 /// of another facet that the part writes with the anchor of the claim of its
 /// object, and `until` gives each path of the facts of the part with a time
 /// after which they count as lacking for the start of an answer that time.
@@ -326,10 +326,22 @@ pub(crate) struct FeedWrite {
     /// another answer moved the state of, as an inner state of an outer
     /// feed, is no publication.
     pub from: Option<String>,
+    /// The token after the last kept part that the call of the answer
+    /// continued from, none for a call without a kept part: the answer of a
+    /// call whose kept parts another answer dropped or moved is no
+    /// publication.
+    pub kept_from: Option<String>,
+    /// The count of the answers of feeds that changed the projection when
+    /// the answer began ([`MountResources::fed_changes`]): the answer of a
+    /// feed that writes a path that the answer of another feed changed since
+    /// is no publication, and its kept parts leave.
+    pub since: u64,
     pub answer: FeedAnswerWrite,
     pub inner: Vec<(Vec<u8>, String)>,
     pub anchors: Vec<(Path, Path)>,
     pub deadline: u64,
+    /// The time of the answer.
+    pub now: u64,
     pub until: HashMap<Path, u64>,
 }
 
@@ -354,6 +366,9 @@ pub(crate) struct KeptWrite {
     /// The token of the state of the feed that the call of the part began
     /// from, as [`FeedWrite::from`].
     pub from: Option<String>,
+    /// The token after the kept part before this one, as
+    /// [`FeedWrite::kept_from`].
+    pub kept_from: Option<String>,
     pub part: Vec<u8>,
     /// The token after the part, from which the answer continues: the
     /// projection has the token after the last kept part alone.
@@ -436,10 +451,99 @@ impl From<ProjectionError> for ProjectionStoreError {
     }
 }
 
+/// What a publication changed: the paths whose lookup or file facts it
+/// wrote with another value or removed, and the paths whose listing it
+/// changed.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Changed {
+    pub records: HashSet<Path>,
+    pub listings: HashSet<Path>,
+}
+
+/// The answers of feeds that changed the projection while an answer of a
+/// feed is in flight, by which the answer of a feed that writes over the
+/// change of another is no publication: its call began before that change.
+#[derive(Default)]
+pub(crate) struct FedChanges {
+    /// The count of the answers recorded so far.
+    count: u64,
+    /// The answers in flight, by the count at their begin.
+    in_flight: BTreeMap<u64, usize>,
+    /// Each recorded answer after the oldest answer in flight: its count,
+    /// the object of its feed, and the paths whose records it changed.
+    log: Vec<(u64, Vec<u8>, HashSet<Path>)>,
+}
+
+impl FedChanges {
+    fn begin(&mut self) -> u64 {
+        *self.in_flight.entry(self.count).or_default() += 1;
+        self.count
+    }
+
+    fn end(&mut self, since: u64) {
+        if let Some(answers) = self.in_flight.get_mut(&since) {
+            *answers -= 1;
+            if *answers == 0 {
+                self.in_flight.remove(&since);
+            }
+        }
+        let oldest = self.in_flight.keys().next().copied();
+        self.log
+            .retain(|(count, _, _)| oldest.is_some_and(|oldest| *count > oldest));
+    }
+
+    fn record(&mut self, object: &[u8], changed: &HashSet<Path>) {
+        if changed.is_empty() || self.in_flight.is_empty() {
+            return;
+        }
+        self.count += 1;
+        self.log
+            .push((self.count, object.to_vec(), changed.clone()));
+    }
+
+    /// Whether the answer of the feed of `object` that began at `since`,
+    /// with records at `written` and the removals `removed`, writes a path
+    /// whose record the answer of another feed changed since.
+    fn moved<'a>(
+        &self,
+        object: &[u8],
+        since: u64,
+        mut written: impl Iterator<Item = &'a Path>,
+        removed: &[Path],
+    ) -> bool {
+        let others: Vec<&HashSet<Path>> = self
+            .log
+            .iter()
+            .filter(|(count, by, _)| *count > since && by != object)
+            .map(|(_, _, changed)| changed)
+            .collect();
+        !others.is_empty()
+            && (written.any(|path| others.iter().any(|changed| changed.contains(path)))
+                || removed.iter().any(|removed| {
+                    others
+                        .iter()
+                        .any(|changed| changed.iter().any(|path| path.has_prefix(removed)))
+                }))
+    }
+}
+
+/// An answer of a feed in flight, from its begin to its end.
+pub(crate) struct FeedAnswerFlight<'a> {
+    resources: &'a MountResources,
+    pub(crate) since: u64,
+}
+
+impl Drop for FeedAnswerFlight<'_> {
+    fn drop(&mut self) {
+        self.resources.fed_changes.lock().end(self.since);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum PublicationOutcome {
     Committed {
         invalidations: Vec<Invalidation>,
+        changed: Changed,
     },
     Fenced,
     /// Another answer moved the state of the feed of the transition after
@@ -530,10 +634,16 @@ pub struct MountResources {
     pub(crate) memory: MemoryTier,
     pub(crate) coherence: Mutex<Coherence>,
     pub(crate) request_locks: dashmap::DashMap<BlobRequestId, Arc<AsyncMutex<()>>>,
+    /// The handle of the answer of each blob request that an operation in
+    /// flight staged, which the projection does not have yet.
     pub(crate) request_handles: dashmap::DashMap<BlobRequestId, u64>,
     pub(crate) pending_blob_writes: dashmap::DashMap<u64, Vec<BlobWrite>>,
     pub(crate) blob_handles: dashmap::DashMap<u64, Arc<BlobRecord>>,
+    /// The blob handles of each operation in flight, each with the request
+    /// that it staged.
+    operation_blobs: dashmap::DashMap<u64, Vec<(u64, Option<BlobRequestId>)>>,
     pub(crate) next_blob_id: AtomicU64,
+    fed_changes: Mutex<FedChanges>,
     publication: PublicationReservations,
     fence: Arc<ResourceFence>,
     generation: ResourceGeneration,
@@ -580,25 +690,48 @@ impl ResourceFence {
     }
 }
 
+/// The blobs of one operation, from its begin to its end: its blob handles
+/// are of the operation alone, and the answers of its blob requests with the
+/// identity of their bytes publish with its terminal.
 pub(crate) struct BlobPublicationGuard<'a> {
     resources: &'a MountResources,
     operation_id: u64,
-    armed: bool,
 }
 
 impl BlobPublicationGuard<'_> {
-    pub(crate) fn take(mut self) -> Vec<BlobWrite> {
-        self.armed = false;
+    /// The answers of the blob requests of the operation, for the
+    /// publication of its terminal.
+    pub(crate) fn take(&mut self) -> Vec<BlobWrite> {
         self.resources.take_blob_writes(self.operation_id)
     }
 }
 
 impl Drop for BlobPublicationGuard<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            self.resources
-                .pending_blob_writes
-                .remove(&self.operation_id);
+        // The answer of a request with the identity of its bytes stands
+        // whatever its operation did after it: an operation that failed
+        // publishes it alone, so that no request downloads it again.
+        let blobs = self.resources.take_blob_writes(self.operation_id);
+        if !blobs.is_empty()
+            && let Err(error) = self.resources.publish(
+                ProjectionTransition {
+                    blobs,
+                    ..ProjectionTransition::default()
+                },
+                self.resources.current_epoch(),
+            )
+        {
+            tracing::warn!(%error, "the blobs of a failed operation were not published");
+        }
+        if let Some((_, handles)) = self.resources.operation_blobs.remove(&self.operation_id) {
+            for (handle, request) in handles {
+                self.resources.blob_handles.remove(&handle);
+                if let Some(request) = request {
+                    self.resources
+                        .request_handles
+                        .remove_if(&request, |_, staged| *staged == handle);
+                }
+            }
         }
     }
 }
@@ -680,7 +813,9 @@ impl MountResources {
             request_handles: dashmap::DashMap::new(),
             pending_blob_writes: dashmap::DashMap::new(),
             blob_handles: dashmap::DashMap::new(),
+            operation_blobs: dashmap::DashMap::new(),
             next_blob_id: AtomicU64::new(1),
+            fed_changes: Mutex::new(FedChanges::default()),
             publication: PublicationReservations {
                 active: Mutex::new(HashSet::new()),
                 wake: Notify::new(),
@@ -725,7 +860,14 @@ impl MountResources {
         BlobPublicationGuard {
             resources: self,
             operation_id,
-            armed: true,
+        }
+    }
+
+    /// Begin an answer of a feed, for [`FeedWrite::since`].
+    pub(crate) fn begin_feed_answer(&self) -> FeedAnswerFlight<'_> {
+        FeedAnswerFlight {
+            resources: self,
+            since: self.fed_changes.lock().begin(),
         }
     }
 
@@ -734,13 +876,23 @@ impl MountResources {
         self.coherence.lock().invalidation_epoch
     }
 
+    /// The body of the blob of `handle` and its length. The answer of a
+    /// failing status is no content.
     pub(crate) fn body_for_handle(&self, handle: u64) -> Result<(BodyId, u64), ProjectionError> {
         let record = self.blob_handles.get(&handle).ok_or_else(|| {
             ProjectionError::Inconsistent(format!("unknown runtime blob handle {handle}"))
         })?;
+        if !(200..300).contains(&record.status) {
+            return Err(ProjectionError::Inconsistent(format!(
+                "blob handle {handle} is the answer of status {}, which is no content",
+                record.status
+            )));
+        }
         Ok((record.body, record.size))
     }
 
+    /// The lock of `request`, which one fetch of it holds at a time, and
+    /// which leaves with [`Self::release_blob_request_lock`].
     pub(crate) fn blob_request_lock(&self, request: BlobRequestId) -> Arc<AsyncMutex<()>> {
         self.request_locks
             .entry(request)
@@ -748,15 +900,27 @@ impl MountResources {
             .clone()
     }
 
+    /// Forget the lock of `request` that no other fetch holds or waits for.
+    pub(crate) fn release_blob_request_lock(
+        &self,
+        request: BlobRequestId,
+        lock: Arc<AsyncMutex<()>>,
+    ) {
+        self.request_locks
+            .remove_if(&request, |_, held| Arc::strong_count(held) == 2);
+        drop(lock);
+    }
+
+    /// The answer of `request` that an operation in flight staged or that
+    /// the projection has.
     pub(crate) fn blob_for_request(
         &self,
         request: BlobRequestId,
     ) -> Result<Option<Arc<BlobRecord>>, ProjectionError> {
-        if let Some(handle) = self.request_handles.get(&request) {
-            return Ok(self
-                .blob_handles
-                .get(&*handle)
-                .map(|record| Arc::clone(&record)));
+        if let Some(handle) = self.request_handles.get(&request)
+            && let Some(record) = self.blob_handles.get(&*handle)
+        {
+            return Ok(Some(Arc::clone(&record)));
         }
         let Some(bytes) = self.projection.get(&blob_key(request))? else {
             return Ok(None);
@@ -766,6 +930,10 @@ impl MountResources {
                 "blob request key contains a non-blob fact".into(),
             ));
         };
+        // The answer of a failing status answers its own request alone.
+        if !(200..300).contains(&fact.metadata.status) {
+            return Ok(None);
+        }
         let body = BodyId::from_digest_bytes(fact.body_id);
         if fact.metadata.size != fact.length {
             return Err(ProjectionError::Inconsistent(
@@ -773,12 +941,22 @@ impl MountResources {
             ));
         }
         self.body.validate(body, Some(fact.length))?;
-        Ok(Some(self.publish_blob_handle(request, body, fact.metadata)))
+        Ok(Some(Arc::new(BlobRecord {
+            id: 0,
+            body,
+            size: fact.metadata.size,
+            content_type: fact.metadata.content_type,
+            etag: fact.metadata.etag,
+            status: fact.metadata.status,
+            response_headers: fact.metadata.response_headers,
+        })))
     }
 
-    pub(crate) fn publish_blob_handle(
+    /// A blob handle of the operation `operation_id` for `body`.
+    fn blob_handle(
         &self,
-        request: BlobRequestId,
+        operation_id: u64,
+        request: Option<BlobRequestId>,
         body: BodyId,
         metadata: BlobMetadata,
     ) -> Arc<BlobRecord> {
@@ -793,23 +971,54 @@ impl MountResources {
             response_headers: metadata.response_headers,
         });
         self.blob_handles.insert(id, Arc::clone(&record));
-        if (200..300).contains(&record.status) {
-            self.request_handles.insert(request, id);
-        }
+        self.operation_blobs
+            .entry(operation_id)
+            .or_default()
+            .push((id, request));
         record
     }
 
+    /// A blob handle of the operation `operation_id` for the body `body` of
+    /// `length` bytes that the body store has.
+    pub(crate) fn body_handle(
+        &self,
+        operation_id: u64,
+        body: BodyId,
+        length: u64,
+    ) -> Result<u64, ProjectionError> {
+        self.body.validate(body, Some(length))?;
+        Ok(self
+            .blob_handle(
+                operation_id,
+                None,
+                body,
+                BlobMetadata {
+                    size: length,
+                    content_type: None,
+                    etag: None,
+                    status: 200,
+                    response_headers: Vec::new(),
+                },
+            )
+            .id)
+    }
+
+    /// A blob handle of the operation `operation_id` for the answer of a
+    /// blob request. With `request`, the identity of a request with the
+    /// identity of its bytes, the answer of a successful status answers that
+    /// request from then on: for each operation in flight at once, and from
+    /// the projection once the terminal of its operation publishes it. The
+    /// answer of a failing status, and of a request without the identity of
+    /// its bytes, answers its own request alone.
     pub(crate) fn stage_blob_write(
         &self,
         operation_id: u64,
-        request: BlobRequestId,
+        request: Option<BlobRequestId>,
         body: BodyId,
         metadata: BlobMetadata,
     ) -> Arc<BlobRecord> {
-        // The answer of a failing status answers its own request alone: the
-        // projection keeps none of it, and the next request of it asks the
-        // upstream again.
-        if (200..300).contains(&metadata.status) {
+        let request = request.filter(|_| (200..300).contains(&metadata.status));
+        if let Some(request) = request {
             self.pending_blob_writes
                 .entry(operation_id)
                 .or_default()
@@ -819,7 +1028,11 @@ impl MountResources {
                     metadata: metadata.clone(),
                 });
         }
-        self.publish_blob_handle(request, body, metadata)
+        let record = self.blob_handle(operation_id, request, body, metadata);
+        if let Some(request) = request {
+            self.request_handles.insert(request, record.id);
+        }
+        record
     }
 
     pub(crate) fn take_blob_writes(&self, operation_id: u64) -> Vec<BlobWrite> {
@@ -957,13 +1170,30 @@ impl MountResources {
         if captured_epoch != coherence.invalidation_epoch {
             return Ok(PublicationOutcome::Fenced);
         }
-        for (object, from) in feed
+        for (object, from, kept_from) in feed
             .iter()
-            .map(|feed| (&feed.object, &feed.from))
-            .chain(kept.iter().map(|kept| (&kept.object, &kept.from)))
+            .map(|feed| (&feed.object, &feed.from, &feed.kept_from))
+            .chain(
+                kept.iter()
+                    .map(|kept| (&kept.object, &kept.from, &kept.kept_from)),
+            )
         {
             let state = self.feed_state(object)?;
-            if state.map(|state| state.token) != *from {
+            if state.map(|state| state.token) != *from || self.kept_token(object)? != *kept_from {
+                return Ok(PublicationOutcome::Moved);
+            }
+        }
+        if let Some(feed) = &feed {
+            let written = records.iter().map(|record| &record.path);
+            if self
+                .fed_changes
+                .lock()
+                .moved(&feed.object, feed.since, written, &removed_paths)
+            {
+                self.projection.transact(|tx, facts| {
+                    drop_kept_parts(tx, facts, &feed.object)?;
+                    Ok(())
+                })?;
                 return Ok(PublicationOutcome::Moved);
             }
         }
@@ -1006,8 +1236,9 @@ impl MountResources {
                 ProjectionError::Inconsistent("invalidation epoch overflow".into())
             })?)
         };
-        let reconciled_paths = self.projection.transact(|tx, facts| {
+        let (reconciled_paths, changed) = self.projection.transact(|tx, facts| {
             let mut removals = Vec::<Vec<u8>>::new();
+            let mut changed = Changed::default();
 
             let mut claims = HashMap::<String, Vec<u8>>::new();
             for object in &objects {
@@ -1069,7 +1300,9 @@ impl MountResources {
                     record.aux.as_deref(),
                 );
                 let value = postcard::to_allocvec(&record.fact).map_err(ProjectionError::from)?;
-                put(tx, facts, key, value)?;
+                if put(tx, facts, key, value)? {
+                    changed.records.insert(record.path.clone());
+                }
                 if let DurableFact::Lookup(lookup) = &record.fact
                     && let LookupPayload::Negative { id: Some(id) } = lookup
                 {
@@ -1105,10 +1338,14 @@ impl MountResources {
                         fed_key(mutation.path()),
                         fed_mark(mutation.path())?,
                     )?;
-                    apply_dirents(tx, facts, mutation)?;
+                    if apply_dirents(tx, facts, mutation)? {
+                        changed.listings.insert(mutation.path().clone());
+                    }
                 } else {
                     let mutation = with_fed_entries(tx, facts, mutation)?;
-                    apply_dirents(tx, facts, &mutation)?;
+                    if apply_dirents(tx, facts, &mutation)? {
+                        changed.listings.insert(mutation.path().clone());
+                    }
                 }
             }
             if let Some(feed) = &feed {
@@ -1148,8 +1385,12 @@ impl MountResources {
                     postcard::to_allocvec(&freshness.expires_at).map_err(ProjectionError::from)?,
                 )?;
             }
-            let mut reconciled_paths =
+            let (listings, contradictions) =
                 reconcile_listing_relations(tx, facts, &written, &dirents, &mut removals)?;
+            let mut reconciled_paths: HashSet<Path> =
+                listings.union(&contradictions).cloned().collect();
+            changed.listings.extend(listings);
+            changed.records.extend(contradictions);
             // Apply invalidation scanners after all transition writes. Fjall's
             // transaction reads see those writes, so same-terminal aliases,
             // records, Git facts, and negative reverse rows are retired too.
@@ -1178,16 +1419,24 @@ impl MountResources {
                 }
             }
             for path in &removed_paths {
-                reconciled_paths.extend(remove_subtree_facts(tx, facts, path, &mut removals)?);
+                let left = remove_subtree_facts(tx, facts, path, &mut removals)?;
+                changed.records.extend(left.iter().cloned());
+                reconciled_paths.extend(left);
                 if let Some(parent) = remove_from_parent_listing(tx, facts, path)? {
+                    changed.listings.insert(parent.clone());
                     reconciled_paths.insert(parent);
                 }
             }
             for key in removals {
                 delete(tx, facts, key)?;
             }
-            Ok(reconciled_paths)
+            Ok((reconciled_paths, changed))
         })?;
+        if let Some(feed) = &feed {
+            self.fed_changes
+                .lock()
+                .record(&feed.object, &changed.records);
+        }
 
         if let Some(next_epoch) = next_epoch {
             coherence.invalidation_epoch = next_epoch;
@@ -1203,7 +1452,10 @@ impl MountResources {
         for prefix in memory_prefixes {
             self.memory.invalidate_prefix(&prefix);
         }
-        Ok(PublicationOutcome::Committed { invalidations })
+        Ok(PublicationOutcome::Committed {
+            invalidations,
+            changed,
+        })
     }
 
     // --- View cache reads -----------------------------------------------------
@@ -1487,6 +1739,60 @@ impl MountResources {
         }
     }
 
+    /// The feed that the last listing of the fed directory `path` asked, by
+    /// the id of its object: none for a directory that no operation listed.
+    pub(crate) fn listing_feed(&self, path: &Path) -> Result<Option<Vec<u8>>, ProjectionError> {
+        Ok(self.projection.get(&listing_feed_key(path))?)
+    }
+
+    /// Record `feed` as [`Self::listing_feed`] of `path`.
+    pub(crate) fn record_listing_feed(
+        &self,
+        path: &Path,
+        feed: Option<&[u8]>,
+    ) -> Result<(), ProjectionError> {
+        let key = listing_feed_key(path);
+        if self.projection.get(&key)?.as_deref() == feed {
+            return Ok(());
+        }
+        self.projection.transact(|tx, facts| {
+            match feed {
+                Some(feed) => tx.insert(facts, &key, feed),
+                None => tx.remove(facts, &key),
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// The part of the change of the attributes of the fed directory `path`
+    /// that moves with the deadline of the feed of its listing: a filesystem
+    /// lists a directory again only after a change of its attributes, and
+    /// past that deadline a listing asks the feed, when the feed `answers`,
+    /// outside the rate-limit window of a mount with its provider. It is the
+    /// deadline of the feed once `now` is past it, and until then the last
+    /// deadline that an answer of the feed came past, so that it moves once
+    /// for a deadline and stands over the answer that renews the deadline.
+    pub(crate) fn listing_due(
+        &self,
+        path: &Path,
+        answers: bool,
+        now: u64,
+    ) -> Result<u64, ProjectionError> {
+        let Some(feed) = self.listing_feed(path)? else {
+            return Ok(0);
+        };
+        if let Some(state) = self.feed_state(&feed)?
+            && answers
+            && state.deadline <= now
+        {
+            return Ok(state.deadline);
+        }
+        self.projection
+            .get(&passed_key(&feed))?
+            .map_or(Ok(0), |bytes| Ok(postcard::from_bytes(&bytes)?))
+    }
+
     /// Whether the feed of the object `id` has kept parts of a later answer.
     pub(crate) fn has_kept_parts(&self, id: &[u8]) -> Result<bool, ProjectionError> {
         Ok(!self.projection.read_prefix(&kept_prefix(id))?.is_empty())
@@ -1586,17 +1892,18 @@ impl MountResources {
 }
 
 /// Write `value` at `key` unless the projection has it there, so that a
-/// publication without a change commits nothing.
+/// publication without a change commits nothing. Returns whether it wrote.
 fn put(
     tx: &mut fjall::OptimisticWriteTx,
     facts: &fjall::OptimisticTxKeyspace,
     key: impl AsRef<[u8]>,
     value: impl AsRef<[u8]>,
-) -> Result<(), ProjectionError> {
-    if tx.get(facts, key.as_ref())?.as_deref() != Some(value.as_ref()) {
+) -> Result<bool, ProjectionError> {
+    let changed = tx.get(facts, key.as_ref())?.as_deref() != Some(value.as_ref());
+    if changed {
         tx.insert(facts, key.as_ref(), value.as_ref());
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Remove `key` unless the projection lacks it, as [`put`] writes.
@@ -1731,6 +2038,47 @@ fn fed_key(path: &Path) -> Vec<u8> {
     key
 }
 
+/// The key of the last deadline of the feed of the object `id` that an
+/// answer of the feed came past.
+fn passed_key(id: &[u8]) -> Vec<u8> {
+    let mut key = b"p:".to_vec();
+    key.extend_from_slice(hex::encode(id).as_bytes());
+    key
+}
+
+/// Give the feed with `key` the `state`, and record the deadline of the
+/// state before it as the last that an answer came past when `now` is past
+/// it ([`MountResources::listing_due`]).
+fn put_feed_state(
+    tx: &mut fjall::OptimisticWriteTx,
+    facts: &fjall::OptimisticTxKeyspace,
+    id: &[u8],
+    previous: Option<&FeedState>,
+    state: &FeedState,
+    now: u64,
+) -> Result<(), ProjectionError> {
+    if let Some(previous) = previous
+        && previous.deadline <= now
+        && previous.deadline != state.deadline
+    {
+        put(
+            tx,
+            facts,
+            passed_key(id),
+            postcard::to_allocvec(&previous.deadline)?,
+        )?;
+    }
+    put(tx, facts, feed_key(id), postcard::to_allocvec(state)?)?;
+    Ok(())
+}
+
+/// The key of [`MountResources::listing_feed`] of `path`.
+fn listing_feed_key(path: &Path) -> Vec<u8> {
+    let mut key = b"l:".to_vec();
+    key.extend_from_slice(path.as_str().as_bytes());
+    key
+}
+
 /// The key of the anchor of the claim of the object whose anchor of another
 /// facet is `path`.
 fn anchor_key(path: &Path) -> Vec<u8> {
@@ -1768,24 +2116,23 @@ fn write_feed_states(
     facts: &fjall::OptimisticTxKeyspace,
     feed: &FeedWrite,
 ) -> Result<(), ProjectionError> {
-    let key = feed_key(&feed.object);
     let previous = tx
-        .get(facts, &key)?
+        .get(facts, feed_key(&feed.object))?
         .map(|bytes| postcard::from_bytes::<FeedState>(&bytes))
         .transpose()?;
-    let state = match (&feed.answer, previous) {
+    let state = match (&feed.answer, &previous) {
         (FeedAnswerWrite::Part(part), previous) => FeedState {
             token: part.token.clone(),
-            ended: previous.is_some_and(|state| state.ended) || !part.more,
+            ended: previous.as_ref().is_some_and(|state| state.ended) || !part.more,
             deadline: feed.deadline,
         },
         (FeedAnswerWrite::Unchanged, Some(previous)) => FeedState {
             deadline: feed.deadline,
-            ..previous
+            ..previous.clone()
         },
         (FeedAnswerWrite::Restart(token), Some(previous)) => FeedState {
             token: token.clone(),
-            ..previous
+            ..previous.clone()
         },
         (FeedAnswerWrite::Unchanged | FeedAnswerWrite::Restart(_), None) => {
             return Err(ProjectionError::Inconsistent(
@@ -1793,7 +2140,7 @@ fn write_feed_states(
             ));
         },
     };
-    put(tx, facts, key, postcard::to_allocvec(&state)?)?;
+    put_feed_state(tx, facts, &feed.object, previous.as_ref(), &state, feed.now)?;
     if !matches!(feed.answer, FeedAnswerWrite::Unchanged) {
         drop_kept_parts(tx, facts, &feed.object)?;
     }
@@ -1806,19 +2153,22 @@ fn write_feed_states(
         )?;
     }
     // An inner state is the token of its feed from then on, so the kept parts
-    // of an answer from another token leave with it.
+    // of an answer from another token leave with it; the kept parts of an
+    // answer from that token continue it.
     for (id, token) in &feed.inner {
-        put(
-            tx,
-            facts,
-            feed_key(id),
-            postcard::to_allocvec(&FeedState {
-                token: token.clone(),
-                ended: true,
-                deadline: feed.deadline,
-            })?,
-        )?;
-        drop_kept_parts(tx, facts, id)?;
+        let previous = tx
+            .get(facts, feed_key(id))?
+            .map(|bytes| postcard::from_bytes::<FeedState>(&bytes))
+            .transpose()?;
+        let state = FeedState {
+            token: token.clone(),
+            ended: true,
+            deadline: feed.deadline,
+        };
+        put_feed_state(tx, facts, id, previous.as_ref(), &state, feed.now)?;
+        if previous.is_none_or(|previous| previous.token != *token) {
+            drop_kept_parts(tx, facts, id)?;
+        }
     }
     Ok(())
 }
@@ -2126,6 +2476,7 @@ fn remove_path_facts(
     removals.push(expiry);
     removals.push(git_key(path));
     removals.push(fed_key(path));
+    removals.push(listing_feed_key(path));
     removals.push(anchor_key(path));
     Ok(())
 }
@@ -2206,8 +2557,9 @@ fn reconcile_listing_relations(
     records: &[&PreparedRecord],
     dirents: &[DirentsMutation],
     removals: &mut Vec<Vec<u8>>,
-) -> Result<HashSet<Path>, ProjectionError> {
+) -> Result<(HashSet<Path>, HashSet<Path>), ProjectionError> {
     let mut mutated = HashSet::new();
+    let mut retired = HashSet::new();
     // Exact lookup results and a parent's accumulated listing are one logical
     // projection. A positive hint may extend a snapshot but cannot silently
     // preserve an exhaustive claim; a definitive negative removes the name.
@@ -2232,15 +2584,16 @@ fn reconcile_listing_relations(
                     },
                 );
                 listing = DirentsPayload::merged(Some(listing), entries, ListingWrite::Partial);
-                apply_dirents(
+                if apply_dirents(
                     tx,
                     facts,
                     &DirentsMutation::Replace {
                         path: parent.clone(),
                         value: listing,
                     },
-                )?;
-                mutated.insert(parent);
+                )? {
+                    mutated.insert(parent);
+                }
             },
             LookupPayload::Negative { .. } if listing.entries().any(|entry| entry.name == name) => {
                 listing.remove_entry(name);
@@ -2288,10 +2641,10 @@ fn reconcile_listing_relations(
         }
         for path in contradictions {
             remove_path_facts(tx, facts, &path, removals)?;
-            mutated.insert(path);
+            retired.insert(path);
         }
     }
-    Ok(mutated)
+    Ok((mutated, retired))
 }
 
 /// The lookup facts of the direct children of `parent`. The keys of the
@@ -2389,11 +2742,13 @@ fn decode_fact_key(key: &[u8]) -> Result<(Path, RecordKind, Option<String>), Pro
     Ok((path, kind, aux))
 }
 
+/// Apply `mutation` to the listing of its path. Returns whether the listing
+/// changed.
 fn apply_dirents(
     tx: &mut fjall::OptimisticWriteTx,
     facts: &fjall::OptimisticTxKeyspace,
     mutation: &DirentsMutation,
-) -> Result<(), ProjectionError> {
+) -> Result<bool, ProjectionError> {
     let (path, value) = match mutation {
         DirentsMutation::Replace { path, value } => (path, value.clone()),
         DirentsMutation::MergeHints {
@@ -2489,8 +2844,7 @@ fn apply_dirents(
         facts,
         fact_key(path.as_str(), RecordKind::Dirents, None),
         postcard::to_allocvec(&DurableFact::Dirents(value))?,
-    )?;
-    Ok(())
+    )
 }
 
 fn read_dirents_fact(
@@ -3183,14 +3537,244 @@ mod tests {
                 .feed_state(&feed.object)
                 .unwrap()
                 .map(|state| state.token);
+            feed.kept_from = store.kept_token(&feed.object).unwrap();
         }
         if let Some(kept) = &mut transition.kept {
             kept.from = store
                 .feed_state(&kept.object)
                 .unwrap()
                 .map(|state| state.token);
+            kept.kept_from = store.kept_token(&kept.object).unwrap();
         }
-        store.publish(transition, store.current_epoch()).unwrap();
+        assert!(matches!(
+            store.publish(transition, store.current_epoch()).unwrap(),
+            PublicationOutcome::Committed { .. }
+        ));
+    }
+
+    /// The kept part `part` of the feed `object`, of a call from the token
+    /// `from` after the kept part with the token `kept_from`.
+    fn kept_part(
+        object: &[u8],
+        from: &str,
+        kept_from: Option<&str>,
+        part: &str,
+    ) -> ProjectionTransition {
+        ProjectionTransition {
+            kept: Some(KeptWrite {
+                object: object.to_vec(),
+                from: Some(from.into()),
+                kept_from: kept_from.map(Into::into),
+                part: part.as_bytes().to_vec(),
+                token: format!("after {part}"),
+            }),
+            ..ProjectionTransition::default()
+        }
+    }
+
+    #[test]
+    fn an_inner_state_of_the_token_of_its_feed_keeps_the_kept_parts_and_a_part_continues_its_kept_parts_alone()
+     {
+        let (_dir, _caches, store) = open_store("kept");
+        let inner = |token: &str| {
+            let mut outer = fed_part("outer", HashMap::new());
+            outer.object = b"outer".to_vec();
+            outer.inner = vec![(b"feed".to_vec(), token.into())];
+            ProjectionTransition {
+                feed: Some(outer),
+                ..ProjectionTransition::default()
+            }
+        };
+        publish_from_state(&store, inner("token"));
+        publish_from_state(&store, kept_part(b"feed", "token", None, "P1"));
+
+        // The outer feed brings the token that the feed has: the kept part
+        // stays, and the next part continues it.
+        publish_from_state(&store, inner("token"));
+        assert_eq!(store.kept_parts(b"feed").unwrap(), [b"P1".to_vec()]);
+        publish_from_state(&store, kept_part(b"feed", "token", Some("after P1"), "P2"));
+        assert_eq!(
+            store.kept_parts(b"feed").unwrap(),
+            [b"P1".to_vec(), b"P2".to_vec()]
+        );
+
+        // A part of a call that continued other kept parts than the
+        // projection has is no publication: a first part after another
+        // answer kept one, and a part after kept parts that left with
+        // another token of its feed, which came back.
+        let moved = |transition| {
+            matches!(
+                store.publish(transition, store.current_epoch()),
+                Ok(PublicationOutcome::Moved)
+            )
+        };
+        assert!(moved(kept_part(b"feed", "token", None, "P1 again")));
+        publish_from_state(&store, inner("other"));
+        assert!(!store.has_kept_parts(b"feed").unwrap());
+        publish_from_state(&store, inner("token"));
+        assert!(moved(kept_part(b"feed", "token", Some("after P2"), "P3")));
+        let mut last = fed_part("last", HashMap::new());
+        last.from = Some("token".into());
+        last.kept_from = Some("after P2".into());
+        assert!(moved(ProjectionTransition {
+            feed: Some(last),
+            ..ProjectionTransition::default()
+        }));
+        assert!(!store.has_kept_parts(b"feed").unwrap());
+    }
+
+    #[test]
+    fn an_answer_over_the_change_of_another_feed_since_its_begin_is_no_publication() {
+        let (_dir, _caches, store) = open_store("conflict");
+        let title = p("/shelf/books/1/title");
+        let write = |object: &[u8], content: &str, since: u64| {
+            let mut feed = fed_part("token", HashMap::new());
+            feed.object = object.to_vec();
+            feed.from = store.feed_state(object).unwrap().map(|state| state.token);
+            feed.kept_from = store.kept_token(object).unwrap();
+            feed.since = since;
+            ProjectionTransition {
+                records: vec![RecordWrite {
+                    path: title.clone(),
+                    aux: None,
+                    fact: FactPayload::File(FilePayload::new(None, content.as_bytes().to_vec())),
+                }],
+                feed: Some(feed),
+                ..ProjectionTransition::default()
+            }
+        };
+        let content = || {
+            FilePayload::deserialize(
+                &store
+                    .cache_get(&title, RecordKind::File, None)
+                    .unwrap()
+                    .unwrap()
+                    .payload,
+            )
+            .unwrap()
+            .content
+        };
+        let publish = |transition| store.publish(transition, store.current_epoch()).unwrap();
+
+        // The answer of the book began, with a kept part, before the answer
+        // of the shelf changed the title: it is no publication, and its kept
+        // part leaves.
+        let book = store.begin_feed_answer();
+        assert!(matches!(
+            publish(write(b"book", "old", book.since)),
+            PublicationOutcome::Committed { .. }
+        ));
+        publish(kept_part(b"book", "token", None, "P1"));
+        let shelf = store.begin_feed_answer();
+        assert!(matches!(
+            publish(write(b"shelf", "new", shelf.since)),
+            PublicationOutcome::Committed { .. }
+        ));
+        drop(shelf);
+        let mut stale = write(b"book", "old", book.since);
+        stale.feed.as_mut().unwrap().kept_from = Some("after P1".into());
+        assert!(matches!(publish(stale), PublicationOutcome::Moved));
+        assert_eq!(content(), b"new");
+        assert!(!store.has_kept_parts(b"book").unwrap());
+        drop(book);
+
+        // An answer that began after the change publishes, and so does the
+        // answer over a write that changed nothing.
+        let book = store.begin_feed_answer();
+        let shelf = store.begin_feed_answer();
+        publish(write(b"shelf", "new", shelf.since));
+        assert!(matches!(
+            publish(write(b"book", "newer", book.since)),
+            PublicationOutcome::Committed { .. }
+        ));
+        assert_eq!(content(), b"newer");
+        drop((book, shelf));
+        assert!(store.fed_changes.lock().log.is_empty());
+    }
+
+    #[test]
+    fn a_publication_names_the_paths_that_it_changed_alone() {
+        let (_dir, _caches, store) = open_store("changed");
+        let books = p("/shelf/books");
+        let changed = |transition: ProjectionTransition| {
+            let mut transition = transition;
+            transition.feed.as_mut().unwrap().from =
+                store.feed_state(b"feed").unwrap().map(|state| state.token);
+            match store.publish(transition, store.current_epoch()).unwrap() {
+                PublicationOutcome::Committed { changed, .. } => changed,
+                other => panic!("{other:?}"),
+            }
+        };
+        let first = changed(fed_dir(&books, &["1"], ListingWrite::Complete));
+        assert!(first.listings.contains(&books));
+        assert!(first.records.contains(&p("/shelf/books/1")));
+
+        // The same listing again changes nothing.
+        let again = changed(fed_dir(&books, &["1"], ListingWrite::Complete));
+        assert!(again.listings.is_empty() && again.records.is_empty());
+
+        // Another child changes the listing and its own lookup alone, and a
+        // removal the path that left and the listing that had it.
+        let more = changed(fed_dir(&books, &["1", "2"], ListingWrite::Complete));
+        assert_eq!(more.listings, HashSet::from([books.clone()]));
+        assert_eq!(more.records, HashSet::from([p("/shelf/books/2")]));
+        let mut removal = fed_dir(&books, &["1"], ListingWrite::Join);
+        removal.removals = vec![p("/shelf/books/2"), p("/shelf/books/9")];
+        let removed = changed(removal);
+        assert_eq!(removed.listings, HashSet::from([books.clone()]));
+        assert_eq!(removed.records, HashSet::from([p("/shelf/books/2")]));
+    }
+
+    #[test]
+    fn the_change_of_a_listed_directory_moves_once_past_the_deadline_of_the_feed_of_its_listing() {
+        let (_dir, _caches, store) = open_store("due");
+        let books = p("/shelf/books");
+        publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Complete));
+        // No listing asked the feed: nothing lists the directory again.
+        assert_eq!(store.listing_due(&books, true, 5_000).unwrap(), 0);
+
+        // After a listing within the deadline, the change moves once the
+        // deadline passes, to the deadline, for a feed that answers.
+        store.record_listing_feed(&books, Some(b"feed")).unwrap();
+        assert_eq!(store.listing_due(&books, true, 999).unwrap(), 0);
+        assert_eq!(store.listing_due(&books, true, 1_000).unwrap(), 1_000);
+        assert_eq!(store.listing_due(&books, true, 5_000).unwrap(), 1_000);
+        assert_eq!(store.listing_due(&books, false, 5_000).unwrap(), 0);
+
+        // The answer past the deadline, of any operation, renews the
+        // deadline and leaves the change where it was, until the next
+        // deadline passes; an answer within the deadline leaves it too.
+        let answer = |now: u64, deadline: u64| {
+            let mut unchanged = fed_part("token", HashMap::new());
+            unchanged.answer = FeedAnswerWrite::Unchanged;
+            unchanged.now = now;
+            unchanged.deadline = deadline;
+            publish_from_state(
+                &store,
+                ProjectionTransition {
+                    feed: Some(unchanged),
+                    ..ProjectionTransition::default()
+                },
+            );
+        };
+        answer(5_000, 8_000);
+        assert_eq!(store.listing_due(&books, true, 5_000).unwrap(), 1_000);
+        answer(6_000, 9_000);
+        assert_eq!(store.listing_due(&books, true, 8_999).unwrap(), 1_000);
+        assert_eq!(store.listing_due(&books, true, 9_000).unwrap(), 9_000);
+
+        // The record leaves with the directory.
+        let mut removal = fed_part("token", HashMap::new());
+        removal.answer = FeedAnswerWrite::Unchanged;
+        publish_from_state(
+            &store,
+            ProjectionTransition {
+                removals: vec![books.clone()],
+                feed: Some(removal),
+                ..ProjectionTransition::default()
+            },
+        );
+        assert_eq!(store.listing_feed(&books).unwrap(), None);
     }
 
     fn fed_dir(path: &Path, children: &[&str], write: ListingWrite) -> ProjectionTransition {
@@ -3231,6 +3815,8 @@ mod tests {
         FeedWrite {
             object: b"feed".to_vec(),
             from: None,
+            kept_from: None,
+            since: 0,
             answer: FeedAnswerWrite::Part(FeedPartWrite {
                 token: token.into(),
                 more: false,
@@ -3238,6 +3824,7 @@ mod tests {
             inner: Vec::new(),
             anchors: Vec::new(),
             deadline: 1_000,
+            now: 0,
             until,
         }
     }
@@ -3273,6 +3860,7 @@ mod tests {
                 kept: Some(KeptWrite {
                     object: b"feed".to_vec(),
                     from: None,
+                    kept_from: None,
                     part: b"kept".to_vec(),
                     token: "kept token".into(),
                 }),
@@ -3312,6 +3900,7 @@ mod tests {
                 kept: Some(KeptWrite {
                     object: b"inner".to_vec(),
                     from: None,
+                    kept_from: None,
                     part: b"kept".to_vec(),
                     token: "kept token".into(),
                 }),
@@ -3366,6 +3955,7 @@ mod tests {
                     kept: Some(KeptWrite {
                         object: b"feed".to_vec(),
                         from: Some("token".into()),
+                        kept_from: None,
                         part: b"kept".to_vec(),
                         token: "kept token".into(),
                     }),
@@ -3568,79 +4158,82 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn blob_publication_rehydrates_and_scopes_reused_hits() {
-        let (_dir, _caches, store) = open_store("m");
-        let body = store.body.publish(b"body").unwrap();
-        let request = BlobRequestId::new(
-            None,
-            "GET",
-            "https://example.test/body",
-            &[],
-            None,
-            None,
-            None,
-        );
-        let metadata = BlobMetadata {
+    fn blob_request(url: &str, version: Option<&str>) -> BlobRequestId {
+        BlobRequestId::new(None, "GET", url, &[], None, None, version)
+    }
+
+    fn blob_metadata(status: u16) -> BlobMetadata {
+        BlobMetadata {
             size: 4,
             content_type: None,
             etag: None,
-            status: 200,
+            status,
             response_headers: Vec::new(),
-        };
-        let failed = store.blob_publication(1);
-        store.stage_blob_write(1, request, body, metadata.clone());
-        drop(failed);
-        assert!(store.take_blob_writes(1).is_empty());
+        }
+    }
 
-        let second = store.blob_publication(2);
-        store.stage_blob_write(2, request, body, metadata.clone());
+    #[test]
+    fn the_answer_of_a_blob_request_outlives_its_operation_and_its_handle_does_not() {
+        let (_dir, _caches, store) = open_store("m");
+        let body = store.body.publish(b"body").unwrap();
+        let request = blob_request("https://example.test/body", Some("1"));
+
+        // The operation that staged the answer failed: the answer stands,
+        // for an operation in flight at once and from the projection after.
+        let failed = store.blob_publication(1);
+        let handle = store
+            .stage_blob_write(1, Some(request), body, blob_metadata(200))
+            .id;
+        assert_eq!(store.body_for_handle(handle).unwrap(), (body, 4));
+        assert_eq!(store.blob_for_request(request).unwrap().unwrap().body, body);
+        drop(failed);
+        assert!(store.body_for_handle(handle).is_err());
+        assert!(
+            store.blob_handles.is_empty()
+                && store.request_handles.is_empty()
+                && store.operation_blobs.is_empty()
+                && store.pending_blob_writes.is_empty()
+        );
+        let reopened = store.blob_for_request(request).unwrap().unwrap();
+        assert_eq!((reopened.body, reopened.size), (body, 4));
+
+        // The terminal of an operation publishes its answers itself.
+        let other = blob_request("https://example.test/other", Some("1"));
+        let mut second = store.blob_publication(2);
+        store.stage_blob_write(2, Some(other), body, blob_metadata(200));
         let writes = second.take();
         assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].request, request);
+        assert_eq!(writes[0].request, other);
+        drop(second);
+        assert!(store.blob_for_request(other).unwrap().is_none());
 
-        store
-            .publish(
-                ProjectionTransition {
-                    blobs: writes,
-                    ..ProjectionTransition::default()
-                },
-                store.current_epoch(),
-            )
-            .unwrap();
-        store.request_handles.clear();
-        store.blob_handles.clear();
-        let reopened = store.blob_for_request(request).unwrap().unwrap();
-        assert_eq!(reopened.body, body);
-        assert_eq!(reopened.size, 4);
+        // The answer of a failing status, and of a request without the
+        // identity of its bytes, answers its own request alone, and the
+        // answer of a failing status is no content.
+        let third = store.blob_publication(3);
+        let refused = store
+            .stage_blob_write(3, Some(other), body, blob_metadata(302))
+            .id;
+        assert!(store.body_for_handle(refused).is_err());
+        store.stage_blob_write(3, None, body, blob_metadata(200));
+        assert!(store.blob_for_request(other).unwrap().is_none());
+        drop(third);
+        assert!(store.blob_for_request(other).unwrap().is_none());
 
-        let corrupt = BlobRequestId::new(
-            None,
-            "GET",
-            "https://example.test/corrupt",
-            &[],
-            None,
-            None,
-            None,
-        );
+        // A kept part names the body of its blob, which a handle of the
+        // operation that publishes it serves.
+        let fourth = store.blob_publication(4);
+        let kept = store.body_handle(4, body, 4).unwrap();
+        assert_eq!(store.body_for_handle(kept).unwrap(), (body, 4));
+        drop(fourth);
+        assert!(store.body_for_handle(kept).is_err());
+
+        let corrupt = blob_request("https://example.test/corrupt", Some("1"));
         let corrupt_fact = DurableFact::Blob(BlobFact {
             body_id: [0; 32],
             length: 4,
-            metadata,
+            metadata: blob_metadata(200),
         });
-        store.stage_blob_write(
-            3,
-            corrupt,
-            body,
-            BlobMetadata {
-                size: 4,
-                content_type: None,
-                etag: None,
-                status: 200,
-                response_headers: Vec::new(),
-            },
-        );
-        store.take_blob_writes(3);
         store
             .projection
             .transact(|tx, facts| {
@@ -3653,8 +4246,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        store.request_handles.clear();
-        store.blob_handles.clear();
         assert!(store.blob_for_request(corrupt).is_err());
     }
 }

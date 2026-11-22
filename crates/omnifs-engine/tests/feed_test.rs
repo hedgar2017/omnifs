@@ -98,7 +98,7 @@ async fn a_feed_starts_from_its_starting_path_and_answers_once_past_its_deadline
     );
     assert_eq!(
         log(&harness).await[3..],
-        ["oak version-0 -"],
+        ["oak version-0 ~books"],
         "one answer past the deadline, from the token of the first answer"
     );
 
@@ -131,7 +131,11 @@ async fn a_feed_starts_from_its_starting_path_and_answers_once_past_its_deadline
     );
     assert_eq!(
         log(&harness).await[3..],
-        ["oak version-0 -", "oak version-0 -", "oak change-1 -"],
+        [
+            "oak version-0 ~books",
+            "oak version-0 ~books",
+            "oak change-1 ~books"
+        ],
         "the change answered the next answer past the deadline, in two parts"
     );
 }
@@ -211,8 +215,8 @@ async fn a_later_answer_publishes_its_parts_with_its_last_part_and_continues_aft
     );
 
     // After the window, the next operation continues the answer from the
-    // token of its kept part, whatever the deadline, and its last part
-    // publishes both parts.
+    // token of its kept part, whatever the deadline, with what it asks, and
+    // its last part publishes both parts.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert_eq!(
         names(&harness, &["shelves", "wobbly", "books"])
@@ -228,9 +232,78 @@ async fn a_later_answer_publishes_its_parts_with_its_last_part_and_continues_aft
     assert_eq!(
         log(&harness).await[3..],
         [
-            "wobbly version-0 -",
-            "wobbly change-1 -",
-            "wobbly change-1 -"
+            "wobbly version-0 ~books",
+            "wobbly change-1 ~books",
+            "wobbly change-1 ~books"
         ]
     );
+}
+
+/// The change of the attributes of a fed directory, which makes a filesystem
+/// list it again: it stands within the deadline of the feed of its listing,
+/// moves once past it, at a lookup and at a getattr alike, without a call of
+/// the provider's feed, stands over the listing that asks the feed, and moves
+/// with a change of the listing alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_attributes_of_a_listed_fed_directory_change_once_past_the_deadline_of_its_feed() {
+    let harness = make_initialized_runtime(CONFIG);
+    let segments = ["shelves", "oak", "books"];
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
+    let shelf = path(&harness, &["shelves", "oak"]).await;
+    let books = path(&harness, &segments).await;
+    let looked_up = || async {
+        let lookup = harness.namespace.lookup(shelf.clone(), "books").await;
+        lookup.unwrap().attrs().unwrap().change
+    };
+    let stat = || async {
+        harness
+            .namespace
+            .getattr(books.clone())
+            .await
+            .unwrap()
+            .change
+    };
+    let listed = looked_up().await;
+    let calls = log(&harness).await.len();
+    for _ in 0..3 {
+        assert_eq!(looked_up().await, listed);
+        assert_eq!(stat().await, listed);
+        harness.namespace.lookup(books.clone(), "1").await.unwrap();
+    }
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let due = stat().await;
+    assert_ne!(due, listed);
+    assert_eq!(looked_up().await, due);
+    assert_eq!(
+        log(&harness).await.len(),
+        calls,
+        "no attribute asks the feed"
+    );
+
+    // The listing asks the feed, whose facts stand: no attribute moves.
+    let title = path(&harness, &["shelves", "oak", "books", "1", "title"]).await;
+    let unchanged = harness
+        .namespace
+        .getattr(title.clone())
+        .await
+        .unwrap()
+        .change;
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
+    assert_eq!(log(&harness).await.len(), calls + 1);
+    assert_eq!(stat().await, due);
+    assert_eq!(looked_up().await, due);
+    assert_eq!(
+        harness.namespace.getattr(title).await.unwrap().change,
+        unchanged
+    );
+
+    // Past the next deadline the attributes move again, and a listing that
+    // changes moves them once more.
+    read(&harness, &["hello", "shelf-change"]).await;
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let again = stat().await;
+    assert_ne!(again, due);
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "3"]);
+    assert_ne!(stat().await, again);
 }

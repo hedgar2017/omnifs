@@ -78,6 +78,26 @@ impl FeedStart {
     }
 }
 
+/// One call of a feed: the token it continues from, and in a `later` answer,
+/// after the end of the first answer of the feed, the origin of its answer.
+struct FeedCall {
+    token: Option<String>,
+    from: Option<String>,
+    kept_from: Option<String>,
+    since: u64,
+    later: bool,
+}
+
+/// Where the answer of a call of a feed began: the token of the state of its
+/// feed, the token after the last kept part that it continued from, and the
+/// count of [`MountResources::begin_feed_answer`].
+#[derive(Debug, Clone)]
+pub(crate) struct FeedOrigin {
+    pub(crate) from: Option<String>,
+    pub(crate) kept_from: Option<String>,
+    pub(crate) since: u64,
+}
+
 /// What one call of a feed did: the facts of the feed stand, a part,
 /// published or kept, with the token after it, or nothing, for a call whose
 /// feed another answer moved the state of.
@@ -88,31 +108,61 @@ enum FeedStep {
 }
 
 /// A part of a later answer of a feed, which the projection keeps until the
-/// last part of the answer: the part and the effects of its call.
+/// last part of the answer: the part and the effects of its call. In the
+/// projection a kept part is without its token, which the projection has of
+/// the last kept part alone, and each blob of its effects is the index of
+/// its body in `bodies`: a blob handle is of the process that fetched it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct KeptPart {
     part: wit_types::FeedPart,
     effects: wit_types::Effects,
+    bodies: Vec<([u8; 32], u64)>,
 }
 
 impl KeptPart {
-    /// The part for the projection, without its token, which the projection
-    /// has of the last kept part alone.
-    fn encode(&self) -> Result<Vec<u8>> {
-        let kept = Self {
-            part: wit_types::FeedPart {
-                token: String::new(),
-                ..self.part.clone()
-            },
-            effects: self.effects.clone(),
-        };
-        postcard::to_allocvec(&kept)
+    /// The part for the projection.
+    fn encode(mut self, resources: &MountResources) -> Result<Vec<u8>> {
+        self.part.token = String::new();
+        for write in &mut self.effects.fs {
+            if let wit_types::FsKind::File(file) = &mut write.kind
+                && let wit_types::ByteSource::Blob(handle) = &mut file.bytes
+            {
+                let (body, length) = resources
+                    .body_for_handle(*handle)
+                    .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+                *handle = self.bodies.len() as u64;
+                self.bodies.push((*body.as_bytes(), length));
+            }
+        }
+        postcard::to_allocvec(&self)
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self> {
-        postcard::from_bytes(bytes)
-            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))
+    /// The part of the projection, each blob of its effects a handle of the
+    /// operation `operation`.
+    fn decode(bytes: &[u8], resources: &MountResources, operation: u64) -> Result<Self> {
+        let mut kept: Self = postcard::from_bytes(bytes)
+            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+        for write in &mut kept.effects.fs {
+            if let wit_types::FsKind::File(file) = &mut write.kind
+                && let wit_types::ByteSource::Blob(handle) = &mut file.bytes
+            {
+                let (body, length) = usize::try_from(*handle)
+                    .ok()
+                    .and_then(|index| kept.bodies.get(index))
+                    .ok_or_else(|| {
+                        EngineError::ProviderProtocol("a kept part lacks the body of a blob".into())
+                    })?;
+                *handle = resources
+                    .body_handle(
+                        operation,
+                        crate::view::BodyId::from_digest_bytes(*body),
+                        *length,
+                    )
+                    .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+            }
+        }
+        Ok(kept)
     }
 }
 
@@ -337,44 +387,47 @@ impl Runtime {
             .kept_token(object.id.as_bytes())
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
         // The token of the state of the feed, which a published part moves
-        // and a kept part does not.
+        // and a kept part does not, and the token after the last kept part.
         let mut from = state.map(|state| state.token);
-        let mut token = kept.clone().or_else(|| from.clone());
-        let mut kept = kept.is_some();
+        let mut kept = kept;
+        // A published part ends the flight of its call; the kept parts of a
+        // later answer are of one flight with its last part.
+        let mut flight = self.resources.begin_feed_answer();
         loop {
-            match self
-                .run_feed_call(object, token, from.clone(), start, later, kept)
-                .await?
-            {
+            let call = FeedCall {
+                token: kept.clone().or_else(|| from.clone()),
+                from: from.clone(),
+                kept_from: kept.clone(),
+                since: flight.since,
+                later,
+            };
+            match self.run_feed_call(object, call, start).await? {
                 FeedStep::Unchanged | FeedStep::Part { more: false, .. } => return Ok(true),
                 FeedStep::Moved => return Ok(false),
                 FeedStep::Part {
                     more: true,
                     token: next,
                 } => {
-                    if !later {
-                        from = Some(next.clone());
+                    if later {
+                        kept = Some(next);
+                    } else {
+                        from = Some(next);
+                        flight = self.resources.begin_feed_answer();
                     }
-                    token = Some(next);
-                    kept = later;
                 },
             }
         }
     }
 
-    /// One call of the feed of `object` from `token`, in a `later` answer,
-    /// after the end of the first answer of the feed, with `kept` parts. The
-    /// `until` of a part is the time of the facts of the part, a part of a
-    /// later answer with `more` having none.
+    /// One call of the feed of `object`. The `until` of a part is the time
+    /// of the facts of the part, a part of a later answer with `more` having
+    /// none.
     #[allow(clippy::too_many_lines)]
     async fn run_feed_call(
         &self,
         object: &FeedObject,
-        token: Option<String>,
-        from: Option<String>,
+        call: FeedCall,
         start: Option<&FeedStart>,
-        later: bool,
-        kept: bool,
     ) -> Result<FeedStep> {
         let id = self.next_operation_id();
         let span = inspector::provider_span(
@@ -385,8 +438,15 @@ impl Runtime {
             object.path.as_str(),
         );
         let captured_epoch = self.resources.current_epoch();
-        let blob_guard = self.resources.blob_publication(id);
-        let tokened = token.is_some();
+        let mut blob_guard = self.resources.blob_publication(id);
+        let tokened = call.token.is_some();
+        let FeedCall {
+            token,
+            from,
+            kept_from,
+            since,
+            later,
+        } = call;
         async {
             let operation = self.feed_operations.begin(id, object.path.clone());
             let (wire_result, effects, until) = self
@@ -428,8 +488,16 @@ impl Runtime {
                     let token = part.token.clone();
                     let kept = self.keep_feed_part(
                         object,
-                        &KeptPart { part, effects },
-                        from,
+                        KeptPart {
+                            part,
+                            effects,
+                            bodies: Vec::new(),
+                        },
+                        FeedOrigin {
+                            from,
+                            kept_from,
+                            since,
+                        },
                         pending_blobs,
                         captured_epoch,
                     )?;
@@ -440,20 +508,25 @@ impl Runtime {
                         FeedStep::Moved
                     });
                 },
-                wit_types::FeedAnswer::Unchanged if kept => {
+                wit_types::FeedAnswer::Unchanged if kept_from.is_some() => {
                     return Err(EngineError::ProviderProtocol(
                         "a feed answered unchanged after the kept parts of its answer".into(),
                     ));
                 },
-                wit_types::FeedAnswer::Part(part) if kept => {
+                wit_types::FeedAnswer::Part(part) if kept_from.is_some() => {
                     let parts = self
                         .resources
                         .kept_parts(object.id.as_bytes())
                         .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?
                         .iter()
-                        .map(|bytes| KeptPart::decode(bytes))
+                        .map(|bytes| KeptPart::decode(bytes, &self.resources, id))
                         .collect::<Result<Vec<_>>>()?;
-                    let (part, effects) = compose(parts, KeptPart { part, effects })?;
+                    let last = KeptPart {
+                        part,
+                        effects,
+                        bodies: Vec::new(),
+                    };
+                    let (part, effects) = compose(parts, last)?;
                     (wit_types::FeedAnswer::Part(part), effects)
                 },
                 answer => (answer, effects),
@@ -472,26 +545,20 @@ impl Runtime {
                     answer,
                     &effects,
                     deadlined,
-                    from,
+                    FeedOrigin {
+                        from,
+                        kept_from,
+                        since,
+                    },
                     clock::now_millis(),
                 )
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             transition.blobs.extend(pending_blobs);
-            if !self.publish_feed_transition(transition, captured_epoch)? {
+            let Some(published) = self.publish_feed_transition(transition, captured_epoch)? else {
                 inspector::record_outcome(&span, InspectorOutcome::Ok);
                 return Ok(FeedStep::Moved);
-            }
-            for listing in &changes.listings {
-                let fed = self
-                    .resources
-                    .is_fed(listing)
-                    .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-                self.record_dir_changed(listing, fed);
-            }
-            for file in &changes.files {
-                self.record_file_changed(file);
-            }
-            self.record_view_invalidations(Vec::new(), changes.removals);
+            };
+            self.record_feed_changes(changes, &published)?;
             match step {
                 Ok(step) => {
                     inspector::record_outcome(&span, InspectorOutcome::Ok);
@@ -507,6 +574,43 @@ impl Runtime {
         .await
     }
 
+    /// Record what the answer of a feed changed, of the `changes` that its
+    /// part names: a filesystem drops its answers for the paths whose facts
+    /// the publication changed alone, and the facts that an answer writes as
+    /// they were stand.
+    fn record_feed_changes(
+        &self,
+        mut changes: FeedChanges,
+        published: &crate::cache::Changed,
+    ) -> Result<()> {
+        for listing in changes
+            .listings
+            .iter()
+            .filter(|listing| published.listings.contains(*listing))
+        {
+            let fed = self
+                .resources
+                .is_fed(listing)
+                .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+            self.record_dir_changed(listing, fed);
+        }
+        for file in changes
+            .files
+            .iter()
+            .filter(|file| published.records.contains(*file))
+        {
+            self.record_file_changed(file);
+        }
+        changes.removals.retain(|removed| {
+            published
+                .records
+                .iter()
+                .any(|path| path.has_prefix(removed))
+        });
+        self.record_view_invalidations(Vec::new(), changes.removals);
+        Ok(())
+    }
+
     /// Keep a part of a later answer of the feed of `object`, with the blobs
     /// of its call. Its effects lower first, so that a part that cannot
     /// publish fails at its own call. `false` for a part whose feed another
@@ -514,8 +618,8 @@ impl Runtime {
     fn keep_feed_part(
         &self,
         object: &FeedObject,
-        kept: &KeptPart,
-        from: Option<String>,
+        kept: KeptPart,
+        origin: FeedOrigin,
         blobs: Vec<crate::cache::BlobWrite>,
         captured_epoch: u64,
     ) -> Result<bool> {
@@ -525,7 +629,7 @@ impl Runtime {
                 wit_types::FeedAnswer::Part(kept.part.clone()),
                 &kept.effects,
                 HashMap::new(),
-                from.clone(),
+                origin.clone(),
                 clock::now_millis(),
             )
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
@@ -533,13 +637,16 @@ impl Runtime {
             blobs,
             kept: Some(KeptWrite {
                 object: object.id.as_bytes().to_vec(),
-                from,
+                from: origin.from,
+                kept_from: origin.kept_from,
                 token: kept.part.token.clone(),
-                part: kept.encode()?,
+                part: kept.encode(&self.resources)?,
             }),
             ..ProjectionTransition::default()
         };
-        self.publish_feed_transition(transition, captured_epoch)
+        Ok(self
+            .publish_feed_transition(transition, captured_epoch)?
+            .is_some())
     }
 }
 
@@ -563,6 +670,7 @@ fn compose(
     for KeptPart {
         part,
         effects: part_effects,
+        ..
     } in kept.into_iter().chain([last])
     {
         let written = part_effects

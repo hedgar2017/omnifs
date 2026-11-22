@@ -194,15 +194,17 @@ impl Runtime {
             .iter()
             .map(|header| (header.name.clone(), header.value.clone()))
             .collect::<Vec<_>>();
-        let request = crate::cache::identity::BlobRequestId::new(
-            None,
-            &request.method,
-            &request.url,
-            &headers,
-            request.body.as_deref(),
-            request.md5.as_deref(),
-            request.version.as_deref(),
-        );
+        let request = (request.md5.is_some() || request.version.is_some()).then(|| {
+            crate::cache::identity::BlobRequestId::new(
+                None,
+                &request.method,
+                &request.url,
+                &headers,
+                request.body.as_deref(),
+                request.md5.as_deref(),
+                request.version.as_deref(),
+            )
+        });
         let stored = self
             .resources
             .body

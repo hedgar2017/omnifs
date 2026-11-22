@@ -9,7 +9,7 @@ use crate::cache::{
 };
 use crate::clock::{DYNAMIC_TTL_MILLIS, freshness_expiry, page_deadline};
 use crate::object_id::ObjectId;
-use crate::ops::feed::{FeedChanges, FeedClaim, FeedObject};
+use crate::ops::feed::{FeedChanges, FeedClaim, FeedObject, FeedOrigin};
 use crate::ops::namespace::{
     DirEntry, DirListing, ListOutcome, PageRequest, ReadBytes, ReadOutcome,
 };
@@ -457,7 +457,7 @@ impl<'a> EffectApplier<'a> {
         answer: wit_types::FeedAnswer,
         effects: &wit_types::Effects,
         until: HashMap<Path, u64>,
-        from: Option<String>,
+        origin: FeedOrigin,
         now_millis: u64,
     ) -> anyhow::Result<(ProjectionTransition, FeedChanges)> {
         let mut transition = self.lower_writes(effects, now_millis, true)?;
@@ -489,11 +489,14 @@ impl<'a> EffectApplier<'a> {
         let deadline = now_millis.saturating_add(DYNAMIC_TTL_MILLIS);
         let mut feed = FeedWrite {
             object: object.id.as_bytes().to_vec(),
-            from,
+            from: origin.from,
+            kept_from: origin.kept_from,
+            since: origin.since,
             answer: FeedAnswerWrite::Unchanged,
             inner: Vec::new(),
             anchors: Vec::new(),
             deadline,
+            now: now_millis,
             until,
         };
         match answer {

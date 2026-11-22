@@ -1,7 +1,6 @@
 use crate::Runtime;
 use omnifs_core::path::Path;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 
 #[derive(Default)]
 pub(crate) struct InvalidationState {
@@ -9,9 +8,6 @@ pub(crate) struct InvalidationState {
     invalidated_paths: Mutex<Vec<Path>>,
     changed_dirs: Mutex<Vec<(Path, bool)>>,
     changed_files: Mutex<Vec<Path>>,
-    /// The deadline of the feed of its listing for which each fed directory
-    /// was last recorded as changed.
-    due_dirs: Mutex<HashMap<Path, u64>>,
 }
 
 impl InvalidationState {
@@ -73,29 +69,14 @@ impl Runtime {
         self.invalidation.record_changed_dir(path.clone(), fed);
     }
 
-    /// Record once that the fed directory `path` is past the `deadline` of the
-    /// feed that answers its listing: its attributes change in place, and
-    /// stay until an answer gives the feed another deadline.
-    pub fn record_dir_due(&self, path: &Path, deadline: u64) {
-        if self
-            .invalidation
-            .due_dirs
-            .lock()
-            .insert(path.clone(), deadline)
-            != Some(deadline)
-        {
-            self.record_dir_changed(path, true);
-        }
-    }
-
-    /// Record that a feed answer wrote the fed file `path`. Filesystems see
+    /// Record that a feed answer changed the fed file `path`. Filesystems see
     /// its attributes changed in place, so it keeps its identity, as the
     /// filehandle of a read that waits for the answer.
-    pub fn record_file_changed(&self, path: &Path) {
+    pub(crate) fn record_file_changed(&self, path: &Path) {
         self.invalidation.record_changed_file(path.clone());
     }
 
-    pub fn drain_changed_files(&self) -> Vec<Path> {
+    pub(crate) fn drain_changed_files(&self) -> Vec<Path> {
         self.invalidation.drain_changed_files()
     }
 

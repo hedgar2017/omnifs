@@ -28,9 +28,7 @@ pub(crate) enum FedFact {
 /// a lookup of each segment from the root, a filehandle that it held too, so
 /// that a child that only the listing brings is found. A lookup under a
 /// complete listing, or under one at or above that anchor, keeps the rules
-/// below. A feed with kept parts of a later answer continues that
-/// answer, whatever its deadline, outside the rate-limit window of the mount.
-/// Else, after the end of the first answer of a feed of full listings, only a
+/// below. After the end of the first answer of a feed of full listings, only a
 /// listing of its anchor and a lookup of an entry of that listing, on a
 /// starting path of the feed, without its positive lookup take an answer,
 /// once the feed is past its deadline, outside the rate-limit window of the
@@ -44,9 +42,16 @@ pub(crate) enum FedFact {
 /// projection, as not found for a path that it lacks. Any other operation
 /// takes an answer once the feed is past its deadline, outside the rate-limit
 /// window of the mount, with `due` and its path for an operation on a
-/// starting path of the feed. An operation that waited on another answer of
-/// the same feed, or whose feed another answer moved before its flight,
-/// decides again after it.
+/// starting path of the feed. A feed with kept parts of a later answer
+/// continues that answer by the same rules, with the start of the operation,
+/// and for an operation that those rules give no answer, without a start,
+/// whatever its deadline, outside the rate-limit window of the mount. An
+/// operation that waited on another answer of the same feed, or whose feed
+/// another answer moved before its flight, decides again after it.
+///
+/// A listing records its answering feed as the feed of the listing of its
+/// directory ([`MountResources::listing_due`]), unless it is a feed of full
+/// listings after the end of its first answer that the listing does not ask.
 ///
 /// Once the answering claim needs no answer, or after its answer that the
 /// operation ran, the operation asks the innermost own claim inner to the
@@ -93,24 +98,22 @@ pub(crate) async fn answer_claims(
             .map_err(|error| TreeError::internal(error.to_string()))?;
         let first_answer = state.as_ref().is_none_or(|state| !state.ended);
         let below_own = claim.own && path.segments().count() > claim.object.path.segments().count();
-        let start = if kept {
-            runtime.rate_limited_until().is_none().then_some(None)
-        } else if claim.full_listings && !first_answer {
-            (runtime.rate_limited_until().is_none()
-                && past_deadline(state.as_ref())
-                && asks_listing(runtime, path, fact, at, claim)?)
-            .then(|| claim.starts.then(|| FeedStart::Due(under_anchor.clone())))
+        let limited = runtime.rate_limited_until().is_some();
+        let due = !limited && past_deadline(state.as_ref());
+        let start = if claim.full_listings && !first_answer {
+            (due && asks_listing(runtime, path, fact, at, claim)?)
+                .then(|| claim.starts.then(|| FeedStart::Due(under_anchor.clone())))
         } else if claim.starts
             && (first_answer || below_own || !matches!(fact, FedFact::Lookup))
             && !has_fact(runtime, at, fact)?
         {
             Some(Some(FeedStart::Lacks(under_anchor.clone())))
-        } else if runtime.rate_limited_until().is_none() && past_deadline(state.as_ref()) {
+        } else if due {
             Some(claim.starts.then(|| FeedStart::Due(under_anchor.clone())))
         } else {
             None
         };
-        let Some(start) = start else {
+        let Some(start) = start.or((kept && !limited).then_some(None)) else {
             break answering;
         };
         if runtime
@@ -120,6 +123,20 @@ pub(crate) async fn answer_claims(
             break answering;
         }
     };
+    if matches!(fact, FedFact::Listing) {
+        let claim = &claims[answering];
+        let ended = runtime
+            .resources
+            .feed_state(claim.object.id.as_bytes())
+            .map_err(|error| TreeError::internal(error.to_string()))?
+            .is_some_and(|state| state.ended);
+        let asked = !(claim.full_listings && ended)
+            || under(&claim.object.path, path)? == claim.object.path;
+        runtime
+            .resources
+            .record_listing_feed(at, asked.then_some(claim.object.id.as_bytes()))
+            .map_err(|error| TreeError::internal(error.to_string()))?;
+    }
     answer_own(runtime, path, fact, &claims[answering + 1..]).await?;
     Ok((at.clone(), under_anchor.clone()))
 }
@@ -197,36 +214,6 @@ fn asks_listing(
         },
         FedFact::File => false,
     })
-}
-
-/// Record the fed directory `dir` as changed, once for a deadline, when the
-/// feed that answers its listing is past its deadline, outside the rate-limit
-/// window of the mount: a filesystem lists a directory again only after a
-/// change of its attributes, and that listing asks the feed. The answering
-/// feed is the outer claim whose first answer ended, else the innermost one,
-/// as for each operation.
-pub(crate) async fn due_listing(runtime: &Runtime, dir: &Path) -> Result<()> {
-    if runtime.rate_limited_until().is_some() {
-        return Ok(());
-    }
-    let Some(claims) = listing_claims(runtime, dir).await? else {
-        return Ok(());
-    };
-    let states = claims
-        .iter()
-        .map(|claim| runtime.resources.feed_state(claim.object.id.as_bytes()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|error| TreeError::internal(error.to_string()))?;
-    let answering = states
-        .iter()
-        .find(|state| state.as_ref().is_some_and(|state| state.ended))
-        .or(states.last());
-    if let Some(Some(state)) = answering
-        && state.deadline <= now_millis()
-    {
-        runtime.record_dir_due(dir, state.deadline);
-    }
-    Ok(())
 }
 
 /// The path of the fact of an operation on `path` in the projection, for

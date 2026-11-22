@@ -41,7 +41,7 @@ pub(crate) use self::error::{TreeError, TreeErrorKind};
 pub(crate) use self::handle::{RangedHandle, spawn_live_follow_pump};
 pub(crate) use self::list::{Cursor, ListOutcome};
 pub(crate) use self::node::HostKind;
-pub(crate) use self::node::{Node, NodeBody};
+pub(crate) use self::node::{Entry, Node, NodeBody};
 pub(crate) use self::read::ReadRange;
 /// Maximum whole-file payload the tree will materialize in memory for one read.
 ///

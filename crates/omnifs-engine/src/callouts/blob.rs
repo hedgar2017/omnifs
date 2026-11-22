@@ -9,7 +9,10 @@ use crate::cache::MountResources;
 use crate::cache::body::{BodyStore, BodyStoreError, BodyWriter};
 use crate::cache::identity::BlobRequestId;
 use crate::cache::mount::{BlobMetadata, BlobRecord};
-use crate::callouts::{callout_internal, callout_network, callout_too_large, record_outcome};
+use crate::callouts::{
+    callout_error, callout_internal, callout_invalid, callout_network, callout_too_large,
+    record_outcome,
+};
 use crate::http::{HttpStack, decode_response_headers};
 use crate::log_redaction::{LogUrl, WitHeaders};
 use futures::StreamExt;
@@ -98,7 +101,14 @@ impl From<BlobError> for wit_types::CalloutResult {
     fn from(error: BlobError) -> Self {
         match error {
             BlobError::TooLarge { .. } => callout_too_large(error.to_string()),
-            BlobError::Network(_) | BlobError::Content { .. } => callout_network(error.to_string()),
+            BlobError::Network(_) => callout_network(error.to_string()),
+            // The upstream has another version than the provider asked for:
+            // the same request has the same answer, so it is not retryable.
+            BlobError::Content { .. } => callout_error(
+                wit_types::ErrorKind::VersionMismatch,
+                error.to_string(),
+                false,
+            ),
             BlobError::Io(_) => callout_internal(error.to_string()),
             BlobError::Internal(msg) => callout_internal(msg),
         }
@@ -145,63 +155,78 @@ impl BlobExecutor {
         req: &wit_types::BlobFetchRequest,
         operation_id: u64,
     ) -> wit_types::CalloutResult {
-        let result =
-            match self
-                .http
-                .validate(&req.method, &req.url, &req.headers, req.body.as_deref())
-            {
-                Err(early) => early,
-                Ok(request) => {
-                    let request_id = request.blob_request_id(
+        let result = match (
+            self.http
+                .validate(&req.method, &req.url, &req.headers, req.body.as_deref()),
+            req.md5.as_deref().map(valid_md5).transpose(),
+        ) {
+            (Err(early), _) => early,
+            (_, Err(invalid)) => callout_invalid(invalid),
+            (Ok(request), Ok(md5)) => {
+                // The request with the identity of its bytes, by their MD5
+                // or their version, has one answer, which the projection
+                // keeps; a request without one is asked each time.
+                let request_id = (md5.is_some() || req.version.is_some()).then(|| {
+                    request.blob_request_id(
                         self.http.auth_binding_for_url(request.original_url()),
-                        req.md5.as_deref(),
+                        md5,
                         req.version.as_deref(),
-                    );
-                    let lock = self.resources.blob_request_lock(request_id);
-                    let _guard = lock.lock().await;
-                    match self.resources.blob_for_request(request_id) {
-                        Ok(Some(record)) => {
-                            let record = self.resources.stage_blob_write(
-                                operation_id,
-                                request_id,
-                                record.body,
-                                record.metadata(),
-                            );
-                            wit_types::CalloutResult::BlobFetched(record.as_ref().into())
-                        },
-                        Ok(None) => {
-                            let sent = tokio::time::timeout(
-                                BLOB_IDLE_TIMEOUT,
-                                self.http.send_validated(&request, None),
-                            )
-                            .await
-                            .unwrap_or_else(|_| Err(idle().into()));
-                            match sent {
-                                Ok(response) => {
-                                    match self
-                                        .materialize(
-                                            operation_id,
-                                            request_id,
-                                            response,
-                                            req.md5.as_deref(),
-                                        )
-                                        .await
-                                    {
-                                        Ok(record) => {
-                                            wit_types::CalloutResult::BlobFetched((&record).into())
-                                        },
-                                        Err(error) => error.into(),
-                                    }
-                                },
-                                Err(early) => early,
-                            }
-                        },
-                        Err(error) => BlobError::Internal(error.to_string()).into(),
-                    }
-                },
-            };
+                    )
+                });
+                match request_id {
+                    Some(request_id) => {
+                        let lock = self.resources.blob_request_lock(request_id);
+                        let guard = lock.lock().await;
+                        let result = match self.resources.blob_for_request(request_id) {
+                            Ok(Some(record)) => {
+                                let record = self.resources.stage_blob_write(
+                                    operation_id,
+                                    Some(request_id),
+                                    record.body,
+                                    record.metadata(),
+                                );
+                                wit_types::CalloutResult::BlobFetched(record.as_ref().into())
+                            },
+                            Ok(None) => {
+                                self.download(operation_id, Some(request_id), &request, md5)
+                                    .await
+                            },
+                            Err(error) => BlobError::Internal(error.to_string()).into(),
+                        };
+                        drop(guard);
+                        self.resources.release_blob_request_lock(request_id, lock);
+                        result
+                    },
+                    None => self.download(operation_id, None, &request, md5).await,
+                }
+            },
+        };
         record_outcome(&result);
         result
+    }
+
+    /// Ask the upstream for `request` and stage its answer.
+    async fn download(
+        &self,
+        operation_id: u64,
+        request_id: Option<BlobRequestId>,
+        request: &crate::http::ValidatedRequest,
+        md5: Option<&str>,
+    ) -> wit_types::CalloutResult {
+        match self
+            .http
+            .send_validated(request, crate::http::Wait::Status(BLOB_IDLE_TIMEOUT))
+            .await
+        {
+            Ok(response) => match self
+                .materialize(operation_id, request_id, response, md5)
+                .await
+            {
+                Ok(record) => wit_types::CalloutResult::BlobFetched((&record).into()),
+                Err(error) => error.into(),
+            },
+            Err(early) => early,
+        }
     }
 
     /// Stream the response body to disk and persist the cache record.
@@ -211,7 +236,7 @@ impl BlobExecutor {
     async fn materialize(
         &self,
         operation_id: u64,
-        request_id: BlobRequestId,
+        request_id: Option<BlobRequestId>,
         response: reqwest::Response,
         md5: Option<&str>,
     ) -> Result<BlobRecord, BlobError> {
@@ -336,6 +361,22 @@ async fn stream_response_body(
         writer,
         size: total,
     })
+}
+
+/// `md5` as the MD5 of the bytes of a blob request: 32 lowercase
+/// hexadecimal digits, as the host compares it to the digest of the body.
+fn valid_md5(md5: &str) -> Result<&str, String> {
+    if md5.len() == 32
+        && md5
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(md5)
+    } else {
+        Err(format!(
+            "the MD5 of a blob request is 32 lowercase hexadecimal digits, not {md5:?}"
+        ))
+    }
 }
 
 /// The error of a blob fetch whose upstream sent nothing for

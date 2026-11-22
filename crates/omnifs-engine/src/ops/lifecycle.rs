@@ -28,7 +28,7 @@ impl Runtime {
             "lookup_child",
             child_path.as_str(),
         );
-        let blob_guard = self.resources.blob_publication(id);
+        let mut blob_guard = self.resources.blob_publication(id);
         async {
             let (wire_result, effects) = self
                 .instance
@@ -85,7 +85,7 @@ impl Runtime {
             "list_children",
             path.as_str(),
         );
-        let blob_guard = self.resources.blob_publication(id);
+        let mut blob_guard = self.resources.blob_publication(id);
         async {
             let (wire_result, effects) = self
                 .instance
@@ -147,7 +147,7 @@ impl Runtime {
             "read_file",
             path.as_str(),
         );
-        let blob_guard = self.resources.blob_publication(id);
+        let mut blob_guard = self.resources.blob_publication(id);
         async {
             let (wire_result, effects) = self
                 .instance
@@ -237,7 +237,7 @@ impl Runtime {
             "open_file",
             path.as_str(),
         );
-        let blob_guard = self.resources.blob_publication(id);
+        let mut blob_guard = self.resources.blob_publication(id);
         async {
             let (wire_result, effects) = self
                 .instance
@@ -290,7 +290,7 @@ impl Runtime {
         let id = self.next_operation_id();
         let span =
             inspector::provider_span(id, &self.mount_name, &self.provider_name, "read_chunk", "");
-        let blob_guard = self.resources.blob_publication(id);
+        let mut blob_guard = self.resources.blob_publication(id);
         async {
             let (wire_result, effects) =
                 self.instance.read_chunk(id, handle, offset, length).await?;
@@ -359,7 +359,7 @@ impl Runtime {
         let id = self.next_operation_id();
         let span =
             inspector::provider_span(id, &self.mount_name, &self.provider_name, "on_event", "");
-        let blob_guard = self.resources.blob_publication(id);
+        let mut blob_guard = self.resources.blob_publication(id);
         async {
             let (wire_result, effects) = self.instance.on_event(id, event).await?;
             crate::op_validate::validate_event(&wire_result, &effects, |tree| {
@@ -387,23 +387,23 @@ impl Runtime {
         transition: crate::cache::ProjectionTransition,
         captured_epoch: u64,
     ) -> Result<()> {
-        if self.publish_feed_transition(transition, captured_epoch)? {
-            Ok(())
-        } else {
-            Err(EngineError::ProviderProtocol(
-                "cache publication of no feed found the state of a feed moved".into(),
-            ))
-        }
+        self.publish_feed_transition(transition, captured_epoch)?
+            .map(|_| ())
+            .ok_or_else(|| {
+                EngineError::ProviderProtocol(
+                    "cache publication of no feed found the state of a feed moved".into(),
+                )
+            })
     }
 
-    /// Publish `transition`, the answer of a call of a feed: `false` for an
-    /// answer whose feed another answer moved the state of after its call
-    /// began, which is no publication.
+    /// Publish `transition`, the answer of a call of a feed, and return what
+    /// it changed: none for an answer whose feed another answer moved after
+    /// its call began, which is no publication.
     pub(crate) fn publish_feed_transition(
         &self,
         transition: crate::cache::ProjectionTransition,
         captured_epoch: u64,
-    ) -> Result<bool> {
+    ) -> Result<Option<crate::cache::Changed>> {
         let outcome = self
             .resources
             .publish(transition, captured_epoch)
@@ -411,7 +411,10 @@ impl Runtime {
                 EngineError::ProviderProtocol(format!("cache publication failed: {error}"))
             })?;
         match outcome {
-            crate::cache::PublicationOutcome::Committed { invalidations } => {
+            crate::cache::PublicationOutcome::Committed {
+                invalidations,
+                changed,
+            } => {
                 let mut prefixes = Vec::new();
                 let mut paths = Vec::new();
                 for invalidation in invalidations {
@@ -422,12 +425,12 @@ impl Runtime {
                     }
                 }
                 self.record_view_invalidations(prefixes, paths);
-                Ok(true)
+                Ok(Some(changed))
             },
             crate::cache::PublicationOutcome::Fenced => Err(EngineError::ProviderProtocol(
                 "cache publication crossed an invalidation fence".into(),
             )),
-            crate::cache::PublicationOutcome::Moved => Ok(false),
+            crate::cache::PublicationOutcome::Moved => Ok(None),
         }
     }
 

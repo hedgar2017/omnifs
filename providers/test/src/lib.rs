@@ -410,7 +410,7 @@ impl Shelf {
             state.shelf_log.push(format!(
                 "{shelf} {} {}",
                 token.as_deref().unwrap_or("-"),
-                cx.start().unwrap_or("-")
+                asked(cx.start(), cx.due())
             ));
             state.shelf_version
         });
@@ -512,7 +512,7 @@ impl Book {
         cx.state_mut(|state| {
             state.shelf_log.push(format!(
                 "{shelf}/{book} {token} {}",
-                cx.start().unwrap_or("-")
+                asked(cx.start(), cx.due())
             ));
         });
         core::future::ready(
@@ -529,6 +529,17 @@ impl Book {
 struct BookKey {
     shelf: String,
     book: u64,
+}
+
+/// What the operation of a feed call asked, for the log of the feeds: its
+/// starting path without its fact, its starting path past the deadline of
+/// the feed after `~`, or `-`.
+fn asked(start: Option<&str>, due: Option<&str>) -> String {
+    match (start, due) {
+        (Some(start), _) => start.to_owned(),
+        (None, Some(due)) => format!("~{due}"),
+        (None, None) => "-".to_owned(),
+    }
 }
 
 /// The calls of the shelf and book feeds so far, one per line.
