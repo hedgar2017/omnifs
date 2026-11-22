@@ -18,7 +18,6 @@
 //! and the next read takes them once more.
 
 use std::collections::BTreeSet;
-use std::time::SystemTime;
 
 use omnifs_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -829,9 +828,7 @@ impl PageFeed<'_> {
         Ok(self
             .cx
             .count(format!("{}/comments", self.path()))?
-            .is_some_and(|comments| {
-                comments.complete && comments.until.is_none_or(|until| SystemTime::now() < until)
-            }))
+            .is_some_and(|comments| comments.complete && !comments.unsettled))
     }
 
     /// A request of the comments, by the cursor of the previous one, and at
@@ -962,7 +959,7 @@ impl DataSource {
 fn page_part(token: &PageToken, more: bool, until: Option<OffsetDateTime>) -> Result<Feed> {
     let part = Feed::part(&Some(token))?.more(more);
     Ok(match until {
-        Some(until) => part.until(SystemTime::from(until)),
+        Some(_) => part.unsettled(),
         None => part,
     }
     .into())

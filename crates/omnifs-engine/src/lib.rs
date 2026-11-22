@@ -53,7 +53,7 @@ pub use namespace::{
 #[cfg(feature = "runtime")]
 pub use runtime::registry::{
     MountAvailability, MountBuildInput, MountBuildState, MountTable, ProviderBuildInput,
-    RegistryError,
+    RegistryError, SyncError,
 };
 #[cfg(feature = "runtime")]
 pub use runtime::wasm::ComponentEngine;

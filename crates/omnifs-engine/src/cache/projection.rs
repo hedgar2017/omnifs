@@ -175,15 +175,6 @@ impl ProjectionStore {
         self.transact_as(Some(PersistMode::SyncAll), plan)
     }
 
-    /// A transaction whose commit waits for no write to the disk: of a
-    /// record that its writer writes again after a stop.
-    pub(crate) fn transact_unsynced<F, T>(&self, plan: F) -> Result<T, ProjectionStoreError>
-    where
-        F: FnMut(&mut OptimisticWriteTx, &OptimisticTxKeyspace) -> Result<T, ProjectionStoreError>,
-    {
-        self.transact_as(None, plan)
-    }
-
     fn transact_as<F, T>(
         &self,
         durability: Option<PersistMode>,

@@ -372,6 +372,33 @@ impl ServingCell {
             .clone()
     }
 
+    /// Begin a sync of `mount` in the serving generation; see
+    /// [`MountTable::begin_sync`](crate::MountTable::begin_sync).
+    pub fn begin_sync(&self, mount: &str) -> Result<u64, crate::SyncError> {
+        self.with_table(mount, |table| table.begin_sync(mount))
+    }
+
+    /// End the sync `sync` of `mount` in the serving generation.
+    pub fn end_sync(&self, mount: &str, sync: u64) -> Result<(), crate::SyncError> {
+        self.with_table(mount, |table| table.end_sync(mount, sync))
+    }
+
+    fn with_table<T>(
+        &self,
+        mount: &str,
+        call: impl FnOnce(&crate::MountTable) -> Result<T, crate::SyncError>,
+    ) -> Result<T, crate::SyncError> {
+        let active = self
+            .active
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let table = active
+            .as_ref()
+            .and_then(|generation| generation.inner.table.as_ref())
+            .ok_or_else(|| crate::SyncError::UnknownMount(mount.to_owned()))?;
+        call(table)
+    }
+
     /// One atomic view of mount statuses and the provenance that describes
     /// them. Callers that need both must not call `mount_statuses` and
     /// `provenance` back to back: a `publish` between the two calls would

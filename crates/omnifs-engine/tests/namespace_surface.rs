@@ -345,7 +345,7 @@ async fn stream_face_reads_through_open_file() {
 // --- errors ------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn missing_child_is_a_cacheable_lookup_answer() {
+async fn missing_child_is_a_lookup_answer_that_the_kernel_asks_again() {
     let t = test_ns();
     let ns = &t.ns;
 
@@ -355,7 +355,9 @@ async fn missing_child_is_a_cacheable_lookup_answer() {
         .await
         .expect("missing child answer");
     assert!(answer.is_missing());
-    assert!(!answer.ttl().is_zero());
+    // The projection answers it again at no cost: no time stands for the
+    // next sync, which may give the child.
+    assert!(answer.ttl().is_zero());
 }
 
 // --- invalidation events -----------------------------------------------------

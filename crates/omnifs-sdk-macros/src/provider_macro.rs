@@ -997,7 +997,7 @@ fn generate_namespace(type_name: &syn::Ident, state_type: &Type) -> TokenStream2
                     omnifs_sdk::omnifs::provider::types::ProviderError,
                 >,
                 omnifs_sdk::omnifs::provider::types::Effects,
-                Option<u64>,
+                bool,
             ) {
                 let (Ok(state), Ok(router)) = (state_handle(), router_handle()) else {
                     return (
@@ -1005,16 +1005,16 @@ fn generate_namespace(type_name: &syn::Ident, state_type: &Type) -> TokenStream2
                             "provider not initialized",
                         ).into()),
                         omnifs_sdk::prelude::Effects::new().into_wit(),
-                        None,
+                        false,
                     );
                 };
                 let cx = omnifs_sdk::__internal::Cx::<#state_type>::new(id, state);
                 match router.feed(&cx, &path, token, start).await {
-                    Ok((answer, effects, until)) => (Ok(answer), effects.into_wit(), until),
+                    Ok((answer, effects, unsettled)) => (Ok(answer), effects.into_wit(), unsettled),
                     Err(error) => (
                         Err(error.into()),
                         omnifs_sdk::prelude::Effects::new().into_wit(),
-                        None,
+                        false,
                     ),
                 }
             }

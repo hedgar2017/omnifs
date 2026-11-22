@@ -169,11 +169,9 @@ impl EngineNamespace {
         let mut index = 0;
         while let Some(page) = dirents.pages.get(index) {
             index += 1;
-            let Some(validator) = page
-                .validator
-                .as_ref()
-                .filter(|validator| validator.deadline <= crate::clock::now_millis())
-            else {
+            let Some(validator) = page.validator.as_ref().filter(|validator| {
+                validator.due(runtime.resources.sync_now(), crate::clock::now_millis())
+            }) else {
                 continue;
             };
             let request = PageRequest {

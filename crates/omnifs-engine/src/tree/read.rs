@@ -7,7 +7,6 @@
 //! `ReadResult` into kernel/protocol identity + reply encoding.
 
 use crate::cache::{FactPayload, MountResources, ProjectionTransition, RecordKind, RecordWrite};
-use crate::clock::now_millis;
 use crate::ops::namespace::{ReadBytes, ReadOutcome, ReadReply};
 use crate::pagination::NextPageOutcome;
 use crate::view as view_types;
@@ -86,14 +85,9 @@ impl<'a> FileAttrStore<'a> {
         Self { resources, path }
     }
 
-    pub(crate) fn cached(
-        &self,
-        now_millis: u64,
-        respect_expiry: bool,
-    ) -> Result<Option<FileAttrsCache>> {
+    pub(crate) fn cached(&self, respect_expiry: bool) -> Result<Option<FileAttrsCache>> {
         let lookup = if respect_expiry {
-            self.resources
-                .view_get(self.path, RecordKind::Lookup, None, now_millis)
+            self.resources.view_get(self.path, RecordKind::Lookup, None)
         } else {
             self.resources
                 .cache_get(self.path, RecordKind::Lookup, None)
@@ -110,8 +104,7 @@ impl<'a> FileAttrStore<'a> {
         }
 
         let attrs = if respect_expiry {
-            self.resources
-                .view_get(self.path, RecordKind::Attr, None, now_millis)
+            self.resources.view_get(self.path, RecordKind::Attr, None)
         } else {
             self.resources.cache_get(self.path, RecordKind::Attr, None)
         }
@@ -369,7 +362,7 @@ fn fed_range(
         else {
             return Ok(None);
         };
-        let attrs = FileAttrStore::new(resources, path).cached(now_millis(), online)?;
+        let attrs = FileAttrStore::new(resources, path).cached(online)?;
         if let Some(range) = body_range(resources, body, length, offset, len, attrs)? {
             return Ok(Some(range));
         }
@@ -440,10 +433,9 @@ fn stored_read(
     // its body names a body that the store has no more: the next read of
     // the facts has the body that replaced it.
     for _ in 0..2 {
-        let now = now_millis();
-        let expired = !offline && resources.view_expired(path, now).map_err(internal)?;
+        let expired = !offline && resources.view_expired(path).map_err(internal)?;
         let projected = attr_store
-            .cached(now, !offline)?
+            .cached(!offline)?
             .or_else(|| (!expired).then(|| node.attrs().cloned()).flatten());
         let Some(attrs) = projected.as_ref() else {
             return Ok(None);

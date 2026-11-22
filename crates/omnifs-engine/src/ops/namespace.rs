@@ -1,7 +1,6 @@
 use crate::EngineError;
 use crate::Runtime;
 use crate::cache::{PublicationKey, RecordKind};
-use crate::clock::now_millis;
 use crate::effect_apply::LookupOutcome;
 use crate::object_id::ObjectId;
 use crate::runtime::Result;
@@ -295,10 +294,9 @@ impl Runtime {
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
         let child_path = parent_path.join_segment(&name);
         let captured_epoch = self.resources.current_epoch();
-        let now = now_millis();
         if self
             .resources
-            .negative_for_checked(&child_path, now)
+            .negative_for_checked(&child_path)
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?
         {
             return Ok(LookupOutcome::NotFound);
@@ -375,7 +373,6 @@ impl Runtime {
         content_type: String,
         captured_epoch: u64,
     ) -> Result<ReadReply> {
-        let now = now_millis();
         let cached_canonical = self
             .resources
             .cached_canonical_for(path)
@@ -383,7 +380,7 @@ impl Runtime {
         let mode = if cached_canonical.is_some()
             && self
                 .resources
-                .view_expired(path, now)
+                .view_expired(path)
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?
         {
             ReadMode::Revalidate
@@ -402,10 +399,9 @@ impl Runtime {
         cached_canonical: Option<crate::cache::CachedCanonical>,
         captured_epoch: u64,
     ) -> Result<ReadReply> {
-        let now = now_millis();
         if self
             .resources
-            .negative_for_checked(path, now)
+            .negative_for_checked(path)
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?
         {
             return Err(enoent(path.as_str()));
@@ -432,7 +428,7 @@ impl Runtime {
         };
 
         let live = if warm_id.is_some() {
-            leaf_stability(self, path, now)?
+            leaf_stability(self, path)?
         } else {
             None
         }
@@ -633,10 +629,10 @@ impl ChunkOutcome {
     }
 }
 
-fn leaf_stability(runtime: &Runtime, path: &Path, now_millis: u64) -> Result<Option<Stability>> {
+fn leaf_stability(runtime: &Runtime, path: &Path) -> Result<Option<Stability>> {
     let record = runtime
         .resources
-        .view_get(path, RecordKind::Attr, None, now_millis)
+        .view_get(path, RecordKind::Attr, None)
         .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
     let Some(record) = record else {
         return Ok(None);

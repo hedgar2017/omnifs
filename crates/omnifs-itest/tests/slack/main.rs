@@ -13,10 +13,10 @@ use omnifs_itest::RuntimeHarness;
 use omnifs_provider::Artifact;
 use serde_json::Value;
 use support::{
-    PAST_DEADLINE, answering, blob, channel, elsewhere, expect_channels, expect_file,
-    expect_history, expect_message, expect_new, expect_replies, expect_users, failure, file,
-    hidden, lookup, message, names, names_at, network, ok, page, rate_limited, read, reply, served,
-    slack_harness, thread, ts, unedited, user, with_files,
+    answering, blob, channel, elsewhere, expect_channels, expect_file, expect_history,
+    expect_message, expect_new, expect_replies, expect_users, failure, file, hidden, lookup,
+    message, names, names_at, network, ok, page, rate_limited, read, reply, served, slack_harness,
+    thread, ts, unedited, user, with_files,
 };
 
 /// The `ts` of the fixtures `ns`, sorted.
@@ -118,7 +118,7 @@ async fn the_users_are_the_full_listings_of_users_list() {
     expect_users(&requests[0], Some("cursor-2"));
     // An answer of `users.list` with its objects under another name than
     // `members` has none.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (refused, requests) = answering(
         &harness,
         names(&harness, "/slack/users"),
@@ -154,7 +154,7 @@ async fn the_users_are_the_full_listings_of_users_list() {
     .unwrap();
     assert_eq!(object, user("U02", None));
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(
         served(&harness, read(&harness, "/slack/users/U01/name"))
             .await
@@ -184,7 +184,7 @@ async fn the_users_are_the_full_listings_of_users_list() {
         "Ada King"
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (found, requests) = answering(
         &harness,
         lookup(&harness, "/slack/users/U04"),
@@ -221,7 +221,7 @@ async fn the_users_are_the_full_listings_of_users_list() {
 /// at its lookup alone, a full listing for `channels/` and one
 /// for a channel that it lacks, which removes a channel that the listing
 /// lacks with its messages, and no request for a channel that it lacks
-/// within the deadline.
+/// outside a sync.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_channels_are_the_full_listings_of_users_conversations() {
@@ -273,7 +273,7 @@ async fn the_channels_are_the_full_listings_of_users_conversations() {
             .change,
         folder.attrs().unwrap().change
     );
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(
         served(&harness, read(&harness, "/slack/channels/C01/name"))
             .await
@@ -283,7 +283,9 @@ async fn the_channels_are_the_full_listings_of_users_conversations() {
     let due = served(&harness, lookup(&harness, "/slack/channels"))
         .await
         .unwrap();
-    assert_ne!(due.attrs().unwrap().change, folder.attrs().unwrap().change);
+    // The change of the folder moves with a change of its listing alone,
+    // not with the sync.
+    assert_eq!(due.attrs().unwrap().change, folder.attrs().unwrap().change);
     assert_eq!(
         served(&harness, lookup(&harness, "/slack/channels"))
             .await
@@ -312,7 +314,7 @@ async fn the_channels_are_the_full_listings_of_users_conversations() {
         "announcements"
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (found, requests) = answering(
         &harness,
         lookup(&harness, "/slack/channels/C03"),
@@ -433,7 +435,7 @@ async fn the_first_full_listing_of_a_channel_takes_each_page_at_its_answer() {
             .unwrap(),
         "Fourth"
     );
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (text, requests) = answering(
         &harness,
         read(&harness, &format!("{}/text", at(4))),
@@ -529,7 +531,7 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
     expect_replies(&requests[0], "C01", &ts(2), None);
 
     // The messages after the latest one.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (text, requests) = answering(
         &harness,
         read(&harness, &format!("{}/text", at(3))),
@@ -548,7 +550,7 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
     );
 
     // A sweep: an edit, a removal, and a thread as it was.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, messages),
@@ -609,7 +611,7 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
     );
 
     // A sweep with a thread of another `reply_count` and `latest_reply`.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, messages),
@@ -646,7 +648,7 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
 
     // A read of `messages/` sweeps from the first page in place of an
     // unfinished answer of the new messages.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
         read(&harness, &format!("{}/text", at(4))),
@@ -663,7 +665,7 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
     assert_eq!(stopped.unwrap(), "Fourth");
     expect_new(&requests[0], "C01", &ts(5), None);
     expect_new(&requests[1], "C01", &ts(5), Some("cursor-2"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, messages),
@@ -710,7 +712,7 @@ async fn a_message_by_its_ts_before_the_end_of_the_first_full_listing() {
         "First"
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (read_text, requests) = answering(
         &harness,
         read(&harness, &text),
@@ -866,7 +868,7 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
         .is_missing()
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let edited = thread(message(1, Some("U01"), "Question"), 2, 7);
     let (listing, requests) = answering(
         &harness,
@@ -898,7 +900,7 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
         "Another answer"
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names_at(&harness, &replies(1)),
@@ -929,8 +931,8 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
 /// content again for another one, the content of a file of a reply, no
 /// folder of a file without `url_private_download`, and none of a file that
 /// its message has no more; no request for a `url_private_download` of
-/// another host than `files.slack.com`, and none for a file after a `429` of
-/// another one, until the end of its wait.
+/// another host than `files.slack.com`; and a `429` without a `Retry-After`
+/// fails the read of its file alone, without a wait of the host.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_content_of_a_file_is_the_blob_of_its_edit_timestamp() {
@@ -967,23 +969,16 @@ async fn the_content_of_a_file_is_the_blob_of_its_edit_timestamp() {
         "{limited:?}"
     );
     expect_file(&requests[0], "F06", "limited.txt", Some("1700000000"));
-    // No request of another file within the wait of 5 seconds after a `429`
-    // without a `Retry-After`.
-    let waiting = served(&harness, read(&harness, &format!("{others}/F07/content"))).await;
-    assert!(
-        matches!(waiting, Err(NsError::RateLimited { .. })),
-        "{waiting:?}"
-    );
-    tokio::time::sleep(Duration::from_millis(5_100)).await;
+    // A `429` without a `Retry-After` states no wait: the read of another
+    // file asks for it.
     let (bytes, requests) = answering(
         &harness,
         read(&harness, &format!("{others}/F07/content")),
-        vec![ok(&page("messages", &[], None)), blob(200, b"waited")],
+        vec![blob(200, b"waited")],
     )
     .await;
     assert_eq!(bytes.unwrap(), "waited");
-    expect_new(&requests[0], "C01", &ts(2), None);
-    expect_file(&requests[1], "F07", "waiting.txt", Some("1700000000"));
+    expect_file(&requests[0], "F07", "waiting.txt", Some("1700000000"));
     let files = format!("/slack/channels/C01/messages/{}/files", ts(1));
     assert_eq!(
         served(&harness, names(&harness, &files)).await.unwrap(),
@@ -1062,7 +1057,7 @@ async fn the_content_of_a_file_is_the_blob_of_its_edit_timestamp() {
     expect_replies(&requests[0], "C01", &ts(1), None);
     expect_file(&requests[1], "F04", "reply.txt", Some("1700000050"));
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/slack/channels/C01/messages"),
@@ -1111,7 +1106,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
     expect_users(&requests[0], None);
     expect_users(&requests[1], Some("cursor-2"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/slack/users"),
@@ -1137,7 +1132,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
     expect_channels(&requests[0], None);
     expect_channels(&requests[1], Some("cursor-2"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     channels(&harness, &[channel("C01", "general")]).await;
 
     let question = || thread(message(1, Some("U01"), "Question"), 1, 11);
@@ -1153,7 +1148,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
     expect_history(&requests[0], "C01", None);
     expect_history(&requests[1], "C01", Some("cursor-2"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/slack/channels/C01/messages"),
@@ -1180,7 +1175,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert!(matches!(stopped, Err(NsError::Timeout)), "{stopped:?}");
     expect_replies(&requests[0], "C01", &ts(1), None);
     expect_replies(&requests[1], "C01", &ts(1), Some("cursor-2"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     // The channel is past its deadline after the window of the stop: its
     // new messages come before the replies.
     let (listing, requests) = answering(
@@ -1221,7 +1216,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
             failure("invalid_cursor"),
         ]
     };
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let text = format!("/slack/channels/C01/messages/{}/text", ts(2));
     let (stopped, requests) = answering(&harness, read(&harness, &text), stop()).await;
     // The read of the new messages that stopped is served what the
@@ -1229,7 +1224,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert_eq!(stopped.unwrap(), "Second");
     expect_new(&requests[0], "C01", &ts(2), None);
     expect_new(&requests[1], "C01", &ts(2), Some("cursor-2"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (read_text, requests) = answering(
         &harness,
         read(&harness, &text),
@@ -1243,7 +1238,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert_eq!(read_text.unwrap(), "Second");
     expect_new(&requests[0], "C01", &ts(2), None);
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "/slack/channels/C01/messages"),
@@ -1253,7 +1248,7 @@ async fn invalid_cursor_begins_the_requests_again_from_the_first_one() {
     assert_eq!(stopped.unwrap(), stamps(&[1, 2, 3]));
     expect_history(&requests[0], "C01", None);
     expect_history(&requests[1], "C01", Some("cursor-2"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/slack/channels/C01/messages"),
@@ -1354,7 +1349,7 @@ async fn the_errors_of_slack_remove_fail_and_wait() {
         // The next request waits for the end of the window of a failure for
         // now.
         if matches!(kind, "network error" | "timeout") {
-            tokio::time::sleep(PAST_DEADLINE).await;
+            harness.begin_sync();
         }
     }
 
@@ -1413,7 +1408,7 @@ async fn a_channel_that_left_and_came_back_takes_each_page_again() {
     // The channels leave at a full listing of the channels and come back at
     // the next one.
     let leave_and_come_back = || async {
-        tokio::time::sleep(PAST_DEADLINE).await;
+        harness.begin_sync();
         let (listing, _) = answering(
             &harness,
             names(&harness, "/slack/channels"),
@@ -1421,7 +1416,7 @@ async fn a_channel_that_left_and_came_back_takes_each_page_again() {
         )
         .await;
         assert!(listing.unwrap().is_empty());
-        tokio::time::sleep(PAST_DEADLINE).await;
+        harness.begin_sync();
         channels(&harness, &both).await;
     };
     let messages = "/slack/channels/C01/messages";
@@ -1468,7 +1463,7 @@ async fn a_channel_that_left_and_came_back_takes_each_page_again() {
 
     // The kept page of the new messages has message 6, which Slack has no
     // more when the channel comes back.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
         read(&harness, &format!("{messages}/{}/text", ts(1))),
@@ -1528,7 +1523,7 @@ async fn a_channel_that_the_feed_of_a_message_removed_takes_each_page_again() {
     )
     .await;
     assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (found, requests) = answering(
         &harness,
         lookup(&harness, &format!("{messages}/{}", ts(5))),
@@ -1537,7 +1532,7 @@ async fn a_channel_that_the_feed_of_a_message_removed_takes_each_page_again() {
     .await;
     assert!(found.unwrap().is_missing());
     expect_message(&requests[0], "C01", &ts(5));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     channels(&harness, &[channel("C01", "general")]).await;
     let text = served(
         &harness,
@@ -1636,7 +1631,7 @@ async fn a_second_walk_with_nothing_changed_asks_for_no_replies_and_no_file() {
     expect_file(&requests[0], "F01", "notes.txt", Some("1700000000"));
     expect_file(&requests[1], "F02", "plain.txt", None);
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/slack/channels"),
@@ -1673,7 +1668,7 @@ async fn each_page_of_the_replies_is_written_at_its_answer() {
     first_full_listing(&harness, "C01", &[message(1, Some("U01"), "First")]).await;
     // A message of the messages after the latest one, whose feed has no
     // state yet.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let question = thread(message(2, Some("U01"), "Question"), 2, 22);
     let (text, requests) = answering(
         &harness,

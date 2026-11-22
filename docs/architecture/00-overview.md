@@ -27,7 +27,7 @@ Identity is layered. The provider computes a logical id from object kind and nor
 
 ## Callouts and effects
 
-Provider namespace and notify calls are async component exports that return terminal results. When provider code awaits host work, it calls an async WIT import. The host executes callouts such as HTTP fetches, blob fetches, and git clone/open operations, then the component future resumes with the typed result.
+Provider namespace calls are async component exports that return terminal results. When provider code awaits host work, it calls an async WIT import. The host executes callouts such as HTTP fetches, blob fetches, and git clone/open operations, then the component future resumes with the typed result.
 
 One provider instance can serve multiple concurrent filesystem operations. Wasmtime's component async runtime owns suspension while the host owns the callout executors, auth injection, capability checks, tracing, and cache-visible effects.
 
@@ -49,7 +49,7 @@ The host owns storage as opaque facts and bytes.
 
 On a warm object read, the host pushes cached canonical bytes into the provider's read operation. The provider decodes and renders from those bytes. There is no provider-to-host canonical-read callout and no host-side render operation.
 
-Online access uses freshness deadlines to decide when provider revalidation is needed. Cache-only access ignores those deadlines and serves complete durable facts. A missing body, partial listing, deferred/live/ranged value, or other provider-dependent fact returns `OfflineMiss`; a corrupt relation fails table construction.
+Online access asks a provider again only in a sync of its mount, once for each feed, page, and fact, and for a fact that the projection lacks; nothing asks because time passed. Cache-only access ignores syncs and serves complete durable facts. A missing body, partial listing, deferred/live/ranged value, or other provider-dependent fact returns `OfflineMiss`; a corrupt relation fails table construction.
 
 ## Dispatch and listing
 

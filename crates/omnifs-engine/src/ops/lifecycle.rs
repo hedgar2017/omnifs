@@ -1,7 +1,6 @@
 //! Typed provider operation execution and settled terminal publication.
 
 use crate::Runtime;
-use crate::clock;
 use crate::effect_apply::EffectApplier;
 use crate::effect_apply::LookupOutcome;
 use crate::inspector;
@@ -46,14 +45,14 @@ impl Runtime {
             let wire_result = self.provider_result(wire_result)?;
             let applier = EffectApplier::new(&self.resources);
             let mut transition = applier
-                .lower_effects(&effects, clock::now_millis())
+                .lower_effects(&effects, self.due_in()?)
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             let (result, result_transition) = applier
                 .lower_lookup(
                     parent_path,
                     &child_path,
                     wire_result,
-                    clock::now_millis(),
+                    self.due_in()?,
                     |tree| self.tree_ref(tree).map(|reference| reference.id),
                 )
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
@@ -107,12 +106,12 @@ impl Runtime {
             inspect_result(&span, &wire_result);
             let wire_result = self.provider_result(wire_result)?;
             let applier = EffectApplier::new(&self.resources);
-            let now_millis = clock::now_millis();
+            let due_in = self.due_in()?;
             let mut transition = applier
-                .lower_effects(&effects, now_millis)
+                .lower_effects(&effects, due_in)
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             let (result, result_transition) = applier
-                .lower_list(path, wire_result, &request, now_millis, |tree| {
+                .lower_list(path, wire_result, &request, due_in, |tree| {
                     self.tree_ref(tree).map(|reference| reference.id)
                 })
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
@@ -162,12 +161,12 @@ impl Runtime {
             let wire_result = self.provider_result(wire_result)?;
             let applier = EffectApplier::new(&self.resources);
             let mut transition = applier
-                .lower_effects(&effects, clock::now_millis())
+                .lower_effects(&effects, self.due_in()?)
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             let result = match wire_result {
                 wit_types::ReadFileOutcome::Found(value) => {
                     let (result, result_transition) = applier
-                        .lower_read(path, value, &transition.objects)
+                        .lower_read(path, value, &transition.objects, self.due_in()?)
                         .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
                     merge_transition(&mut transition, result_transition);
                     ReadReply::File(result)
@@ -195,9 +194,7 @@ impl Runtime {
                     });
                     transition.freshness.push(crate::cache::Freshness {
                         path: path.clone(),
-                        expires_at: Some(
-                            clock::now_millis().saturating_add(clock::DYNAMIC_TTL_MILLIS),
-                        ),
+                        expires_at: Some(self.due_in()?),
                     });
                     self.publish_transition(transition, captured_epoch)?;
                     inspector::record_outcome(&span, InspectorOutcome::NotFound);
@@ -245,7 +242,7 @@ impl Runtime {
             let outcome = OpenOutcome::from_wit(wire_result);
             let meta = crate::view::EntryMeta::file(outcome.attrs.clone());
             let mut transition = EffectApplier::new(&self.resources)
-                .lower_effects(&effects, clock::now_millis())
+                .lower_effects(&effects, self.due_in()?)
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             transition.records.extend([
                 crate::cache::RecordWrite {
@@ -292,7 +289,7 @@ impl Runtime {
             inspect_result(&span, &wire_result);
             let wire_result = self.provider_result(wire_result)?;
             let mut transition = EffectApplier::new(&self.resources)
-                .lower_effects(&effects, clock::now_millis())
+                .lower_effects(&effects, self.due_in()?)
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             let mut outcome = ChunkOutcome::from_wit(wire_result);
             if let (Some(path), Some(attrs)) = (path, attrs)

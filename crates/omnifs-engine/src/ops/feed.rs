@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::EngineError;
 use crate::Runtime;
 use crate::cache::{FeedState, KeptWrite, MountResources, ProjectionTransition};
-use crate::clock;
 use crate::effect_apply::EffectApplier;
 use crate::inspector;
 use crate::object_id::ObjectId;
@@ -301,7 +300,7 @@ impl ProjectionReads {
         Ok(Some(wit_types::FileRange {
             bytes,
             length,
-            until: self.resources.fed_until(&path).map_err(internal)?,
+            unsettled: self.resources.fed_until(&path).map_err(internal)?.is_some(),
         }))
     }
 
@@ -318,7 +317,7 @@ impl ProjectionReads {
             .map(|listing| wit_types::ListingNames {
                 names: listing.names,
                 complete: listing.complete,
-                until: listing.until,
+                unsettled: listing.unsettled,
             }))
     }
 
@@ -334,7 +333,7 @@ impl ProjectionReads {
                 Ok(wit_types::ListingCount {
                     count: u64::try_from(listing.names.len()).map_err(internal)?,
                     complete: listing.complete,
-                    until: listing.until,
+                    unsettled: listing.unsettled,
                 })
             })
             .transpose()
@@ -342,8 +341,8 @@ impl ProjectionReads {
 
     /// The listing of `path` in the projection, for the feed operation `id`
     /// and a path in the subtree of its object: its names, whether it is
-    /// complete, and the time of its fed mark, after which it counts as
-    /// lacking; none for a path without a listing.
+    /// complete, and whether its fed mark says that it is unsettled; none
+    /// for a path without a listing.
     fn listing(
         &self,
         id: u64,
@@ -360,7 +359,7 @@ impl ProjectionReads {
                 .map(|entry| entry.name.clone())
                 .collect(),
             complete: listing.is_complete_offline(),
-            until: self.resources.fed_until(&path).map_err(internal)?,
+            unsettled: self.resources.fed_until(&path).map_err(internal)?.is_some(),
         }))
     }
 }
@@ -369,7 +368,7 @@ impl ProjectionReads {
 struct Listing {
     names: Vec<String>,
     complete: bool,
-    until: Option<u64>,
+    unsettled: bool,
 }
 
 /// The refusal of a read of the projection that failed in the host.
@@ -471,9 +470,9 @@ impl Runtime {
         }
     }
 
-    /// One call of the feed of `object`. The `until` of a part is the time
-    /// of the facts of the part under the anchor of the object, a part of a
-    /// later answer with `more` having none.
+    /// One call of the feed of `object`. The facts of an unsettled part
+    /// under the anchor of the object count as lacking in the next sync, a
+    /// part of a later answer with `more` being never unsettled.
     #[allow(clippy::too_many_lines)]
     async fn run_feed_call(
         &self,
@@ -506,7 +505,7 @@ impl Runtime {
         };
         async {
             let operation = self.feed_operations.begin(id, object.path.clone());
-            let (wire_result, effects, until) = self
+            let (wire_result, effects, unsettled) = self
                 .instance
                 .feed(
                     id,
@@ -520,23 +519,24 @@ impl Runtime {
                 .resources
                 .sequence()
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
-            crate::op_validate::validate_feed(&wire_result, &effects, until, tokened, |tree| {
+            crate::op_validate::validate_feed(&wire_result, &effects, unsettled, tokened, |tree| {
                 self.tree_ref(tree).is_some()
             })
             .map_err(EngineError::ProviderProtocol)?;
             super::lifecycle::inspect_result(&span, &wire_result);
             let answer = self.provider_result(wire_result)?;
-            // The facts of the part of this call under the anchor of its
-            // object, whose time is its `until`: a fact that the part writes
-            // elsewhere, as the listing that its object joins, is of another
-            // feed.
+            // The facts of an unsettled part of this call under the anchor
+            // of its object, which count as lacking from the next sync: a
+            // fact that the part writes elsewhere, as the listing that its
+            // object joins, is of another feed.
             let mut deadlined = HashMap::new();
-            if let Some(until) = until {
+            if unsettled {
+                let due_in = self.due_in()?;
                 for write in &effects.fs {
                     let path = Path::parse(&write.path)
                         .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
                     if path.has_prefix(&object.path) {
-                        deadlined.insert(path, until);
+                        deadlined.insert(path, due_in);
                     }
                 }
             }
@@ -556,9 +556,9 @@ impl Runtime {
             };
             let (answer, parts) = match answer {
                 wit_types::FeedAnswer::Part(part) if later && part.more => {
-                    if until.is_some() {
+                    if unsettled {
                         return Err(EngineError::ProviderProtocol(
-                            "a part of a later feed answer with more parts has no until".into(),
+                            "a part of a later feed answer with more parts is not unsettled".into(),
                         ));
                     }
                     let kept = self.keep_feed_part(
@@ -620,14 +620,7 @@ impl Runtime {
                 })
                 .collect::<Vec<_>>();
             let (transition, changes) = EffectApplier::new(&self.resources)
-                .lower_feed(
-                    object,
-                    answer,
-                    &calls,
-                    deadlined,
-                    origin,
-                    clock::now_millis(),
-                )
+                .lower_feed(object, answer, &calls, deadlined, origin, self.due_in()?)
                 .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
             let Some(published) = self.publish_feed_transition(transition, captured_epoch)? else {
                 inspector::record_outcome(&span, InspectorOutcome::Ok);
@@ -707,7 +700,7 @@ impl Runtime {
                 }],
                 HashMap::new(),
                 origin.clone(),
-                clock::now_millis(),
+                self.due_in()?,
             )
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
         let transition = ProjectionTransition {

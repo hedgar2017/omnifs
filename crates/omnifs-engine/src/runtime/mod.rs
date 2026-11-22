@@ -32,16 +32,10 @@ pub(crate) mod wasm;
 #[allow(unused_imports)] // re-exported for callers via crate root
 pub use host::{HostError, HostOnline, HostRuntimeOpen};
 
-use crate::clock;
 use crate::op_validate;
 use crate::runtime::wasm::ComponentEngine;
 
 pub(crate) const HTTP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-// Host-side 429 cooldown when the provider error carried no Retry-After.
-const RATE_LIMIT_DEFAULT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
-// Upper bound so a hostile Retry-After cannot overflow `Instant` or wedge the
-// window open indefinitely.
-const RATE_LIMIT_MAX_COOLDOWN: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// Runtime for one mounted WASM provider component.
 ///
@@ -59,12 +53,14 @@ pub struct Runtime {
     pub(crate) invalidation: InvalidationState,
     pub(crate) namespace_flights: crate::ops::namespace::NamespaceFlights,
     pub(crate) feed_operations: Arc<crate::ops::feed::FeedOperations>,
-    // Per-mount window, open until its instant with the error that opened
-    // it, while the upstream of the mount limits its rate (from a 429's
-    // Retry-After) or failed for now: an operation is served from what the
-    // projection has until it closes. std Mutex: the critical section is a
-    // single set/get with no await held across it.
+    // Per-mount window, open until the instant that the upstream of the
+    // mount states for its rate limit, with the error that opened it. std
+    // Mutex: the critical section is a single set/get with no await held
+    // across it.
     window: std::sync::Mutex<Option<(std::time::Instant, wit_types::ProviderError)>>,
+    // The feeds whose check failed, by the id of their object, with the
+    // number of the sync of the failure and its error.
+    failures: std::sync::Mutex<std::collections::HashMap<Vec<u8>, (u64, wit_types::ProviderError)>>,
     pub(crate) test_callouts: Option<std::sync::Mutex<mpsc::Receiver<TestSignal>>>,
     /// The blob executor of the mount, which answers a captured blob fetch
     /// of a test as a fetch.
@@ -291,11 +287,18 @@ impl Runtime {
             namespace_flights: crate::ops::namespace::NamespaceFlights::new(),
             feed_operations,
             window: std::sync::Mutex::new(None),
+            failures: std::sync::Mutex::new(std::collections::HashMap::new()),
             test_callouts: test_rx.map(std::sync::Mutex::new),
             blob,
         };
         let transition = crate::effect_apply::EffectApplier::new(&runtime.resources)
-            .lower_effects(&initialize_effects, clock::now_millis())
+            .lower_effects(
+                &initialize_effects,
+                runtime
+                    .resources
+                    .due_in()
+                    .map_err(|error| BuildError::ProviderProtocol(error.to_string()))?,
+            )
             .map_err(|error| BuildError::ProviderProtocol(error.to_string()))?;
         if publish_initialize_effects {
             runtime
@@ -317,43 +320,34 @@ impl Runtime {
         self.instance.close_file(handle)
     }
 
-    /// Arm the mount's rate-limit window after a 429. `retry_after` is the
-    /// provider error's structured Retry-After (seconds) if present.
+    /// Open the window of the mount after an answer that limits its rate
+    /// for the `retry_after` that its upstream states: within it, an
+    /// operation is served from the projection, and one that lacks its fact
+    /// has the error of the window without a request. An answer without a
+    /// time of the upstream opens no window: the feed or the request that it
+    /// failed is not asked again in the sync ([`Self::record_failure`]).
     pub(crate) fn note_rate_limited(&self, retry_after: Option<std::time::Duration>) {
-        let cooldown = retry_after
-            .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
-            .min(RATE_LIMIT_MAX_COOLDOWN);
-        self.open_window(
-            cooldown,
-            wit_types::ProviderError {
-                kind: wit_types::ErrorKind::RateLimited,
-                message: "the upstream limits the rate of the mount".into(),
-                retryable: true,
-                retry_after: None,
-            },
-        );
-    }
-
-    /// Arm the window of the mount after a check of a feed that failed for
-    /// now with `error`, at the network, a timeout, or the upstream: the next
-    /// check waits as long as after an answer.
-    pub(crate) fn note_failed_for_now(&self, error: &wit_types::ProviderError) {
-        self.open_window(
-            std::time::Duration::from_millis(crate::clock::DYNAMIC_TTL_MILLIS),
-            error.clone(),
-        );
-    }
-
-    fn open_window(&self, cooldown: std::time::Duration, error: wit_types::ProviderError) {
-        let until = std::time::Instant::now() + cooldown;
+        let Some(retry_after) = retry_after else {
+            return;
+        };
+        let Some(until) = std::time::Instant::now().checked_add(retry_after) else {
+            return;
+        };
+        let error = wit_types::ProviderError {
+            kind: wit_types::ErrorKind::RateLimited,
+            message: "the upstream limits the rate of the mount".into(),
+            retryable: true,
+            retry_after: None,
+        };
         let mut window = self.window.lock().unwrap();
         if window.as_ref().is_none_or(|(open, _)| *open < until) {
             *window = Some((until, error));
         }
     }
 
-    /// The window of the mount, if currently open: the time until it closes
-    /// and the error that opened it. Lazily clears an expired window.
+    /// The window of the mount, if open: the time until the instant that its
+    /// upstream stated, and the error that opened it. The wall clock is read
+    /// to compare it with that instant alone.
     pub(crate) fn window(&self) -> Option<(std::time::Duration, wit_types::ProviderError)> {
         let mut guard = self.window.lock().unwrap();
         let now = std::time::Instant::now();
@@ -371,6 +365,63 @@ impl Runtime {
     pub fn rate_limited_until(&self) -> Option<std::time::Instant> {
         self.window()
             .map(|(remaining, _)| std::time::Instant::now() + remaining)
+    }
+
+    /// Record that the check of the feed of the object `id` failed with
+    /// `error` in the last sync begun: the feed is not asked again until the
+    /// next sync, and an operation that lacks its fact has the error
+    /// without a request in place of a request of each retry.
+    pub(crate) fn record_failure(&self, id: &[u8], error: &wit_types::ProviderError) -> Result<()> {
+        let sync = self
+            .resources
+            .sync_count()
+            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+        self.failures
+            .lock()
+            .unwrap()
+            .insert(id.to_vec(), (sync, error.clone()));
+        Ok(())
+    }
+
+    /// The error of the check of the feed of the object `id` that failed in
+    /// the last sync begun, none for a feed that did not.
+    pub(crate) fn failure(&self, id: &[u8]) -> Result<Option<wit_types::ProviderError>> {
+        let sync = self
+            .resources
+            .sync_count()
+            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+        Ok(self
+            .failures
+            .lock()
+            .unwrap()
+            .get(id)
+            .filter(|(failed_in, _)| *failed_in == sync)
+            .map(|(_, error)| error.clone()))
+    }
+
+    /// The number of the first sync in which a fact written now is due.
+    pub(crate) fn due_in(&self) -> Result<u64> {
+        self.resources
+            .due_in()
+            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))
+    }
+
+    /// Begin a sync of the mount ([`crate::cache::MountResources::begin_sync`]),
+    /// after which no failure of an earlier sync holds a request back.
+    pub fn begin_sync(&self) -> Result<u64> {
+        let sync = self
+            .resources
+            .begin_sync()
+            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+        self.failures.lock().unwrap().clear();
+        Ok(sync)
+    }
+
+    /// End the sync `number` of the mount.
+    pub fn end_sync(&self, number: u64) -> Result<()> {
+        self.resources
+            .end_sync(number)
+            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))
     }
 
     pub(crate) fn next_operation_id(&self) -> u64 {

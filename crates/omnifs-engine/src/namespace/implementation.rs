@@ -20,7 +20,6 @@ use super::{
     Attrs, CachedCursor, DirCursor, DirEntry, DirPage, EntryKind, EventStream, LookupAnswer,
     Namespace, NsError, NsEvent, ReadAnswer, ReadStyle, Stability,
 };
-use crate::clock::DYNAMIC_TTL_MILLIS;
 use crate::inspect;
 use crate::registry::{MountEntry, MountTable};
 use crate::tree::{HostKind, ListOutcome, RangedHandle, ReadRange, RequestCtx};
@@ -61,7 +60,7 @@ fn read_attrs(
     fed: bool,
     epoch: u64,
 ) -> Attrs {
-    attrs_from_cache(kind, attrs, change_counter_parts(id, attrs, epoch, 0), fed)
+    attrs_from_cache(kind, attrs, change_counter_parts(id, attrs, epoch), fed)
 }
 
 /// Policied attrs for an entry. A fed entry has the zero lifetime of dynamic
@@ -708,15 +707,10 @@ impl EngineNamespace {
                 continue;
             }
             let epoch = self.changed_at(mount, rel);
-            let due = if *fed {
-                self.listing_due(mount, rel)
-            } else {
-                0
-            };
             let attrs = attrs_from_cache(
                 EntryKind::Directory,
                 None,
-                change_counter_parts(&dir, None, epoch, due),
+                change_counter_parts(&dir, None, epoch),
                 *fed,
             );
             let _ = self.events.send(NsEvent::AttrsChanged { path: dir, attrs });
@@ -740,7 +734,7 @@ impl EngineNamespace {
             let attrs = attrs_from_cache(
                 EntryKind::File,
                 None,
-                change_counter_parts(&file, None, epoch, 0),
+                change_counter_parts(&file, None, epoch),
                 true,
             );
             let _ = self
@@ -807,25 +801,12 @@ impl EngineNamespace {
         attrs: Option<&FileAttrsCache>,
     ) -> Attrs {
         let epoch = self.node_epoch(node);
-        let due = if node.is_fed() && node.is_dir() {
-            self.listing_due(node.mount(), node.fact())
-        } else {
-            0
-        };
         attrs_from_cache(
             entry_kind_from_node(node),
             attrs,
-            self.root_aware_change(id, node, attrs, epoch, due),
+            self.root_aware_change(id, node, attrs, epoch),
             node.is_fed(),
         )
-    }
-
-    /// [`MountResources::listing_due`] of the fed directory whose facts are
-    /// at `fact` in `mount`: a part of its change counter in each answer.
-    fn listing_due(&self, mount: &str, fact: &Path) -> u64 {
-        self.projection_count(mount, fact, |resources| {
-            resources.listing_due(fact, crate::clock::now_millis())
-        })
     }
 
     /// [`MountResources::changed_at`] of the facts at `fact` in `mount`: the
@@ -886,9 +867,8 @@ impl EngineNamespace {
         node: &crate::Node,
         attrs: Option<&FileAttrsCache>,
         epoch: u64,
-        due: u64,
     ) -> u64 {
-        let change = change_counter(node, attrs, epoch, due);
+        let change = change_counter(node, attrs, epoch);
         if !id.is_root() {
             return change;
         }
@@ -1088,7 +1068,7 @@ impl EngineNamespace {
             let attrs = attrs_from_cache(
                 EntryKind::File,
                 Some(&grown),
-                change_counter_parts(&id, Some(&grown), node_epoch, 0),
+                change_counter_parts(&id, Some(&grown), node_epoch),
                 false,
             );
             let _ = events.send(NsEvent::AttrsChanged {
@@ -1218,21 +1198,14 @@ impl EngineNamespace {
             },
         );
         let kind = entry_kind_from_meta(meta);
-        let (epoch, due) = match parent.fact().join(name) {
-            Ok(fact) => (
-                self.changed_at(parent.mount(), &fact),
-                if fed && kind == EntryKind::Directory {
-                    self.listing_due(parent.mount(), &fact)
-                } else {
-                    0
-                },
-            ),
-            Err(_) => (0, 0),
-        };
+        let epoch = parent
+            .fact()
+            .join(name)
+            .map_or(0, |fact| self.changed_at(parent.mount(), &fact));
         let attrs = attrs_from_cache(
             kind.clone(),
             merged.as_ref(),
-            change_counter_parts(&id, merged.as_ref(), epoch, due),
+            change_counter_parts(&id, merged.as_ref(), epoch),
             fed,
         );
         DirEntry {
@@ -1251,7 +1224,16 @@ impl EngineNamespace {
         let (display_mount, display_path) = inspector_identity(&mount, &full_path);
         let span = Self::begin_span(op, &display_mount, &display_path);
         let result = async {
-            let node = self.resolve_node(&full_path).await?;
+            let mut node = self.resolve_node(&full_path).await?;
+            if node.is_dir() && node.is_fed() {
+                let runtime = self.runtime_for(node.mount()).map_err(NsError::from)?;
+                if runtime.resources.sync_now() != 0 {
+                    crate::tree::feed::answer_in_sync(&runtime, node.path())
+                        .await
+                        .map_err(NsError::from)?;
+                    node = self.resolve_node(&full_path).await?;
+                }
+            }
             // The attrs carry each change that the resolve recorded.
             self.process_invalidations(&mount);
             if let Some((tree_ref, relative, _)) = node.host() {
@@ -1675,10 +1657,7 @@ impl Namespace for EngineNamespace {
                 let node = match resolved {
                     Ok(node) => node,
                     Err(error) if error.kind == TreeErrorKind::NotFound => {
-                        return Ok(LookupAnswer::missing(
-                            child_full,
-                            Duration::from_millis(DYNAMIC_TTL_MILLIS),
-                        ));
+                        return Ok(LookupAnswer::missing(child_full, Duration::ZERO));
                     },
                     Err(error) => return Err(NsError::from(error)),
                 };
@@ -1800,32 +1779,24 @@ fn inspector_identity(mount: &str, full_path: &Path) -> (String, String) {
 
 /// Change counter over a resolved node, folding the node's last invalidation
 /// epoch into the same facts NFS's `entry_change` hashes.
-/// `due` is the part of a fed directory that moves with the deadline of the
-/// feed of its listing, and `0` for each other node.
-fn change_counter(node: &crate::Node, attrs: Option<&FileAttrsCache>, epoch: u64, due: u64) -> u64 {
+fn change_counter(node: &crate::Node, attrs: Option<&FileAttrsCache>, epoch: u64) -> u64 {
     let mut hasher = DefaultHasher::new();
     node.mount().hash(&mut hasher);
     node.path().hash(&mut hasher);
-    hash_attr_facts(&mut hasher, attrs, epoch, due);
+    hash_attr_facts(&mut hasher, attrs, epoch);
     hasher.finish()
 }
 
 /// Change counter without a resolved node in hand (a read/live-growth answer).
-fn change_counter_parts(id: &Path, attrs: Option<&FileAttrsCache>, epoch: u64, due: u64) -> u64 {
+fn change_counter_parts(id: &Path, attrs: Option<&FileAttrsCache>, epoch: u64) -> u64 {
     let mut hasher = DefaultHasher::new();
     id.hash(&mut hasher);
-    hash_attr_facts(&mut hasher, attrs, epoch, due);
+    hash_attr_facts(&mut hasher, attrs, epoch);
     hasher.finish()
 }
 
-fn hash_attr_facts(
-    hasher: &mut DefaultHasher,
-    attrs: Option<&FileAttrsCache>,
-    epoch: u64,
-    due: u64,
-) {
+fn hash_attr_facts(hasher: &mut DefaultHasher, attrs: Option<&FileAttrsCache>, epoch: u64) {
     epoch.hash(hasher);
-    due.hash(hasher);
     if let Some(attrs) = attrs {
         attrs.version_token().hash(hasher);
         attrs.st_size().hash(hasher);
@@ -2216,7 +2187,7 @@ mod tests {
     /// entries.
     #[tokio::test(flavor = "multi_thread")]
     #[allow(clippy::too_many_lines)]
-    async fn a_tree_past_its_deadline_follows_the_commit_of_its_upstream() {
+    async fn a_tree_in_a_sync_follows_the_commit_of_its_upstream() {
         use crate::authority::RuntimeAuthority;
         use crate::cache::identity::GitId;
         use crate::git::GitExecutor;
@@ -2290,12 +2261,12 @@ mod tests {
         )
         .await;
         let readme = readme.expect("README lookup");
-        assert!(validators.is_empty(), "the tree serves within its deadline");
+        assert!(validators.is_empty(), "the tree serves outside a sync");
         assert_eq!(readme.attrs().expect("README attrs").ttl, Duration::ZERO);
         let read = || Namespace::read(namespace.as_ref(), readme.path.clone(), 0, 64);
         let mut events = namespace.subscribe();
 
-        tokio::time::sleep(Duration::from_millis(3_300)).await;
+        runtime.begin_sync().expect("a sync begins");
         let (kept, validators) = answering_commits(&runtime, &executor, read(), &[None]).await;
         assert_eq!(kept.expect("README read").bytes, b"Hello from cache\n");
         assert_eq!(validators, [Some(first.clone())]);
@@ -2304,7 +2275,7 @@ mod tests {
             .expect("second README");
         run_git(&source, &["commit", "-am", "second"]);
         let second = head(&source);
-        tokio::time::sleep(Duration::from_millis(3_300)).await;
+        runtime.begin_sync().expect("a sync begins");
         let (moved, validators) =
             answering_commits(&runtime, &executor, read(), &[Some(&second)]).await;
         assert_eq!(
@@ -2320,10 +2291,7 @@ mod tests {
             .expect("the Git fact of the tree");
         assert_eq!(fact.commit, second);
         let (_, validators) = answering_commits(&runtime, &executor, read(), &[]).await;
-        assert!(
-            validators.is_empty(),
-            "the new commit renews the deadline of the tree"
-        );
+        assert!(validators.is_empty(), "the tree is asked once in a sync");
         let changed = std::iter::from_fn(|| events.try_recv())
             .filter(
                 |event| matches!(event, NsEvent::AttrsChanged { path, .. } if *path == tree.path),

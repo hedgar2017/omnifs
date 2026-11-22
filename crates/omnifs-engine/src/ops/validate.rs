@@ -94,16 +94,16 @@ where
     }
 
     /// `tokened` says whether the call carried a token, the only call
-    /// `unchanged` and a restart can answer. Only a part has an `until`, and
-    /// a restart carries no effects.
+    /// `unchanged` and a restart can answer. Only a part is unsettled, and a
+    /// restart carries no effects.
     pub(crate) fn feed(
         result: &std::result::Result<wit_types::FeedAnswer, wit_types::ProviderError>,
         effects: &wit_types::Effects,
-        until: Option<u64>,
+        unsettled: bool,
         tokened: bool,
     ) -> std::result::Result<(), String> {
-        if until.is_some() && !matches!(result, Ok(wit_types::FeedAnswer::Part(_))) {
-            return Err("only a feed part has an until".to_string());
+        if unsettled && !matches!(result, Ok(wit_types::FeedAnswer::Part(_))) {
+            return Err("only a feed part is unsettled".to_string());
         }
         let Ok(answer) = result else { return Ok(()) };
         match answer {
@@ -526,12 +526,12 @@ where
     v.list(result, validated)
 }
 /// Validate one feed call: `tokened` says whether the call carried a token,
-/// and `until` is the time the call gave the facts of its part. The effects
+/// and `unsettled` whether the call said that the facts of its part are. The effects
 /// of a part are its fed facts.
 pub(crate) fn validate_feed<F>(
     result: &std::result::Result<wit_types::FeedAnswer, wit_types::ProviderError>,
     effects: &wit_types::Effects,
-    until: Option<u64>,
+    unsettled: bool,
     tokened: bool,
     tree_exists: F,
 ) -> std::result::Result<(), String>
@@ -539,7 +539,7 @@ where
     F: Fn(u64) -> bool,
 {
     let _ = ReturnValidator::checked(result, effects, tree_exists, true)?;
-    ReturnValidator::<F>::feed(result, effects, until, tokened)
+    ReturnValidator::<F>::feed(result, effects, unsettled, tokened)
 }
 pub(crate) fn validate_read<F>(
     result: &std::result::Result<wit_types::ReadFileOutcome, wit_types::ProviderError>,
@@ -943,10 +943,10 @@ mod tests {
         };
         let large = "t".repeat(64 * 1024 * 1024 + 1);
         assert_eq!(
-            validate_feed(&part(large), &effects(), None, false, |_| false),
+            validate_feed(&part(large), &effects(), false, false, |_| false),
             Ok(())
         );
-        assert!(validate_feed(&part(String::new()), &effects(), None, false, |_| false).is_err());
+        assert!(validate_feed(&part(String::new()), &effects(), false, false, |_| false).is_err());
     }
 
     /// A fed file without bytes is a view leaf of the canonical bytes that
@@ -987,7 +987,7 @@ mod tests {
             ..effects()
         };
         let valid =
-            |effects: &wit_types::Effects| validate_feed(&part, effects, None, false, |_| false);
+            |effects: &wit_types::Effects| validate_feed(&part, effects, false, false, |_| false);
         assert_eq!(
             valid(&leaf(Some("1"), wit_types::FileSize::Unknown)),
             Ok(())

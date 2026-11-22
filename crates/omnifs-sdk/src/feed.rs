@@ -57,8 +57,9 @@
 //! its names, each parsed as a key ([`FeedCx::names`]), or as its count
 //! ([`FeedCx::count`]), and a fed file by a range of its bytes
 //! ([`FeedCx::read_range`]) or, for a file that is one record, whole within
-//! the bytes it names ([`FeedCx::read_record`]). Each read gives the time
-//! that the part that wrote the fact gave with [`FeedPart::until`].
+//! the bytes it names ([`FeedCx::read_record`]). Each read says whether the
+//! part that wrote the fact said that it is unsettled
+//! ([`FeedPart::unsettled`]).
 //!
 //! [`FeedCx::canonical`] writes the canonical bytes of an object, which the
 //! feed has from its own request: the faces of that object that serve
@@ -68,7 +69,6 @@ use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime};
 
 use crate::browse::{Effects, ListingWrite};
 use crate::cx::Cx;
@@ -171,8 +171,9 @@ impl<K, S> FeedCx<K, S> {
     }
 
     /// The declared starting path, relative to the object, of the operation
-    /// of an answer the host asks for once the feed is past its deadline,
-    /// `None` for another answer or an operation on no starting path.
+    /// of an answer the host asks for because the feed is due in a sync of
+    /// the mount, `None` for another answer or an operation on no starting
+    /// path.
     pub fn due(&self) -> Option<&'static str> {
         match self.start {
             Some(FeedStart::Due(due)) => Some(due),
@@ -201,7 +202,7 @@ impl<K, S> FeedCx<K, S> {
                         })
                         .collect::<Result<_>>()?,
                     complete: listed.complete,
-                    until: listed.until.map(time),
+                    unsettled: listed.unsettled,
                 })
             })
             .transpose()
@@ -217,7 +218,7 @@ impl<K, S> FeedCx<K, S> {
                 |listed| ListedCount {
                     count: listed.count,
                     complete: listed.complete,
-                    until: listed.until.map(time),
+                    unsettled: listed.unsettled,
                 },
             ),
         )
@@ -241,7 +242,7 @@ impl<K, S> FeedCx<K, S> {
                 .map(|range| FedRange {
                     bytes: range.bytes,
                     length: range.length,
-                    until: range.until.map(time),
+                    unsettled: range.unsettled,
                 }),
         )
     }
@@ -264,7 +265,7 @@ impl<K, S> FeedCx<K, S> {
                 }
                 Ok(FedRecord {
                     bytes: range.bytes,
-                    until: range.until,
+                    unsettled: range.unsettled,
                 })
             })
             .transpose()
@@ -360,10 +361,10 @@ pub struct ListedNames<T> {
     pub names: Vec<T>,
     /// Whether the listing is complete.
     pub complete: bool,
-    /// The time after which the listing counts as lacking for the start of
-    /// an answer, which the part that wrote it gave with
-    /// [`FeedPart::until`]; `None` for a listing without one.
-    pub until: Option<SystemTime>,
+    /// Whether the part that wrote the listing said that it is unsettled
+    /// ([`FeedPart::unsettled`]): it counts as lacking for the start of an
+    /// answer in the next sync of the mount.
+    pub unsettled: bool,
 }
 
 /// The count of the names of a listing of the host projection.
@@ -372,9 +373,8 @@ pub struct ListedCount {
     pub count: u64,
     /// Whether the listing is complete.
     pub complete: bool,
-    /// The time after which the listing counts as lacking, as of
-    /// [`ListedNames::until`].
-    pub until: Option<SystemTime>,
+    /// Whether the listing is unsettled, as of [`ListedNames::unsettled`].
+    pub unsettled: bool,
 }
 
 /// A range of a fed file of the host projection.
@@ -384,23 +384,16 @@ pub struct FedRange {
     pub bytes: Vec<u8>,
     /// The length of the whole file.
     pub length: u64,
-    /// The time after which the file counts as lacking, as of
-    /// [`ListedNames::until`].
-    pub until: Option<SystemTime>,
+    /// Whether the file is unsettled, as of [`ListedNames::unsettled`].
+    pub unsettled: bool,
 }
 
 /// The whole of a fed file of the host projection that is one record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FedRecord {
     pub bytes: Vec<u8>,
-    /// The time after which the file counts as lacking, as of
-    /// [`ListedNames::until`].
-    pub until: Option<SystemTime>,
-}
-
-/// The time of `millis` milliseconds of the Unix epoch.
-fn time(millis: u64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_millis(millis)
+    /// Whether the file is unsettled, as of [`ListedNames::unsettled`].
+    pub unsettled: bool,
 }
 
 /// The answer of one feed call.
@@ -428,7 +421,7 @@ impl Feed {
             token: encode(token)?,
             more: false,
             inner: Vec::new(),
-            until: None,
+            unsettled: false,
             unlisted: false,
             anew: false,
         })
@@ -454,21 +447,29 @@ impl From<FeedPart> for Feed {
 }
 
 /// One part of a feed answer.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one field of the `feed-part` record of WIT"
+)]
 pub struct FeedPart {
     token: String,
     more: bool,
     inner: Vec<InnerState>,
-    until: Option<SystemTime>,
+    unsettled: bool,
     unlisted: bool,
     anew: bool,
 }
 
 /// A [`FeedPart`] taken apart for the host.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one field of the `feed-part` record of WIT"
+)]
 pub(crate) struct FeedPartParts {
     pub(crate) token: String,
     pub(crate) more: bool,
     pub(crate) inner: Vec<InnerState>,
-    pub(crate) until: Option<SystemTime>,
+    pub(crate) unsettled: bool,
     pub(crate) unlisted: bool,
     pub(crate) anew: bool,
 }
@@ -476,8 +477,7 @@ pub(crate) struct FeedPartParts {
 impl FeedPart {
     /// No inventory of a feed above this own feed has its object, as an
     /// item that its upstream gives by its id alone: the host asks this feed
-    /// itself for its paths, past its own deadline with
-    /// [`FeedCx::due`], until a part of a feed above it brings its state
+    /// itself for its paths, once in each sync with [`FeedCx::due`], until a part of a feed above it brings its state
     /// with [`FeedPart::inner`]. Each part of the feed says it again.
     #[must_use]
     pub fn unlisted(mut self) -> Self {
@@ -514,14 +514,16 @@ impl FeedPart {
         Ok(self)
     }
 
-    /// The time after which the facts of this part, a file or a complete
-    /// listing, count as lacking for the start of an answer, while the
-    /// projection serves them. The host refuses it on a part of a later
-    /// answer with [`FeedPart::more`], and takes it for the facts of the
-    /// last part of a later answer.
+    /// The facts of this part under the anchor of its object, each file and
+    /// complete listing, are unsettled, as facts that its upstream gave with
+    /// less precision than a change has: they count as lacking for the start
+    /// of an answer in the next sync of the mount, while the projection
+    /// serves them. The host refuses it on a part of a later answer with
+    /// [`FeedPart::more`], and takes it for the facts of the last part of a
+    /// later answer.
     #[must_use]
-    pub fn until(mut self, until: SystemTime) -> Self {
-        self.until = Some(until);
+    pub fn unsettled(mut self) -> Self {
+        self.unsettled = true;
         self
     }
 
@@ -530,7 +532,7 @@ impl FeedPart {
             token: self.token,
             more: self.more,
             inner: self.inner,
-            until: self.until,
+            unsettled: self.unsettled,
             unlisted: self.unlisted,
             anew: self.anew,
         }

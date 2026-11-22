@@ -187,6 +187,22 @@ impl RuntimeHarness {
         self.runtime.start_read_file(&path, &content_type, None)
     }
 
+    /// Begin a sync of the selected mount, which ends the sync before it:
+    /// each feed, fact, and page is due once in it. Returns its number.
+    pub fn begin_sync(&self) -> u64 {
+        self.runtime
+            .begin_sync()
+            .expect("a sync of the mount begins")
+    }
+
+    /// End the sync `number` of the selected mount: an operation after it is
+    /// served from the projection.
+    pub fn end_sync(&self, number: u64) {
+        self.runtime
+            .end_sync(number)
+            .expect("the sync of the mount ends");
+    }
+
     pub fn current_epoch(&self) -> u64 {
         omnifs_engine::test_support::cache::current_epoch(&self.runtime)
     }

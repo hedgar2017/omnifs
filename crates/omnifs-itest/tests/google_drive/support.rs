@@ -1,16 +1,11 @@
 //! The requests of the mount `google-drive` that its tests answer, and the
 //! objects of Google Drive of those answers.
 
-use std::time::Duration;
-
 use omnifs_engine::{Namespace, NsError};
 use omnifs_itest::support::{Answer, Request, decoded, lookup};
 use omnifs_itest::{RuntimeHarness, make_initialized_runtime};
 use omnifs_wit::host::types::{CalloutResult, Header, HttpResponse};
 use serde_json::{Value, json};
-
-/// Past the deadline of a feed, `DYNAMIC_TTL_MILLIS` after its last answer.
-pub const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
 
 /// The fields of an item that the provider asks for.
 pub const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,headRevisionId,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";

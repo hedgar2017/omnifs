@@ -7,7 +7,7 @@ use crate::cache::{
     CallSpan, DirentsMutation, FactPayload, FeedAnswerWrite, FeedPartWrite, FeedWrite, Freshness,
     GitWrite, Invalidation, MountResources, ObjectMutation, ProjectionTransition, RecordWrite,
 };
-use crate::clock::{DYNAMIC_TTL_MILLIS, freshness_expiry, page_deadline};
+use crate::clock::freshness_expiry;
 use crate::object_id::ObjectId;
 use crate::ops::feed::{CallFacts, FeedChanges, FeedClaim, FeedObject, FeedOrigin};
 use crate::ops::namespace::{
@@ -61,9 +61,9 @@ impl<'a> EffectApplier<'a> {
     pub(crate) fn lower_effects(
         &self,
         effects: &wit_types::Effects,
-        now_millis: u64,
+        due_in: u64,
     ) -> anyhow::Result<ProjectionTransition> {
-        self.lower_writes(effects, now_millis, false)
+        self.lower_writes(effects, due_in, false)
     }
 
     /// Lower the effects of a terminal. The writes of a feed part are fed
@@ -75,7 +75,7 @@ impl<'a> EffectApplier<'a> {
     fn lower_writes(
         &self,
         effects: &wit_types::Effects,
-        now_millis: u64,
+        due_in: u64,
         fed: bool,
     ) -> anyhow::Result<ProjectionTransition> {
         let mut transition = ProjectionTransition::default();
@@ -144,7 +144,7 @@ impl<'a> EffectApplier<'a> {
                         path,
                         expires_at: freshness_expiry(
                             stability_from_wit(wit_types::Stability::Dynamic),
-                            now_millis,
+                            due_in,
                         ),
                     });
                 }
@@ -219,7 +219,7 @@ impl<'a> EffectApplier<'a> {
         parent: &Path,
         child: &Path,
         result: wit_types::LookupChildResult,
-        now_millis: u64,
+        due_in: u64,
         resolve_tree: impl Fn(u64) -> Option<GitId>,
     ) -> anyhow::Result<(LookupOutcome, ProjectionTransition)> {
         let mut transition = ProjectionTransition::default();
@@ -282,7 +282,7 @@ impl<'a> EffectApplier<'a> {
                 let tree = subtree.tree;
                 let id = resolve_tree(tree)
                     .ok_or_else(|| anyhow::anyhow!("unresolved Git tree handle {tree}"))?;
-                add_subtree_records(&mut transition, child, id, subtree.commit, now_millis);
+                add_subtree_records(&mut transition, child, id, subtree.commit, due_in);
                 LookupOutcome::Subtree(tree)
             },
             wit_types::LookupChildResult::NotFound(id) => {
@@ -295,7 +295,7 @@ impl<'a> EffectApplier<'a> {
                 });
                 transition.freshness.push(Freshness {
                     path: child.clone(),
-                    expires_at: Some(now_millis.saturating_add(DYNAMIC_TTL_MILLIS)),
+                    expires_at: Some(due_in),
                 });
                 LookupOutcome::NotFound
             },
@@ -321,7 +321,7 @@ impl<'a> EffectApplier<'a> {
         path: &Path,
         result: wit_types::ListChildrenResult,
         request: &PageRequest,
-        now_millis: u64,
+        due_in: u64,
         resolve_tree: impl Fn(u64) -> Option<GitId>,
     ) -> anyhow::Result<(ListOutcome, ProjectionTransition)> {
         let mut transition = ProjectionTransition::default();
@@ -367,7 +367,8 @@ impl<'a> EffectApplier<'a> {
                     validator: listing.validator.as_ref().map(|validator| PageValidator {
                         token: validator.token.clone(),
                         interval: validator.interval,
-                        deadline: page_deadline(validator.interval, now_millis),
+                        due_in,
+                        answered_at: crate::clock::now_millis(),
                     }),
                     entries: page_entries,
                 };
@@ -404,7 +405,7 @@ impl<'a> EffectApplier<'a> {
                         } else {
                             Stability::Dynamic
                         },
-                        now_millis,
+                        due_in,
                     ),
                 });
                 ListOutcome::Entries(DirListing {
@@ -422,7 +423,7 @@ impl<'a> EffectApplier<'a> {
                 let tree = subtree.tree;
                 let id = resolve_tree(tree)
                     .ok_or_else(|| anyhow::anyhow!("unresolved Git tree handle {tree}"))?;
-                add_subtree_records(&mut transition, path, id, subtree.commit, now_millis);
+                add_subtree_records(&mut transition, path, id, subtree.commit, due_in);
                 ListOutcome::Subtree(tree)
             },
             wit_types::ListChildrenResult::Unchanged(validator) => {
@@ -432,14 +433,14 @@ impl<'a> EffectApplier<'a> {
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?
                     .is_some();
                 match (tree, validator) {
-                    (true, None) => transition.freshness.push(tree_freshness(path, now_millis)),
+                    (true, None) => transition.freshness.push(tree_freshness(path, due_in)),
                     (false, Some(validator)) => {
                         transition.dirents.push(DirentsMutation::RenewPage {
                             path: path.clone(),
                             cursor: request.cursor.clone(),
                             token: validator.token,
                             interval: validator.interval,
-                            now_millis,
+                            due_in,
                         });
                     },
                     (true, Some(_)) => {
@@ -472,14 +473,14 @@ impl<'a> EffectApplier<'a> {
         calls: &[CallFacts<'_>],
         until: HashMap<Path, u64>,
         origin: FeedOrigin,
-        now_millis: u64,
+        due_in: u64,
     ) -> anyhow::Result<(ProjectionTransition, FeedChanges)> {
         let mut changes = FeedChanges::default();
         let mut lowered = Vec::with_capacity(calls.len());
         // The paths that the calls after each call write.
         let mut later = std::collections::BTreeSet::<String>::new();
         for call in calls.iter().rev() {
-            let mut part = self.lower_writes(call.effects, now_millis, true)?;
+            let mut part = self.lower_writes(call.effects, due_in, true)?;
             part.removals.retain(|removed| {
                 let below = if removed.is_root() {
                     "/".to_owned()
@@ -535,9 +536,7 @@ impl<'a> EffectApplier<'a> {
                 ended: call.ended,
             });
         }
-        transition.feed = Some(feed_write(
-            object, answer, spans, until, origin, now_millis,
-        )?);
+        transition.feed = Some(feed_write(object, answer, spans, until, origin, due_in)?);
         Ok((transition, changes))
     }
 
@@ -546,6 +545,7 @@ impl<'a> EffectApplier<'a> {
         path: &Path,
         value: wit_types::ReadFileResult,
         staged_objects: &[ObjectMutation],
+        due_in: u64,
     ) -> anyhow::Result<(ReadOutcome, ProjectionTransition)> {
         let outcome = ReadOutcome::from_wit(value, |handle| {
             self.store
@@ -630,7 +630,7 @@ impl<'a> EffectApplier<'a> {
         }
         transition.freshness.push(Freshness {
             path: path.clone(),
-            expires_at: freshness_expiry(attrs.stability(), crate::clock::now_millis()),
+            expires_at: freshness_expiry(attrs.stability(), due_in),
         });
         Ok((outcome, transition))
     }
@@ -734,7 +734,7 @@ fn add_subtree_records(
     path: &Path,
     id: GitId,
     commit: String,
-    now_millis: u64,
+    due_in: u64,
 ) {
     transition.git.push(GitWrite {
         path: path.clone(),
@@ -747,15 +747,15 @@ fn add_subtree_records(
         aux: None,
         fact: FactPayload::Lookup(LookupPayload::Positive(EntryMeta::directory())),
     });
-    transition.freshness.push(tree_freshness(path, now_millis));
+    transition.freshness.push(tree_freshness(path, due_in));
 }
 
-/// The deadline of the tree of `path`, `DYNAMIC_TTL_MILLIS` after its last
+/// The expiry of the tree of `path`: due in the next sync after its last
 /// answer.
-fn tree_freshness(path: &Path, now_millis: u64) -> Freshness {
+fn tree_freshness(path: &Path, due_in: u64) -> Freshness {
     Freshness {
         path: path.clone(),
-        expires_at: Some(now_millis.saturating_add(DYNAMIC_TTL_MILLIS)),
+        expires_at: Some(due_in),
     }
 }
 
@@ -793,9 +793,8 @@ fn feed_write(
     spans: Vec<CallSpan>,
     until: HashMap<Path, u64>,
     origin: FeedOrigin,
-    now_millis: u64,
+    due_in: u64,
 ) -> anyhow::Result<FeedWrite> {
-    let deadline = now_millis.saturating_add(DYNAMIC_TTL_MILLIS);
     let mut feed = FeedWrite {
         object: object.id.as_bytes().to_vec(),
         from: origin.from,
@@ -804,8 +803,7 @@ fn feed_write(
         answer: FeedAnswerWrite::Unchanged,
         inner: Vec::new(),
         anchors: Vec::new(),
-        deadline,
-        now: now_millis,
+        due_in,
         until,
     };
     match answer {

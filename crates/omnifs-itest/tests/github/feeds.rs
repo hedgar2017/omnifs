@@ -14,9 +14,6 @@ use serde_json::{Value, json};
 
 use super::support::{github_harness, http, request_header};
 
-/// Past the deadline of a feed, `DYNAMIC_TTL_MILLIS` after its last answer.
-const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
-
 /// The repository of the tests under the mount.
 const REPO: &str = "/github/octocat/hello";
 
@@ -431,7 +428,7 @@ async fn a_check_asks_after_the_cursors_and_for_the_comments_since_a_second_befo
     )
     .await;
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
@@ -455,7 +452,7 @@ async fn a_check_asks_after_the_cursors_and_for_the_comments_since_a_second_befo
     );
     assert_eq!(header(&requests[2], "if-none-match"), None);
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
@@ -498,7 +495,7 @@ async fn a_check_takes_the_changed_items_the_comments_since_and_the_ids_of_an_it
     )
     .await;
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
@@ -618,7 +615,7 @@ async fn a_comment_deleted_from_an_unchanged_item_leaves_at_the_next_check() {
     )
     .await;
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
@@ -650,7 +647,7 @@ async fn a_comment_deleted_from_an_unchanged_item_leaves_at_the_next_check() {
         ["12"]
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (_, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
@@ -680,7 +677,7 @@ async fn a_comment_that_moved_while_the_comments_paged_asks_for_them_again() {
     .await;
 
     let next = r#"<https://api.github.com/repositories/1/issues/comments?page=2>; rel="next""#;
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
@@ -752,7 +749,7 @@ async fn a_check_takes_the_numbers_of_a_kind_with_another_count_once() {
     )
     .await;
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let nine = node(9, "Nine", "OPEN", "2026-11-17T08:00:00Z", 0);
     let ten = node(10, "Ten", "CLOSED", "2026-11-17T09:00:00Z", 0);
     let mut found = by_number(9, "Issue", "octocat/hello", 9, &nine);
@@ -794,7 +791,7 @@ async fn a_check_takes_the_numbers_of_a_kind_with_another_count_once() {
         nine.to_string()
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
@@ -884,7 +881,7 @@ async fn an_item_that_github_answers_from_elsewhere_left_this_repository() {
         &[],
     )
     .await;
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let mut elsewhere = ids(1, &[], None);
     elsewhere["repository"]["nameWithOwner"] = json!("octocat/elsewhere");
     let (listing, _) = answering(
@@ -998,7 +995,7 @@ async fn a_check_stopped_by_the_network_serves_a_read_what_the_projection_has() 
     )
     .await;
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (title, requests) = answering(
         &harness,
         read(&harness, &at("issues/all/1/title")),
@@ -1020,7 +1017,7 @@ async fn a_check_stopped_by_the_network_serves_a_read_what_the_projection_has() 
         "One"
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (title, requests) = answering(
         &harness,
         read(&harness, &at("issues/all/1/title")),
@@ -1045,7 +1042,7 @@ async fn a_check_stopped_by_the_rate_limit_of_github_graphql_continues_with_its_
     )
     .await;
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let reset = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + Duration::from_secs(2))
         .as_secs()
         .to_string();
@@ -1146,7 +1143,7 @@ async fn an_item_before_the_end_of_the_first_full_listing_takes_its_own_answers(
         api("/repositories/1/issues/3/comments?page=2")
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let next =
         r#"<https://api.github.com/repositories/1/issues/3/comments?since=x&page=2>; rel="next""#;
     let (title, requests) = answering(
@@ -1259,7 +1256,7 @@ async fn an_issue_that_its_own_feed_closes_leaves_open() {
             })));
         }
 
-        tokio::time::sleep(PAST_DEADLINE).await;
+        harness.begin_sync();
         let (title, _) =
             answering(&harness, read(&harness, &at("issues/all/3/title")), closed).await;
         assert_eq!(title.unwrap(), "Three");
@@ -1301,7 +1298,7 @@ async fn a_later_answer_of_an_item_stopped_by_the_network_continues_from_its_nex
             .is_empty()
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let since =
         api("/repos/octocat/hello/issues/7/comments?per_page=100&since=2026-11-18T08:59:59Z");
     let (stopped, requests) = answering(
@@ -1322,7 +1319,7 @@ async fn a_later_answer_of_an_item_stopped_by_the_network_continues_from_its_nex
     assert_eq!(stopped.unwrap(), "Seven");
     assert_eq!(http(&requests[1]).url, since);
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (title, requests) = answering(
         &harness,
         read(&harness, &at("issues/all/7/title")),
@@ -1438,7 +1435,7 @@ async fn a_check_asks_github_graphql_for_a_hundred_changed_items_a_post() {
     answers.extend((1..=100).map(fetched));
     answers.push(graphql(&page(101..=101)));
     answers.push(fetched(101));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) =
         answering(&harness, names(&harness, &at("issues/all")), answers).await;
     assert_eq!(listing.unwrap().len(), 102);

@@ -14,10 +14,10 @@ use omnifs_itest::support::{
 use omnifs_wit::host::types::Callout;
 use serde_json::{Value, json};
 use support::{
-    Corpus, PAST_DEADLINE, at, blob, bytes, changed, changes, drive_harness, drives, expect_bytes,
-    expect_changes, expect_drives, expect_export, expect_export_refusal, expect_first_byte,
-    expect_item, expect_listing, expect_revision, expect_start, failure, files, google, in_drive,
-    md5, ok, read_range, removed, sized, trashed, uploaded, without,
+    Corpus, at, blob, bytes, changed, changes, drive_harness, drives, expect_bytes, expect_changes,
+    expect_drives, expect_export, expect_export_refusal, expect_first_byte, expect_item,
+    expect_listing, expect_revision, expect_start, failure, files, google, in_drive, md5, ok,
+    read_range, removed, sized, trashed, uploaded, without,
 };
 
 const EDITED: &str = "2026-11-21T10:00:00.000Z";
@@ -165,7 +165,7 @@ async fn the_first_full_listing_takes_the_items_of_the_user_and_of_each_shared_d
     assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
     // Past its deadline, an operation on an item that the listing brought
     // checks it by its ID while the listing has not ended.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (old, requests) = answering(
         &harness,
         harness.namespace.read(name.clone(), 0, u32::MAX),
@@ -439,7 +439,7 @@ async fn the_content_takes_the_bytes_and_the_export_of_a_file_at_the_revision_of
     expect_bytes(&requests[0], "file-2", md5("old"));
     expect_item(&requests[1], "file-2");
     expect_bytes(&requests[2], "file-2", md5("new"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("files")),
@@ -506,7 +506,7 @@ async fn the_changes_take_the_items_after_the_token_of_the_answer_before() {
     let plan_edited = google("doc-1", "document", "Plan", EDITED_LATER);
     let headless = without(uploaded("file-5", "raw.bin", "busy"), "md5Checksum");
     let found = uploaded("file-9", "found again.md", "new");
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("files")),
@@ -586,7 +586,7 @@ async fn the_changes_take_the_items_after_the_token_of_the_answer_before() {
     expect_export(&requests[0], "doc-1", "text/markdown", EDITED_LATER);
 
     // A last page without the token of the changes after it.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (ended, requests) = answering(
         &harness,
         names(&harness, &at("files")),
@@ -677,7 +677,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
 
             // A status other than `400` leaves the token of the changes as
             // it was.
-            tokio::time::sleep(PAST_DEADLINE).await;
+            harness.begin_sync();
             let (denied, requests) = answering(
                 &harness,
                 names(&harness, &at("files")),
@@ -789,7 +789,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
 
     // The export by its ID comes back at its next lookup past its deadline,
     // and the host keeps the answer of its request of its content.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (content, requests) = reading(
         &harness,
         "files/doc-9/content",
@@ -819,8 +819,8 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
 /// revision alone, and the item leaves for `404` or in the trash. A full
 /// listing leaves an item that it lacks and the mount has by its ID, and
 /// takes an item that it brings from then on. The answer of a file by its
-/// ID from before the listing gives way to the listing. Within the window
-/// of a rate limit, each item is served from the projection.
+/// ID from before the listing gives way to the listing. A rate limit
+/// without a `Retry-After` holds no other item back.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_file_a_folder_and_another_item_by_their_ids() {
@@ -898,7 +898,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
 
     // Past its deadline, each operation on the file takes it by its ID.
     let edited = uploaded("file-1", "edited.md", "notes!");
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (found, requests) = answering(
         &harness,
         lookup(&harness, &at("files/file-1")),
@@ -907,24 +907,24 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
     .await;
     assert!(!found.unwrap().is_missing());
     expect_item(&requests[0], "file-1");
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) =
         answering(&harness, names(&harness, &at("files/file-1")), [ok(&notes)]).await;
 
     assert_eq!(listing.unwrap(), ["content", "file.json", "name"]);
     expect_item(&requests[0], "file-1");
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (object, requests) = reading(&harness, "files/file-1/file.json", [ok(&notes)]).await;
     let object: Value = serde_json::from_str(&object.unwrap()).unwrap();
     assert_eq!(object, notes);
     expect_item(&requests[0], "file-1");
     // The content of the same revision comes not again.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (content, requests) = reading(&harness, "files/file-1/content", [ok(&notes)]).await;
     assert_eq!(content.unwrap(), "notes");
     expect_item(&requests[0], "file-1");
     // Another name and other content.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (_, requests) = reading(&harness, "files/file-1/name", [ok(&edited)]).await;
     expect_item(&requests[0], "file-1");
     assert_eq!(text(&harness, "files/file-1/name").await, "edited.md");
@@ -933,7 +933,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
     assert_eq!(content.unwrap(), "notes!");
     expect_bytes(&requests[0], "file-1", md5("notes!"));
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     // The answer of the file by its ID from before a full listing with its
     // other name comes after the listing, and the name is of the listing.
     let listed_file = uploaded("file-1", "listed.md", "notes!");
@@ -973,7 +973,7 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
     // After the listing, the changes bring nothing of an item by its ID
     // alone: an operation past its deadline takes it again, with its other
     // name, or its removal.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (_, requests) = reading(
         &harness,
         "files/file-5/name",
@@ -1011,13 +1011,13 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
         assert!(listed(&harness, kind).await.is_empty(), "{kind}");
     }
 
-    // Within the window of a rate limit, an item by its ID past its
-    // deadline is served from the projection.
+    // A `429` without a `Retry-After` opens no window: in the same sync,
+    // another item by its ID is asked once.
     let harness = drive_harness();
     let survey = google("form-1", "form", "Survey", EDITED);
     let (found, _) = reading(&harness, "others/form-1/name", [ok(&survey)]).await;
     assert_eq!(found.unwrap(), "Survey");
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (limited, requests) = reading(
         &harness,
         "files/file-5/content",
@@ -1032,6 +1032,8 @@ async fn a_file_a_folder_and_another_item_by_their_ids() {
         "{limited:?}"
     );
     expect_bytes(&requests[1], "file-5", md5("shared"));
+    let (found, _) = reading(&harness, "others/form-1/name", [ok(&survey)]).await;
+    assert_eq!(found.unwrap(), "Survey");
     assert_eq!(text(&harness, "others/form-1/name").await, "Survey");
 }
 
@@ -1138,7 +1140,8 @@ async fn a_refused_content_is_the_error_of_its_read_and_a_missing_one_removes_it
         ])
     );
 
-    // A refusal over a quota holds the next requests of the mount back.
+    // A refusal over a quota without a `Retry-After` states no wait: the
+    // next read of another file asks for it.
     let (limited, requests) = reading(
         &harness,
         "files/file-3/content",
@@ -1150,8 +1153,14 @@ async fn a_refused_content_is_the_error_of_its_read_and_a_missing_one_removes_it
         "{limited:?}"
     );
     expect_first_byte(&requests[1], "file-3");
-    let held = served(&harness, read(&harness, &at("files/sheet-1/content"))).await;
-    assert!(matches!(held, Err(NsError::RateLimited { .. })), "{held:?}");
+    let (asked, requests) = reading(
+        &harness,
+        "files/sheet-1/content",
+        [blob(403, b"{}"), failure(403, "exportSizeLimitExceeded")],
+    )
+    .await;
+    assert!(matches!(asked, Err(NsError::Permission)), "{asked:?}");
+    expect_export(&requests[0], "sheet-1", "text/csv", EDITED);
 
     // A credential that Google Drive refuses.
     let harness = drive_harness();

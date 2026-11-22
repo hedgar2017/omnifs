@@ -10,9 +10,6 @@ use omnifs_itest::{RuntimeHarness, make_initialized_runtime};
 
 const CONFIG: &str = r#"{"provider":"test_provider.wasm","mount":"test"}"#;
 
-/// Past the deadline of a feed, `DYNAMIC_TTL_MILLIS` after its last answer.
-const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
-
 async fn path(harness: &RuntimeHarness, segments: &[&str]) -> Path {
     let mut path = harness
         .namespace
@@ -95,7 +92,7 @@ async fn a_feed_starts_from_its_starting_path_and_answers_once_past_its_deadline
 
     // Within its deadline the feed is not asked again; past it, an answer
     // with its token stands.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(
         names(&harness, &["shelves", "oak", "books"]).await.unwrap(),
         ["1", "2"]
@@ -114,7 +111,7 @@ async fn a_feed_starts_from_its_starting_path_and_answers_once_past_its_deadline
         names(&harness, &["shelves", "oak", "books"]).await.unwrap(),
         ["1", "2"]
     );
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(
         names(&harness, &["shelves", "oak", "books"]).await.unwrap(),
         ["1", "3"]
@@ -165,7 +162,7 @@ async fn a_stopped_feed_keeps_its_token_and_its_inner_states_answer_meanwhile() 
 
     // Past the deadline of that inner state, before its shelf feed ended,
     // the book's own feed answers for its title from the inner token.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(
         read(&harness, &["shelves", "flaky", "books", "1", "title"]).await,
         "Book 1 (own)"
@@ -202,31 +199,30 @@ async fn a_later_answer_publishes_its_parts_with_its_last_part_and_continues_aft
     // its last part: the check failed for now, so the operation is served
     // what the projection has, without the kept part.
     read(&harness, &["hello", "shelf-change"]).await;
-    tokio::time::sleep(PAST_DEADLINE).await;
-    let due = change().await;
-    assert_ne!(due, listed);
+    harness.begin_sync();
+    let stood = change().await;
+    assert_eq!(stood, listed, "a kept part changes nothing yet");
     assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
     let calls = log(&harness).await.len();
 
-    // While the window of the mount is open, each operation is served from
-    // the projection without a call, and the attributes of the directory
-    // stand where the deadline moved them.
+    // While the window that the upstream stated is open, each operation is
+    // served from the projection without a call, and the attributes of the
+    // directory stand.
     assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
     assert_eq!(
         read(&harness, &["shelves", "wobbly", "books", "1", "title"]).await,
         "Book 1"
     );
-    assert_eq!(change().await, due);
+    assert_eq!(change().await, listed);
     assert_eq!(log(&harness).await.len(), calls);
 
-    // The check waits for the end of the window: the attributes of the
-    // directory move once more then, and the listing that they bring
-    // continues the answer from the token of its kept part, with what it
-    // asks, and its last part publishes both parts.
+    // After the second of the Retry-After of the upstream, the next
+    // operation in the same sync continues the answer from the token of its
+    // kept part, with what it asks, and its last part publishes both parts:
+    // the attributes of the directory move with them.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
-    let waited = change().await;
-    assert!(waited != due && waited != listed);
     assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "3"]);
+    assert_ne!(change().await, listed);
     assert_eq!(
         read(&harness, &["shelves", "wobbly", "books", "1", "title"]).await,
         "Book 1 v1"
@@ -272,17 +268,17 @@ async fn a_check_that_fails_for_now_serves_the_projection_and_the_next_check_wai
     assert_eq!(log(&harness).await.len(), calls);
 
     // After the wait the listing continues the first answer.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
 }
 
 /// The change of the attributes of a fed directory, which makes a filesystem
-/// list it again: it stands within the deadline of the feed of its listing,
-/// moves once past it, at a lookup and at a getattr alike, without a call of
-/// the provider's feed, stands over the listing that asks the feed, and moves
-/// with a change of the listing alone.
+/// list it again, moves with a change of its listing alone: outside a sync
+/// it stands without a call of the provider's feed; in a sync the getattr
+/// of the directory asks its feed once, and the change stands over facts
+/// that stand and moves with a listing that changes.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_attributes_of_a_listed_fed_directory_change_once_past_the_deadline_of_its_feed() {
+async fn the_attributes_of_a_listed_fed_directory_change_with_its_listing_alone() {
     let harness = make_initialized_runtime(CONFIG);
     let segments = ["shelves", "oak", "books"];
     assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
@@ -307,18 +303,10 @@ async fn the_attributes_of_a_listed_fed_directory_change_once_past_the_deadline_
         assert_eq!(stat().await, listed);
         harness.namespace.lookup(books.clone(), "1").await.unwrap();
     }
+    assert_eq!(log(&harness).await.len(), calls, "outside a sync");
 
-    tokio::time::sleep(PAST_DEADLINE).await;
-    let due = stat().await;
-    assert_ne!(due, listed);
-    assert_eq!(looked_up().await, due);
-    assert_eq!(
-        log(&harness).await.len(),
-        calls,
-        "no attribute asks the feed"
-    );
-
-    // The listing asks the feed, whose facts stand: no attribute moves.
+    // In a sync the getattr asks the feed once, whose facts stand: no
+    // attribute moves, and the listing asks nothing more.
     let title = path(&harness, &["shelves", "oak", "books", "1", "title"]).await;
     let unchanged = harness
         .namespace
@@ -326,23 +314,25 @@ async fn the_attributes_of_a_listed_fed_directory_change_once_past_the_deadline_
         .await
         .unwrap()
         .change;
-    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
+    harness.begin_sync();
+    assert_eq!(stat().await, listed);
     assert_eq!(log(&harness).await.len(), calls + 1);
-    assert_eq!(stat().await, due);
-    assert_eq!(looked_up().await, due);
+    assert_eq!(looked_up().await, listed);
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
+    assert_eq!(stat().await, listed);
+    assert_eq!(log(&harness).await.len(), calls + 1);
     assert_eq!(
         harness.namespace.getattr(title).await.unwrap().change,
         unchanged
     );
 
-    // Past the next deadline the attributes move again, and a listing that
-    // changes moves them once more.
+    // In the next sync a listing that changes moves them.
     read(&harness, &["hello", "shelf-change"]).await;
-    tokio::time::sleep(PAST_DEADLINE).await;
-    let again = stat().await;
-    assert_ne!(again, due);
+    harness.begin_sync();
+    let changed = stat().await;
+    assert_ne!(changed, listed);
     assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "3"]);
-    assert_ne!(stat().await, again);
+    assert_eq!(stat().await, changed);
 }
 
 /// A getattr of a file past its deadline reads nothing, and a read gives the
@@ -364,7 +354,7 @@ async fn a_read_gives_the_bytes_of_the_size_that_the_attributes_told() {
     assert_eq!(told, 13);
 
     // Past the deadline no getattr reads the file.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     for _ in 0..3 {
         assert_eq!(size().await, told);
     }
@@ -415,7 +405,7 @@ async fn an_answer_that_writes_a_file_as_it_was_changes_nothing_for_a_filesystem
             .is_err()
     );
     let segments = ["shelves", "flaky", "books", "1", "title"];
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(read(&harness, &segments).await, "Book 1 (own)");
     let title = path(&harness, &segments).await;
     let change = harness
@@ -428,7 +418,7 @@ async fn an_answer_that_writes_a_file_as_it_was_changes_nothing_for_a_filesystem
     let mut events = harness.namespace.subscribe();
 
     // The own feed of the book answers again, with the same title.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(read(&harness, &segments).await, "Book 1 (own)");
     assert_eq!(log(&harness).await.len(), calls + 1);
     assert_eq!(
@@ -456,7 +446,7 @@ async fn a_part_that_declines_the_kept_parts_of_its_answer_publishes_alone() {
     let segments = ["shelves", "fickle", "books"];
     assert_eq!(names(&harness, &segments).await.unwrap(), ["1", "2"]);
     read(&harness, &["hello", "shelf-change"]).await;
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
 
     // The first part of the later answer, which the host keeps, renames
     // book 1 and adds book 3; the last part declines it and removes book 2.
@@ -497,7 +487,7 @@ async fn an_unlisted_own_feed_is_asked_past_its_deadline_for_its_paths() {
         ["1"]
     );
     assert_eq!(read(&harness, &text).await, "Note 2");
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(read(&harness, &text).await, "Note 2");
     let log = log(&harness).await;
     // The lookup of the anchor of the note on the way to its text, a
@@ -519,7 +509,7 @@ async fn a_read_that_continues_a_fed_file_gives_the_version_that_it_began() {
     );
     let title = path(&harness, &segments).await;
     read(&harness, &["hello", "shelf-change"]).await;
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let rest = harness.namespace.read(title, 4, 64).await.unwrap();
     assert_eq!(rest.bytes, b" 1");
     assert!(rest.eof);
@@ -547,8 +537,8 @@ async fn a_feed_reads_the_names_and_the_count_of_a_listing_with_its_completeness
     support::read(&harness, "/test/hello/shelf-change")
         .await
         .unwrap();
-    tokio::time::sleep(PAST_DEADLINE).await;
-    for (shelf, until) in [("oak", "None"), ("dated", "Some(4102444800)")] {
+    harness.begin_sync();
+    for (shelf, unsettled) in [("oak", false), ("dated", true)] {
         assert_eq!(
             support::names(&harness, &format!("/test/shelves/{shelf}/books"))
                 .await
@@ -565,7 +555,7 @@ async fn a_feed_reads_the_names_and_the_count_of_a_listing_with_its_completeness
             support::read(&harness, &format!("/test/shelves/{shelf}/listed"))
                 .await
                 .unwrap(),
-            format!("names true {until}, count 2 true {until}")
+            format!("names true {unsettled}, count 2 true {unsettled}")
         );
     }
 }
@@ -584,8 +574,8 @@ async fn a_feed_reads_a_fed_file_by_its_ranges_and_a_record_whole_within_its_byt
     support::read(&harness, "/test/hello/shelf-change")
         .await
         .unwrap();
-    tokio::time::sleep(PAST_DEADLINE).await;
-    for (shelf, until) in [("oak", "None"), ("dated", "Some(4102444800)")] {
+    harness.begin_sync();
+    for (shelf, unsettled) in [("oak", false), ("dated", true)] {
         support::names(&harness, &format!("/test/shelves/{shelf}/books"))
             .await
             .unwrap();
@@ -594,7 +584,7 @@ async fn a_feed_reads_a_fed_file_by_its_ranges_and_a_record_whole_within_its_byt
                 .await
                 .unwrap(),
             format!(
-                "150000 bytes in 3 ranges, same, until {until}; \
+                "150000 bytes in 3 ranges, same, unsettled {unsettled}; \
                  as a record: TooLarge; title Some(\"Book 1\")"
             )
         );
@@ -679,7 +669,7 @@ async fn the_faces_of_an_object_render_from_the_canonical_bytes_of_a_feed_withou
 
     // Past the deadline of a loaded object, the bytes of the feed stand, and
     // an answer of the feed that writes none leaves the faces as they were.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     faces(0).await;
     faces(0).await;
     support::names(harness, "/test/shelves/oak/prints")
@@ -691,7 +681,7 @@ async fn the_faces_of_an_object_render_from_the_canonical_bytes_of_a_feed_withou
     support::read(harness, "/test/hello/shelf-change")
         .await
         .unwrap();
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(
         support::names(harness, "/test/shelves/oak/prints")
             .await
@@ -704,4 +694,22 @@ async fn the_faces_of_an_object_render_from_the_canonical_bytes_of_a_feed_withou
         written,
         "other bytes of the same length change the attributes of a face"
     );
+}
+
+/// A sync of a mount begins by the mount table with the number after the
+/// last one, ends by its number alone, and is of a mount that the table
+/// serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_of_a_mount_begins_and_ends_by_its_number() {
+    let harness = make_initialized_runtime(CONFIG);
+    let first = harness.registry.begin_sync("test").unwrap();
+    let second = harness.registry.begin_sync("test").unwrap();
+    assert_eq!(second, first + 1, "a begin ends the sync in progress");
+    assert!(harness.registry.end_sync("test", first).is_err());
+    harness.registry.end_sync("test", second).unwrap();
+    assert!(harness.registry.end_sync("test", second).is_err());
+    assert!(matches!(
+        harness.registry.begin_sync("none"),
+        Err(omnifs_engine::SyncError::UnknownMount(_))
+    ));
 }

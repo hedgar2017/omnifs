@@ -2019,12 +2019,12 @@ fn entry_names(page: &omnifs_engine::DirPage) -> Vec<&str> {
 }
 
 /// A page of `actions/runs/` with the `ETag` of its answer serves from cache
-/// within its deadline, three seconds without an interval of its upstream, and
-/// is asked for again with `If-None-Match` only after it; `304` keeps it, a
+/// outside a sync, and is asked for again with `If-None-Match` in a sync;
+/// `304` keeps it, a
 /// rate limit is the error of the listing, and a read in the window of the
 /// rate limit takes the cached entries without a request.
 #[tokio::test(flavor = "multi_thread")]
-async fn github_action_runs_page_is_asked_again_with_its_etag_after_its_deadline() {
+async fn github_action_runs_page_is_asked_again_with_its_etag_in_a_sync() {
     let harness = github_harness();
     let runs = resolve_namespace(
         harness.namespace.as_ref(),
@@ -2059,9 +2059,9 @@ async fn github_action_runs_page_is_asked_again_with_its_etag_after_its_deadline
 
     let (cached, requests) = answering(&harness, readdir(), []).await;
     assert_eq!(entry_names(&cached.unwrap()), ["123"]);
-    assert!(requests.is_empty(), "the page serves within its deadline");
+    assert!(requests.is_empty(), "the page serves outside a sync");
 
-    tokio::time::sleep(std::time::Duration::from_millis(3_300)).await;
+    harness.begin_sync();
     let (kept, requests) = answering(&harness, readdir(), [fetched(not_modified())]).await;
     assert_eq!(entry_names(&kept.unwrap()), ["123"]);
     assert_eq!(
@@ -2069,7 +2069,7 @@ async fn github_action_runs_page_is_asked_again_with_its_etag_after_its_deadline
         Some(r#""runs-1""#)
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(3_300)).await;
+    harness.begin_sync();
     let (limited, _) = answering(
         &harness,
         readdir(),
@@ -2177,11 +2177,15 @@ async fn github_notifications_are_asked_again_only_after_their_poll_interval() {
     );
 
     let (_, requests) = answering(&harness, readdir(), []).await;
+    assert!(requests.is_empty(), "the page serves outside a sync");
+    harness.begin_sync();
+    let (_, requests) = answering(&harness, readdir(), []).await;
     assert!(
         requests.is_empty(),
-        "the page serves within its poll interval"
+        "in a sync, the page serves within the poll interval that GitHub stated"
     );
 
+    // The second of `X-Poll-Interval`, which GitHub states, by the clock.
     tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
     let (kept, requests) = answering(
         &harness,
@@ -2201,12 +2205,12 @@ async fn github_notifications_are_asked_again_only_after_their_poll_interval() {
     );
 
     let (_, requests) = answering(&harness, readdir(), []).await;
-    assert!(requests.is_empty(), "304 renews the deadline of the page");
+    assert!(requests.is_empty(), "the page is asked once in a sync");
 }
 
 /// Pull request 7 by its number, which its own feed asks GitHub GraphQL for
 /// before the first full listing of the repository, and again once the feed
-/// is past its deadline.
+/// is due in a sync.
 fn pull_seven() -> HttpResponse {
     HttpResponse {
         status: 200,
@@ -2223,11 +2227,10 @@ fn pull_seven() -> HttpResponse {
 }
 
 /// The page of the folder `folder` of pull request 7, `body` from `url` with
-/// the `ETag` `"page-1"`, has `names`. It serves from cache within its
-/// deadline, three seconds without an interval of its upstream, and is asked
-/// for again with `If-None-Match` only after it, once the feed of the pull
-/// request has asked for its row again; `304` keeps it.
-async fn pull_page_is_asked_again_with_its_etag_after_its_deadline(
+/// the `ETag` `"page-1"`, has `names`. It serves from cache outside a sync,
+/// and is asked for again with `If-None-Match` in a sync, once the feed of
+/// the pull request has asked for its row again; `304` keeps it.
+async fn pull_page_is_asked_again_with_its_etag_in_a_sync(
     folder: &str,
     url: &str,
     body: &[u8],
@@ -2269,9 +2272,9 @@ async fn pull_page_is_asked_again_with_its_etag_after_its_deadline(
 
     let (cached, requests) = answering(&harness, readdir(), []).await;
     assert_eq!(entry_names(&cached.unwrap()), names);
-    assert!(requests.is_empty(), "the page serves within its deadline");
+    assert!(requests.is_empty(), "the page serves outside a sync");
 
-    tokio::time::sleep(std::time::Duration::from_millis(3_300)).await;
+    harness.begin_sync();
     let (kept, requests) = answering(
         &harness,
         readdir(),
@@ -2291,8 +2294,8 @@ async fn pull_page_is_asked_again_with_its_etag_after_its_deadline(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn github_pr_files_page_is_asked_again_with_its_etag_after_its_deadline() {
-    pull_page_is_asked_again_with_its_etag_after_its_deadline(
+async fn github_pr_files_page_is_asked_again_with_its_etag_in_a_sync() {
+    pull_page_is_asked_again_with_its_etag_in_a_sync(
         "files",
         "files?per_page=100&page=1",
         br#"[{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"changes":2}]"#,
@@ -2302,8 +2305,8 @@ async fn github_pr_files_page_is_asked_again_with_its_etag_after_its_deadline() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn github_pr_reviews_page_is_asked_again_with_its_etag_after_its_deadline() {
-    pull_page_is_asked_again_with_its_etag_after_its_deadline(
+async fn github_pr_reviews_page_is_asked_again_with_its_etag_in_a_sync() {
+    pull_page_is_asked_again_with_its_etag_in_a_sync(
         "reviews",
         "reviews?per_page=100&page=1",
         br#"[{"id":80,"state":"APPROVED","body":"ok","user":{"login":"reviewer"}}]"#,
@@ -2313,8 +2316,8 @@ async fn github_pr_reviews_page_is_asked_again_with_its_etag_after_its_deadline(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn github_pr_review_comments_page_is_asked_again_with_its_etag_after_its_deadline() {
-    pull_page_is_asked_again_with_its_etag_after_its_deadline(
+async fn github_pr_review_comments_page_is_asked_again_with_its_etag_in_a_sync() {
+    pull_page_is_asked_again_with_its_etag_in_a_sync(
         "reviews/80/comments",
         "reviews/80/comments?per_page=100&page=1",
         br#"[{"id":99,"body":"nit","path":"src/lib.rs","diff_hunk":"@@ -1 +1 @@","user":{"login":"reviewer"}}]"#,

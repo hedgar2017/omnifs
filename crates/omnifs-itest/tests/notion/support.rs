@@ -1,7 +1,5 @@
 //! Notion provider route-test helpers.
 
-use std::time::Duration;
-
 use omnifs_core::path::Path;
 use omnifs_engine::{Namespace, NsError};
 use omnifs_itest::support::{Answer, Request};
@@ -10,9 +8,6 @@ use omnifs_wit::host::types::{
     CalloutError, CalloutResult, ErrorKind, Header, HttpRequest, HttpResponse,
 };
 use serde_json::{Value, json};
-
-/// Past the deadline of a feed, `DYNAMIC_TTL_MILLIS` after its last answer.
-pub const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
 
 /// The `last_edited_time` of a fixture, by the minute as Notion gives it.
 pub const EDITED: &str = "2026-11-21T10:00:00.000Z";

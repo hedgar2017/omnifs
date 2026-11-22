@@ -341,7 +341,7 @@ impl EngineNamespace {
         };
         if runtime.rate_limited_until().is_some()
             || !resources
-                .view_expired(rel, crate::clock::now_millis())
+                .view_expired(rel)
                 .map_err(|error| TreeError::internal(error.to_string()))?
         {
             return Ok(Some(tree_ref));
@@ -384,7 +384,7 @@ fn cached_child_node(
     let offline = entry.runtime().is_none();
     let expired = !offline
         && resources
-            .view_expired(rel, crate::clock::now_millis())
+            .view_expired(rel)
             .map_err(|error| TreeError::internal(error.to_string()))?;
     if let Some(node) = cached_lookup_node(resources, mount, rel, offline, expired)? {
         return Ok(Some(node));

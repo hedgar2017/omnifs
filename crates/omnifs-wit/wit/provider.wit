@@ -384,31 +384,31 @@ interface types {
     }
 
     /// The names of a listing of the projection, whether the listing is
-    /// complete, and the time, in milliseconds of the Unix epoch, after which
-    /// it counts as lacking for the start of an answer, from the part that
-    /// wrote it.
+    /// complete, and whether the part that wrote it said that it is
+    /// unsettled: it counts as lacking for the start of an answer in the
+    /// next sync of the mount.
     record listing-names {
         names: list<string>,
         complete: bool,
-        until: option<u64>,
+        unsettled: bool,
     }
 
     /// The count of the names of a listing of the projection, whether the
-    /// listing is complete, and the time after which it counts as lacking,
-    /// as of `listing-names`.
+    /// listing is complete, and whether it is unsettled, as of
+    /// `listing-names`.
     record listing-count {
         count: u64,
         complete: bool,
-        until: option<u64>,
+        unsettled: bool,
     }
 
     /// A range of the body of a fed file of the projection: at most the
-    /// bytes asked for, the length of the whole body, and the time after
-    /// which the file counts as lacking, as of `listing-names`.
+    /// bytes asked for, the length of the whole body, and whether the file
+    /// is unsettled, as of `listing-names`.
     record file-range {
         bytes: list<u8>,
         length: u64,
-        until: option<u64>,
+        unsettled: bool,
     }
 
     /// Opened ranged-read handle. `open-file` is only valid for files
@@ -552,12 +552,12 @@ interface namespace {
     close-file: func(handle: file-handle);
     /// One call of the feed of the object anchored at `path`, from `token`.
     /// `start` is the path of the operation that starts the answer. Beside
-    /// the answer and its effects, the call returns the time, in
-    /// milliseconds of the Unix epoch, after which the facts of its part
-    /// count as lacking for the start of an answer, while the projection
-    /// serves them.
+    /// the answer and its effects, the call returns whether the facts of its
+    /// part under the anchor of its object are unsettled: they count as
+    /// lacking for the start of an answer in the next sync of the mount,
+    /// while the projection serves them.
     feed: async func(id: correlation-id, path: string, token: option<feed-token>, start: option<feed-start>)
-        -> tuple<result<feed-answer, provider-error>, effects, option<u64>>;
+        -> tuple<result<feed-answer, provider-error>, effects, bool>;
 }
 
 // === Host import ===

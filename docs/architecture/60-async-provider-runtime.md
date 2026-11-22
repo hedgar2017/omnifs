@@ -28,7 +28,7 @@ Current responsibilities:
 
 ## WIT boundary
 
-The provider world imports `omnifs:provider/callouts` and exports async namespace and notify methods. Namespace and notify operations return operation-specific typed result/effects tuples directly.
+The provider world imports `omnifs:provider/callouts` and exports async namespace methods. Namespace operations return operation-specific typed result/effects tuples directly.
 
 Not part of the provider protocol:
 
@@ -66,7 +66,7 @@ Lifecycle and close-file calls use Wasmtime's concurrent typed function path. `i
 
 ## SDK runtime
 
-The SDK owns no custom executor. The provider macro emits async namespace and notify exports that await router dispatch directly. `Cx` contains no yielded or delivered callout queues.
+The SDK owns no custom executor. The provider macro emits async namespace exports that await router dispatch directly. `Cx` contains no yielded or delivered callout queues.
 
 `CalloutFuture` has two states:
 

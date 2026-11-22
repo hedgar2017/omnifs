@@ -3,7 +3,6 @@
 
 use crate::Runtime;
 use crate::cache::FeedState;
-use crate::clock::now_millis;
 use crate::ops::feed::{FeedClaim, FeedStart};
 use crate::ops::namespace::{ListOutcome, PageRequest};
 use crate::view::LookupPayload;
@@ -94,7 +93,7 @@ pub(crate) async fn answer_claims(
         let kept = state.as_ref().is_some_and(|state| state.kept > 0);
         let first_answer = state.as_ref().is_none_or(|state| !state.ended);
         let below_own = claim.own && path.segments().count() > claim.object.path.segments().count();
-        let due = past_deadline(state.as_ref());
+        let due = is_due(runtime, state.as_ref());
         let start = if claim.full_listings && !first_answer {
             (due && asks_listing(runtime, path, fact, at, claim)?)
                 .then(|| claim.starts.then(|| FeedStart::Due(under_anchor.clone())))
@@ -118,24 +117,15 @@ pub(crate) async fn answer_claims(
         // have nothing to be served.
         let served =
             !lacks && state.is_some() && !(first_answer && matches!(fact, FedFact::Listing));
-        if let Some((remaining, error)) = runtime.window() {
-            if !served {
-                return Err(crate::EngineError::ProviderError(wit_types::ProviderError {
-                    retry_after: Some(
-                        u32::try_from(remaining.as_secs().max(1)).unwrap_or(u32::MAX),
-                    ),
-                    ..error
-                })
-                .into());
+        // Within the window that the upstream states, and after a failure
+        // of the feed in this sync, the operation is served without a
+        // request, or has the error: the feed is asked again after the
+        // instant of the window, else in the next sync.
+        if let Some(error) = held_back(runtime, claim)? {
+            if served {
+                break answering;
             }
-            // The check waits for the end of the window.
-            let now = now_millis();
-            let wait = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-            runtime
-                .resources
-                .defer_feed(claim.object.id.as_bytes(), now.saturating_add(wait), now)
-                .map_err(internal)?;
-            break answering;
+            return Err(crate::EngineError::ProviderError(error).into());
         }
         match runtime
             .feed(
@@ -149,21 +139,17 @@ pub(crate) async fn answer_claims(
             Ok(true) => break answering,
             Ok(false) => {},
             Err(crate::EngineError::ProviderError(error)) if failed_for_now(&error) => {
-                // The next check waits, as after a rate limit, so that no
-                // retry of an operation is a request of its own.
-                if error.kind != wit_types::ErrorKind::RateLimited {
-                    runtime.note_failed_for_now(&error);
-                }
+                // No retry of an operation is a request of its own: the feed
+                // is asked again in the next sync.
+                fail_for_now(runtime, claim, &error)?;
                 if !served {
                     return Err(crate::EngineError::ProviderError(error).into());
                 }
+                break answering;
             },
             Err(error) => return Err(error.into()),
         }
     };
-    if matches!(fact, FedFact::Listing) {
-        record_listing(runtime, path, at, &claims[answering])?;
-    }
     answer_own(runtime, path, fact, &claims[answering + 1..]).await?;
     Ok((at.clone(), under_anchor.clone()))
 }
@@ -200,18 +186,16 @@ async fn answer_own(
             .map_err(|error| TreeError::internal(error.to_string()))?;
         if matches!(fact, FedFact::Lookup)
             && under_anchor == claim.object.path
-            && !past_deadline(state.as_ref())
+            && state.is_some()
+            && !is_due(runtime, state.as_ref())
         {
             return Ok(());
         }
-        // The fact lacks: within the window of the mount the operation has
-        // the error of the window, without a request.
-        if let Some((remaining, error)) = runtime.window() {
-            return Err(crate::EngineError::ProviderError(wit_types::ProviderError {
-                retry_after: Some(u32::try_from(remaining.as_secs().max(1)).unwrap_or(u32::MAX)),
-                ..error
-            })
-            .into());
+        // The fact lacks: within the window of the mount, and after a failure
+        // of the feed in this sync, the operation has the error without a
+        // request.
+        if let Some(error) = held_back(runtime, claim)? {
+            return Err(crate::EngineError::ProviderError(error).into());
         }
         let at = fact_path(path, fact, &claim.object.path, &under_anchor).clone();
         let start = FeedStart::Lacks(under_anchor);
@@ -222,34 +206,12 @@ async fn answer_own(
             Ok(true) => return Ok(()),
             Ok(false) => {},
             Err(crate::EngineError::ProviderError(error)) if failed_for_now(&error) => {
-                if error.kind != wit_types::ErrorKind::RateLimited {
-                    runtime.note_failed_for_now(&error);
-                }
+                fail_for_now(runtime, claim, &error)?;
                 return Err(crate::EngineError::ProviderError(error).into());
             },
             Err(error) => return Err(error.into()),
         }
     }
-}
-
-/// Record the feed of `claim`, the answering feed of the listing of `path`
-/// with its fact at `at`, as the feed of that listing. A feed of full
-/// listings after the end of its first answer answers the listing of its
-/// anchor alone.
-fn record_listing(runtime: &Runtime, path: &Path, at: &Path, claim: &FeedClaim) -> Result<()> {
-    let internal = |error: crate::cache::ProjectionError| TreeError::internal(error.to_string());
-    let ended = runtime
-        .resources
-        .feed_state(claim.object.id.as_bytes())
-        .map_err(internal)?
-        .is_some_and(|state| state.ended);
-    if !(claim.full_listings && ended) || under(&claim.object.path, path)? == claim.object.path {
-        runtime
-            .resources
-            .record_listing_feed(at, claim.object.id.as_bytes(), now_millis())
-            .map_err(internal)?;
-    }
-    Ok(())
 }
 
 /// The answering claim among `claims` with their `states`: the innermost own
@@ -279,9 +241,46 @@ fn failed_for_now(error: &wit_types::ProviderError) -> bool {
     )
 }
 
-/// Whether a feed has no state or is past its deadline.
-fn past_deadline(state: Option<&FeedState>) -> bool {
-    state.is_none_or(|state| state.deadline <= now_millis())
+/// Whether a feed of `state` is due: a feed whose first answer has not
+/// ended, whose facts the projection lacks, whenever an operation asks; and
+/// in a sync, once, a feed that was not asked in it. Outside a sync, a feed
+/// whose first answer ended is served from the projection.
+fn is_due(runtime: &Runtime, state: Option<&FeedState>) -> bool {
+    let sync = runtime.resources.sync_now();
+    state.is_none_or(|state| !state.ended || (sync != 0 && state.due_in <= sync))
+}
+
+/// The error that holds an answer of the feed of `claim` back: the one of
+/// the window that the upstream of the mount stated, while it is open, or
+/// the one of a check of the feed that failed in this sync.
+fn held_back(runtime: &Runtime, claim: &FeedClaim) -> Result<Option<wit_types::ProviderError>> {
+    if let Some((remaining, error)) = runtime.window() {
+        return Ok(Some(wit_types::ProviderError {
+            retry_after: Some(u32::try_from(remaining.as_secs().max(1)).unwrap_or(u32::MAX)),
+            ..error
+        }));
+    }
+    Ok(runtime.failure(claim.object.id.as_bytes())?)
+}
+
+/// Record the check of the feed of `claim` that failed for now with `error`:
+/// it is due in the next sync, and not asked again in this one.
+fn fail_for_now(
+    runtime: &Runtime,
+    claim: &FeedClaim,
+    error: &wit_types::ProviderError,
+) -> Result<()> {
+    // A rate limit with the time of its upstream holds the feed back for
+    // that time alone, by the window of the mount: after it, the feed is
+    // asked once more in the same sync.
+    if error.kind == wit_types::ErrorKind::RateLimited && error.retry_after.is_some() {
+        return Ok(());
+    }
+    runtime.record_failure(claim.object.id.as_bytes(), error)?;
+    runtime
+        .resources
+        .defer_feed(claim.object.id.as_bytes())
+        .map_err(|error| TreeError::internal(error.to_string()))
 }
 
 /// Whether the operation on `path`, with its fact at `at`, asks the feed of
@@ -342,6 +341,22 @@ fn incomplete_listing(runtime: &Runtime, at: &Path, anchor: &Path) -> Result<Opt
 
 /// The claims of the feeds that answer for `listing`, none for a listing that
 /// no feed answers.
+/// In a sync, have the feed of the fed directory `path` answer once, as its
+/// listing would: the attributes of a directory that a sync reads carry what
+/// the sync changed, so that a client that keeps a listing by the change of
+/// its directory lists it again after a change alone. Outside a sync, and
+/// for a feed already asked in the sync, nothing is asked.
+pub(crate) async fn answer_in_sync(runtime: &Runtime, path: &Path) -> Result<()> {
+    if runtime.resources.sync_now() == 0 {
+        return Ok(());
+    }
+    let Some(claims) = listing_claims(runtime, path).await? else {
+        return Ok(());
+    };
+    answer_claims(runtime, path, FedFact::Listing, &claims).await?;
+    Ok(())
+}
+
 async fn listing_claims(runtime: &Runtime, listing: &Path) -> Result<Option<Vec<FeedClaim>>> {
     let request = PageRequest {
         cursor: None,
@@ -391,7 +406,7 @@ fn has_fact(runtime: &Runtime, path: &Path, fact: FedFact) -> Result<bool> {
     let until = resources
         .fed_until(path)
         .map_err(|error| TreeError::internal(error.to_string()))?;
-    Ok(found && until.is_none_or(|until| now_millis() < until))
+    Ok(found && !crate::cache::expired(until, resources.sync_now()))
 }
 
 /// Whether the projection has a complete listing of `path`.
@@ -426,8 +441,7 @@ mod tests {
             Some(FeedState {
                 version: 1,
                 ended,
-                deadline: 0,
-                passed: 0,
+                due_in: 1,
                 token: [0; 32],
                 kept: 0,
                 unlisted,

@@ -242,6 +242,38 @@ impl MountTable {
         self.entries.get(mount)
     }
 
+    /// Begin a sync of `mount`: each feed, fact, and page of its projection
+    /// is due once in it, and an operation of the mount outside a sync is
+    /// served from the projection. Returns the number of the sync.
+    pub fn begin_sync(&self, mount: &str) -> Result<u64, SyncError> {
+        self.sync_runtime(mount)?
+            .begin_sync()
+            .map_err(|error| SyncError::Engine {
+                mount: mount.to_owned(),
+                message: error.to_string(),
+            })
+    }
+
+    /// End the sync `sync` of `mount`.
+    pub fn end_sync(&self, mount: &str, sync: u64) -> Result<(), SyncError> {
+        self.sync_runtime(mount)?
+            .end_sync(sync)
+            .map_err(|error| SyncError::Engine {
+                mount: mount.to_owned(),
+                message: error.to_string(),
+            })
+    }
+
+    fn sync_runtime(&self, mount: &str) -> Result<Arc<Runtime>, SyncError> {
+        let entry = self
+            .entries
+            .get(mount)
+            .ok_or_else(|| SyncError::UnknownMount(mount.to_owned()))?;
+        entry
+            .runtime()
+            .ok_or_else(|| SyncError::Unavailable(mount.to_owned()))
+    }
+
     pub fn mounts(&self) -> Vec<String> {
         self.entries.keys().cloned().collect()
     }
@@ -424,6 +456,17 @@ pub enum RegistryError {
     ConfigError(String),
     #[error("runtime error: {0}")]
     RuntimeError(String),
+}
+
+/// The error of a begin or an end of a sync of a mount.
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    #[error("no mount {0} is served")]
+    UnknownMount(String),
+    #[error("mount {0} has no provider to sync")]
+    Unavailable(String),
+    #[error("sync of mount {mount}: {message}")]
+    Engine { mount: String, message: String },
 }
 
 #[cfg(test)]

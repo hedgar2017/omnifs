@@ -13,9 +13,8 @@ use omnifs_itest::RuntimeHarness;
 use omnifs_itest::support::{Answer, answering, lookup, names, read, served};
 use serde_json::{Value, json};
 use support::{
-    EDITED, PAST_DEADLINE, VERSION, answer, comment, data_source, expect, expect_search, failure,
-    id, list, markdown, network, notion_harness, notion_id, ok, page, rate_limited, read_at, row,
-    trashed,
+    EDITED, VERSION, answer, comment, data_source, expect, expect_search, failure, id, list,
+    markdown, network, notion_harness, notion_id, ok, page, rate_limited, read_at, row, trashed,
 };
 
 /// Earlier `last_edited_time`s than `EDITED`, from the latest.
@@ -27,10 +26,6 @@ const EDITED_LATER: &str = "2026-11-21T10:05:00.000Z";
 
 /// A `Date` five seconds before the end of the minute of `EDITED`.
 const WITHIN: &str = "Sat, 21 Nov 2026 10:00:55 GMT";
-
-/// Past the end of the minute of `EDITED` after an answer of the `Date`
-/// `WITHIN`, and past the deadline of a feed.
-const PAST_WITHIN: Duration = Duration::from_millis(5_200);
 
 /// The `Date` of the end of the minute of `EDITED`.
 const AT_END: &str = "Sat, 21 Nov 2026 10:01:00 GMT";
@@ -184,7 +179,7 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
 
     // The answer of another page to the request of a page that the listing
     // lacks is the error of the read, and the next read asks for it again.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "/notion/pages"),
@@ -308,7 +303,7 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
     expect(&requests[0], "GET", &markdown_of(&id(2)), None);
     expect(&requests[1], "GET", &markdown_of(&id(21)), None);
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "/notion/pages"),
@@ -377,7 +372,7 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
 
     // A later full listing whose cursor Notion refuses begins again from its
     // first request.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "/notion/databases"),
@@ -428,8 +423,7 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
     expect(&requests[0], "GET", &markdown_of(&id(2)), None);
 }
 
-/// The changes at a read of a file of a page past the deadline of the last
-/// answer: the `page_size` of the count of the latest time and one more, then
+/// The changes at a read of a file of a page in a sync: the `page_size` of the count of the latest time and one more, then
 /// `100` by `next_cursor`, until an older result, from their next request
 /// after the window of a failure, whose read is served; a page with another
 /// `last_edited_time` takes its `body.md` and its `comments/` once more at
@@ -532,7 +526,10 @@ async fn the_changes_take_the_search_until_an_older_result() {
     expect(&requests[0], "GET", &markdown_of(&id(2)), None);
     expect(&requests[1], "GET", &markdown_of(&id(21)), None);
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    // The second of the `Retry-After` of Notion, by the clock, and then the
+    // next sync.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    harness.begin_sync();
     let (stopped, requests) = answering(
         &harness,
         read(&harness, &format!("/notion/pages/{}/title", id(2))),
@@ -553,7 +550,7 @@ async fn the_changes_take_the_search_until_an_older_result() {
     assert_eq!(stopped.unwrap(), "Two");
     expect_search(&requests[0], 3, None);
     expect_search(&requests[1], 100, Some("cursor-2"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (title, requests) = answering(
         &harness,
         read(&harness, &format!("/notion/pages/{}/title", id(2))),
@@ -608,7 +605,7 @@ async fn the_changes_take_the_search_until_an_older_result() {
     expect(&requests[0], "GET", &markdown_of(&id(2)), None);
 
     // The next changes start from the latest time of these, with its count.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (_, requests) = answering(
         &harness,
         read(&harness, &format!("/notion/pages/{}/title", id(2))),
@@ -650,7 +647,7 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
         "First"
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (title, requests) = answering(
         &harness,
         read(&harness, &format!("{}/title", at(1))),
@@ -702,7 +699,7 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
     }
 
     // After the end of the first full listing the changes answer for it.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (title, requests) = answering(
         &harness,
         read(&harness, &format!("{}/title", at(1))),
@@ -729,7 +726,7 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
             .unwrap()
             .is_missing()
     );
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (found, requests) = answering(
         &harness,
         lookup(&harness, &at(5)),
@@ -845,22 +842,20 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
 
     // A content of a `Date` at the end of the minute of its
     // `last_edited_time`, which Notion may have read within that minute, is
-    // taken once more at the next read, here the read after its lookup.
+    // unsettled: it serves until the next sync, which takes it once more,
+    // as the content of the `Date` `WITHIN` below.
     let (body, requests) = answering(
         &harness,
         read(&harness, &format!("/notion/pages/{}/body.md", id(6))),
-        vec![
-            answer(200, &[("Date", AT_END)], &markdown("Page 6 body", &[])),
-            ok(&markdown("Page 6 body, edited", &[])),
-        ],
+        vec![answer(
+            200,
+            &[("Date", AT_END)],
+            &markdown("Page 6 body", &[]),
+        )],
     )
     .await;
-    // The read gives the version whose size its lookup told, and the next
-    // one the version that the read took.
     assert_eq!(body.unwrap(), "Page 6 body");
-    for request in &requests {
-        expect(request, "GET", &markdown_of(&id(6)), None);
-    }
+    expect(&requests[0], "GET", &markdown_of(&id(6)), None);
     assert_eq!(
         served(
             &harness,
@@ -868,16 +863,7 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
         )
         .await
         .unwrap(),
-        "Page 6 body, edited"
-    );
-    assert_eq!(
-        served(
-            &harness,
-            read(&harness, &format!("/notion/pages/{}/body.md", id(6)))
-        )
-        .await
-        .unwrap(),
-        "Page 6 body, edited"
+        "Page 6 body"
     );
 
     let (body, requests) = answering(
@@ -901,7 +887,7 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
         .unwrap(),
         "Page 4 body"
     );
-    tokio::time::sleep(PAST_WITHIN).await;
+    harness.begin_sync();
     let (body, requests) = answering(
         &harness,
         read(&harness, &format!("/notion/pages/{}/body.md", id(4))),
@@ -1151,7 +1137,7 @@ async fn the_comments_take_their_answers_by_next_cursor() {
         assert_eq!(comments.unwrap(), names_of(&[41]), "{n}");
         expect(&requests[0], "GET", &comments_of(n, None), None);
     }
-    tokio::time::sleep(PAST_WITHIN).await;
+    harness.begin_sync();
     // The comments that Notion restricts once more are no comments.
     let (comments, requests) = answering(
         &harness,
@@ -1321,7 +1307,7 @@ async fn a_refused_cursor_begins_again_from_the_first_request() {
     let mut changed = vec![page(5, "Five", EDITED)];
     changed.extend(all.clone());
     for after in ["the changes", "a full listing"] {
-        tokio::time::sleep(PAST_DEADLINE).await;
+        harness.begin_sync();
         let (stopped, requests) = answering(
             &harness,
             read(&harness, &title),
@@ -1399,7 +1385,7 @@ async fn a_refused_cursor_begins_again_from_the_first_request() {
     }
     // Changes that stop for now serve their read, and a read of `pages/`
     // after them takes a full listing anew, without their kept parts.
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (served_title, requests) = answering(
         &harness,
         read(&harness, &title),
@@ -1420,7 +1406,7 @@ async fn a_refused_cursor_begins_again_from_the_first_request() {
     assert_eq!(served_title.unwrap(), "One");
     expect_search(&requests[0], 4, None);
     expect_search(&requests[1], 100, Some("cursor-4"));
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/notion/pages"),
@@ -1442,7 +1428,7 @@ async fn the_first_request_of_the_changes_has_a_page_size_from_1_to_100() {
         .map(|n| page(n, "Page", EDITED))
         .collect::<Vec<_>>();
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (found, requests) = answering(
         &harness,
         lookup(&harness, &format!("/notion/pages/{}", id(1))),
@@ -1456,7 +1442,7 @@ async fn the_first_request_of_the_changes_has_a_page_size_from_1_to_100() {
     expect_search(&requests[0], 1, None);
     expect_search(&requests[1], 100, Some("cursor-2"));
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     let (title, requests) = answering(
         &harness,
         read(&harness, &format!("/notion/pages/{}/title", id(1))),

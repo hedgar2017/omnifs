@@ -32,7 +32,7 @@ impl<S> CompiledRouter<S> {
         path: &str,
         token: Option<String>,
         start: Option<wit_types::FeedStart>,
-    ) -> Result<(wit_types::FeedAnswer, Effects, Option<u64>)> {
+    ) -> Result<(wit_types::FeedAnswer, Effects, bool)> {
         let abs =
             Path::parse(path).map_err(|error| ProviderError::invalid_input(error.to_string()))?;
         let shape = self.shape();
@@ -92,11 +92,11 @@ impl<S> CompiledRouter<S> {
             )?);
         }
         match answer {
-            Feed::Unchanged => Ok((wit_types::FeedAnswer::Unchanged, effects, None)),
+            Feed::Unchanged => Ok((wit_types::FeedAnswer::Unchanged, effects, false)),
             Feed::Part(part) => {
                 let anchors = shape.facet_anchors(&effects)?;
-                let (part, until) = wit_part(part, anchors)?;
-                Ok((wit_types::FeedAnswer::Part(part), effects, until))
+                let (part, unsettled) = wit_part(part, anchors);
+                Ok((wit_types::FeedAnswer::Part(part), effects, unsettled))
             },
             Feed::Restart { token, error } => Ok((
                 wit_types::FeedAnswer::Restart(wit_types::FeedRestart {
@@ -104,7 +104,7 @@ impl<S> CompiledRouter<S> {
                     error: error.into(),
                 }),
                 Effects::new(),
-                None,
+                false,
             )),
         }
     }
@@ -209,16 +209,16 @@ fn leading_segments(path: &Path, count: usize) -> Result<Path> {
 }
 
 /// `part` for the host, with the facet `anchors` that its effects write, and
-/// its `until` in milliseconds.
+/// whether its facts are unsettled.
 fn wit_part(
     part: crate::feed::FeedPart,
     anchors: Vec<wit_types::FacetAnchor>,
-) -> Result<(wit_types::FeedPart, Option<u64>)> {
+) -> (wit_types::FeedPart, bool) {
     let crate::feed::FeedPartParts {
         token,
         more,
         inner,
-        until,
+        unsettled,
         unlisted,
         anew,
     } = part.into_parts();
@@ -229,16 +229,7 @@ fn wit_part(
             token: state.token,
         })
         .collect();
-    let until = until
-        .map(|until| {
-            let since = until
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| ProviderError::internal(error.to_string()))?;
-            u64::try_from(since.as_millis())
-                .map_err(|error| ProviderError::internal(error.to_string()))
-        })
-        .transpose()?;
-    Ok((
+    (
         wit_types::FeedPart {
             token,
             more,
@@ -247,6 +238,6 @@ fn wit_part(
             unlisted,
             anew,
         },
-        until,
-    ))
+        unsettled,
+    )
 }

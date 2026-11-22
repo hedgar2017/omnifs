@@ -401,7 +401,7 @@ impl Shelf {
     /// in `seen` the names the host listed for `books` and in `listed` the
     /// completeness, the time and the count of that listing in a part, and removes
     /// book 2 in its last part. The last part of the first answer writes
-    /// `catalog`, with a time for the `dated` shelf, and the part of a change
+    /// `catalog`, unsettled for the `dated` shelf, and the part of a change
     /// records in `catalog-read` what it reads of the fed files; the `wobbly`
     /// shelf stops once at a rate limit of a second before that last part.
     fn feed(cx: FeedCx<ShelfKey, State>) -> impl core::future::Future<Output = Result<Feed>> {
@@ -460,7 +460,7 @@ impl Shelf {
                 cx.file(format!("/shelves/{shelf}/catalog"), catalog())?;
                 let part = Feed::part(&ShelfToken::Version(version))?;
                 Ok(if shelf == "dated" {
-                    part.until(dated_until())
+                    part.unsettled()
                 } else {
                     part
                 }
@@ -532,11 +532,7 @@ impl Shelf {
             format!("/shelves/{shelf}/listed"),
             format!(
                 "names {} {:?}, count {} {} {:?}",
-                seen.complete,
-                seen.until.map(epoch_seconds),
-                listed.count,
-                listed.complete,
-                listed.until.map(epoch_seconds),
+                seen.complete, seen.unsettled, listed.count, listed.complete, listed.unsettled,
             )
             .into_bytes(),
         )
@@ -560,7 +556,7 @@ impl Shelf {
             let ended = range.bytes.len() < CATALOG_RANGE as usize;
             read.extend(range.bytes);
             if ended {
-                break (range.length, range.until);
+                break (range.length, range.unsettled);
             }
         };
         let record = cx.read_record(&at, CATALOG_RANGE).map_or_else(
@@ -571,9 +567,8 @@ impl Shelf {
             .read_record(format!("/shelves/{shelf}/books/1/title"), CATALOG_RANGE)?
             .map(|record| String::from_utf8_lossy(&record.bytes).into_owned());
         Ok(format!(
-            "{length} bytes in {ranges} ranges, {}, until {:?}; as a record: {record}; title {title:?}",
+            "{length} bytes in {ranges} ranges, {}, unsettled {until}; as a record: {record}; title {title:?}",
             if read == catalog() { "same" } else { "other" },
-            until.map(epoch_seconds),
         ))
     }
 }
@@ -584,18 +579,6 @@ const CATALOG_RANGE: u32 = 64 * 1024;
 /// The catalog of a shelf: a fed file of more than two ranges.
 fn catalog() -> Vec<u8> {
     (0..150_000_u32).map(|at| (at % 251) as u8).collect()
-}
-
-/// The time until which the listing of the books of the `dated` shelf
-/// counts: the first second of the year 2100.
-fn dated_until() -> std::time::SystemTime {
-    std::time::SystemTime::UNIX_EPOCH + Duration::from_hours(1_139_568)
-}
-
-/// The seconds of `time` after the Unix epoch.
-fn epoch_seconds(time: std::time::SystemTime) -> u64 {
-    time.duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
 }
 
 /// The token of the feed of a shelf: the page of its first answer that a
@@ -742,7 +725,7 @@ struct DeskKey {
 
 /// A note of a desk, of an own feed: it joins the listing of the notes of
 /// its desk, says that the desk does not list it for a note other than 1,
-/// and gives its facts a time of a second on the `dated` desk.
+/// and says that its facts are unsettled on the `dated` desk.
 #[omnifs_sdk::object(kind = "test.note", key = NoteKey, no_load)]
 struct Note;
 
@@ -770,7 +753,7 @@ impl Note {
         )?;
         let mut part = Feed::part(&token.map_or(1, |token| token + 1))?;
         if desk == "dated" {
-            part = part.until(std::time::SystemTime::now() + Duration::from_secs(1));
+            part = part.unsettled();
         }
         if *note != 1 {
             part = part.unlisted();
@@ -1353,7 +1336,7 @@ async fn validated(cx: DirCx<State>) -> Result<DirListing> {
     cx.state_mut(|state| state.validated_calls += 1);
     let validator = |token: &str| PageValidator {
         token: VersionToken::from(token),
-        interval: Some(1),
+        interval: None,
     };
     let page = |names: &[&str], token: &str| {
         let entries = names.iter().map(|name| Entry::dir(*name));

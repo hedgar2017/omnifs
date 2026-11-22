@@ -142,7 +142,7 @@ type FeedTransport = std::result::Result<
     (
         std::result::Result<wit_types::FeedAnswer, wit_types::ProviderError>,
         wit_types::Effects,
-        Option<u64>,
+        bool,
     ),
     EngineError,
 >;

@@ -704,13 +704,29 @@ pub struct DirentsPage {
 }
 
 /// The validator of a cached page: the token the provider gave it, the
-/// seconds of the interval of its upstream, and the deadline after which the
-/// page is asked for again with the token.
+/// seconds that its upstream asks between two requests of it, the first sync
+/// in which the page is asked for again with the token, and the time of the
+/// answer that gave the token.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PageValidator {
     pub token: String,
     pub interval: Option<u32>,
-    pub deadline: u64,
+    pub due_in: u64,
+    pub answered_at: u64,
+}
+
+impl PageValidator {
+    /// Whether the page is asked for again in the sync `sync` at the wall
+    /// time `now`: once in a sync after the one of its answer, and not
+    /// before the interval that its upstream asks for after its answer.
+    #[must_use]
+    pub fn due(&self, sync: u64, now: u64) -> bool {
+        sync != 0
+            && self.due_in <= sync
+            && self.interval.is_none_or(|interval| {
+                now >= self.answered_at.saturating_add(u64::from(interval) * 1000)
+            })
+    }
 }
 
 impl DirentsPayload {

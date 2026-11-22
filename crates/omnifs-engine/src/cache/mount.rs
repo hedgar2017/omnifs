@@ -156,14 +156,14 @@ pub(crate) enum DirentsMutation {
         exhaustive: bool,
     },
     /// An `unchanged` answer for the cached page of `cursor`: the page keeps
-    /// its entries, takes `interval` when the answer carries one, and gets a
-    /// new deadline from its interval.
+    /// its entries, takes `interval` when the answer carries one, and is due
+    /// in the sync `due_in`.
     RenewPage {
         path: Path,
         cursor: Option<CachedCursor>,
         token: String,
         interval: Option<u32>,
-        now_millis: u64,
+        due_in: u64,
     },
 }
 
@@ -298,8 +298,9 @@ impl ProjectionTransition {
 }
 
 /// The state of a feed, without its token, which is apart and which only a
-/// call of the feed reads: whether its first answer ended, and its deadline,
-/// after which an operation that does not start it asks it for an answer.
+/// call of the feed reads: whether its first answer ended, and the sync
+/// after which it is due ([`MountResources::sync_now`]): a feed is due once
+/// in each sync.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FeedState {
     /// The count of the changes of the token of the feed and of its kept
@@ -307,9 +308,8 @@ pub(crate) struct FeedState {
     /// from.
     pub version: u64,
     pub ended: bool,
-    pub deadline: u64,
-    /// The last deadline of the feed that a check of it came past.
-    pub passed: u64,
+    /// The number of the first sync in which the feed is due.
+    pub due_in: u64,
     /// The BLAKE3 digest of the token.
     pub token: [u8; 32],
     /// The count of the kept parts of a later answer.
@@ -318,26 +318,6 @@ pub(crate) struct FeedState {
     /// has its object, and no part of a feed above it brought its state
     /// since: the feed answers for its paths itself.
     pub unlisted: bool,
-}
-
-impl FeedState {
-    /// The part of the change of the attributes of a directory that moves
-    /// with the deadline of this feed, the feed of its listing: the deadline
-    /// once `now` is past it, and until then the last deadline that a check
-    /// came past. A check renews the deadline, so the change moves once for
-    /// each deadline and never back.
-    pub(crate) fn change(&self, now: u64) -> u64 {
-        if self.deadline <= now {
-            self.deadline
-        } else {
-            self.passed
-        }
-    }
-
-    /// The last deadline that a check at `now` came past.
-    fn passed_at(previous: Option<&Self>, now: u64) -> u64 {
-        previous.map_or(0, |previous| previous.change(now))
-    }
 }
 
 /// The facts of one call of a feed in a publication: its records before
@@ -357,7 +337,7 @@ pub(crate) struct CallSpan {
 /// restart, a part and a restart dropping its kept parts, and the inner
 /// states the part brought, each a token whose first answer ended, which
 /// drops the kept parts of its feed unless it is the token that the feed
-/// has. Every state but that of a restart gets `deadline`. `anchors` pairs
+/// has. Every state but that of a restart gets `due_in`. `anchors` pairs
 /// each anchor of another facet that the part writes with the anchor of the
 /// claim of its object, and `until` gives each path of the facts of the part
 /// with a time after which they count as lacking for the start of an answer.
@@ -380,9 +360,11 @@ pub(crate) struct FeedWrite {
     pub answer: FeedAnswerWrite,
     pub inner: Vec<(Vec<u8>, String)>,
     pub anchors: Vec<(Path, Path)>,
-    pub deadline: u64,
-    /// The time of the answer.
-    pub now: u64,
+    /// The number of the first sync in which the feeds of the answer are
+    /// due: the sync after the last one begun.
+    pub due_in: u64,
+    /// The sync from which each path of the facts of the part counts as
+    /// lacking, for the facts of a part that its feed says are unsettled.
     pub until: HashMap<Path, u64>,
 }
 
@@ -406,12 +388,12 @@ impl FeedWrite {
 /// What one answer of a feed does to its state.
 #[derive(Debug, Clone)]
 pub(crate) enum FeedAnswerWrite {
-    /// The facts of the feed stand: its state renews its deadline.
+    /// The facts of the feed stand: its state is due in the next sync.
     Unchanged,
     /// A part, with the token after it.
     Part(FeedPartWrite),
     /// A restart: the feed takes the token, with the end of its first answer
-    /// and its deadline as they were.
+    /// and the sync in which it is due as they were.
     Restart(String),
 }
 
@@ -692,6 +674,8 @@ pub struct MountResources {
     /// The calls of feeds in flight, by the count of [`Self::sequence`] at
     /// their begin.
     feed_calls: Mutex<BTreeMap<u64, usize>>,
+    /// The number of the sync of the mount in progress, none outside one.
+    sync: Mutex<Option<u64>>,
     publication: PublicationReservations,
     fence: Arc<ResourceFence>,
     generation: ResourceGeneration,
@@ -838,6 +822,7 @@ impl MountResources {
             operation_blobs: dashmap::DashMap::new(),
             next_blob_id: AtomicU64::new(1),
             feed_calls: Mutex::new(BTreeMap::new()),
+            sync: Mutex::new(None),
             publication: PublicationReservations {
                 active: Mutex::new(HashSet::new()),
                 wake: Notify::new(),
@@ -1306,21 +1291,7 @@ impl MountResources {
                 }
             }
             if let Some(feed) = &feed {
-                let state = write_feed_states(tx, facts, feed)?;
-                // The feed of a listing that it writes first is the feed of
-                // that listing, from the change of the feed as it is, so
-                // that the change of the directory begins where it was.
-                for mutation in &dirents {
-                    let key = listing_feed_key(mutation.path());
-                    if tx.get(facts, &key)?.is_none() {
-                        tx.insert(
-                            facts,
-                            &key,
-                            postcard::to_allocvec(&(&feed.object, state.change(feed.now)))
-                                .map_err(ProjectionError::from)?,
-                        );
-                    }
-                }
+                write_feed_states(tx, facts, feed)?;
             }
             if let Some(kept) = &kept {
                 keep_part(tx, facts, kept)?;
@@ -1404,7 +1375,7 @@ impl MountResources {
                 && !prepared_records.iter().any(|record| record.path == *lacked)
                 && !dirents.iter().any(|mutation| mutation.path() == lacked)
                 && let Some(mark) = read_fed_mark(tx, facts, lacked)?
-                && mark.until.is_some_and(|until| until <= feed.now)
+                && expired(mark.until, self.sync_now())
             {
                 // The feed let the fact that the operation lacked stand.
                 put_fed_mark(tx, facts, lacked, None)?;
@@ -1731,89 +1702,78 @@ impl MountResources {
         Ok(())
     }
 
-    /// The feed of the listing of the fed directory `path`, by the id of its
-    /// object: the feed that wrote the listing first, until a listing asks
-    /// another ([`Self::record_listing_feed`]).
-    pub(crate) fn listing_feed(&self, path: &Path) -> Result<Option<Vec<u8>>, ProjectionError> {
-        Ok(self.listing_row(path)?.map(|(feed, _)| feed))
-    }
-
-    fn listing_row(&self, path: &Path) -> Result<Option<(Vec<u8>, u64)>, ProjectionError> {
+    /// The number of the last sync begun of the mount, `0` before its first.
+    pub(crate) fn sync_count(&self) -> Result<u64, ProjectionError> {
         self.projection
-            .get(&listing_feed_key(path))?
-            .map(|bytes| postcard::from_bytes(&bytes).map_err(ProjectionError::from))
-            .transpose()
+            .get(SYNC_KEY)?
+            .map_or(Ok(0), |bytes| Ok(postcard::from_bytes(&bytes)?))
     }
 
-    /// Record `feed`, the feed that a listing of the fed directory `path`
-    /// asks, as the feed of that listing in place of another, with the
-    /// change of the directory as it is at `now`.
-    pub(crate) fn record_listing_feed(
-        &self,
-        path: &Path,
-        feed: &[u8],
-        now: u64,
-    ) -> Result<(), ProjectionError> {
-        if self.listing_feed(path)?.as_deref() == Some(feed)
-            || *self.fence.active.lock() != self.generation.0
-        {
-            return Ok(());
+    /// The number of the sync of the mount in progress, `0` outside a sync:
+    /// the facts that a fact, a feed, or a page is due after are compared
+    /// to it, so that nothing is due outside a sync, and each is due once in
+    /// a sync.
+    pub(crate) fn sync_now(&self) -> u64 {
+        self.sync.lock().unwrap_or(0)
+    }
+
+    /// The number of the first sync in which a fact written now is due: the
+    /// sync after the last one begun.
+    pub(crate) fn due_in(&self) -> Result<u64, ProjectionError> {
+        self.sync_count()?
+            .checked_add(1)
+            .ok_or_else(|| ProjectionError::Inconsistent("the count of the syncs overflows".into()))
+    }
+
+    /// Begin a sync of the mount, which ends the sync in progress: its
+    /// number is the one after the last one begun, durable over a restart,
+    /// and each feed, fact, and page written before it is due once in it.
+    pub(crate) fn begin_sync(&self) -> Result<u64, ProjectionError> {
+        if *self.fence.active.lock() != self.generation.0 {
+            return Err(ProjectionError::Inconsistent(
+                "a sync begins on the serving projection alone".into(),
+            ));
         }
         let _coherence = self.coherence.lock();
-        // The record leaves with the facts of the directory.
-        if !self.is_fed(path)? {
-            return Ok(());
-        }
-        let change = self.feed_state(feed)?.map_or(0, |state| state.change(now));
-        let base = change.wrapping_sub(self.listing_due(path, now)?);
-        let key = listing_feed_key(path);
-        let value = postcard::to_allocvec(&(feed, base))?;
-        // The record is of the listing that asks: the next one records it
-        // again after a stop before the write reaches the disk.
-        self.projection.transact_unsynced(|tx, facts| {
-            tx.insert(facts, &key, &value);
+        let mut sync = self.sync.lock();
+        let next = self.due_in()?;
+        self.projection.transact(|tx, facts| {
+            tx.insert(
+                facts,
+                SYNC_KEY,
+                postcard::to_allocvec(&next).map_err(ProjectionError::from)?,
+            );
             Ok(())
         })?;
+        *sync = Some(next);
+        Ok(next)
+    }
+
+    /// End the sync `number` of the mount: an operation after it is served
+    /// from the projection. Ending another sync than the one in progress is
+    /// an error.
+    pub(crate) fn end_sync(&self, number: u64) -> Result<(), ProjectionError> {
+        let mut sync = self.sync.lock();
+        if *sync != Some(number) {
+            return Err(ProjectionError::Inconsistent(format!(
+                "sync {number} is not the sync in progress"
+            )));
+        }
+        *sync = None;
         Ok(())
     }
 
-    /// The part of the change of the attributes of the fed directory `path`
-    /// that moves with the deadline of the feed of its listing
-    /// ([`FeedState::change`]), from where it was when the feed became the
-    /// feed of the listing: a filesystem lists a directory again only after
-    /// a change of its attributes, and past that deadline a listing asks the
-    /// feed. `0` for a directory without a listing of a feed.
-    pub(crate) fn listing_due(&self, path: &Path, now: u64) -> Result<u64, ProjectionError> {
-        let Some((feed, base)) = self.listing_row(path)? else {
-            return Ok(0);
-        };
-        Ok(self
-            .feed_state(&feed)?
-            .map_or(0, |state| state.change(now))
-            .wrapping_sub(base))
-    }
-
-    /// Give the feed of the object `id` the `deadline` after a check that
-    /// gave no answer at `now`, at a failure for now or in the rate-limit
-    /// window of the mount: the next check waits for it, and the deadline
-    /// before it is one that a check came past.
-    pub(crate) fn defer_feed(
-        &self,
-        id: &[u8],
-        deadline: u64,
-        now: u64,
-    ) -> Result<(), ProjectionError> {
+    /// Make the feed of the object `id` due in the next sync after a check
+    /// of it that failed in this one: no check of it is repeated in a sync.
+    pub(crate) fn defer_feed(&self, id: &[u8]) -> Result<(), ProjectionError> {
         if *self.fence.active.lock() != self.generation.0 {
             return Ok(());
         }
         let _coherence = self.coherence.lock();
+        let due_in = self.due_in()?;
         self.projection.transact(|tx, facts| {
             if let Some(previous) = read_feed_state(tx, facts, id)? {
-                let state = FeedState {
-                    deadline,
-                    passed: FeedState::passed_at(Some(&previous), now),
-                    ..previous
-                };
+                let state = FeedState { due_in, ..previous };
                 put(
                     tx,
                     facts,
@@ -1862,39 +1822,30 @@ impl MountResources {
             .transpose()
     }
 
-    /// Whether the indexed view leaf has reached its freshness deadline.
-    pub(crate) fn view_expired(
-        &self,
-        path: &Path,
-        now_millis: u64,
-    ) -> Result<bool, ProjectionError> {
+    /// Whether the indexed view leaf is due ([`expired`]).
+    pub(crate) fn view_expired(&self, path: &Path) -> Result<bool, ProjectionError> {
         let Some(bytes) = self.projection.get(&expiry_key(path))? else {
             return Ok(false);
         };
         let expiry: Option<u64> = postcard::from_bytes(&bytes)?;
-        Ok(expiry.is_some_and(|deadline| deadline <= now_millis))
+        Ok(expired(expiry, self.sync_now()))
     }
 
-    /// Expiry-aware view read: returns `None` when the leaf is past its deadline.
+    /// Expiry-aware view read: returns `None` when the leaf is due.
     pub(crate) fn view_get(
         &self,
         path: &Path,
         kind: RecordKind,
         aux: Option<&str>,
-        now_millis: u64,
     ) -> Result<Option<Record>, ProjectionError> {
-        if self.view_expired(path, now_millis)? {
+        if self.view_expired(path)? {
             return Ok(None);
         }
         self.cache_get(path, kind, aux)
     }
 
     /// Live negative for `path`. `None` when absent or expired.
-    pub(crate) fn negative_for_checked(
-        &self,
-        path: &Path,
-        now_millis: u64,
-    ) -> Result<bool, ProjectionError> {
+    pub(crate) fn negative_for_checked(&self, path: &Path) -> Result<bool, ProjectionError> {
         let Some(record) = self.cache_get(path, RecordKind::Lookup, None)? else {
             return Ok(false);
         };
@@ -1908,10 +1859,7 @@ impl MountResources {
             .map(|bytes| postcard::from_bytes::<Option<u64>>(&bytes))
             .transpose()?
             .flatten();
-        if expiry.is_some_and(|deadline| now_millis >= deadline) {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(!expired(expiry, self.sync_now()))
     }
 
     /// The file fact of `path` with `aux`: its version token, its body, and
@@ -2205,12 +2153,16 @@ fn removed_key(sequence: u64) -> Vec<u8> {
     format!("d:{sequence:016x}:").into_bytes()
 }
 
-/// The key of [`MountResources::listing_feed`] of `path`.
-fn listing_feed_key(path: &Path) -> Vec<u8> {
-    let mut key = b"l:".to_vec();
-    key.extend_from_slice(path.as_str().as_bytes());
-    key
+/// Whether the fact with the expiry `expiry` is due in the sync `now`: the
+/// expiry of a fact is the number of the first sync in which it is due, `0`
+/// for a fact due at each operation, and none for a fact that is never due.
+/// Outside a sync, `now` is `0`, and only a fact due at each operation is.
+pub(crate) fn expired(expiry: Option<u64>, now: u64) -> bool {
+    expiry.is_some_and(|due_in| due_in == 0 || (now != 0 && due_in <= now))
 }
+
+/// The key of [`MountResources::sync_count`].
+const SYNC_KEY: &[u8] = b"y:";
 
 /// The key of the anchor of the claim of the object whose anchor of another
 /// facet is `path`.
@@ -2477,12 +2429,10 @@ fn write_feed_states(
     feed: &FeedWrite,
 ) -> Result<FeedState, ProjectionError> {
     let previous = read_feed_state(tx, facts, &feed.object)?;
-    let passed = FeedState::passed_at(previous.as_ref(), feed.now);
     let moved = |token: &str, previous: Option<&FeedState>| FeedState {
         version: previous.map_or(1, |previous| previous.version + 1),
         ended: true,
-        deadline: feed.deadline,
-        passed: FeedState::passed_at(previous, feed.now),
+        due_in: feed.due_in,
         token: *blake3::hash(token.as_bytes()).as_bytes(),
         kept: 0,
         unlisted: false,
@@ -2494,14 +2444,12 @@ fn write_feed_states(
             ..moved(&part.token, previous.as_ref())
         },
         (FeedAnswerWrite::Unchanged, Some(previous)) => FeedState {
-            deadline: feed.deadline,
-            passed,
+            due_in: feed.due_in,
             ..previous.clone()
         },
         (FeedAnswerWrite::Restart(token), Some(previous)) => FeedState {
             ended: previous.ended,
-            deadline: previous.deadline,
-            passed: previous.passed,
+            due_in: previous.due_in,
             unlisted: previous.unlisted,
             ..moved(token, Some(previous))
         },
@@ -2540,8 +2488,7 @@ fn write_feed_states(
         let state = match previous {
             Some(previous) if previous.token == brought.token => FeedState {
                 ended: true,
-                deadline: brought.deadline,
-                passed: brought.passed,
+                due_in: brought.due_in,
                 unlisted: false,
                 ..previous
             },
@@ -2861,7 +2808,6 @@ fn remove_path_facts(
     removals.push(git_key(path));
     removals.push(fed_key(path));
     removals.push(change_key(path));
-    removals.push(listing_feed_key(path));
     removals.push(anchor_key(path));
     Ok(())
 }
@@ -3207,7 +3153,7 @@ fn apply_dirents(
             cursor,
             token,
             interval,
-            now_millis,
+            due_in,
         } => {
             let mut current = read_dirents_fact(tx, facts, path)?.ok_or_else(|| {
                 ProjectionError::Inconsistent("missing revalidated listing".into())
@@ -3224,7 +3170,8 @@ fn apply_dirents(
                 })?;
             validator.token.clone_from(token);
             validator.interval = *interval;
-            validator.deadline = crate::clock::page_deadline(*interval, *now_millis);
+            validator.due_in = *due_in;
+            validator.answered_at = crate::clock::now_millis();
             (path, current)
         },
     };
@@ -3633,11 +3580,16 @@ mod tests {
     fn negative_ttl_replacement_and_object_invalidation_are_durable() {
         let (_dir, _caches, store) = open_store("m");
         let path = p("/missing");
-        publish_negative(&store, &path, Some(OBJ_ID.to_vec()), 10_000);
-        assert!(store.negative_for_checked(&path, 1_000).unwrap());
-        assert!(!store.negative_for_checked(&path, 11_000).unwrap());
-        publish_negative(&store, &path, Some(OBJ_ID.to_vec()), 20_000);
-        assert!(store.negative_for_checked(&path, 1_000).unwrap());
+        // A negative due in the second sync stands outside a sync and in
+        // the first, and is due in the second.
+        publish_negative(&store, &path, Some(OBJ_ID.to_vec()), 2);
+        assert!(store.negative_for_checked(&path).unwrap());
+        store.begin_sync().unwrap();
+        assert!(store.negative_for_checked(&path).unwrap());
+        store.begin_sync().unwrap();
+        assert!(!store.negative_for_checked(&path).unwrap());
+        publish_negative(&store, &path, Some(OBJ_ID.to_vec()), 3);
+        assert!(store.negative_for_checked(&path).unwrap());
         store
             .publish(
                 ProjectionTransition {
@@ -3647,7 +3599,7 @@ mod tests {
                 store.current_epoch(),
             )
             .unwrap();
-        assert!(!store.negative_for_checked(&path, 1_000).unwrap());
+        assert!(!store.negative_for_checked(&path).unwrap());
 
         let parent = p("/dir");
         let child = p("/dir/child");
@@ -3714,7 +3666,7 @@ mod tests {
         publish_negative(&store, &child, Some(OBJ_ID.to_vec()), 30_000);
         let listing = store.dirents_payload(&parent).unwrap().unwrap();
         assert!(listing.entries().next().is_none());
-        assert!(store.negative_for_checked(&child, 1_000).unwrap());
+        assert!(store.negative_for_checked(&child).unwrap());
 
         let invalidated_parent = p("/invalidated");
         let invalidated_child = p("/invalidated/child");
@@ -4015,8 +3967,7 @@ mod tests {
             }),
             inner: Vec::new(),
             anchors: Vec::new(),
-            deadline: 1_000,
-            now: 0,
+            due_in: 1,
             until,
         }
     }
@@ -4242,81 +4193,46 @@ mod tests {
         assert!(store.changed_at(&books).unwrap() > counted);
     }
 
+    /// A feed is due once in each sync, and never outside one: an answer in
+    /// a sync makes it due in the next, and a failed check defers it to the
+    /// next as well.
     #[test]
-    fn the_change_of_a_fed_directory_moves_once_past_each_deadline_of_the_feed_of_its_listing() {
+    fn a_feed_is_due_once_in_each_sync_and_never_outside_one() {
         let (_dir, _caches, store) = open_store("due");
         let books = p("/shelf/books");
-        let answer = |object: &[u8], now: u64, deadline: u64| {
+        let due_in = || store.feed_state(b"feed").unwrap().unwrap().due_in;
+        let answer = |store: &MountResources| {
             let mut unchanged = fed_part("token", HashMap::new());
-            unchanged.object = object.to_vec();
             unchanged.answer = FeedAnswerWrite::Unchanged;
-            unchanged.now = now;
-            unchanged.deadline = deadline;
+            unchanged.due_in = store.due_in().unwrap();
             publish_from_state(
-                &store,
+                store,
                 ProjectionTransition {
                     feed: Some(unchanged),
                     ..ProjectionTransition::default()
                 },
             );
         };
+        let mut first = fed_dir(&books, &["1"], ListingWrite::Complete);
+        first.feed.as_mut().unwrap().due_in = store.due_in().unwrap();
+        publish_from_state(&store, first);
+        assert_eq!((store.sync_now(), due_in()), (0, 1));
 
-        // The feed that writes the listing first is the feed of the listing,
-        // whose change the first listing leaves where it was: a directory
-        // without a listing of a feed has none.
-        assert_eq!(store.listing_due(&books, 5_000).unwrap(), 0);
-        answer_first(&store, &books);
-        assert_eq!(store.listing_feed(&books).unwrap(), Some(b"feed".to_vec()));
-        assert_eq!(store.listing_due(&books, 999).unwrap(), 0);
+        let sync = store.begin_sync().unwrap();
+        assert_eq!((sync, store.sync_now()), (1, 1));
+        assert!(due_in() <= store.sync_now(), "due in the first sync");
+        answer(&store);
+        assert_eq!(due_in(), 2, "not due again in the first sync");
+        store.end_sync(sync).unwrap();
+        assert_eq!(store.sync_now(), 0);
+        assert!(store.end_sync(sync).is_err());
 
-        // The change moves once the deadline passes, and stands over the
-        // answer that renews the deadline, of any operation, and over an
-        // answer within the deadline, until the next deadline passes.
-        let passed = store.listing_due(&books, 1_000).unwrap();
-        assert_ne!(passed, 0);
-        assert_eq!(store.listing_due(&books, 5_000).unwrap(), passed);
-        answer(b"feed", 5_000, 8_000);
-        assert_eq!(store.listing_due(&books, 5_000).unwrap(), passed);
-        answer(b"feed", 6_000, 9_000);
-        assert_eq!(store.listing_due(&books, 8_999).unwrap(), passed);
-        let again = store.listing_due(&books, 9_000).unwrap();
-        assert_ne!(again, passed);
-
-        // A check that gives no answer, in the window of the mount or at a
-        // failure for now, defers the feed: the change stands until the
-        // deadline that it gave passes, and never moves back.
-        store.defer_feed(b"feed", 12_000, 9_500).unwrap();
-        assert_eq!(store.listing_due(&books, 9_500).unwrap(), again);
-        assert_eq!(store.listing_due(&books, 11_999).unwrap(), again);
-        let deferred = store.listing_due(&books, 12_000).unwrap();
-        assert!(deferred != again && deferred != passed);
-
-        // Another feed that a listing asks is the feed of the listing from
-        // the change as it is, and moves it past its own deadline.
-        answer_other(&store);
-        store.record_listing_feed(&books, b"other", 12_500).unwrap();
-        assert_eq!(store.listing_feed(&books).unwrap(), Some(b"other".to_vec()));
-        assert_eq!(store.listing_due(&books, 12_500).unwrap(), deferred);
-        assert_ne!(store.listing_due(&books, 20_000).unwrap(), deferred);
-
-        // The record leaves with the directory.
-        let mut removal = fed_part("token", HashMap::new());
-        removal.answer = FeedAnswerWrite::Unchanged;
-        publish_from_state(
-            &store,
-            ProjectionTransition {
-                removals: vec![books.clone()],
-                feed: Some(removal),
-                ..ProjectionTransition::default()
-            },
-        );
-        assert_eq!(store.listing_feed(&books).unwrap(), None);
-        store.record_listing_feed(&books, b"other", 13_000).unwrap();
-        assert_eq!(store.listing_feed(&books).unwrap(), None);
+        let sync = store.begin_sync().unwrap();
+        assert!(due_in() <= sync);
+        store.defer_feed(b"feed").unwrap();
+        assert_eq!(due_in(), sync + 1);
     }
 
-    /// The change of the attributes of a path is of the projection: it
-    /// stands over a restart of the daemon, which opens the projection again.
     #[test]
     fn the_change_of_the_attributes_of_a_path_stands_over_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -4332,42 +4248,26 @@ mod tests {
         let (caches, store) = open();
         publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Complete));
         publish_from_state(&store, fed_dir(&books, &["1", "2"], ListingWrite::Complete));
+        let sync = store.begin_sync().unwrap();
         let before = (
             store.changed_at(&books).unwrap(),
-            store.listing_due(&books, 500).unwrap(),
-            store.listing_due(&books, 1_000).unwrap(),
+            store.sync_count().unwrap(),
         );
-        assert!(before.0 > 0 && before.1 != before.2);
+        assert!(before.0 > 0 && before.1 == sync);
         drop((store, caches));
 
+        // The sync in progress ends with the process: the next sync after
+        // it is a new one.
         let (_caches, store) = open();
         assert_eq!(
             (
                 store.changed_at(&books).unwrap(),
-                store.listing_due(&books, 500).unwrap(),
-                store.listing_due(&books, 1_000).unwrap(),
+                store.sync_count().unwrap()
             ),
             before
         );
-    }
-
-    fn answer_first(store: &MountResources, books: &Path) {
-        publish_from_state(store, fed_dir(books, &["1"], ListingWrite::Complete));
-    }
-
-    /// The first answer of the feed `other`, with the deadline `20_000`.
-    fn answer_other(store: &MountResources) {
-        let mut other = fed_part("token", HashMap::new());
-        other.object = b"other".to_vec();
-        other.now = 12_400;
-        other.deadline = 20_000;
-        publish_from_state(
-            store,
-            ProjectionTransition {
-                feed: Some(other),
-                ..ProjectionTransition::default()
-            },
-        );
+        assert_eq!(store.sync_now(), 0);
+        assert_eq!(store.begin_sync().unwrap(), sync + 1);
     }
 
     #[test]
@@ -4381,38 +4281,45 @@ mod tests {
             aux: None,
             fact: FactPayload::Lookup(LookupPayload::Positive(EntryMeta::directory())),
         });
-        own.feed.as_mut().unwrap().until = HashMap::from([(title.clone(), 5)]);
+        own.feed.as_mut().unwrap().until = HashMap::from([(title.clone(), 2)]);
         publish_from_state(&store, own);
-        assert_eq!(store.fed_until(&title).unwrap(), Some(5));
+        assert_eq!(store.fed_until(&title).unwrap(), Some(2));
 
         // An answer that the operation that lacked the title started, and
-        // that ends with the facts as they were, lets the title stand.
-        let unchanged = |lacked: Option<&Path>, now: u64| {
+        // that ends with the facts as they were in a sync in which the
+        // title lacks, lets the title stand.
+        let unchanged = |lacked: Option<&Path>| {
             let mut feed = fed_part("token", HashMap::new());
             feed.object = b"book".to_vec();
             feed.answer = FeedAnswerWrite::Unchanged;
-            feed.now = now;
             feed.lacked = lacked.cloned();
             ProjectionTransition {
                 feed: Some(feed),
                 ..ProjectionTransition::default()
             }
         };
-        publish_from_state(&store, unchanged(None, 9));
-        assert_eq!(store.fed_until(&title).unwrap(), Some(5));
-        publish_from_state(&store, unchanged(Some(&title), 4));
-        assert_eq!(store.fed_until(&title).unwrap(), Some(5));
-        publish_from_state(&store, unchanged(Some(&title), 9));
+        publish_from_state(&store, unchanged(Some(&title)));
+        assert_eq!(store.fed_until(&title).unwrap(), Some(2), "outside a sync");
+        store.begin_sync().unwrap();
+        publish_from_state(&store, unchanged(Some(&title)));
+        assert_eq!(
+            store.fed_until(&title).unwrap(),
+            Some(2),
+            "in the first sync"
+        );
+        store.begin_sync().unwrap();
+        publish_from_state(&store, unchanged(None));
+        assert_eq!(store.fed_until(&title).unwrap(), Some(2));
+        publish_from_state(&store, unchanged(Some(&title)));
         assert_eq!(store.fed_until(&title).unwrap(), None);
 
-        // An answer that writes the fact again gives it its own time.
+        // An answer that writes the fact again gives it its own sync.
         let mut written = fed_file(b"book", &title, "again");
         let feed = written.feed.as_mut().unwrap();
-        feed.until = HashMap::from([(title.clone(), 9)]);
+        feed.until = HashMap::from([(title.clone(), 3)]);
         feed.lacked = Some(title.clone());
-        feed.now = 9;
         publish_from_state(&store, written);
-        assert_eq!(store.fed_until(&title).unwrap(), Some(9));
+        assert_eq!(store.fed_until(&title).unwrap(), Some(3));
 
         // A part that says that no inventory above its feed has its object
         // makes its feed unlisted, until a feed above it brings its state.
@@ -4459,7 +4366,7 @@ mod tests {
         assert!(store.is_fed(&p("/shelf/books/2")).unwrap());
 
         // A restart takes its token with the end of the first answer and the
-        // deadline as they were, and drops the kept parts.
+        // sync in which it is due as they were, and drops the kept parts.
         publish_from_state(&store, kept_part(b"feed", "kept"));
         assert_eq!(store.feed_state(b"feed").unwrap().unwrap().kept, 1);
         assert_eq!(
@@ -4468,7 +4375,7 @@ mod tests {
         );
         let mut restart = fed_part("restart", HashMap::new());
         restart.answer = FeedAnswerWrite::Restart("restart".into());
-        restart.deadline = 2_000;
+        restart.due_in = 2;
         publish_from_state(
             &store,
             ProjectionTransition {
@@ -4479,7 +4386,7 @@ mod tests {
         assert!(store.kept_parts(b"feed").unwrap().is_empty());
         assert_eq!(store.kept_token(b"feed").unwrap(), None);
         let state = store.feed_state(b"feed").unwrap().unwrap();
-        assert_eq!((state.ended, state.deadline, state.kept), (true, 1_000, 0));
+        assert_eq!((state.ended, state.due_in, state.kept), (true, 1, 0));
         assert_eq!(store.feed_token(b"feed").unwrap(), Some("restart".into()));
 
         // An inner state of another token drops the kept parts of its feed.
@@ -4690,7 +4597,7 @@ mod tests {
         assert_eq!(listing.entries().count(), 2);
         assert!(store.is_fed(&books).unwrap());
         let state = store.feed_state(b"feed").unwrap().unwrap();
-        assert_eq!((state.ended, state.deadline), (true, 1_000));
+        assert_eq!((state.ended, state.due_in), (true, 1));
         assert_eq!(store.feed_token(b"feed").unwrap(), Some("token".into()));
 
         // A removal retracts the child and its subtree and leaves the

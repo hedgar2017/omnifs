@@ -28,7 +28,7 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod error;
-mod feed;
+pub(crate) mod feed;
 mod handle;
 mod invalidate;
 mod list;

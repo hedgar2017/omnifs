@@ -1,7 +1,5 @@
 //! Slack provider route-test helpers.
 
-use std::time::Duration;
-
 use omnifs_core::path::Path;
 use omnifs_engine::{DirCursor, Namespace, NsError};
 use omnifs_itest::support::decoded;
@@ -11,9 +9,6 @@ use omnifs_wit::host::types::{
     CalloutError, CalloutResult, ErrorKind, Header, HttpRequest, HttpResponse,
 };
 use serde_json::{Value, json};
-
-/// Past the deadline of a feed, `DYNAMIC_TTL_MILLIS` after its last answer.
-pub const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
 
 pub fn slack_harness() -> RuntimeHarness {
     make_initialized_runtime(

@@ -1,7 +1,5 @@
 //! Namespace-visible pagination behavior.
 
-use std::time::Duration;
-
 use omnifs_core::path::Path;
 use omnifs_engine::{DirCursor, Namespace};
 use omnifs_itest::{RuntimeHarness, make_initialized_runtime};
@@ -148,15 +146,15 @@ async fn pagination_preserves_siblings_and_non_paged_directories_have_no_next() 
 }
 
 /// A listing of pages with validators serves from cache within the deadline of
-/// its pages and asks for each page again with its validator after it: an
-/// `unchanged` page stands with a new deadline, a changed first page replaces
+/// its pages and asks for each page again with its validator in a sync: an
+/// `unchanged` page stands to the next sync, a changed first page replaces
 /// its entries and keeps the later page while its cursor stays, and drops it
 /// for another cursor. A listing of pages without a validator keeps the
-/// freshness it has, served from cache past those deadlines.
+/// freshness it has, served from cache in those syncs.
 #[tokio::test(flavor = "multi_thread")]
-async fn pages_with_validators_are_asked_again_after_their_deadline() {
-    // The pages of `hello/validated` have an interval of one second.
-    const PAST_DEADLINE: Duration = Duration::from_millis(1_200);
+async fn pages_with_validators_are_asked_again_once_in_each_sync() {
+    // The pages of `hello/validated` state no interval: each sync asks for
+    // them again.
 
     let harness = make_initialized_runtime(CONFIG);
     let feed = feed(&harness).await;
@@ -166,49 +164,47 @@ async fn pages_with_validators_are_asked_again_after_their_deadline() {
     assert_eq!(validated_calls(&harness).await, 2);
 
     assert_eq!(walk(&harness, &validated).await, ["v-0", "v-1", "v-2"]);
-    assert_eq!(
-        validated_calls(&harness).await,
-        2,
-        "served within the deadline"
-    );
+    assert_eq!(validated_calls(&harness).await, 2, "served outside a sync");
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(walk(&harness, &validated).await, ["v-0", "v-1", "v-2"]);
     assert_eq!(
         validated_calls(&harness).await,
         4,
-        "each page past its deadline is asked for with its validator"
+        "each page is asked for with its validator once in a sync"
     );
     assert_eq!(walk(&harness, &validated).await, ["v-0", "v-1", "v-2"]);
     assert_eq!(
         validated_calls(&harness).await,
         4,
-        "an unchanged page stands with a new deadline"
+        "an unchanged page stands to the next sync"
     );
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    let sync = harness.begin_sync();
     assert_eq!(walk(&harness, &validated).await, ["v-0", "v-1b", "v-2"]);
     assert_eq!(validated_calls(&harness).await, 6);
 
+    // Outside a sync the listings are served from the projection, without
+    // the provider.
+    harness.end_sync(sync);
     harness.runtime.shutdown().unwrap();
     assert_eq!(walk(&harness, &feed).await, feed_names);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_changed_page_without_its_next_cursor_drops_the_later_pages() {
-    // The pages of `hello/validated` have an interval of one second; its
-    // third revalidation answers a complete first page.
-    const PAST_DEADLINE: Duration = Duration::from_millis(1_200);
+    // The third revalidation of the pages of `hello/validated` answers a
+    // complete first page.
 
     let harness = make_initialized_runtime(CONFIG);
     let validated = hello_child(&harness, "validated").await;
     assert_eq!(walk(&harness, &validated).await, ["v-0", "v-1", "v-2"]);
     for names in [["v-0", "v-1", "v-2"], ["v-0", "v-1b", "v-2"]] {
-        tokio::time::sleep(PAST_DEADLINE).await;
+        harness.begin_sync();
         assert_eq!(walk(&harness, &validated).await, names);
     }
 
-    tokio::time::sleep(PAST_DEADLINE).await;
+    harness.begin_sync();
     assert_eq!(walk(&harness, &validated).await, ["v-0"]);
     assert_eq!(
         validated_calls(&harness).await,
