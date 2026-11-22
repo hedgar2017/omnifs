@@ -689,9 +689,22 @@ async fn graphql<T: DeserializeOwned>(
     decode_json(repository.get())
 }
 
-/// The selection of an item: the canonical bytes of `Issue` and
-/// `PullRequest`.
+/// The selection of an issue: the canonical bytes of `Issue`.
 const ITEM: &str = "number title body state author { login } updatedAt comments { totalCount }";
+
+/// The selection of a pull request: the canonical bytes of `PullRequest`,
+/// with the commits of its base and of its head, which version its diff.
+const PULL: &str = "number title body state author { login } updatedAt comments { totalCount } baseRefOid headRefOid";
+
+impl ItemKind {
+    /// The selection of a node of the kind.
+    const fn selection(self) -> &'static str {
+        match self {
+            Self::Issues => ITEM,
+            Self::Pulls => PULL,
+        }
+    }
+}
 
 /// The selection of the identity of a node.
 const IDENTITY: &str = "number repository { nameWithOwner }";
@@ -774,9 +787,9 @@ async fn by_numbers(cx: &Cx, repo: &RepoId, numbers: &[u64]) -> Result<Vec<(u64,
         .map(|number| {
             format!(
                 "t{number}: issueOrPullRequest(number: {number}) {{ __typename {} }} \
-                 n{number}: issueOrPullRequest(number: {number}) {{ {} }}",
+                 n{number}: issueOrPullRequest(number: {number}) \
+                 {{ ... on Issue {{ {ITEM} }} ... on PullRequest {{ {PULL} }} }}",
                 on_items(IDENTITY),
-                on_items(ITEM)
             )
         })
         .collect::<Vec<_>>()
@@ -811,17 +824,18 @@ async fn by_numbers(cx: &Cx, repo: &RepoId, numbers: &[u64]) -> Result<Vec<(u64,
 }
 
 /// The item of `kind` with `number` as its object loads it: its node.
-pub(crate) async fn load_item(
+pub(crate) async fn load_item<T: DeserializeOwned>(
     cx: &Cx,
     repo: &RepoId,
     kind: ItemKind,
     number: u64,
-) -> Result<Load<ItemData>> {
+) -> Result<Load<T>> {
     let mut items = by_numbers(cx, repo, &[number]).await?;
     Ok(match items.pop() {
-        Some((_, ByNumber::Found(found, node))) if found == kind => {
-            Load::fresh(node.data, Canonical::new(node.bytes.get().as_bytes(), None))
-        },
+        Some((_, ByNumber::Found(found, node))) if found == kind => Load::fresh(
+            decode_json(node.bytes.get())?,
+            Canonical::new(node.bytes.get().as_bytes(), None),
+        ),
         _ => Load::NotFound,
     })
 }
@@ -1261,7 +1275,7 @@ impl RepoFeed<'_> {
         for kind in kinds {
             let alias = rows_alias(*kind);
             declared.push(format!(", ${alias}: String"));
-            selection.push(page_selection(alias, *kind, alias, ITEM, true));
+            selection.push(page_selection(alias, *kind, alias, kind.selection(), true));
             variables[alias] = self.cursor(*kind).clone().into();
         }
         let mut answer: Aliased = graphql(

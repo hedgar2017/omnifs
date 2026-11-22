@@ -163,15 +163,7 @@ impl Issue {
         _since: Option<Validator>,
     ) -> Result<Load<Self>> {
         let repo = RepoId::new(&key.owner, &key.repo);
-        Ok(
-            match crate::feed::load_item(cx, &repo, ItemKind::Issues, key.number).await? {
-                Load::Fresh {
-                    value, canonical, ..
-                } => Load::fresh(Self(value), canonical),
-                Load::Unchanged => Load::Unchanged,
-                Load::NotFound => Load::NotFound,
-            },
-        )
+        crate::feed::load_item(cx, &repo, ItemKind::Issues, key.number).await
     }
 }
 
@@ -182,15 +174,7 @@ impl PullRequest {
         _since: Option<Validator>,
     ) -> Result<Load<Self>> {
         let repo = RepoId::new(&key.owner, &key.repo);
-        Ok(
-            match crate::feed::load_item(cx, &repo, ItemKind::Pulls, key.number).await? {
-                Load::Fresh {
-                    value, canonical, ..
-                } => Load::fresh(Self(value), canonical),
-                Load::Unchanged => Load::Unchanged,
-                Load::NotFound => Load::NotFound,
-            },
-        )
+        crate::feed::load_item(cx, &repo, ItemKind::Pulls, key.number).await
     }
 }
 
@@ -318,7 +302,9 @@ impl Owner {
     ///
     /// A page with a cursor or a validator asks the repos of their owner
     /// kind. The first page without them asks the repos of an organization,
-    /// which answer `404` for a user, and then the repos of that user.
+    /// which answer `404` for a user, and then the repos of that user: the
+    /// listing of the owner loads its profile in the same operation, whose
+    /// type the projection holds only once the operation ends.
     pub(crate) async fn repos(
         key: OwnerKey,
         cx: ListCx<RepoCursor>,
@@ -586,17 +572,24 @@ impl Notification {
 // ===========================================================================
 
 impl PullRequest {
-    /// The diff of the pull request between its base and its head, which
-    /// `GET /repos/{owner}/{repo}/pulls/{number}` names: the host holds the
-    /// diff of each pair of commits and asks GitHub for it once.
+    /// The diff of the pull request between its base and its head, which its
+    /// node in the projection names: the host holds the diff of each pair of
+    /// commits and asks GitHub for it once. The read of `diff.patch` follows
+    /// the lookup of its pull request, whose answer wrote that node, so a pull
+    /// request that the projection lacks is not found.
     pub(crate) async fn diff(cx: Cx, key: PullKey) -> Result<BlobFile<Diff>> {
+        let Some(pull) = cx.object::<Self>(&key)? else {
+            return Err(ProviderError::not_found(format!(
+                "the projection has no pull request {}",
+                key.number
+            )));
+        };
         let path = format!(
             "/repos/{}/pulls/{}",
             RepoId::new(&key.owner, &key.repo),
             key.number
         );
-        let pull: PullCommits = cx.endpoint(GitHubApi).get(path.as_str()).json().await?;
-        let version = format!("{}..{}", pull.base.sha, pull.head.sha);
+        let version = format!("{}..{}", pull.base_ref_oid, pull.head_ref_oid);
         let blob = cx
             .endpoint(GitHubApi)
             .get(path)
@@ -806,16 +799,4 @@ async fn find_pull_file(
         }
     }
     Ok(None)
-}
-
-/// The commits of a pull request: its base and its head.
-#[derive(Debug, Deserialize)]
-struct PullCommits {
-    base: Commit,
-    head: Commit,
-}
-
-#[derive(Debug, Deserialize)]
-struct Commit {
-    sha: String,
 }

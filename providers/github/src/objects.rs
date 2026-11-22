@@ -61,14 +61,21 @@ impl Representable<Markdown> for Issue {
     }
 }
 
+/// A pull request as a node of GitHub GraphQL: its item, with the commits of
+/// its base and of its head.
 #[omnifs_sdk::object(kind = "github.pull", key = crate::item::PullKey)]
 #[derive(Clone, Debug, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct PullRequest(pub(crate) ItemData);
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PullRequest {
+    #[serde(flatten)]
+    pub(crate) data: ItemData,
+    pub(crate) base_ref_oid: String,
+    pub(crate) head_ref_oid: String,
+}
 
 impl Representable<Markdown> for PullRequest {
     fn represent(&self) -> Vec<u8> {
-        self.0.markdown()
+        self.data.markdown()
     }
 }
 
