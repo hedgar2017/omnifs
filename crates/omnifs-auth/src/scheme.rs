@@ -136,8 +136,9 @@ pub enum AmbientKind {
 pub struct OauthScheme {
     pub key: String,
     pub display_name: String,
-    /// The authorization endpoint of a flow in which a user signs in; empty
-    /// for a flow without one, which has no authorization request.
+    /// The authorization endpoint of a flow in which a user signs in. A flow
+    /// without a sign-in, as a JWT bearer grant, has no authorization
+    /// request and declares none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub authorization_endpoint: String,
     pub token_endpoint: String,

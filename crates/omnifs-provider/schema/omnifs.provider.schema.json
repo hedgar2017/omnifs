@@ -645,7 +645,7 @@
       "type": "object",
       "properties": {
         "authorizationEndpoint": {
-          "description": "The authorization endpoint of a flow in which a user signs in; empty\nfor a flow without one, which has no authorization request.",
+          "description": "The authorization endpoint of a flow in which a user signs in. A flow\nwithout a sign-in, as a JWT bearer grant, has no authorization\nrequest and declares none.",
           "type": "string"
         },
         "defaultClientId": {

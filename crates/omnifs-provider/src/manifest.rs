@@ -441,10 +441,17 @@ fn validate_oauth_flow(key: &str, oauth: &OauthScheme) -> Result<(), ProviderMet
             &format!("auth.schemes.{key}.flow.authorizationEndpoint"),
             &oauth.authorization_endpoint,
         )?;
-    } else if !oauth.token_endpoint_auth.is_none() {
-        return Err(ProviderMetadataError::Validation(format!(
-            "auth.schemes.{key}.tokenEndpointAuth must be none for the flow of a JWT bearer grant, whose assertion authenticates the client"
-        )));
+    } else {
+        if !oauth.authorization_endpoint.is_empty() {
+            return Err(ProviderMetadataError::Validation(format!(
+                "auth.schemes.{key}.authorizationEndpoint must not be declared for the flow of a JWT bearer grant, which has no authorization request"
+            )));
+        }
+        if !oauth.token_endpoint_auth.is_none() {
+            return Err(ProviderMetadataError::Validation(format!(
+                "auth.schemes.{key}.tokenEndpointAuth must be none for the flow of a JWT bearer grant, whose assertion authenticates the client"
+            )));
+        }
     }
     match &oauth.flow {
         OAuthFlow::JwtBearer => {},
@@ -955,60 +962,6 @@ mod tests {
         );
     }
 
-    /// A JWT bearer grant has no authorization request: its scheme is valid
-    /// with and without an authorization endpoint, which a flow with a user
-    /// requires.
-    #[test]
-    fn a_jwt_bearer_scheme_needs_no_authorization_endpoint() {
-        let jwt_bearer = |edit: fn(&mut serde_json::Value)| {
-            let mut manifest = serde_json::to_value(oauth_provider_manifest()).unwrap();
-            let oauth = &mut manifest["auth"]["schemes"][0]["oauth"];
-            oauth["flow"] = "jwtBearer".into();
-            edit(oauth);
-            ProviderManifest::from_bytes(&json(&manifest))
-        };
-        jwt_bearer(|_| {}).expect("a manifest that carries the endpoint stays valid");
-        let without = jwt_bearer(|oauth| {
-            oauth
-                .as_object_mut()
-                .unwrap()
-                .remove("authorizationEndpoint");
-        })
-        .unwrap();
-        assert!(encode_provider_manifest(&without).is_ok());
-        jwt_bearer(|oauth| {
-            oauth
-                .as_object_mut()
-                .unwrap()
-                .remove("authorizationEndpoint");
-            oauth["flow"] = serde_json::json!({ "jwtBearerScopeClaim": { "claim": "scope" } });
-        })
-        .expect("a claim for the scopes");
-
-        for (needle, edit) in [(
-            "tokenEndpointAuth must be none",
-            (|oauth| oauth["tokenEndpointAuth"] = "clientSecretPost".into())
-                as fn(&mut serde_json::Value),
-        )] {
-            let error = jwt_bearer(edit).unwrap_err();
-            assert!(
-                matches!(&error, ProviderMetadataError::Validation(message) if message.contains(needle)),
-                "{needle}: {error}"
-            );
-        }
-
-        let mut with_user = serde_json::to_value(oauth_provider_manifest()).unwrap();
-        with_user["auth"]["schemes"][0]["oauth"]
-            .as_object_mut()
-            .unwrap()
-            .remove("authorizationEndpoint");
-        let error = ProviderManifest::from_bytes(&json(&with_user)).unwrap_err();
-        assert!(
-            matches!(&error, ProviderMetadataError::Validation(message) if message.contains("authorizationEndpoint")),
-            "{error}"
-        );
-    }
-
     /// The manifest of `oauth_provider_manifest()` with the flow of a JWT
     /// bearer grant and no authorization endpoint, after `edit` of its
     /// scheme.
@@ -1031,6 +984,46 @@ mod tests {
             ProviderMetadataError::Validation(message) => message,
             error => panic!("no validation error: {error}"),
         }
+    }
+
+    /// A JWT bearer grant has no authorization request: its scheme declares
+    /// no authorization endpoint, which a flow with a user requires.
+    #[test]
+    fn a_jwt_bearer_scheme_declares_no_authorization_endpoint() {
+        let without = jwt_bearer(|_| {}).unwrap();
+        assert!(encode_provider_manifest(&without).is_ok());
+        jwt_bearer(|oauth| {
+            oauth["flow"] = serde_json::json!({ "jwtBearerScopeClaim": { "claim": "scope" } });
+        })
+        .expect("a claim for the scopes");
+
+        for flow in [
+            serde_json::json!("jwtBearer"),
+            serde_json::json!({ "jwtBearerScopeClaim": { "claim": "scope" } }),
+        ] {
+            let error = validation_error(jwt_bearer(|oauth| {
+                oauth["flow"] = flow.clone();
+                oauth["authorizationEndpoint"] = "https://linear.app/oauth/authorize".into();
+            }));
+            assert_eq!(
+                error,
+                "auth.schemes.oauth.authorizationEndpoint must not be declared for the flow of a JWT bearer grant, which has no authorization request",
+                "{flow}"
+            );
+        }
+
+        let error = validation_error(jwt_bearer(|oauth| {
+            oauth["tokenEndpointAuth"] = "clientSecretPost".into();
+        }));
+        assert!(error.contains("tokenEndpointAuth must be none"), "{error}");
+
+        let mut with_user = serde_json::to_value(oauth_provider_manifest()).unwrap();
+        with_user["auth"]["schemes"][0]["oauth"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authorizationEndpoint");
+        let error = validation_error(ProviderManifest::from_bytes(&json(&with_user)));
+        assert!(error.contains("authorizationEndpoint"), "{error}");
     }
 
     /// The claim of the scopes of a JWT bearer grant is none of the

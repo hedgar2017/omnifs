@@ -158,10 +158,16 @@ impl FakeAuthServer {
     }
 
     fn scheme(&self, flow: OAuthFlow, revocation_endpoint: Option<String>) -> OauthScheme {
+        // A flow without a sign-in declares no authorization endpoint.
+        let authorization_endpoint = if flow.needs_user() {
+            self.endpoint("/authorize")
+        } else {
+            String::new()
+        };
         OauthScheme {
             key: "oauth".to_owned(),
             display_name: "fake".to_owned(),
-            authorization_endpoint: self.endpoint("/authorize"),
+            authorization_endpoint,
             token_endpoint: self.endpoint("/token"),
             revocation_endpoint,
             default_client_id: Some("client-id".to_owned()),
