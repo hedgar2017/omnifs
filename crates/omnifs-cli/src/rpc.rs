@@ -508,7 +508,7 @@ fn connect_error(error: &tonic::transport::Error) -> anyhow::Error {
 
 /// Whether the connection to the control socket found no daemon: the socket
 /// is missing or refuses the connection.
-fn without_daemon(error: &anyhow::Error) -> bool {
+pub(crate) fn without_daemon(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
             matches!(

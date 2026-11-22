@@ -36,7 +36,8 @@ pub(crate) struct DaemonFacts {
     pub(crate) status: Option<DaemonInventory>,
     pub(crate) probe: DaemonProbe,
     /// Whether the daemon runs the program of this command; none without the
-    /// status of a daemon.
+    /// status of a daemon, as of a daemon that the probe gives as
+    /// unresponsive.
     pub(crate) current_program: Option<bool>,
 }
 
@@ -44,8 +45,35 @@ pub(crate) struct DaemonFacts {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum DaemonProbe {
     Responding,
+    /// No daemon listens on the control socket and the profile records none.
     Stopped,
+    /// No daemon listens on the control socket and the profile records one,
+    /// or its record is unreadable.
     Unreachable { message: String },
+    /// A daemon holds the control socket and its status request failed, as a
+    /// daemon of another build of omnifs whose answer this one cannot read.
+    Unresponsive { message: String },
+}
+
+impl DaemonProbe {
+    /// The probe of a status request that failed with `error`, in a profile
+    /// with the record of a daemon, with none, or with an unreadable one.
+    fn of_failure<T>(error: &anyhow::Error, identity: std::io::Result<Option<T>>) -> Self {
+        if !crate::rpc::without_daemon(error) {
+            return Self::Unresponsive {
+                message: format!("{error:#}"),
+            };
+        }
+        match identity {
+            Ok(Some(_)) => Self::Unreachable {
+                message: format!("{error:#}"),
+            },
+            Ok(None) => Self::Stopped,
+            Err(identity_error) => Self::Unreachable {
+                message: format!("{error:#}; cannot read process identity: {identity_error}"),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,9 +112,8 @@ impl DaemonFacts {
     pub(crate) fn health(&self) -> DaemonHealth {
         match (&self.probe, self.status.as_ref()) {
             (DaemonProbe::Stopped, _) => DaemonHealth::Stopped,
-            (DaemonProbe::Unreachable { .. }, _) | (DaemonProbe::Responding, None) => {
-                DaemonHealth::Unreachable
-            },
+            (DaemonProbe::Unreachable { .. } | DaemonProbe::Unresponsive { .. }, _)
+            | (DaemonProbe::Responding, None) => DaemonHealth::Unreachable,
             (DaemonProbe::Responding, Some(status)) => match status.health.overall_state() {
                 HealthState::Healthy => DaemonHealth::Running,
                 HealthState::Starting => DaemonHealth::Starting,
@@ -578,17 +605,7 @@ impl Inventory {
                     (daemon, mounts, Some(inventory), true, active_mutation)
                 },
                 Err(error) => {
-                    let probe = match endpoint.read_process_identity() {
-                        Ok(Some(_)) => DaemonProbe::Unreachable {
-                            message: format!("{error:#}"),
-                        },
-                        Ok(None) => DaemonProbe::Stopped,
-                        Err(identity_error) => DaemonProbe::Unreachable {
-                            message: format!(
-                                "{error:#}; cannot read process identity: {identity_error}"
-                            ),
-                        },
-                    };
+                    let probe = DaemonProbe::of_failure(&error, endpoint.read_process_identity());
                     let daemon_known = probe == DaemonProbe::Stopped;
                     (
                         DaemonFacts {
@@ -863,6 +880,41 @@ pub(crate) fn filesystem_statuses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon that holds the control socket and fails its status request
+    /// is neither a stopped daemon nor a record of one without a daemon.
+    #[test]
+    fn a_failed_status_request_of_a_listening_daemon_is_an_unresponsive_probe() {
+        let connection = |kind| anyhow::Error::new(std::io::Error::from(kind)).context("connect");
+        let request = || anyhow::anyhow!("daemon control request timed out");
+        let state = |probe: DaemonProbe| serde_json::to_value(probe).unwrap()["state"].clone();
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert_eq!(
+                DaemonProbe::of_failure::<()>(&connection(kind), Ok(None)),
+                DaemonProbe::Stopped
+            );
+            assert_eq!(
+                state(DaemonProbe::of_failure(&connection(kind), Ok(Some(())))),
+                "unreachable"
+            );
+        }
+        for identity in [Ok(None), Ok(Some(()))] {
+            assert_eq!(
+                state(DaemonProbe::of_failure(&request(), identity)),
+                "unresponsive"
+            );
+        }
+        assert_eq!(
+            state(DaemonProbe::of_failure::<()>(
+                &request(),
+                Err(std::io::ErrorKind::InvalidData.into())
+            )),
+            "unresponsive"
+        );
+    }
 
     #[test]
     fn human_state_labels_are_readable_without_changing_wire_names() {
