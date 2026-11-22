@@ -1,20 +1,19 @@
-//! Google Drive provider route-test helpers.
+//! The requests of the mount `google-drive` that its tests answer, and the
+//! objects of Google Drive of those answers.
 
-use std::future::Future;
 use std::time::Duration;
 
-use omnifs_core::path::Path;
-use omnifs_engine::test_support::PendingTestCallout;
-use omnifs_engine::{DirCursor, LookupAnswer, Namespace, NsError};
+use omnifs_engine::{Namespace, NsError};
+use omnifs_itest::support::{Answer, Request, decoded, lookup};
 use omnifs_itest::{RuntimeHarness, make_initialized_runtime};
-use omnifs_wit::host::types::{Callout, CalloutResult, Header, HttpRequest, HttpResponse};
+use omnifs_wit::host::types::{CalloutResult, Header, HttpResponse};
 use serde_json::{Value, json};
 
 /// Past the deadline of a feed, `DYNAMIC_TTL_MILLIS` after its last answer.
 pub const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
 
 /// The fields of an item that the provider asks for.
-pub const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
+pub const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,headRevisionId,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
 
 pub fn drive_harness() -> RuntimeHarness {
     make_initialized_runtime(
@@ -31,117 +30,47 @@ pub fn drive_harness() -> RuntimeHarness {
     )
 }
 
-/// The name under which a request of a fixture has the MD5 of the bytes that
-/// a blob fetch asks for.
-const MD5: &str = "blob-md5";
-
-/// The answer of Google Drive to a request of a fixture.
-pub enum Answer {
-    /// The answer to a request whose body the provider reads.
-    Fetch(CalloutResult),
-    /// The status and the body of the answer to a request whose body the
-    /// host holds as a blob.
-    Blob(u16, Vec<u8>),
+/// The path of `path` under the mount.
+pub fn at(path: &str) -> String {
+    format!("/google-drive/{path}")
 }
 
-/// The answer `status` with `body` to a request of the bytes of a file.
+/// The answer `status` with `body` to a blob fetch.
 pub fn blob(status: u16, body: &[u8]) -> Answer {
     Answer::Blob(status, body.to_vec())
 }
 
-/// The next callout of the mount, which waits for its answer.
-pub async fn next_callout(harness: &RuntimeHarness) -> PendingTestCallout {
-    loop {
-        match harness.runtime.try_recv_test_callout() {
-            Some(callout) => break callout,
-            None => tokio::time::sleep(Duration::from_millis(2)).await,
-        }
-    }
-}
-
-/// Run a namespace operation, answer the callouts it makes in order with
-/// `answers`, and return its output with the requests of those callouts. An
-/// operation that makes another number of callouts times out.
-pub async fn answering<T>(
+/// At most `len` bytes of the file at `path` under the mount from `offset`,
+/// and whether they reach its end.
+pub async fn read_range(
     harness: &RuntimeHarness,
-    operation: impl Future<Output = T>,
-    answers: Vec<Answer>,
-) -> (T, Vec<HttpRequest>) {
-    let runtime = &harness.runtime;
-    let answer = async {
-        let mut requests = Vec::new();
-        for answer in answers {
-            let callout = next_callout(harness).await;
-            match (callout.callout(), answer) {
-                (Callout::Fetch(request), Answer::Fetch(result)) => {
-                    requests.push(request.clone());
-                    callout.answer(result);
-                },
-                (Callout::FetchBlob(request), Answer::Blob(status, body)) => {
-                    // The MD5 of the bytes of the request, as a header of the
-                    // request of the fixture.
-                    let mut headers = request.headers.clone();
-                    headers.extend(request.md5.clone().map(|value| Header {
-                        name: MD5.to_owned(),
-                        value,
-                    }));
-                    requests.push(HttpRequest {
-                        method: request.method.clone(),
-                        url: request.url.clone(),
-                        headers,
-                        body: request.body.clone(),
-                        follow_redirects: false,
-                    });
-                    runtime.answer_test_blob(callout, status, &body).await;
-                },
-                (callout, _) => panic!("another callout than its answer: {callout:?}"),
-            }
-        }
-        requests
-    };
-    let (output, requests) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(operation, answer)
-    })
-    .await
-    .expect("the operation makes exactly the answered requests");
-    (output, requests)
+    path: &str,
+    offset: u64,
+    len: u32,
+) -> Result<(String, bool), NsError> {
+    let file = lookup(harness, &at(path)).await?;
+    let read = harness.namespace.read(file.path, offset, len).await?;
+    Ok((String::from_utf8(read.bytes).unwrap(), read.eof))
 }
 
-/// Run `operation`, which makes no request.
-pub async fn served<T>(harness: &RuntimeHarness, operation: impl Future<Output = T>) -> T {
-    answering(harness, operation, Vec::new()).await.0
-}
-
-fn decoded(part: &str) -> String {
-    let bytes = part.as_bytes();
-    let mut text = Vec::new();
-    let mut at = 0;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'%' => {
-                let hex = std::str::from_utf8(&bytes[at + 1..at + 3]).unwrap();
-                text.push(u8::from_str_radix(hex, 16).unwrap());
-                at += 3;
-            },
-            b'+' => {
-                text.push(b' ');
-                at += 1;
-            },
-            byte => {
-                text.push(byte);
-                at += 1;
-            },
-        }
+/// The method, the URL, and whether the host follows its redirects, of a
+/// request.
+fn sent(request: &Request) -> (&str, &str, bool) {
+    match request {
+        Request::Fetch(request) => (&request.method, &request.url, request.follow_redirects),
+        Request::Blob(request) => (&request.method, &request.url, request.follow_redirects),
     }
-    String::from_utf8(text).unwrap()
 }
 
 /// Check that `request` is a `GET` of `path` of the API of Google Drive
-/// with the parameters `query` in their order.
-pub fn expect(request: &HttpRequest, path: &str, query: &[(&str, &str)]) {
-    assert_eq!(request.method, "GET", "{}", request.url);
-    let (url, sent) = request.url.split_once('?').unwrap_or((&request.url, ""));
-    assert_eq!(url, format!("https://www.googleapis.com/drive/v3{path}"));
+/// with the parameters `query` in their order, which follows redirects as
+/// `follows` says.
+fn expect(request: &Request, path: &str, query: &[(&str, &str)], follows: bool) {
+    let (method, url, follow_redirects) = sent(request);
+    assert_eq!(method, "GET", "{url}");
+    assert_eq!(follow_redirects, follows, "{url}");
+    let (base, sent) = url.split_once('?').unwrap_or((url, ""));
+    assert_eq!(base, format!("https://www.googleapis.com/drive/v3{path}"));
     let sent = sent
         .split('&')
         .filter(|pair| !pair.is_empty())
@@ -154,39 +83,61 @@ pub fn expect(request: &HttpRequest, path: &str, query: &[(&str, &str)]) {
         .iter()
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect::<Vec<_>>();
-    assert_eq!(sent, query, "{}", request.url);
+    assert_eq!(sent, query, "{url}");
 }
 
 /// Check that `request` is that of the token of the changes after now.
-pub fn expect_start(request: &HttpRequest) {
+pub fn expect_start(request: &Request) {
     expect(
         request,
         "/changes/startPageToken",
         &[("supportsAllDrives", "true")],
+        false,
     );
 }
 
-/// Check that `request` is that of a full listing from the token `page`.
-pub fn expect_listing(request: &HttpRequest, page: Option<&str>) {
+/// The corpus of a request of a full listing.
+#[derive(Clone, Copy)]
+pub enum Corpus<'a> {
+    User,
+    Drive(&'a str),
+}
+
+/// Check that `request` is that of a page of a full listing of `corpus`
+/// from the token `page`.
+pub fn expect_listing(request: &Request, corpus: Corpus<'_>, page: Option<&str>) {
     let fields = format!("nextPageToken,incompleteSearch,files({FIELDS})");
-    let mut query = vec![
-        ("corpora", "allDrives"),
+    let mut query = match corpus {
+        Corpus::User => vec![("corpora", "user")],
+        Corpus::Drive(id) => vec![("corpora", "drive"), ("driveId", id)],
+    };
+    query.extend([
         ("includeItemsFromAllDrives", "true"),
         ("supportsAllDrives", "true"),
         ("q", "trashed = false"),
         ("pageSize", "1000"),
         ("fields", fields.as_str()),
-    ];
+    ]);
     if let Some(page) = page {
         query.push(("pageToken", page));
     }
-    expect(request, "/files", &query);
+    expect(request, "/files", &query, false);
+}
+
+/// Check that `request` is that of a page of the shared drives from the
+/// token `page`.
+pub fn expect_drives(request: &Request, page: Option<&str>) {
+    let mut query = vec![("pageSize", "100"), ("fields", "nextPageToken,drives(id)")];
+    if let Some(page) = page {
+        query.push(("pageToken", page));
+    }
+    expect(request, "/drives", &query, false);
 }
 
 /// Check that `request` is that of the changes from the token `page`.
-pub fn expect_changes(request: &HttpRequest, page: &str) {
+pub fn expect_changes(request: &Request, page: &str) {
     let fields = format!(
-        "nextPageToken,newStartPageToken,changes(changeType,fileId,removed,file({FIELDS}))"
+        "nextPageToken,newStartPageToken,changes(changeType,fileId,driveId,removed,file({FIELDS}))"
     );
     expect(
         request,
@@ -199,42 +150,64 @@ pub fn expect_changes(request: &HttpRequest, page: &str) {
             ("pageSize", "1000"),
             ("fields", fields.as_str()),
         ],
+        false,
     );
 }
 
 /// Check that `request` is that of the item `id` by its ID.
-pub fn expect_item(request: &HttpRequest, id: &str) {
+pub fn expect_item(request: &Request, id: &str) {
     expect(
         request,
         &format!("/files/{id}"),
         &[("supportsAllDrives", "true"), ("fields", FIELDS)],
+        false,
     );
 }
 
-/// Check that `request` is that of the bytes of the uploaded file `id` with
-/// the checksum `md5`, for the host to hold.
-pub fn expect_bytes(request: &HttpRequest, id: &str, md5: &str) {
+/// The MD5 and the version of the bytes of a blob fetch.
+fn pinned(request: &Request) -> (Option<&str>, Option<&str>) {
+    let Request::Blob(request) = request else {
+        panic!("a request of bytes is a blob fetch: {request:?}");
+    };
+    (request.md5.as_deref(), request.version.as_deref())
+}
+
+/// Check that `request` is the blob fetch of the bytes of the uploaded file
+/// `id` with the MD5 `md5`.
+pub fn expect_bytes(request: &Request, id: &str, md5: &str) {
     expect(
         request,
         &format!("/files/{id}"),
         &[("alt", "media"), ("supportsAllDrives", "true")],
+        true,
     );
-    let asked = request
-        .headers
-        .iter()
-        .find(|header| header.name == MD5)
-        .map(|header| header.value.as_str());
-    assert_eq!(asked, Some(md5), "{}", request.url);
+    assert_eq!(pinned(request), (Some(md5), None));
 }
 
-/// Check that `request` is that of the first byte of the uploaded file
-/// `id`, whose answer has the reason of a refusal of its bytes.
-pub fn expect_first_byte(request: &HttpRequest, id: &str) {
+/// Check that `request` is the blob fetch of the bytes of the uploaded file
+/// `id` of the revision `revision`, without an MD5.
+pub fn expect_revision(request: &Request, id: &str, revision: &str) {
     expect(
         request,
         &format!("/files/{id}"),
         &[("alt", "media"), ("supportsAllDrives", "true")],
+        true,
     );
+    assert_eq!(pinned(request), (None, Some(revision)));
+}
+
+/// Check that `request` is the request of the first byte of the uploaded
+/// file `id`, whose answer has the reason of a refusal of its bytes.
+pub fn expect_first_byte(request: &Request, id: &str) {
+    expect(
+        request,
+        &format!("/files/{id}"),
+        &[("alt", "media"), ("supportsAllDrives", "true")],
+        true,
+    );
+    let Request::Fetch(request) = request else {
+        panic!("the request of a first byte is inline: {request:?}");
+    };
     let range = request
         .headers
         .iter()
@@ -243,13 +216,28 @@ pub fn expect_first_byte(request: &HttpRequest, id: &str) {
     assert_eq!(range, Some("bytes=0-0"), "{}", request.url);
 }
 
-/// Check that `request` is that of the export of the file `id` of Google
-/// with `mime_type`.
-pub fn expect_export(request: &HttpRequest, id: &str, mime_type: &str) {
+/// Check that `request` is the blob fetch of the export of the file `id` of
+/// Google with `mime_type`, modified at `modified`.
+pub fn expect_export(request: &Request, id: &str, mime_type: &str, modified: &str) {
     expect(
         request,
         &format!("/files/{id}/export"),
         &[("mimeType", mime_type)],
+        true,
+    );
+    assert_eq!(pinned(request), (None, Some(modified)));
+}
+
+/// Check that `request` is the inline request of the export of the file
+/// `id` of Google with `mime_type`, whose answer has the reason of a refusal
+/// of its export.
+pub fn expect_export_refusal(request: &Request, id: &str, mime_type: &str) {
+    assert!(matches!(request, Request::Fetch(_)), "{request:?}");
+    expect(
+        request,
+        &format!("/files/{id}/export"),
+        &[("mimeType", mime_type)],
+        true,
     );
 }
 
@@ -309,7 +297,8 @@ pub fn uploaded(id: &str, name: &str, body: &str) -> Value {
     sized(id, name, md5(body), body.len() as u64)
 }
 
-/// An uploaded file `id` with `name`, the checksum `md5` and `size` bytes.
+/// An uploaded file `id` with `name`, the checksum `md5`, the revision of
+/// its bytes, and `size` bytes.
 pub fn sized(id: &str, name: &str, md5: &str, size: u64) -> Value {
     json!({
         "id": id,
@@ -321,6 +310,7 @@ pub fn sized(id: &str, name: &str, md5: &str, size: u64) -> Value {
         "modifiedTime": "2026-11-21T10:00:00.000Z",
         "size": size.to_string(),
         "md5Checksum": md5,
+        "headRevisionId": format!("revision-{}", &md5[..8]),
     })
 }
 
@@ -343,9 +333,32 @@ pub fn trashed(mut object: Value) -> Value {
     object
 }
 
+/// `object` without `field`.
+pub fn without(mut object: Value, field: &str) -> Value {
+    object.as_object_mut().unwrap().remove(field);
+    object
+}
+
+/// `object` in the shared drive `drive`.
+pub fn in_drive(mut object: Value, drive: &str) -> Value {
+    object["driveId"] = drive.into();
+    object
+}
+
 /// A page of a full listing with `files` and the token of its next page.
 pub fn files(files: &[Value], next: Option<&str>) -> Value {
     let mut list = json!({ "files": files, "incompleteSearch": false });
+    if let Some(next) = next {
+        list["nextPageToken"] = next.into();
+    }
+    list
+}
+
+/// A page of the shared drives `ids` and the token of its next page.
+pub fn drives(ids: &[&str], next: Option<&str>) -> Value {
+    let mut list = json!({
+        "drives": ids.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>(),
+    });
     if let Some(next) = next {
         list["nextPageToken"] = next.into();
     }
@@ -366,56 +379,4 @@ pub fn removed(id: &str) -> Value {
 /// changes after it.
 pub fn changes(changes: &[Value], next: &str) -> Value {
     json!({ "changes": changes, "newStartPageToken": next })
-}
-
-/// Look up `path` under the mount a segment at a time, to its first missing
-/// segment.
-pub async fn lookup(harness: &RuntimeHarness, path: &str) -> Result<LookupAnswer, NsError> {
-    let mut answer = harness
-        .namespace
-        .lookup(Path::root(), "google-drive")
-        .await?;
-    for segment in path.split('/') {
-        if answer.is_missing() {
-            break;
-        }
-        answer = harness.namespace.lookup(answer.path, segment).await?;
-    }
-    Ok(answer)
-}
-
-/// The names of the directory at `path`, sorted.
-pub async fn names(harness: &RuntimeHarness, path: &str) -> Result<Vec<String>, NsError> {
-    let dir = lookup(harness, path).await?;
-    let page = harness
-        .namespace
-        .readdir(dir.path, DirCursor::start(), 0)
-        .await?;
-    let mut names = page
-        .entries
-        .into_iter()
-        .map(|entry| entry.name)
-        .collect::<Vec<_>>();
-    names.sort();
-    Ok(names)
-}
-
-pub async fn read(harness: &RuntimeHarness, path: &str) -> Result<String, NsError> {
-    let file = lookup(harness, path).await?;
-    let read = harness.namespace.read(file.path, 0, u32::MAX).await?;
-    assert!(read.eof, "{path}");
-    Ok(String::from_utf8(read.bytes).unwrap())
-}
-
-/// At most `len` bytes of the file at `path` from `offset`, and whether
-/// they reach its end.
-pub async fn read_range(
-    harness: &RuntimeHarness,
-    path: &str,
-    offset: u64,
-    len: u32,
-) -> Result<(String, bool), NsError> {
-    let file = lookup(harness, path).await?;
-    let read = harness.namespace.read(file.path, offset, len).await?;
-    Ok((String::from_utf8(read.bytes).unwrap(), read.eof))
 }
