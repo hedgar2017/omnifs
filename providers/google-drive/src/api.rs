@@ -19,15 +19,12 @@ use crate::{Id, Result};
 pub(crate) struct DriveApi;
 
 impl EndpointHooks for DriveApi {
-    /// The rate-limited error of a `403` over a quota; `None` for every
-    /// other answer.
     fn classify(&self, response: &Response<Vec<u8>>) -> Option<ProviderError> {
         (response.status().as_u16() == 403 && over_quota(response.body()))
             .then(|| ProviderError::rate_limited("HTTP 403"))
     }
 }
 
-/// The error object of an answer of Google Drive.
 #[derive(Deserialize)]
 struct Failure {
     error: FailureBody,
@@ -43,8 +40,6 @@ struct FailureItem {
     reason: String,
 }
 
-/// Whether the error object in `body` has a reason of a request over a
-/// quota.
 fn over_quota(body: &[u8]) -> bool {
     serde_json::from_slice::<Failure>(body).is_ok_and(|failure| {
         failure.error.errors.iter().any(|item| {
@@ -58,7 +53,7 @@ fn over_quota(body: &[u8]) -> bool {
 
 /// The fields of an item that the provider asks Google Drive for, and that
 /// `file.json`, `folder.json`, and `item.json` have.
-pub(crate) const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
+pub(crate) const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,headRevisionId,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
 
 pub(crate) fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(|error| {
@@ -66,9 +61,9 @@ pub(crate) fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
     })
 }
 
-/// A page of the items of Google Drive: its objects as they came, the token
-/// of its next page while it has one, and whether Google Drive searched not
-/// every drive for it.
+/// A page of the items of a corpus of Google Drive: its objects as they
+/// came, the token of its next page while it has one, and whether Google
+/// Drive searched not all of the corpus for it.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileList {
@@ -77,31 +72,43 @@ pub(crate) struct FileList {
     pub(crate) incomplete_search: bool,
 }
 
+/// A page of the shared drives of the account, and the token of its next
+/// page while it has one.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DriveList {
+    pub(crate) drives: Vec<SharedDrive>,
+    pub(crate) next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SharedDrive {
+    pub(crate) id: String,
+}
+
 /// A page of the changes of Google Drive: the token of its next page while
 /// it has one, and after its last page the token of the changes after it.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChangeList {
-    pub(crate) changes: Vec<Change>,
+    pub(crate) changes: Vec<DriveChange>,
     pub(crate) next_page_token: Option<String>,
     pub(crate) new_start_page_token: Option<String>,
 }
 
-/// A change of Google Drive: what it is of, and for an item its ID, whether
-/// the account no longer has it, and its object as it came while the account
-/// has it.
+/// A change of Google Drive, of an item or of a shared drive: the ID of
+/// what it is of, whether the account no longer has it, and the object of
+/// an item as it came while the account has it.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Change {
-    #[serde(rename = "changeType")]
-    pub(crate) of: ChangeType,
+pub(crate) struct DriveChange {
+    pub(crate) change_type: ChangeType,
     pub(crate) file_id: Option<Id>,
+    pub(crate) drive_id: Option<String>,
     pub(crate) removed: bool,
     pub(crate) file: Option<Box<RawValue>>,
 }
 
-/// What a change is of: an item, or a shared drive, of which the mount has
-/// nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ChangeType {
@@ -116,21 +123,22 @@ pub(crate) struct StartPageToken {
     pub(crate) start_page_token: String,
 }
 
-/// The ID of an object of an item.
-#[derive(Deserialize)]
-pub(crate) struct Identified {
-    pub(crate) id: Id,
-}
-
-/// What the provider reads of the object of an item.
+/// What the provider reads of the object of an item: its ID, its MIME type,
+/// and whether it is in the trash, which place it in the mount, and what
+/// the files of its folder are of, which Google Drive states for some items
+/// alone.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Item {
-    pub(crate) name: String,
+    pub(crate) id: Id,
     mime_type: String,
     pub(crate) trashed: bool,
-    modified_time: String,
+    pub(crate) name: Option<String>,
+    pub(crate) drive_id: Option<String>,
+    size: Option<String>,
+    modified_time: Option<String>,
     md5_checksum: Option<String>,
+    head_revision_id: Option<String>,
 }
 
 /// What an item is for the mount.
@@ -148,22 +156,28 @@ impl Kind {
 
 /// What the file `content` of a file has.
 pub(crate) enum Content<'a> {
-    /// The bytes with this MD5 of an uploaded file.
-    Bytes(&'a str),
-    /// The export with `mime_type` of a file of Google modified at
-    /// `modified`.
+    /// The bytes of an uploaded file, with their MD5 and the ID of their
+    /// revision where Google Drive states them.
+    Bytes {
+        md5: Option<&'a str>,
+        head: Option<&'a str>,
+    },
+    /// The export with `mime_type` of a file of Google, modified at
+    /// `modified` where Google Drive states it.
     Export {
         mime_type: &'static str,
-        modified: &'a str,
+        modified: Option<&'a str>,
     },
 }
 
 impl Content<'_> {
-    /// What changes with the content.
-    pub(crate) fn revision(&self) -> &str {
+    /// What changes with the content: the MD5 of the bytes, else the ID of
+    /// their revision, and the time of the modification of an export; none
+    /// where Google Drive states neither.
+    pub(crate) fn revision(&self) -> Option<&str> {
         match self {
-            Self::Bytes(md5) => md5,
-            Self::Export { modified, .. } => modified,
+            Self::Bytes { md5, head } => md5.or(*head),
+            Self::Export { modified, .. } => *modified,
         }
     }
 }
@@ -171,11 +185,15 @@ impl Content<'_> {
 const GOOGLE: &str = "application/vnd.google-apps.";
 
 impl Item {
-    /// The content of a file, by its MIME type and its MD5; none for a
-    /// folder and for another item.
+    /// The content of a file: the bytes of an item of another MIME type than
+    /// one of Google that has a size, and the export of a file of Google
+    /// with one; none for each other item.
     pub(crate) fn content(&self) -> Option<Content<'_>> {
         let Some(google) = self.mime_type.strip_prefix(GOOGLE) else {
-            return self.md5_checksum.as_deref().map(Content::Bytes);
+            return self.size.is_some().then_some(Content::Bytes {
+                md5: self.md5_checksum.as_deref(),
+                head: self.head_revision_id.as_deref(),
+            });
         };
         let mime_type = match google {
             "document" => "text/markdown",
@@ -187,7 +205,7 @@ impl Item {
         };
         Some(Content::Export {
             mime_type,
-            modified: &self.modified_time,
+            modified: self.modified_time.as_deref(),
         })
     }
 
