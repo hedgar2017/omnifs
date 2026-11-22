@@ -1,13 +1,14 @@
 //! Slack provider route-test helpers.
 
-use std::future::Future;
 use std::time::Duration;
 
 use omnifs_core::path::Path;
-use omnifs_engine::{DirCursor, LookupAnswer, Namespace, NsError};
+use omnifs_engine::{DirCursor, Namespace, NsError};
+use omnifs_itest::support::decoded;
+pub use omnifs_itest::support::{Answer, Request, answering, lookup, names, read, served};
 use omnifs_itest::{RuntimeHarness, make_initialized_runtime};
 use omnifs_wit::host::types::{
-    Callout, CalloutError, CalloutResult, ErrorKind, Header, HttpRequest, HttpResponse,
+    CalloutError, CalloutResult, ErrorKind, Header, HttpRequest, HttpResponse,
 };
 use serde_json::{Value, json};
 
@@ -29,109 +30,23 @@ pub fn slack_harness() -> RuntimeHarness {
     )
 }
 
-/// The name under which a request of a fixture has the version of the bytes
-/// that a blob fetch asks for.
-const VERSION: &str = "blob-version";
-
-/// The answer of Slack to a request of a fixture.
-pub enum Answer {
-    /// The answer to a request whose body the provider reads.
-    Fetch(CalloutResult),
-    /// The status and the body of the answer to a request whose body the
-    /// host holds as a blob.
-    Blob(u16, Vec<u8>),
-}
-
 /// The answer `status` with `body` to a request of the bytes of a file.
 pub fn blob(status: u16, body: &[u8]) -> Answer {
     Answer::Blob(status, body.to_vec())
 }
 
-/// Run a namespace operation, answer the callouts it makes in order with
-/// `answers`, and return its output with the requests of those callouts. An
-/// operation that makes another number of callouts times out.
-pub async fn answering<T>(
-    harness: &RuntimeHarness,
-    operation: impl Future<Output = T>,
-    answers: Vec<Answer>,
-) -> (T, Vec<HttpRequest>) {
-    let runtime = &harness.runtime;
-    let answer = async {
-        let mut requests = Vec::new();
-        for answer in answers {
-            let callout = loop {
-                match runtime.try_recv_test_callout() {
-                    Some(callout) => break callout,
-                    None => tokio::time::sleep(Duration::from_millis(2)).await,
-                }
-            };
-            match (callout.callout(), answer) {
-                (Callout::Fetch(request), Answer::Fetch(result)) => {
-                    requests.push(request.clone());
-                    callout.answer(result);
-                },
-                (Callout::FetchBlob(request), Answer::Blob(status, body)) => {
-                    // The version of the bytes of the request, as a header
-                    // of the request of the fixture.
-                    let mut headers = request.headers.clone();
-                    headers.extend(request.version.clone().map(|value| Header {
-                        name: VERSION.to_owned(),
-                        value,
-                    }));
-                    requests.push(HttpRequest {
-                        method: request.method.clone(),
-                        url: request.url.clone(),
-                        headers,
-                        body: request.body.clone(),
-                        follow_redirects: false,
-                    });
-                    runtime.answer_test_blob(callout, status, &body).await;
-                },
-                (callout, _) => panic!("another callout than its answer: {callout:?}"),
-            }
-        }
-        requests
-    };
-    let (output, requests) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(operation, answer)
-    })
-    .await
-    .expect("the operation makes exactly the answered requests");
-    (output, requests)
-}
-
-/// Run `operation`, which makes no request.
-pub async fn served<T>(harness: &RuntimeHarness, operation: impl Future<Output = T>) -> T {
-    answering(harness, operation, Vec::new()).await.0
-}
-
-fn decoded(part: &str) -> String {
-    let bytes = part.as_bytes();
-    let mut text = Vec::new();
-    let mut at = 0;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'%' => {
-                let hex = std::str::from_utf8(&bytes[at + 1..at + 3]).unwrap();
-                text.push(u8::from_str_radix(hex, 16).unwrap());
-                at += 3;
-            },
-            b'+' => {
-                text.push(b' ');
-                at += 1;
-            },
-            byte => {
-                text.push(byte);
-                at += 1;
-            },
-        }
+/// The request of a fetch whose body the provider reads.
+fn fetched(request: &Request) -> &HttpRequest {
+    match request {
+        Request::Fetch(request) => request,
+        Request::Blob(request) => panic!("a blob fetch of {}", request.url),
     }
-    String::from_utf8(text).unwrap()
 }
 
 /// Check that `request` is a `GET` of the method `method` of the Web API of
 /// Slack with the parameters `query` in their order and then `cursor`.
-fn expect(request: &HttpRequest, method: &str, query: &[(&str, &str)], cursor: Option<&str>) {
+fn expect(request: &Request, method: &str, query: &[(&str, &str)], cursor: Option<&str>) {
+    let request = fetched(request);
     assert_eq!(request.method, "GET", "{}", request.url);
     let (url, sent) = request.url.split_once('?').unwrap_or((&request.url, ""));
     assert_eq!(url, format!("https://slack.com/api/{method}"));
@@ -153,12 +68,12 @@ fn expect(request: &HttpRequest, method: &str, query: &[(&str, &str)], cursor: O
 }
 
 /// Check that `request` is that of the page of the users from `cursor`.
-pub fn expect_users(request: &HttpRequest, cursor: Option<&str>) {
+pub fn expect_users(request: &Request, cursor: Option<&str>) {
     expect(request, "users.list", &[("limit", "999")], cursor);
 }
 
 /// Check that `request` is that of the page of the channels from `cursor`.
-pub fn expect_channels(request: &HttpRequest, cursor: Option<&str>) {
+pub fn expect_channels(request: &Request, cursor: Option<&str>) {
     expect(
         request,
         "users.conversations",
@@ -173,7 +88,7 @@ pub fn expect_channels(request: &HttpRequest, cursor: Option<&str>) {
 
 /// Check that `request` is that of the page of the history of `channel` from
 /// `cursor`.
-pub fn expect_history(request: &HttpRequest, channel: &str, cursor: Option<&str>) {
+pub fn expect_history(request: &Request, channel: &str, cursor: Option<&str>) {
     expect(
         request,
         "conversations.history",
@@ -182,9 +97,20 @@ pub fn expect_history(request: &HttpRequest, channel: &str, cursor: Option<&str>
     );
 }
 
+/// Check that `request` is that of the page of the messages of `channel`
+/// after `oldest` from `cursor`.
+pub fn expect_new(request: &Request, channel: &str, oldest: &str, cursor: Option<&str>) {
+    expect(
+        request,
+        "conversations.history",
+        &[("channel", channel), ("oldest", oldest), ("limit", "999")],
+        cursor,
+    );
+}
+
 /// Check that `request` is that of the message `ts` of `channel` by its
 /// `ts`.
-pub fn expect_message(request: &HttpRequest, channel: &str, ts: &str) {
+pub fn expect_message(request: &Request, channel: &str, ts: &str) {
     expect(
         request,
         "conversations.history",
@@ -201,7 +127,7 @@ pub fn expect_message(request: &HttpRequest, channel: &str, ts: &str) {
 
 /// Check that `request` is that of the page of the replies of the message
 /// `ts` of `channel` from `cursor`.
-pub fn expect_replies(request: &HttpRequest, channel: &str, ts: &str, cursor: Option<&str>) {
+pub fn expect_replies(request: &Request, channel: &str, ts: &str, cursor: Option<&str>) {
     expect(
         request,
         "conversations.replies",
@@ -211,16 +137,16 @@ pub fn expect_replies(request: &HttpRequest, channel: &str, ts: &str, cursor: Op
 }
 
 /// Check that `request` is that of the bytes of the file `id` with `name`,
-/// for the host to hold, with `version`.
-pub fn expect_file(request: &HttpRequest, id: &str, name: &str, version: Option<&str>) {
+/// for the host to hold, with `version`, whose redirects the host does not
+/// follow.
+pub fn expect_file(request: &Request, id: &str, name: &str, version: Option<&str>) {
+    let Request::Blob(request) = request else {
+        panic!("a fetch in place of a blob fetch: {request:?}");
+    };
     assert_eq!(request.method, "GET", "{}", request.url);
     assert_eq!(request.url, download(id, name));
-    let asked = request
-        .headers
-        .iter()
-        .find(|header| header.name == VERSION)
-        .map(|header| header.value.as_str());
-    assert_eq!(asked, version, "{}", request.url);
+    assert_eq!(request.version.as_deref(), version, "{}", request.url);
+    assert!(!request.follow_redirects, "{}", request.url);
 }
 
 /// An answer of Slack with `status`, `headers`, and `body`.
@@ -365,41 +291,25 @@ pub fn unedited(id: &str, name: &str) -> Value {
     file
 }
 
+/// A file `id` with `name` whose `url_private_download` is of another host
+/// than `files.slack.com`.
+pub fn elsewhere(id: &str, name: &str) -> Value {
+    let mut file = file(id, name, 1_700_000_000);
+    file["url_private_download"] = format!("https://elsewhere.example/{id}/{name}").into();
+    file
+}
+
 /// A file `id` that the workspace hides, without its bytes.
 pub fn hidden(id: &str) -> Value {
     json!({ "id": id, "mode": "hidden_by_limit" })
 }
 
-/// Look up `path` under the mount a segment at a time, to its first missing
-/// segment.
-pub async fn lookup(harness: &RuntimeHarness, path: &str) -> Result<LookupAnswer, NsError> {
-    let mut answer = harness.namespace.lookup(Path::root(), "slack").await?;
-    for segment in path.split('/') {
-        if answer.is_missing() {
-            break;
-        }
-        answer = harness.namespace.lookup(answer.path, segment).await?;
-    }
-    Ok(answer)
-}
-
-/// The names of the directory at `path`, sorted.
-pub async fn names(harness: &RuntimeHarness, path: &str) -> Result<Vec<String>, NsError> {
-    let dir = lookup(harness, path).await?;
-    listed(harness, dir.path).await
-}
-
-/// The names of the directory at `path` under the mount by its path alone,
-/// without a lookup, as by a filehandle held across a change of the
-/// projection, sorted.
+/// The names of the directory at `path` by its path alone, without a
+/// lookup, as by a filehandle held across a change of the projection, sorted.
 pub async fn names_at(harness: &RuntimeHarness, path: &str) -> Result<Vec<String>, NsError> {
-    listed(harness, Path::parse(&format!("/slack/{path}")).unwrap()).await
-}
-
-async fn listed(harness: &RuntimeHarness, dir: Path) -> Result<Vec<String>, NsError> {
     let page = harness
         .namespace
-        .readdir(dir, DirCursor::start(), 0)
+        .readdir(Path::parse(path).unwrap(), DirCursor::start(), 0)
         .await?;
     let mut names = page
         .entries
@@ -408,10 +318,4 @@ async fn listed(harness: &RuntimeHarness, dir: Path) -> Result<Vec<String>, NsEr
         .collect::<Vec<_>>();
     names.sort();
     Ok(names)
-}
-
-pub async fn read(harness: &RuntimeHarness, path: &str) -> Result<String, NsError> {
-    let file = lookup(harness, path).await?;
-    let read = harness.namespace.read(file.path, 0, u32::MAX).await?;
-    Ok(String::from_utf8(read.bytes).unwrap())
 }
