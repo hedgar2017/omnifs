@@ -84,17 +84,11 @@ where
     }
 
     /// A feed token carries what an answer takes to its last part, as the
-    /// IDs of the results of a listing of an upstream without an inventory or
-    /// the content of a fed file so far: at most as many bytes as a fed file.
+    /// IDs of the results of a listing of an upstream without an inventory:
+    /// no size bounds it, as none bounds the upstream.
     fn feed_token(token: &str) -> std::result::Result<(), String> {
         if token.is_empty() {
             return Err("feed token must not be empty".to_string());
-        }
-        if u64::try_from(token.len()).map_or(true, |len| len > crate::tree::MATERIALIZE_MAX_BYTES) {
-            return Err(format!(
-                "feed token exceeds {} bytes",
-                crate::tree::MATERIALIZE_MAX_BYTES
-            ));
         }
         Ok(())
     }
@@ -915,5 +909,23 @@ mod tests {
             },
         ));
         validate_list(&result, &effects(), false, |_| true).unwrap();
+    }
+
+    #[test]
+    fn no_size_bounds_the_token_of_a_feed_part() {
+        let part = |token: String| {
+            Ok(wit_types::FeedAnswer::Part(wit_types::FeedPart {
+                token,
+                more: false,
+                inner: Vec::new(),
+                anchors: Vec::new(),
+            }))
+        };
+        let large = "t".repeat(64 * 1024 * 1024 + 1);
+        assert_eq!(
+            validate_feed(&part(large), &effects(), None, false, |_| false),
+            Ok(())
+        );
+        assert!(validate_feed(&part(String::new()), &effects(), None, false, |_| false).is_err());
     }
 }
