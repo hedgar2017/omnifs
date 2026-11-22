@@ -63,34 +63,6 @@ impl BlobRef {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{BlobId, BlobRef};
-    use crate::error::ProviderErrorKind;
-
-    #[test]
-    fn a_blob_of_a_successful_status_alone_is_content() {
-        let blob = |status| BlobRef {
-            id: BlobId(1),
-            size: 0,
-            content_type: None,
-            etag: None,
-            status,
-            response_headers: Vec::new(),
-        };
-        for status in [200, 206, 299] {
-            assert!(blob(status).error_for_status().is_ok(), "{status}");
-        }
-        for status in [100, 199, 300, 302, 304, 399, 404, 500] {
-            assert!(blob(status).error_for_status().is_err(), "{status}");
-        }
-        assert_eq!(
-            blob(404).error_for_status().unwrap_err().kind(),
-            ProviderErrorKind::NotFound
-        );
-    }
-}
-
 impl From<BlobFetched> for BlobRef {
     fn from(fetched: BlobFetched) -> Self {
         Self {
@@ -135,4 +107,32 @@ pub(crate) fn extract_blob(result: CalloutResult) -> Result<BlobRef> {
         },
         result,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlobId, BlobRef};
+    use crate::error::ProviderErrorKind;
+
+    #[test]
+    fn a_blob_of_a_successful_status_alone_is_content() {
+        let blob = |status| BlobRef {
+            id: BlobId(1),
+            size: 0,
+            content_type: None,
+            etag: None,
+            status,
+            response_headers: Vec::new(),
+        };
+        for status in [200, 206, 299] {
+            assert!(blob(status).error_for_status().is_ok(), "{status}");
+        }
+        for status in [100, 199, 300, 302, 304, 399, 404, 500] {
+            assert!(blob(status).error_for_status().is_err(), "{status}");
+        }
+        assert_eq!(
+            blob(404).error_for_status().unwrap_err().kind(),
+            ProviderErrorKind::NotFound
+        );
+    }
 }
