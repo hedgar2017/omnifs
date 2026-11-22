@@ -8,10 +8,9 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
-const CLONE_TIMEOUT: Duration = Duration::from_mins(2);
 const CLONE_REPO_DIR: &str = "repo";
 const CLONE_BINDING_FILE: &str = "binding.json";
 
@@ -21,11 +20,6 @@ pub enum CloneError {
     Failed {
         command: &'static str,
         status: ExitStatus,
-    },
-    #[error("git {command} timed out after {timeout_secs}s")]
-    Timeout {
-        command: &'static str,
-        timeout_secs: u64,
     },
     #[error("failed to spawn git")]
     Spawn(#[from] std::io::Error),
@@ -374,8 +368,9 @@ impl GitCloner {
         Self::supervise(git, command)
     }
 
-    /// Run a git `command` to its end with its standard error drained, killed
-    /// past `CLONE_TIMEOUT`.
+    /// Run a git `command` to its end with its standard error drained. No
+    /// timer bounds it: git ends with its connection to the remote, by its
+    /// close or its reset (`docs/contracts/10-system.md`).
     fn supervise(mut git: Command, command: &'static str) -> Result<(), CloneError> {
         let mut child = git.stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
         let stderr_handle = child.stderr.take();
@@ -390,26 +385,10 @@ impl GitCloner {
                 }
             }
         });
-        let start = Instant::now();
-        let outcome = loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => break Ok(()),
-                Ok(Some(status)) => break Err(CloneError::Failed { command, status }),
-                Ok(None) if start.elapsed() > CLONE_TIMEOUT => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(CloneError::Timeout {
-                        command,
-                        timeout_secs: CLONE_TIMEOUT.as_secs(),
-                    });
-                },
-                Ok(None) => std::thread::sleep(Duration::from_millis(500)),
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(CloneError::Wait(error));
-                },
-            }
+        let outcome = match child.wait() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(CloneError::Failed { command, status }),
+            Err(error) => Err(CloneError::Wait(error)),
         };
         let _ = stderr_thread.join();
         outcome

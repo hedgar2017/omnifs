@@ -27,7 +27,6 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::warn;
 
 pub(crate) fn www_authenticate(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -53,15 +52,6 @@ pub(crate) const MAX_REDIRECTS: usize = 10;
 /// one owner of that in the host.
 pub(crate) fn successful(status: u16) -> bool {
     (200..300).contains(&status)
-}
-
-/// The bound of the wait for an answer: for the whole of it, body included
-/// and each redirect with it, or for the status of each of its hops alone,
-/// where the caller bounds the wait for its body.
-#[derive(Clone, Copy)]
-pub(crate) enum Wait {
-    Whole(Duration),
-    Status(Duration),
 }
 
 /// Request after URL, method, authority, and provider-header validation.
@@ -148,7 +138,6 @@ impl HttpStack {
     fn client_builder() -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .user_agent("omnifs")
-            .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
     }
 
@@ -236,12 +225,7 @@ impl HttpStack {
         &self,
         request: &ValidatedRequest,
         host: Option<&HopHeaders>,
-        wait: Wait,
     ) -> Result<Answer, wit_types::CalloutResult> {
-        let whole = match wait {
-            Wait::Whole(timeout) => Some(tokio::time::Instant::now() + timeout),
-            Wait::Status(_) => None,
-        };
         let mut transport = request.transport.clone();
         let mut url = request.original_url.clone();
         let mut redirected = None;
@@ -255,20 +239,6 @@ impl HttpStack {
             if let Some(host) = host.filter(|host| host.url == url) {
                 headers.extend(host.headers.iter().cloned());
             }
-            let wait = match (wait, whole) {
-                (Wait::Whole(_), Some(deadline)) => Wait::Whole(
-                    deadline
-                        .checked_duration_since(tokio::time::Instant::now())
-                        .filter(|left| !left.is_zero())
-                        .ok_or_else(|| {
-                            callout_network(format!(
-                                "{} did not answer in time",
-                                LogUrl(&request.original_url)
-                            ))
-                        })?,
-                ),
-                (wait, _) => wait,
-            };
             let response = self
                 .send_authorized(
                     &request.method,
@@ -276,7 +246,6 @@ impl HttpStack {
                     &url,
                     &headers,
                     request.body.as_deref().filter(|_| own),
-                    wait,
                 )
                 .await?;
             let location = if request.follow_redirects {
@@ -331,9 +300,8 @@ impl HttpStack {
         url: &str,
         headers: &[(String, String)],
         body: Option<&[u8]>,
-        wait: Wait,
     ) -> Result<reqwest::Response, wit_types::CalloutResult> {
-        let send = || self.send_once(method.clone(), transport, url, headers, body, wait);
+        let send = || self.send_once(method.clone(), transport, url, headers, body);
         let response = send().await?;
         let rejection = match &self.auth {
             Some(auth) => {
@@ -380,7 +348,6 @@ impl HttpStack {
         url: &str,
         headers: &[(String, String)],
         body: Option<&[u8]>,
-        wait: Wait,
     ) -> Result<reqwest::Response, wit_types::CalloutResult> {
         let auth_header = match &self.auth {
             Some(auth) => auth
@@ -409,13 +376,12 @@ impl HttpStack {
         if let Some(body) = body {
             request = request.body(body.to_vec());
         }
-        match wait {
-            Wait::Whole(timeout) => request.timeout(timeout).send().await,
-            Wait::Status(timeout) => tokio::time::timeout(timeout, request.send())
-                .await
-                .map_err(|_| callout_network(idle_message(timeout)))?,
-        }
-        .map_err(|e| callout_network(e.to_string()))
+        // No timer bounds the wait: the connection ends it, by its close,
+        // its reset, or the end of the answer (`docs/contracts/10-system.md`).
+        request
+            .send()
+            .await
+            .map_err(|e| callout_network(e.to_string()))
     }
 
     fn client_and_url_for(
@@ -468,12 +434,8 @@ impl HttpStack {
         error.message = tracing::field::Empty,
         error.retryable = tracing::field::Empty,
     ))]
-    pub async fn fetch(
-        &self,
-        req: &wit_types::HttpRequest,
-        timeout: Duration,
-    ) -> wit_types::CalloutResult {
-        let result = match self.answer(req, timeout).await {
+    pub async fn fetch(&self, req: &wit_types::HttpRequest) -> wit_types::CalloutResult {
+        let result = match self.answer(req).await {
             Ok(response) => wit_types::CalloutResult::HttpResponse(response),
             Err(early) => early,
         };
@@ -484,7 +446,6 @@ impl HttpStack {
     async fn answer(
         &self,
         req: &wit_types::HttpRequest,
-        timeout: Duration,
     ) -> Result<wit_types::HttpResponse, wit_types::CalloutResult> {
         let request = self.validate(
             &req.method,
@@ -496,9 +457,7 @@ impl HttpStack {
         let Answer {
             response,
             redirected,
-        } = self
-            .send_validated(&request, None, Wait::Whole(timeout))
-            .await?;
+        } = self.send_validated(&request, None).await?;
         let status = response.status().as_u16();
         let headers = wit_headers(decode_response_headers(response.headers()));
         let body = response
@@ -512,14 +471,6 @@ impl HttpStack {
             redirected,
         })
     }
-}
-
-/// The message of the error of an upstream that sent nothing for `bound`.
-pub(crate) fn idle_message(bound: Duration) -> String {
-    format!(
-        "the upstream sent nothing for {} seconds",
-        bound.as_secs_f64()
-    )
 }
 
 /// The `Location` of an answer that redirects: of the status `301`, `302`,

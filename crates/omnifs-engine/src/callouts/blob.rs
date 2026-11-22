@@ -15,8 +15,8 @@ use crate::callouts::{
     record_outcome,
 };
 use crate::http::{
-    Answer, BlobPin, HopHeaders, HttpStack, ValidatedRequest, Wait, decode_response_headers,
-    idle_message, successful, wit_headers,
+    Answer, BlobPin, HopHeaders, HttpStack, ValidatedRequest, decode_response_headers, successful,
+    wit_headers,
 };
 use crate::log_redaction::{LogUrl, WitHeaders};
 use futures::StreamExt;
@@ -24,12 +24,6 @@ use md5::{Digest as _, Md5};
 use omnifs_wit::host::types as wit_types;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
-
-/// The longest wait for the status of each hop of a blob fetch, and for the
-/// next bytes of its body. `docs/contracts/10-system.md` owns what bounds a
-/// fetch.
-const BLOB_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// The longest version of a blob request, in bytes.
 const MAX_VERSION_BYTES: usize = 256;
@@ -107,7 +101,6 @@ pub struct BlobExecutor {
     http: Arc<HttpStack>,
     resources: Arc<MountResources>,
     limits: BlobLimits,
-    idle: Duration,
 }
 
 /// The answer of an upstream to a blob request as a fetch takes it: its
@@ -124,6 +117,7 @@ pub(crate) struct Upstream<S> {
 pub struct BlobRequest {
     http: ValidatedRequest,
     md5: Option<String>,
+    version: Option<String>,
     id: BlobRequestId,
     pinned: bool,
 }
@@ -159,16 +153,7 @@ impl BlobExecutor {
             http,
             resources,
             limits,
-            idle: BLOB_IDLE_TIMEOUT,
         }
-    }
-
-    /// The executor with another idle bound, for the test of the bound.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn with_idle_bound(mut self, idle: Duration) -> Self {
-        self.idle = idle;
-        self
     }
 
     /// Fetch the answer of an HTTP request, the body of a successful one
@@ -237,6 +222,7 @@ impl BlobExecutor {
         Ok(BlobRequest {
             http,
             md5: pin.md5.map(ToOwned::to_owned),
+            version: pin.version.map(ToOwned::to_owned),
             id,
             pinned: pin.md5.is_some() || pin.version.is_some(),
         })
@@ -267,7 +253,7 @@ impl BlobExecutor {
             redirected,
         } = self
             .http
-            .send_validated(&request.http, validators.as_ref(), Wait::Status(self.idle))
+            .send_validated(&request.http, validators.as_ref())
             .await?;
         let upstream = Upstream {
             response: BlobResponse {
@@ -311,15 +297,36 @@ impl BlobExecutor {
             || (request.revalidates()
                 && answered.status == 200
                 && validators(&answered, request.http.original_url()).is_some());
-        let body = stream_response_body(
+        let Streamed { body, md5 } = stream_response_body(
             body,
             length,
             Arc::clone(&self.resources.body),
             self.limits.max_fetch_blob_bytes,
-            request.md5.clone(),
-            self.idle,
+            request.md5.is_some(),
         )
         .await?;
+        // Bytes of another MD5 than the request asks for are the answer of
+        // the request for that MD5: the host keeps them under it, so that
+        // the next fetch of those bytes needs no download, and the request
+        // has the error of the mismatch.
+        if let (Some(expected), Some(actual)) = (&request.md5, md5)
+            && *expected != actual
+        {
+            let id = request.http.blob_request_id(
+                self.http.auth_binding_for_url(request.http.original_url()),
+                BlobPin {
+                    md5: Some(&actual),
+                    version: request.version.as_deref(),
+                },
+            );
+            let resources = Arc::clone(&self.resources);
+            let answered = answered.clone();
+            blocking(move || Ok(resources.keep_blob(id, answered, &body)?)).await?;
+            return Err(BlobError::Content {
+                expected: expected.clone(),
+                actual,
+            });
+        }
         let body = if keeps {
             let resources = Arc::clone(&self.resources);
             let (id, answered) = (request.id, answered.clone());
@@ -400,18 +407,24 @@ enum Part<B> {
     End,
 }
 
+/// A body that a fetch published, with its MD5 when the fetch asked for it.
+struct Streamed {
+    body: BlobBody,
+    md5: Option<String>,
+}
+
 /// Publish the body `stream`, which declares `declared` bytes, in `store`,
-/// of at most the `limit` bytes of a mount with one and, for `md5`, of
-/// bytes of that MD5 alone. The writes and the digests run on a blocking
-/// task; the wait for each next bytes is at most `idle`.
+/// of at most the `limit` bytes of a mount with one, with its MD5 for
+/// `md5`. The writes and the digests run on a blocking task. No timer
+/// bounds the wait for the next bytes: the connection of the upstream ends
+/// it, by the end of the body, its close, or its reset.
 async fn stream_response_body<B: AsRef<[u8]> + Send + 'static>(
     mut stream: impl futures::Stream<Item = Result<B, String>> + Unpin,
     declared: Option<u64>,
     store: Arc<BodyStore>,
     limit: Option<u64>,
-    md5: Option<String>,
-    idle: Duration,
-) -> Result<BlobBody, BlobError> {
+    md5: bool,
+) -> Result<Streamed, BlobError> {
     if let (Some(max), Some(actual)) = (limit, declared)
         && actual > max
     {
@@ -420,7 +433,7 @@ async fn stream_response_body<B: AsRef<[u8]> + Send + 'static>(
     let (parts, mut taken) = tokio::sync::mpsc::channel::<Part<B>>(1);
     let writer = tokio::task::spawn_blocking(move || {
         let mut writer = store.stage()?;
-        let mut digest = md5.as_ref().map(|_| Md5::new());
+        let mut digest = md5.then(Md5::new);
         let mut length = 0_u64;
         loop {
             match taken.blocking_recv() {
@@ -443,24 +456,20 @@ async fn stream_response_body<B: AsRef<[u8]> + Send + 'static>(
                 None => return Err(BlobError::Network("the fetch stopped".into())),
             }
         }
-        if let (Some(expected), Some(digest)) = (md5, digest) {
-            let actual = hex::encode(digest.finalize());
-            if actual != expected {
-                return Err(BlobError::Content { expected, actual });
-            }
-        }
-        Ok(BlobBody {
-            length,
-            hold: store.publish_staged(writer)?,
+        Ok(Streamed {
+            body: BlobBody {
+                length,
+                hold: store.publish_staged(writer)?,
+            },
+            md5: digest.map(|digest| hex::encode(digest.finalize())),
         })
     });
     let read = async {
         loop {
-            let part = match tokio::time::timeout(idle, stream.next()).await {
-                Err(_) => return Err(BlobError::Network(idle_message(idle))),
-                Ok(Some(Err(error))) => return Err(BlobError::Network(error)),
-                Ok(Some(Ok(chunk))) => Part::Bytes(chunk),
-                Ok(None) => Part::End,
+            let part = match stream.next().await {
+                Some(Err(error)) => return Err(BlobError::Network(error)),
+                Some(Ok(chunk)) => Part::Bytes(chunk),
+                None => Part::End,
             };
             let end = matches!(part, Part::End);
             // A writer that is gone has the error of the fetch.
@@ -536,8 +545,7 @@ mod tests {
                 declared,
                 Arc::clone(&store),
                 limit,
-                None,
-                BLOB_IDLE_TIMEOUT,
+                false,
             )
         };
         assert!(matches!(
@@ -551,57 +559,36 @@ mod tests {
         assert_eq!(files(tmp.path()), 0);
 
         assert_eq!(BlobLimits::default().max_fetch_blob_bytes, None);
-        let whole = stream(None, None).await.expect("a body without a limit");
+        let whole = stream(None, None)
+            .await
+            .expect("a body without a limit")
+            .body;
         assert_eq!(whole.length, 5);
         assert_eq!(
             store.read_range(whole.hold.id(), 5, 0, 5).unwrap(),
             b"abcde"
         );
-        assert_eq!(stream(Some(5), Some(5)).await.unwrap().length, 5);
+        assert_eq!(stream(Some(5), Some(5)).await.unwrap().body.length, 5);
     }
 
-    /// The bytes of a body that fails, or of another MD5 than the request
-    /// asks for, are no body of the store.
+    /// The bytes of a body that fails are no body of the store, and a body
+    /// that the fetch asks the MD5 of has it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_body_that_fails_or_has_another_md5_leaves_nothing() {
+    async fn a_body_that_fails_leaves_nothing_and_a_body_has_its_md5() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(BodyStore::open(tmp.path()).unwrap());
         let failing = futures::stream::iter([Ok(&b"abc"[..]), Err("reset".to_string())]);
-        let failed = stream_response_body(
-            failing,
-            None,
-            Arc::clone(&store),
-            None,
-            None,
-            BLOB_IDLE_TIMEOUT,
-        )
-        .await;
+        let failed = stream_response_body(failing, None, Arc::clone(&store), None, false).await;
         assert!(matches!(failed, Err(BlobError::Network(message)) if message == "reset"));
-        let other = stream_response_body(
-            body(&[b"abc"]),
-            None,
-            Arc::clone(&store),
-            None,
-            Some("00000000000000000000000000000000".to_string()),
-            BLOB_IDLE_TIMEOUT,
-        )
-        .await;
-        assert!(matches!(
-            other,
-            Err(BlobError::Content { actual, .. }) if actual == "900150983cd24fb0d6963f7d28e17f72"
-        ));
         assert_eq!(files(tmp.path()), 0);
-        let same = stream_response_body(
-            body(&[b"a", b"bc"]),
-            None,
-            Arc::clone(&store),
-            None,
-            Some("900150983cd24fb0d6963f7d28e17f72".to_string()),
-            BLOB_IDLE_TIMEOUT,
-        )
-        .await
-        .expect("the bytes of the MD5");
-        assert_eq!(same.length, 3);
+        let same = stream_response_body(body(&[b"a", b"bc"]), None, Arc::clone(&store), None, true)
+            .await
+            .expect("the bytes of a body");
+        assert_eq!(same.body.length, 3);
+        assert_eq!(
+            same.md5.as_deref(),
+            Some("900150983cd24fb0d6963f7d28e17f72")
+        );
         assert_eq!(files(tmp.path()), 1);
     }
 }

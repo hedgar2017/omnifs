@@ -693,9 +693,11 @@ fn refresh_merge_normalizes_empty_wire_scope_to_explicit_empty_set() {
 }
 
 #[tokio::test]
-async fn authorization_refreshes_credential_inside_refresh_window() {
+async fn authorization_refreshes_a_credential_past_its_expiry() {
     let fake = FakeAuthServer::start(FakeBehavior::default()).await;
-    let (binding, _) = binding_with_oauth(fake.loopback_scheme(None), 30);
+    // Past the `expires_in` of its answer, the only time that the host
+    // compares the clock with.
+    let (binding, _) = binding_with_oauth(fake.loopback_scheme(None), -1);
 
     let authorization = binding
         .authorization_for("https://api.example.test/resource")
@@ -707,9 +709,10 @@ async fn authorization_refreshes_credential_inside_refresh_window() {
 }
 
 #[tokio::test]
-async fn authorization_keeps_credential_outside_refresh_window() {
+async fn authorization_keeps_a_credential_before_its_expiry() {
     let fake = FakeAuthServer::start(FakeBehavior::default()).await;
-    let (binding, _) = binding_with_oauth(fake.loopback_scheme(None), 3600);
+    // Thirty seconds before its expiry: the host adds no margin of its own.
+    let (binding, _) = binding_with_oauth(fake.loopback_scheme(None), 30);
 
     let authorization = binding
         .authorization_for("https://api.example.test/resource")
@@ -1568,7 +1571,7 @@ fn durable_test_entry(scopes: Vec<String>) -> CredentialEntry {
     CredentialEntry::oauth(
         SecretString::from("old-access".to_owned()),
         Some(SecretString::from("refresh-1".to_owned())),
-        Some(OffsetDateTime::now_utc() + time::Duration::seconds(30)),
+        Some(OffsetDateTime::now_utc() - time::Duration::seconds(1)),
         "Bearer",
         scopes,
     )

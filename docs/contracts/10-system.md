@@ -53,7 +53,7 @@ Redirects are a gated transport decision, and this is the whole of it. The answe
 - The headers and the body that the provider wrote go to the origin of the request alone: the same scheme, host, and port. A hop to another origin has none of them.
 - The answer names the URL that answered when it is another than the one of the request (`redirected` of the WIT response and of the blob answer, `url()` and `redirected()` of the SDK). The provider decides what the answer of another URL means, and the rate-limit breaker of the SDK records an answer for the authority that answered it.
 
-The timeout of an inline request bounds the whole of it, redirects included.
+No timer of the host bounds an inline request, a blob fetch, a git command, or a request of an authorization server: the connection ends each one, by the end of its answer, its close, or its reset, and a refusal of the connect ends its start.
 
 ### Blob fetches
 
@@ -71,7 +71,7 @@ The answer tells whether the upstream answered this fetch (`upstream`): an answe
 
 A blob handle is of the operation of its fetch alone, and holds its body in the store until the end of that operation. A body leaves the store with the collection after no fact of a projection refers to it and no hold holds it. The host cannot know whether a provider asks a request again, so the files bound the kept answers: an answer leaves at the second collection in a row that finds no file with its body. A collection runs at the start of the store and once the store took as many bytes as the collection before left, never for an operation; `crates/omnifs-engine/src/cache/collect.rs` owns its soundness.
 
-These bound a fetch: the connect timeout, the idle bound of two minutes for the status of each hop and for each next bytes of the body, `MAX_REDIRECTS`, the `fetch_blob_bytes` limit that the mount declares, and the disk. Nothing bounds the whole time or the size of a fetch of a mount without a declared limit, by design: a bound of the whole time is a bound of the size at a given rate. An upstream that sends a byte within each idle bound holds a fetch open. Only a declared number can close that, such as a least rate in the limits of a manifest: the host has no number of its own that is right for each upstream.
+These bound a fetch: `MAX_REDIRECTS`, the `fetch_blob_bytes` limit that the mount declares, and the disk. A wait that only a timer could end has no end in the host, by the decision of the owner, and each one is this: a connect to an address that answers nothing, neither an acceptance nor a refusal nor a reset, as a host that drops the packets; an upstream that accepts the connection and sends no status; an upstream that sends a status and then neither the next bytes of the body nor its end, nor a close; a git remote that holds its connection without data; and an authorization server that does the same to a token request. Each one holds the operation that waits on it, and the flight of its feed, until the connection ends or the daemon ends; the end of a sync does not end it. The host keeps no time of its own for a credential either: an OAuth token serves until the `expires_in` that its authorization server stated, which the clock is compared with, and a refusal of the upstream before it takes a refresh at that answer.
 
 The host runs the disk work and the digests of a fetch off the thread of the provider instance.
 

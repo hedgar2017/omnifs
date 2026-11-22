@@ -14,7 +14,6 @@ use omnifs_wit::host::types as wit_types;
 use secrecy::{ExposeSecret, SecretString};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -223,7 +222,7 @@ async fn test_execute_fetch_returns_denied_when_auth_is_required_but_missing() {
         body: None,
         follow_redirects: false,
     };
-    match stack.fetch(&req, Duration::from_secs(30)).await {
+    match stack.fetch(&req).await {
         wit_types::CalloutResult::CalloutError(wit_types::CalloutError {
             kind: wit_types::ErrorKind::Denied,
             retryable: false,
@@ -273,7 +272,7 @@ async fn a_static_token_that_the_upstream_rejects_at_a_callout_requires_reauthen
                 body: None,
                 follow_redirects: false,
             };
-            match stack.fetch(&request, Duration::from_secs(5)).await {
+            match stack.fetch(&request).await {
                 wit_types::CalloutResult::HttpResponse(response) => {
                     (response.status, auth.health())
                 },
@@ -315,7 +314,7 @@ async fn oauth_401_refreshes_and_retries_once() {
         follow_redirects: false,
     };
 
-    match stack.fetch(&req, Duration::from_secs(5)).await {
+    match stack.fetch(&req).await {
         wit_types::CalloutResult::HttpResponse(response) => {
             assert_eq!(response.status, 200);
             assert_eq!(response.body, b"ok");
@@ -409,8 +408,9 @@ async fn fetch_blob_uses_same_oauth_retry_path() {
 }
 
 /// A blob fetch with an MD5 answers with the bytes of that MD5 alone: other
-/// bytes are the error of the fetch, which the host keeps nothing of, and
-/// the bytes of each MD5 are the blob of their own request.
+/// bytes are the error of the fetch, which the host keeps as the answer of
+/// the request of their own MD5, so that the fetch of that MD5 needs no
+/// download.
 #[tokio::test]
 async fn fetch_blob_answers_the_bytes_of_the_md5_that_the_provider_asks_for() {
     let tokens = FakeTokenServer::start(false).await;
@@ -462,11 +462,10 @@ async fn fetch_blob_answers_the_bytes_of_the_md5_that_the_provider_asks_for() {
     let calls = api.calls();
     let asked = fetch("3d93da86c9045cb1b17e96790cd19789").await;
     assert!(
-        matches!(&asked, wit_types::CalloutResult::BlobFetched(blob) if size(blob) == Some(9) && blob.upstream),
+        matches!(&asked, wit_types::CalloutResult::BlobFetched(blob) if size(blob) == Some(9) && !blob.upstream),
         "{asked:?}"
     );
-    assert!(api.calls() > calls);
-    let calls = api.calls();
+    assert_eq!(api.calls(), calls, "the host kept the bytes of their MD5");
     let held = fetch("3d93da86c9045cb1b17e96790cd19789").await;
     assert!(
         matches!(&held, wit_types::CalloutResult::BlobFetched(blob) if size(blob) == Some(9) && !blob.upstream),
@@ -499,7 +498,7 @@ async fn oauth_refresh_failure_surfaces_denied_and_preserves_snapshot() {
         follow_redirects: false,
     };
 
-    match stack.fetch(&req, Duration::from_secs(5)).await {
+    match stack.fetch(&req).await {
         wit_types::CalloutResult::CalloutError(wit_types::CalloutError {
             kind: wit_types::ErrorKind::Denied,
             retryable: false,
@@ -865,7 +864,6 @@ fn size(blob: &wit_types::BlobFetched) -> Option<u64> {
 /// start of an answer and nothing after.
 enum Reply {
     Answer(String),
-    Stall(String),
 }
 
 fn reply(status: &str, headers: &[(&str, &str)], body: &str) -> Reply {
@@ -923,16 +921,8 @@ impl Upstream {
                     };
                     let request = read_http_request(&mut stream).await.to_ascii_lowercase();
                     requests.lock().unwrap().push(request.clone());
-                    match script(&request) {
-                        Reply::Answer(answer) => {
-                            stream.write_all(answer.as_bytes()).await.unwrap();
-                        },
-                        Reply::Stall(start) => {
-                            stream.write_all(start.as_bytes()).await.unwrap();
-                            stream.flush().await.unwrap();
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                        },
-                    }
+                    let Reply::Answer(answer) = script(&request);
+                    stream.write_all(answer.as_bytes()).await.unwrap();
                 });
             }
         });
@@ -1022,10 +1012,7 @@ async fn a_redirect_is_the_answer_of_a_request_that_does_not_follow_it() {
     .await;
     let stack = local_stack(&["localhost"]);
     let result = stack
-        .fetch(
-            &get(upstream.url("localhost", "/start"), false),
-            Duration::from_secs(5),
-        )
+        .fetch(&get(upstream.url("localhost", "/start"), false))
         .await;
     match result {
         wit_types::CalloutResult::HttpResponse(response) => {
@@ -1052,10 +1039,7 @@ async fn a_request_follows_each_redirect_that_it_asked_for_with_the_credential_a
     .await;
     let stack = local_stack(&["localhost", "files.test"]);
     let result = stack
-        .fetch(
-            &get(api.url("localhost", "/start"), true),
-            Duration::from_secs(5),
-        )
+        .fetch(&get(api.url("localhost", "/start"), true))
         .await;
     match result {
         wit_types::CalloutResult::HttpResponse(response) => {
@@ -1111,7 +1095,7 @@ async fn a_refused_hop_and_one_too_many_are_errors_that_name_the_host() {
     let fetch = |path: &str| {
         let request = get(upstream.url("localhost", path), true);
         let stack = &stack;
-        async move { stack.fetch(&request, Duration::from_secs(5)).await }
+        async move { stack.fetch(&request).await }
     };
 
     let looped = fetch("/loop").await;
@@ -1169,7 +1153,7 @@ async fn a_request_over_a_socket_or_of_another_method_follows_no_redirect() {
         true,
     );
     for request in [post, socket] {
-        let refused = stack.fetch(&request, Duration::from_secs(5)).await;
+        let refused = stack.fetch(&request).await;
         let error = refusal(&refused);
         assert_eq!(
             (error.kind, error.retryable),
@@ -1206,7 +1190,7 @@ async fn a_hop_that_rejects_its_credential_refreshes_it_and_asks_again() {
     );
     let mut request = get(upstream.url("localhost", "/start"), true);
     request.headers.clear();
-    let result = stack.fetch(&request, Duration::from_secs(5)).await;
+    let result = stack.fetch(&request).await;
     assert!(
         matches!(&result, wit_types::CalloutResult::HttpResponse(response)
             if response.status == 200 && response.body == b"fresh"),
@@ -1244,7 +1228,7 @@ async fn an_upstream_that_rejects_the_refreshed_credential_is_reported_with_its_
     );
     let mut request = get(upstream.url("localhost", "/resource"), false);
     request.headers.clear();
-    let result = stack.fetch(&request, Duration::from_secs(5)).await;
+    let result = stack.fetch(&request).await;
     assert!(
         matches!(&result, wit_types::CalloutResult::HttpResponse(response) if response.status == 401),
         "{result:?}"
@@ -1353,38 +1337,28 @@ async fn the_answer_of_a_failing_status_stores_no_body_and_answers_no_other_requ
     }
 }
 
-/// The host waits for the status of an answer, and for each next bytes of
-/// its body, for its idle bound alone, and keeps nothing of a body that
-/// stopped.
+/// The connection of the upstream ends a blob fetch, with no timer of the
+/// host: an answer whose body stops at the close of its connection is the
+/// error of the fetch, and leaves nothing.
 #[tokio::test]
-async fn a_blob_fetch_ends_with_an_upstream_that_sends_nothing_for_the_idle_bound() {
-    let upstream = Upstream::start(|request| match path_of(request) {
-        "/silent" => Reply::Stall(String::new()),
-        _ => Reply::Stall("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhalf".to_string()),
+async fn a_blob_fetch_ends_with_the_connection_of_its_upstream() {
+    let upstream = Upstream::start(|_| {
+        Reply::Answer(
+            "HTTP/1.1 200 OK\r\ncontent-length: 10\r\nconnection: close\r\n\r\nhalf".to_string(),
+        )
     })
     .await;
-    let mut blobs = blobs(local_stack(&["localhost"]));
-    blobs.executor = blobs.executor.with_idle_bound(Duration::from_millis(300));
-    for path in ["/silent", "/half"] {
-        let started = std::time::Instant::now();
-        let stopped = blobs
-            .executor
-            .fetch(&blob_request(upstream.url("localhost", path)), 0)
-            .await;
-        let error = refusal(&stopped);
-        assert_eq!(
-            (error.kind, error.retryable),
-            (wit_types::ErrorKind::Network, true),
-            "{path}"
-        );
-        assert!(
-            error.message.contains("sent nothing for 0.3 seconds"),
-            "{}",
-            error.message
-        );
-        assert!(started.elapsed() < Duration::from_secs(10), "{path}");
-        assert!(omnifs_engine::test_support::cache::bodies(&blobs.caches).is_empty());
-    }
+    let blobs = blobs(local_stack(&["localhost"]));
+    let stopped = blobs
+        .executor
+        .fetch(&blob_request(upstream.url("localhost", "/half")), 0)
+        .await;
+    let error = refusal(&stopped);
+    assert_eq!(
+        (error.kind, error.retryable),
+        (wit_types::ErrorKind::Network, true)
+    );
+    assert!(omnifs_engine::test_support::cache::bodies(&blobs.caches).is_empty());
 }
 
 /// A blob request without the identity of its bytes keeps the validators

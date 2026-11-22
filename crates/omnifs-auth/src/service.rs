@@ -14,12 +14,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use time::OffsetDateTime;
-
-/// The single freshness margin used by authorization and health decisions.
-#[allow(clippy::duration_suboptimal_units)]
-pub const REFRESH_WINDOW: Duration = Duration::from_secs(60);
 
 /// Why a bound credential could not be authorized. These errors never carry
 /// credential material.
@@ -497,12 +492,12 @@ impl CredentialService {
         }
     }
 
+    /// Whether `entry` serves at `now`: before the expiry that its
+    /// authorization server stated with `expires_in`, which the clock is
+    /// compared with alone; an upstream that refuses it before, as for a
+    /// clock behind, takes a refresh at that answer.
     fn is_fresh(entry: &CredentialEntry, now: OffsetDateTime) -> bool {
-        let window = time::Duration::try_from(REFRESH_WINDOW)
-            .expect("REFRESH_WINDOW fits in time::Duration");
-        entry
-            .expires_at()
-            .is_none_or(|expires_at| expires_at - now > window)
+        entry.expires_at().is_none_or(|expires_at| expires_at > now)
     }
 
     pub fn bind_static(

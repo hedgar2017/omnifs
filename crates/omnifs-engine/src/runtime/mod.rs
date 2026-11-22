@@ -35,8 +35,6 @@ pub use host::{HostError, HostOnline, HostRuntimeOpen};
 use crate::op_validate;
 use crate::runtime::wasm::ComponentEngine;
 
-pub(crate) const HTTP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Runtime for one mounted WASM provider component.
 ///
 /// Manages the Wasmtime instance driver, host callout imports, cache state,

@@ -490,7 +490,6 @@ impl BodyStore {
         self.root
             .join(format!(".body-{}-{sequence}.tmp", std::process::id()))
     }
-
 }
 
 /// A body staged by [`BodyStore::stage`]. It owns the temporary file until
@@ -777,7 +776,9 @@ mod tests {
     fn the_bodies_of_a_publication_take_one_barrier_of_the_device() {
         let dir = tempfile::tempdir().unwrap();
         let store = BodyStore::open(dir.path()).unwrap();
-        let bodies: Vec<Vec<u8>> = (0..64_u32).map(|n| format!("body {n}").into_bytes()).collect();
+        let bodies: Vec<Vec<u8>> = (0..64_u32)
+            .map(|n| format!("body {n}").into_bytes())
+            .collect();
         let all: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
         let syncs = || super::FULL_SYNCS.load(std::sync::atomic::Ordering::Relaxed);
         let before = syncs();
@@ -787,7 +788,10 @@ mod tests {
         store.publish_all(&all).unwrap();
         assert_eq!(syncs() - before, 0, "the store has each body");
         for body in &bodies {
-            assert_eq!(&store.read(super::BodyId::from_bytes(body), None).unwrap()[..], &body[..]);
+            assert_eq!(
+                &store.read(super::BodyId::from_bytes(body), None).unwrap()[..],
+                &body[..]
+            );
         }
     }
 

@@ -26,7 +26,7 @@ pub use scheme::{
 };
 pub use service::{
     AuthBinding, AuthUnavailable, CredentialHealth, CredentialService, DurableCredentialSnapshot,
-    REFRESH_WINDOW, RefreshCandidate, RefreshClassification, RefreshOutcome, RefreshPersistError,
+    RefreshCandidate, RefreshClassification, RefreshOutcome, RefreshPersistError,
     RefreshPersistence, RefreshSink, RejectionEvidence,
 };
 
