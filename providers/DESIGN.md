@@ -121,7 +121,6 @@ impl Provider for GitHub {
             o.dir("issues/{filter}").fed()?;
             o.dir("pulls").choices(StateFilter::choices())?;
             o.dir("pulls/{filter}").fed()?;
-            o.dir("actions/runs").collection::<WorkflowRun>(Repo::workflow_runs)?;
             o.feed(Repo::feed).starts(["issues/{filter}", "pulls/{filter}"])?;
             Ok(())
         })?;
@@ -170,17 +169,6 @@ impl Provider for GitHub {
                 Ok(())
             },
         )?;
-
-        r.object::<WorkflowRun>("/{owner}/{repo}/actions/runs/{run_id}", |o| {
-            o.dynamic();
-            o.file("run.json").canonical::<Json>()?;
-            o.file("status.txt").computed(WorkflowRun::status)?;
-            o.file("conclusion.txt").computed(WorkflowRun::conclusion)?;
-            o.file("log")
-                .direct(WorkflowRun::log)
-                .content_type("text/plain")?;
-            Ok(())
-        })?;
 
         Ok(())
     }
@@ -790,16 +778,17 @@ carry no in-crate route tests.
 
 ### GitHub
 
-GitHub is object-shaped with composed relative faces. Owner, repository, issue,
-pull request, comment, and workflow run are objects. `/{owner}` is both the
-`Owner` object directory and the directory that lists `Repo` children. The
-repository object declares fed directories for issues and pulls, a relative
-collection directory for workflow runs, and the `repo` tree handoff.
+GitHub is object-shaped with composed relative faces. Owner, repository,
+issue, pull request, comment, changed file, review, and review comment are
+objects. `/{owner}` is both the `Owner` object directory and the directory
+that lists `Repo` children. The repository object declares fed directories
+for issues and pulls and the `repo` tree handoff.
 
 The feed of the repository keeps its issues, pull requests, and comments: the
 `title`, `body`, `state`, `user`, and the canonical bytes of each item under
 `{kind}/all/`, which its entry in `{kind}/open/` shares while it is open, and
-the `author` and `body.md` of each comment. The items come from GitHub GraphQL,
+the `author`, `body.md`, and the canonical bytes of each comment, the row of
+its list, from which `comment.json` and `comment.md` render without a load. The items come from GitHub GraphQL,
 each kind in the order of `updatedAt` after the cursor of the last node that
 an answer took, which a check asks after: each changed item comes once, with
 no time and no boundary row, and its node is the canonical bytes of its
@@ -808,12 +797,13 @@ full listing takes the issues, the pull requests, every comment of the REST
 list of the comments of the repository by its link `next`, the counts of the
 comments of each item, where an item with another count takes the ids of its
 comments and each comment of those that the projection lacks by its id, and
-the REST count of the comments. After it, each answer past the deadline is a
-check: one `POST` of the nodes of each kind after its cursor with the count of
+the REST count of the comments. After it, each answer, which the host asks
+for once in each sync, is a check: one `POST` of the nodes of each kind after its cursor with the count of
 each kind; the REST count of the comments with its newest comment; each page
 of the comments since a second before the last one, the first with the `ETag`
-of that time, so that the check takes each comment whether `since` includes
-its second or not, and again from that time when a comment comes twice in one
+of that time: GitHub gives each time to the second, and the second before is
+the one unit of its precision that takes each comment whether `since`
+includes its second or not, and again from that time when a comment comes twice in one
 pass, which a move past a page while the pass paged shifted; the ids of each
 changed item whose comments are other than its count; for a count of a kind
 other than the projection's with the changes of the check, the numbers of that
@@ -831,7 +821,14 @@ number and takes its comments at the first read of its `comments/`, each page
 after the first by the link `next` of the one before it.
 
 The owner and the repository of a key are the segments of its path as they are
-spelled, so that the facts of a feed live under the path of its object.
+spelled, so that the facts of a feed live under the path of its object. The
+sync program reads the spelling that GitHub gives; a path in another spelling
+is a repository of its own, whose first full listing gives it its own whole
+tree, never mixed with the facts of another spelling.
+
+A page of a REST list is the last when its answer has no link `next`. A
+secondary rate limit without `Retry-After` states no window: its feed is asked
+again in the next sync.
 
 A collection stores child canonical bytes only when the list payload satisfies
 the child object's canonical contract. Shallow fields can be eager computed
@@ -869,11 +866,6 @@ async fn diff(cx: Cx<GitHub>, key: PullRequestKey) -> Result<BlobFile<Diff>> {
         .version(version))
 }
 ```
-
-GitHub action logs are the archive that the endpoint answers, a blob face
-`logs.zip` whose fetch follows the redirect of GitHub to the storage of the
-archive, so that the host holds it at any size and asks for it again by its
-validators.
 
 ### arXiv
 
