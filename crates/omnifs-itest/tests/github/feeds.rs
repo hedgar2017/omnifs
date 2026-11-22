@@ -17,11 +17,18 @@ use super::support::{answering, github_harness, not_modified, request_header};
 /// Past the deadline of a feed, `DYNAMIC_TTL_MILLIS` after its last answer.
 const PAST_DEADLINE: Duration = Duration::from_millis(3_200);
 
-/// The link `next` of the first page of rows.
+/// The link `next` of a page of rows.
 const NEXT: &str = r#"<https://api.github.com/repositories/1/issues?state=all&page=2>; rel="next""#;
 
-/// The first page of the rows of the repository.
+/// The rows of the repository.
 const ROWS: &str = "/repos/octocat/hello/issues?state=all&sort=updated&direction=asc&per_page=100";
+
+/// The comments of the repository.
+const COMMENTS: &str =
+    "/repos/octocat/hello/issues/comments?sort=updated&direction=asc&per_page=100";
+
+/// The `updated_at` of a comment of `comment`.
+const COMMENTED: &str = "2026-11-18T08:00:00Z";
 
 fn api(path: &str) -> String {
     format!("https://api.github.com{path}")
@@ -154,18 +161,47 @@ fn comment(id: u64, number: u64, pull: bool, body: &str) -> Value {
         "user": { "login": "hubot" },
         "body": body,
         "html_url": format!("https://github.com/octocat/hello/{kind}/{number}#issuecomment-{id}"),
+        "updated_at": COMMENTED,
     })
 }
 
-/// A page of the items of a connection with the counts of their comments.
+/// The last page of the items of a connection with the counts of their
+/// comments.
 fn counted(items: &[(u64, usize)]) -> Value {
+    counted_before(items, None)
+}
+
+/// A page of the items of a connection with the counts of their comments,
+/// before the page after the cursor `next`.
+fn counted_before(items: &[(u64, usize)], next: Option<&str>) -> Value {
     json!({
         "page": {
             "nodes": items
                 .iter()
                 .map(|(number, comments)| json!({ "number": number, "comments": { "totalCount": comments } }))
                 .collect::<Vec<_>>(),
-            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+        },
+    })
+}
+
+/// The answer of the first `POST` of a check: the counts of the issues and
+/// of the pull requests, with the last page of the counts of the comments of
+/// the items of a connection.
+fn counts(issues: usize, pulls: usize, page: &[(u64, usize)]) -> Value {
+    let mut counts = counted(page);
+    counts["issues"] = json!({ "totalCount": issues });
+    counts["pullRequests"] = json!({ "totalCount": pulls });
+    counts
+}
+
+/// A page of the numbers of the items of a connection, before the page after
+/// the cursor `next`.
+fn numbered(numbers: &[u64], next: Option<&str>) -> Value {
+    json!({
+        "page": {
+            "nodes": numbers.iter().map(|number| json!({ "number": number })).collect::<Vec<_>>(),
+            "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
         },
     })
 }
@@ -183,22 +219,21 @@ fn ids(ids: &[(u64, &str)], next: Option<&str>) -> Value {
     })
 }
 
-/// The first full listing takes the rows by their link `next`, then the
-/// comments by page, then the counts of the issues and of the pull requests.
-/// An item with another count than its `comments/` takes its IDs: a comment
-/// that a deletion moved past a page comes by its ID before the next page of
-/// the IDs, the comments of the projection do not, whatever their
-/// `updatedAt`, and the deleted comment leaves. The four folders are complete
-/// after the last part, and `open/` shares the facts of `all/`. The facts live under the owner as the paths
-/// name it, `OctoCat`, while the requests name the owner of the key,
-/// `octocat`.
+/// The first full listing takes the rows, then the comments, each page after
+/// one that moved the time of its list since that time, then each page of
+/// the counts of the issues and of the pull requests. An item with another
+/// count than its `comments/` takes its IDs: a comment made after the pages
+/// of the comments comes by its ID before the next page of the IDs, the
+/// comments of the projection do not, whatever their `updatedAt`, and a
+/// comment that left its item leaves. The four folders are complete after
+/// the last part, and `open/` shares the facts of `all/`.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts() {
     let harness = github_harness();
     // The first page of comments has comments 1 to 100, comment 50 on the
-    // pull request 2; its deletion moves comment 101 onto the first page
-    // before the second is asked, which has comment 102 alone.
+    // pull request 2, and the second comment 102. Comment 101 is made, and
+    // comment 50 leaves, after them.
     let first = (1..=100)
         .map(|id| {
             if id == 50 {
@@ -215,7 +250,7 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
         .collect::<Vec<_>>();
     let (listing, requests) = answering(
         &harness,
-        names(&harness, "OctoCat/hello/issues/all"),
+        names(&harness, "octocat/hello/issues/all"),
         vec![
             answer(
                 200,
@@ -225,20 +260,17 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
                     item(1, "One", "open", "2026-11-18T09:00:00Z", 101, false),
                 ]),
             ),
-            ok(&json!([item(
-                2,
-                "Two",
-                "open",
-                "2026-11-18T10:00:00Z",
-                1,
-                true
-            )])),
-            ok(&Value::Array(first)),
+            ok(&json!([
+                item(1, "One", "open", "2026-11-18T09:00:00Z", 101, false),
+                item(2, "Two", "open", "2026-11-18T10:00:00Z", 1, true),
+            ])),
+            answer(200, &[("Link", NEXT)], &Value::Array(first)),
             ok(&json!([comment(102, 1, false, "comment 102")])),
-            graphql(&counted(&[(1, 101), (3, 0)])),
+            graphql(&counted_before(&[(1, 101)], Some("counts-2"))),
             graphql(&json!({ "item": ids(&ids_of_1[..100], Some("ids-2")) })),
             ok(&comment(101, 1, false, "comment 101")),
             graphql(&json!({ "item": ids(&ids_of_1[100..], None) })),
+            graphql(&counted(&[(3, 0)])),
             graphql(&counted(&[(2, 0)])),
             graphql(&json!({ "item": ids(&[], None) })),
         ],
@@ -249,22 +281,25 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
     assert_eq!(request_header(&requests[0], "if-none-match"), None);
     assert_eq!(
         requests[1].url,
-        api("/repositories/1/issues?state=all&page=2")
+        api(&format!("{ROWS}&since=2026-11-18T09:00:00Z"))
     );
-    for (request, page) in [(&requests[2], 1), (&requests[3], 2)] {
-        assert_eq!(
-            request.url,
-            api(&format!(
-                "/repos/octocat/hello/issues/comments?sort=created&direction=asc&per_page=100&page={page}"
-            ))
+    assert_eq!(requests[2].url, api(COMMENTS));
+    assert_eq!(
+        requests[3].url,
+        api(&format!("{COMMENTS}&since={COMMENTED}"))
+    );
+    for (request, connection, after) in [
+        (&requests[4], "issues", Value::Null),
+        (&requests[8], "issues", json!("counts-2")),
+        (&requests[9], "pullRequests", Value::Null),
+    ] {
+        let (query, variables) = graphql_of(request);
+        assert!(
+            query.contains(&format!("page: {connection}(first: 100, after: $after)")),
+            "{query}"
         );
+        assert_eq!(variables["after"], after);
     }
-    let (query, variables) = graphql_of(&requests[4]);
-    assert!(
-        query.contains("page: issues(first: 100, after: $after)"),
-        "{query}"
-    );
-    assert_eq!(variables["after"], Value::Null);
     for (request, after) in [(&requests[5], Value::Null), (&requests[7], json!("ids-2"))] {
         let (query, variables) = graphql_of(request);
         assert!(
@@ -278,12 +313,7 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
         requests[6].url,
         api("/repos/octocat/hello/issues/comments/101")
     );
-    let (query, _) = graphql_of(&requests[8]);
-    assert!(
-        query.contains("page: pullRequests(first: 100, after: $after)"),
-        "{query}"
-    );
-    assert_eq!(graphql_of(&requests[9]).1["number"], 2);
+    assert_eq!(graphql_of(&requests[10]).1["number"], 2);
 
     // The projection serves the folders and the facts of the answer alone.
     for (folder, expected) in [
@@ -297,7 +327,7 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
         assert_eq!(
             served(
                 &harness,
-                names(&harness, &format!("OctoCat/hello/{folder}"))
+                names(&harness, &format!("octocat/hello/{folder}"))
             )
             .await
             .unwrap(),
@@ -310,7 +340,7 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
             &harness,
             names(
                 &harness,
-                &format!("OctoCat/hello/issues/{folder}/1/comments"),
+                &format!("octocat/hello/issues/{folder}/1/comments"),
             ),
         )
         .await
@@ -322,7 +352,7 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
                 &harness,
                 read(
                     &harness,
-                    &format!("OctoCat/hello/issues/{folder}/1/comments/101/body.md")
+                    &format!("octocat/hello/issues/{folder}/1/comments/101/body.md")
                 ),
             )
             .await
@@ -338,7 +368,7 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
         ("issues/open/1/comments/7/author", "hubot"),
     ] {
         assert_eq!(
-            served(&harness, read(&harness, &format!("OctoCat/hello/{file}")))
+            served(&harness, read(&harness, &format!("octocat/hello/{file}")))
                 .await
                 .unwrap(),
             expected,
@@ -346,19 +376,19 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
         );
     }
     assert!(
-        served(&harness, lookup(&harness, "OctoCat/hello/issues/open/3"))
+        served(&harness, lookup(&harness, "octocat/hello/issues/open/3"))
             .await
             .unwrap()
             .is_missing()
     );
-    let faces = served(&harness, names(&harness, "OctoCat/hello/issues/open/1"))
+    let faces = served(&harness, names(&harness, "octocat/hello/issues/open/1"))
         .await
         .unwrap();
     assert!(faces.contains(&"title".to_string()), "{faces:?}");
     assert_eq!(
         served(
             &harness,
-            read(&harness, "OctoCat/hello/issues/open/1/title")
+            read(&harness, "octocat/hello/issues/open/1/title")
         )
         .await
         .unwrap(),
@@ -366,9 +396,65 @@ async fn the_first_full_listing_takes_the_rows_then_the_comments_then_the_counts
     );
 }
 
+/// A repository under another spelling of its owner is another repository:
+/// its first full listing asks for it as its path spells it, and each
+/// spelling serves its own facts.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_in_another_spelling_names_another_repository() {
+    let harness = github_harness();
+    for (owner, number) in [("OctoCat", 1), ("octocat", 2)] {
+        let (listing, requests) = answering(
+            &harness,
+            names(&harness, &format!("{owner}/hello/issues/all")),
+            vec![
+                ok(&json!([item(
+                    number,
+                    "An item",
+                    "open",
+                    "2026-11-18T09:00:00Z",
+                    0,
+                    false
+                )])),
+                ok(&json!([])),
+                graphql(&counted(&[(number, 0)])),
+                graphql(&counted(&[])),
+            ],
+        )
+        .await;
+        assert_eq!(listing.unwrap(), [number.to_string()]);
+        assert_eq!(requests[0].url, api(&ROWS.replace("octocat", owner)));
+        let body: Value = serde_json::from_slice(requests[2].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["variables"]["owner"], owner);
+    }
+    for (owner, number) in [("OctoCat", "1"), ("octocat", "2")] {
+        assert_eq!(
+            served(
+                &harness,
+                names(&harness, &format!("{owner}/hello/issues/all"))
+            )
+            .await
+            .unwrap(),
+            [number]
+        );
+        assert_eq!(
+            served(
+                &harness,
+                read(
+                    &harness,
+                    &format!("{owner}/hello/issues/open/{number}/title")
+                )
+            )
+            .await
+            .unwrap(),
+            "An item"
+        );
+    }
+}
+
 /// A first full listing that stops at a rate limit gives each read of the
 /// four folders the error of the stop while the files it took serve, and the
-/// next read after the window continues it from its next page.
+/// next read after the window continues it from its next page, the rows
+/// since the time of its last row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_first_full_listing_stopped_at_a_rate_limit_continues_from_its_next_page() {
     let harness = github_harness();
@@ -440,7 +526,7 @@ async fn a_first_full_listing_stopped_at_a_rate_limit_continues_from_its_next_pa
     assert_eq!(listing.unwrap(), ["2"]);
     assert_eq!(
         requests[0].url,
-        api("/repositories/1/issues?state=all&page=2")
+        api(&format!("{ROWS}&since=2026-11-18T09:30:00Z"))
     );
     assert_eq!(
         served(&harness, names(&harness, "octocat/hello/issues/all"))
@@ -531,15 +617,17 @@ async fn first_full_listing(
 }
 
 /// Past the deadline of the first full listing, a check takes the rows since
-/// its time, the comments since that time, and the counts with the IDs of the
-/// changed items: a comment updated since that no list brought comes by its
-/// ID, a deleted comment leaves, a changed item with the count `comments` `0`
-/// has an empty `comments/` without its IDs, and a count of the issues other
-/// than that of `issues/all/` with the new ones takes the numbers, which
-/// remove the missing issue.
+/// the time of the last row, the comments since the time of the last
+/// comment, and the counts with the IDs of the changed items: a comment made
+/// after the comments of the check comes by its ID, a comment that left its
+/// item leaves, a changed item with the count `comments` `0` has an empty
+/// `comments/` without its IDs, and a count of the issues other than that of
+/// `issues/all/` with the new ones takes the numbers, which remove the
+/// missing issue.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn a_check_takes_the_rows_and_the_comments_since_its_time_and_the_ids_of_the_changed_items() {
+async fn a_check_takes_the_rows_and_the_comments_since_their_times_and_the_ids_of_the_changed_items()
+ {
     let harness = github_harness();
     first_full_listing(
         &harness,
@@ -556,6 +644,19 @@ async fn a_check_takes_the_rows_and_the_comments_since_its_time_and_the_ids_of_t
     )
     .await;
 
+    let mut edited = comment(12, 1, false, "second, edited");
+    edited["updated_at"] = json!("2026-11-18T10:30:00Z");
+    let mut third = comment(11, 1, false, "third");
+    third["updated_at"] = json!("2026-11-18T11:00:00Z");
+    let mut first_post = counts(2, 0, &[(1, 3), (5, 0)]);
+    first_post["i1"] = ids(
+        &[
+            (11, "2026-11-18T11:00:00Z"),
+            (12, "2026-11-18T10:30:00Z"),
+            (13, "2026-11-18T11:40:00Z"),
+        ],
+        None,
+    );
     tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
@@ -565,23 +666,14 @@ async fn a_check_takes_the_rows_and_the_comments_since_its_time_and_the_ids_of_t
                 200,
                 &[("ETag", r#""rows-1""#)],
                 &json!([
-                    item(1, "One again", "open", "2026-11-18T11:00:00Z", 2, false),
+                    item(1, "One again", "open", "2026-11-18T11:00:00Z", 3, false),
                     item(5, "Five", "open", "2026-11-18T11:30:00Z", 0, false),
                 ]),
             ),
-            ok(&json!([comment(11, 1, false, "third")])),
-            graphql(&json!({
-                "issues": { "totalCount": 2 },
-                "pullRequests": { "totalCount": 0 },
-                "i1": ids(&[(11, "2026-11-18T11:00:00Z"), (12, "2026-11-18T10:30:00Z")], None),
-            })),
-            ok(&comment(12, 1, false, "second, edited")),
-            graphql(&json!({
-                "page": {
-                    "nodes": [{ "number": 1 }, { "number": 5 }],
-                    "pageInfo": { "hasNextPage": false, "endCursor": null },
-                },
-            })),
+            ok(&json!([edited, third])),
+            graphql(&first_post),
+            ok(&comment(13, 1, false, "fourth")),
+            graphql(&numbered(&[1, 5], None)),
         ],
     )
     .await;
@@ -593,16 +685,20 @@ async fn a_check_takes_the_rows_and_the_comments_since_its_time_and_the_ids_of_t
     assert_eq!(request_header(&requests[0], "if-none-match"), None);
     assert_eq!(
         requests[1].url,
-        api(
-            "/repos/octocat/hello/issues/comments?sort=created&direction=asc&per_page=100\
-             &since=2026-11-18T09:00:00Z&page=1"
-        )
+        api(&format!("{COMMENTS}&since={COMMENTED}"))
     );
-    let (query, _) = graphql_of(&requests[2]);
+    let (query, variables) = graphql_of(&requests[2]);
     assert!(
         query.contains("issues { totalCount } pullRequests { totalCount }"),
         "{query}"
     );
+    assert!(
+        query.contains(
+            "page: issues(first: 100, after: $after) { nodes { number comments { totalCount } }"
+        ),
+        "{query}"
+    );
+    assert_eq!(variables["after"], Value::Null);
     assert!(
         query.contains("i1: issueOrPullRequest(number: 1)"),
         "{query}"
@@ -610,7 +706,7 @@ async fn a_check_takes_the_rows_and_the_comments_since_its_time_and_the_ids_of_t
     assert!(!query.contains("(number: 5)"), "{query}");
     assert_eq!(
         requests[3].url,
-        api("/repos/octocat/hello/issues/comments/12")
+        api("/repos/octocat/hello/issues/comments/13")
     );
     let (query, _) = graphql_of(&requests[4]);
     assert!(
@@ -631,12 +727,13 @@ async fn a_check_takes_the_rows_and_the_comments_since_its_time_and_the_ids_of_t
         )
         .await
         .unwrap(),
-        ["11", "12"]
+        ["11", "12", "13"]
     );
     for (file, expected) in [
         ("issues/all/1/title", "One again"),
         ("issues/open/1/comments/11/body.md", "third"),
         ("issues/all/1/comments/12/body.md", "second, edited"),
+        ("issues/all/1/comments/13/body.md", "fourth"),
         ("issues/all/5/title", "Five"),
     ] {
         assert_eq!(
@@ -658,26 +755,38 @@ async fn a_check_takes_the_rows_and_the_comments_since_its_time_and_the_ids_of_t
     }
 }
 
-/// A check whose rows keep its time keeps the `ETag` of their answer, and the
-/// next check asks with it: `304` asks for the counts alone, and the same
-/// counts answer `unchanged`, which renews the deadline.
+/// A check whose rows and comments keep the times of their lists keeps the
+/// `ETag` of each, and the next check asks with them: `304` to both asks for
+/// the counts alone, with the next page of the counts of the comments of the
+/// items. A comment edited without a change of a row comes with the
+/// comments since the time of the last comment.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_check_with_304_asks_for_the_counts_alone() {
+async fn a_check_with_304_asks_for_the_comments_and_the_counts() {
     let harness = github_harness();
-    let one = || item(1, "One", "open", "2026-11-18T09:00:00Z", 0, false);
-    first_full_listing(&harness, &json!([one()]), &json!([]), &[(1, 0)], &[]).await;
+    let one = || item(1, "One", "open", "2026-11-18T09:00:00Z", 1, false);
+    first_full_listing(
+        &harness,
+        &json!([one()]),
+        &json!([comment(10, 1, false, "first")]),
+        &[(1, 1)],
+        &[],
+    )
+    .await;
 
+    let mut first_post = counts(1, 0, &[(1, 1)]);
+    first_post["i1"] = ids(&[(10, COMMENTED)], None);
     tokio::time::sleep(PAST_DEADLINE).await;
     answering(
         &harness,
         names(&harness, "octocat/hello/issues/all"),
         vec![
             answer(200, &[("ETag", r#""rows-1""#)], &json!([one()])),
-            ok(&json!([])),
-            graphql(&json!({
-                "issues": { "totalCount": 1 },
-                "pullRequests": { "totalCount": 0 },
-            })),
+            answer(
+                200,
+                &[("ETag", r#""comments-1""#)],
+                &json!([comment(10, 1, false, "first")]),
+            ),
+            graphql(&first_post),
         ],
     )
     .await
@@ -688,13 +797,7 @@ async fn a_check_with_304_asks_for_the_counts_alone() {
     let (listing, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/issues/all"),
-        vec![
-            not_modified(),
-            graphql(&json!({
-                "issues": { "totalCount": 1 },
-                "pullRequests": { "totalCount": 0 },
-            })),
-        ],
+        vec![not_modified(), not_modified(), graphql(&counts(1, 0, &[]))],
     )
     .await;
     assert_eq!(listing.unwrap(), ["1"]);
@@ -706,14 +809,119 @@ async fn a_check_with_304_asks_for_the_counts_alone() {
         request_header(&requests[0], "if-none-match"),
         Some(r#""rows-1""#)
     );
-    let (query, _) = graphql_of(&requests[1]);
-    assert!(!query.contains("issueOrPullRequest"), "{query}");
     assert_eq!(
-        served(&harness, names(&harness, "octocat/hello/issues/all"))
+        requests[1].url,
+        api(&format!("{COMMENTS}&since={COMMENTED}"))
+    );
+    assert_eq!(
+        request_header(&requests[1], "if-none-match"),
+        Some(r#""comments-1""#)
+    );
+    let (query, _) = graphql_of(&requests[2]);
+    assert!(!query.contains("issueOrPullRequest"), "{query}");
+    assert!(
+        query.contains("page: pullRequests(first: 100, after: $after)"),
+        "{query}"
+    );
+
+    let mut edited = comment(10, 1, false, "first, edited");
+    edited["updated_at"] = json!("2026-11-18T12:00:00Z");
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, "octocat/hello/issues/all/1/comments/10/body.md"),
+        vec![
+            not_modified(),
+            ok(&json!([edited])),
+            graphql(&counts(1, 0, &[(1, 1)])),
+        ],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "first, edited");
+    assert!(
+        graphql_of(&requests[2])
+            .0
+            .contains("page: issues(first: 100, after: $after)")
+    );
+    assert_eq!(
+        served(
+            &harness,
+            names(&harness, "octocat/hello/issues/all/1/comments")
+        )
+        .await
+        .unwrap(),
+        ["10"]
+    );
+}
+
+/// A check compares a page of the counts of the comments of the items with
+/// their `comments/`: an item with another count, whose row did not change,
+/// takes its IDs, so that a comment that left it leaves, and an item with
+/// the count `0` has an empty `comments/` without its IDs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_takes_the_ids_of_an_item_with_another_count_of_comments() {
+    let harness = github_harness();
+    first_full_listing(
+        &harness,
+        &json!([
+            item(1, "One", "open", "2026-11-18T08:00:00Z", 2, false),
+            item(2, "Two", "open", "2026-11-18T08:30:00Z", 1, false),
+            item(3, "Three", "open", "2026-11-18T09:00:00Z", 0, false),
+        ]),
+        &json!([
+            comment(10, 1, false, "first"),
+            comment(11, 1, false, "second"),
+            comment(20, 2, false, "third"),
+        ]),
+        &[(1, 2), (2, 1), (3, 0)],
+        &[],
+    )
+    .await;
+
+    tokio::time::sleep(PAST_DEADLINE).await;
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, "octocat/hello/issues/all"),
+        vec![
+            ok(&json!([item(
+                3,
+                "Three",
+                "open",
+                "2026-11-18T09:00:00Z",
+                0,
+                false
+            )])),
+            ok(&json!([])),
+            graphql(&counts(3, 0, &[(1, 1), (2, 0), (3, 0)])),
+            graphql(&json!({ "i1": ids(&[(11, COMMENTED)], None) })),
+        ],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), ["1", "2", "3"]);
+    let (query, _) = graphql_of(&requests[2]);
+    assert!(!query.contains("issueOrPullRequest"), "{query}");
+    let (query, _) = graphql_of(&requests[3]);
+    assert!(!query.contains("totalCount"), "{query}");
+    assert!(
+        query.contains("i1: issueOrPullRequest(number: 1)"),
+        "{query}"
+    );
+    assert!(!query.contains("(number: 2)"), "{query}");
+    for (comments, expected) in [("1", vec!["11"]), ("2", vec![])] {
+        assert_eq!(
+            served(
+                &harness,
+                names(
+                    &harness,
+                    &format!("octocat/hello/issues/all/{comments}/comments")
+                )
+            )
             .await
             .unwrap(),
-        ["1"]
-    );
+            expected,
+            "{comments}"
+        );
+    }
 }
 
 /// Before the first full listing ends, an item takes its own answers: `200`
@@ -803,7 +1011,7 @@ async fn an_item_before_the_end_of_the_first_full_listing_takes_its_own_answers(
     assert_eq!(comments.unwrap(), ["30", "31"]);
     assert_eq!(
         requests[0].url,
-        api("/repos/octocat/hello/issues/3/comments?per_page=100&page=1")
+        api("/repos/octocat/hello/issues/3/comments?per_page=100")
     );
     assert_eq!(graphql_of(&requests[1]).1["number"], 3);
     assert_eq!(
@@ -871,9 +1079,7 @@ async fn an_item_before_the_end_of_the_first_full_listing_takes_its_own_answers(
     assert_eq!(title.unwrap(), "Item 7 closed");
     assert_eq!(
         requests[1].url,
-        api(
-            "/repos/octocat/hello/issues/7/comments?per_page=100&since=2026-11-18T09:00:00Z&page=1"
-        )
+        api("/repos/octocat/hello/issues/7/comments?per_page=100&since=2026-11-18T09:00:00Z")
     );
     assert_eq!(graphql_of(&requests[2]).1["number"], 7);
     assert_eq!(
@@ -918,10 +1124,12 @@ async fn an_item_before_the_end_of_the_first_full_listing_takes_its_own_answers(
     );
 }
 
-/// A check takes each page of its rows by the link `next` of the previous
-/// one, and a count of the pull requests other than that of `pulls/all/`
-/// with the new ones takes the numbers of the pull requests, which remove
-/// the missing pull request.
+/// A check takes each page of its rows after one that moved the time of
+/// their list since that time, so that a row that changes between two pages
+/// moves no other row past a page, and a page after one whose rows end at
+/// the time they were asked since by its link `next`. A count of the pull
+/// requests other than that of `pulls/all/` with the new ones takes the
+/// numbers of the pull requests, which remove the missing pull request.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_check_takes_each_page_of_its_rows_and_the_numbers_of_the_pull_requests() {
     let harness = github_harness();
@@ -945,6 +1153,11 @@ async fn a_check_takes_each_page_of_its_rows_and_the_numbers_of_the_pull_request
             answer(
                 200,
                 &[("Link", NEXT)],
+                &json!([item(1, "One", "open", "2026-11-18T09:00:00Z", 0, false)]),
+            ),
+            answer(
+                200,
+                &[("Link", NEXT)],
                 &json!([item(
                     1,
                     "One again",
@@ -963,16 +1176,8 @@ async fn a_check_takes_each_page_of_its_rows_and_the_numbers_of_the_pull_request
                 true
             )])),
             ok(&json!([])),
-            graphql(&json!({
-                "issues": { "totalCount": 1 },
-                "pullRequests": { "totalCount": 1 },
-            })),
-            graphql(&json!({
-                "page": {
-                    "nodes": [{ "number": 3 }],
-                    "pageInfo": { "hasNextPage": false, "endCursor": null },
-                },
-            })),
+            graphql(&counts(1, 1, &[(1, 0)])),
+            graphql(&numbered(&[3], None)),
         ],
     )
     .await;
@@ -987,14 +1192,12 @@ async fn a_check_takes_each_page_of_its_rows_and_the_numbers_of_the_pull_request
     );
     assert_eq!(
         requests[2].url,
-        api(
-            "/repos/octocat/hello/issues/comments?sort=created&direction=asc&per_page=100\
-             &since=2026-11-18T09:00:00Z&page=1"
-        )
+        api(&format!("{ROWS}&since=2026-11-18T10:00:00Z"))
     );
-    let (query, _) = graphql_of(&requests[3]);
-    assert!(!query.contains("issueOrPullRequest"), "{query}");
+    assert_eq!(requests[3].url, api(COMMENTS));
     let (query, _) = graphql_of(&requests[4]);
+    assert!(!query.contains("issueOrPullRequest"), "{query}");
+    let (query, _) = graphql_of(&requests[5]);
     assert!(
         query.contains("page: pullRequests(first: 100, after: $after) { nodes { number }"),
         "{query}"
@@ -1019,63 +1222,83 @@ async fn a_check_takes_each_page_of_its_rows_and_the_numbers_of_the_pull_request
     );
 }
 
-/// The pages of the rows omit some items of a repository. A check whose
-/// counts are other than the counts of the projection takes each item that
-/// the numbers bring and the projection lacks by its number, with its
-/// comments, and the next check, with the same counts, asks for no numbers.
+/// A check whose counts are other than the counts of the projection takes
+/// each page of the numbers of that kind once: an item of the projection
+/// that they lack leaves, and each item that they bring and the projection
+/// lacks, made after the rows of the check, comes by its number, unless it
+/// left the repository since, `404`. The next check, with the same counts,
+/// asks for no numbers.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_check_takes_by_its_number_an_item_that_the_rows_omit() {
+async fn a_check_takes_by_its_number_an_item_made_after_its_rows() {
     let harness = github_harness();
-    let one = || item(1, "One", "open", "2026-11-18T09:00:00Z", 0, false);
-    first_full_listing(&harness, &json!([one()]), &json!([]), &[(1, 0)], &[]).await;
+    let three = || item(3, "Three", "open", "2026-11-18T09:00:00Z", 0, false);
+    first_full_listing(
+        &harness,
+        &json!([
+            item(1, "One", "open", "2026-11-18T08:00:00Z", 0, false),
+            three()
+        ]),
+        &json!([]),
+        &[(1, 0), (3, 0)],
+        &[],
+    )
+    .await;
 
-    let totals = || {
-        graphql(&json!({
-            "issues": { "totalCount": 2 },
-            "pullRequests": { "totalCount": 0 },
-        }))
-    };
     tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/issues/all"),
         vec![
-            answer(200, &[("ETag", r#""rows-1""#)], &json!([one()])),
-            ok(&json!([])),
-            totals(),
-            graphql(&json!({
-                "page": {
-                    "nodes": [{ "number": 1 }, { "number": 5 }],
-                    "pageInfo": { "hasNextPage": false, "endCursor": null },
-                },
-            })),
-            ok(&item(5, "Five", "closed", "2026-11-17T08:00:00Z", 0, false)),
+            answer(200, &[("ETag", r#""rows-1""#)], &json!([three()])),
+            answer(200, &[("ETag", r#""comments-1""#)], &json!([])),
+            graphql(&counts(3, 0, &[(1, 0), (4, 0), (5, 0)])),
+            graphql(&numbered(&[1], Some("numbers-2"))),
+            graphql(&numbered(&[4, 5], None)),
+            ok(&item(4, "Four", "closed", "2026-11-17T08:00:00Z", 0, false)),
+            empty(404, &[]),
         ],
     )
     .await;
-    assert_eq!(listing.unwrap(), ["1", "5"]);
-    let (query, _) = graphql_of(&requests[3]);
-    assert!(
-        query.contains("page: issues(first: 100, after: $after) { nodes { number }"),
-        "{query}"
-    );
-    assert_eq!(requests[4].url, api("/repos/octocat/hello/issues/5"));
+    assert_eq!(listing.unwrap(), ["1", "4"]);
+    for (request, after) in [
+        (&requests[3], Value::Null),
+        (&requests[4], json!("numbers-2")),
+    ] {
+        let (query, variables) = graphql_of(request);
+        assert!(
+            query.contains("page: issues(first: 100, after: $after) { nodes { number }"),
+            "{query}"
+        );
+        assert_eq!(variables["after"], after);
+    }
+    for (request, number) in [(&requests[5], 4), (&requests[6], 5)] {
+        assert_eq!(
+            request.url,
+            api(&format!("/repos/octocat/hello/issues/{number}"))
+        );
+    }
     assert_eq!(
-        served(&harness, read(&harness, "octocat/hello/issues/all/5/title"))
+        served(&harness, read(&harness, "octocat/hello/issues/all/4/title"))
             .await
             .unwrap(),
-        "Five"
+        "Four"
+    );
+    assert_eq!(
+        served(&harness, read(&harness, "octocat/hello/issues/all/1/title"))
+            .await
+            .unwrap(),
+        "One"
     );
 
     tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/issues/all"),
-        vec![not_modified(), totals()],
+        vec![not_modified(), not_modified(), graphql(&counts(2, 0, &[]))],
     )
     .await;
-    assert_eq!(listing.unwrap(), ["1", "5"]);
-    assert_eq!(requests.len(), 2);
+    assert_eq!(listing.unwrap(), ["1", "4"]);
+    assert_eq!(requests.len(), 3);
 }
 
 /// A check makes a part of each request and publishes its parts with its
@@ -1115,7 +1338,10 @@ async fn a_check_stopped_by_the_rate_limit_of_github_graphql_continues_with_its_
             ok(&json!([])),
             answer(
                 200,
-                &[("x-ratelimit-reset", &reset)],
+                &[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", &reset),
+                ],
                 &json!({
                     "data": null,
                     "errors": [{ "type": "RATE_LIMITED", "message": "API rate limit exceeded" }],
@@ -1143,10 +1369,7 @@ async fn a_check_stopped_by_the_rate_limit_of_github_graphql_continues_with_its_
     let (listing, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/issues/all"),
-        vec![graphql(&json!({
-            "issues": { "totalCount": 1 },
-            "pullRequests": { "totalCount": 0 },
-        }))],
+        vec![graphql(&counts(1, 0, &[(1, 0)]))],
     )
     .await;
     assert_eq!(listing.unwrap(), ["1"]);
@@ -1197,10 +1420,7 @@ async fn a_check_stopped_by_the_network_gives_its_error_to_a_read() {
     .await;
     assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
 
-    let comments = api(
-        "/repos/octocat/hello/issues/comments?sort=created&direction=asc&per_page=100\
-         &since=2026-11-18T09:00:00Z&page=1",
-    );
+    let comments = api(COMMENTS);
     let (stopped, requests) = answering(
         &harness,
         read(&harness, "octocat/hello/issues/all/1/title"),
@@ -1213,13 +1433,7 @@ async fn a_check_stopped_by_the_network_gives_its_error_to_a_read() {
     let (title, requests) = answering(
         &harness,
         read(&harness, "octocat/hello/issues/all/1/title"),
-        vec![
-            ok(&json!([])),
-            graphql(&json!({
-                "issues": { "totalCount": 1 },
-                "pullRequests": { "totalCount": 0 },
-            })),
-        ],
+        vec![ok(&json!([])), graphql(&counts(1, 0, &[(1, 0)]))],
     )
     .await;
     assert_eq!(title.unwrap(), "One again");
@@ -1267,8 +1481,9 @@ async fn a_check_asks_github_graphql_for_a_hundred_changed_items_a_post() {
         )
     };
     let mut first = page(1..=100);
-    first["issues"] = json!({ "totalCount": 102 });
-    first["pullRequests"] = json!({ "totalCount": 0 });
+    for (key, value) in counts(102, 0, &[]).as_object().unwrap() {
+        first[key] = value.clone();
+    }
 
     tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
@@ -1277,7 +1492,11 @@ async fn a_check_asks_github_graphql_for_a_hundred_changed_items_a_post() {
         vec![
             answer(200, &[("Link", NEXT)], &Value::Array(rows[..100].to_vec())),
             ok(&Value::Array(rows[100..].to_vec())),
-            ok(&Value::Array(comments[..100].to_vec())),
+            answer(
+                200,
+                &[("Link", NEXT)],
+                &Value::Array(comments[..100].to_vec()),
+            ),
             ok(&Value::Array(comments[100..].to_vec())),
             graphql(&first),
             graphql(&page(101..=101)),
@@ -1285,6 +1504,14 @@ async fn a_check_asks_github_graphql_for_a_hundred_changed_items_a_post() {
     )
     .await;
     assert_eq!(listing.unwrap().len(), 102);
+    assert_eq!(
+        requests[1].url,
+        api(&format!("{ROWS}&since=2026-11-18T10:00:00Z"))
+    );
+    assert_eq!(
+        requests[3].url,
+        api(&format!("{COMMENTS}&since={COMMENTED}"))
+    );
     let (query, _) = graphql_of(&requests[4]);
     assert!(query.contains("issues { totalCount }"), "{query}");
     assert!(
@@ -1311,11 +1538,12 @@ async fn a_check_asks_github_graphql_for_a_hundred_changed_items_a_post() {
 
 /// A first full listing stopped by the network at a page of its rows gives
 /// each read of its folders the error of the network of its next page alone,
-/// and the next read continues it from that page.
+/// the rows since the time of its last row, and the next read continues it
+/// from that page.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_first_full_listing_stopped_by_the_network_continues_from_its_next_page() {
     let harness = github_harness();
-    let next = api("/repositories/1/issues?state=all&page=2");
+    let next = api(&format!("{ROWS}&since=2026-11-18T09:00:00Z"));
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/issues/all"),
@@ -1400,7 +1628,7 @@ async fn later_answer_stopped(harness: &RuntimeHarness, stop: HttpResponse) -> N
 
 /// The page of the comments of item 7 since the time of its first answer.
 const ITEM_7_SINCE: &str =
-    "/repos/octocat/hello/issues/7/comments?per_page=100&since=2026-11-18T09:00:00Z&page=1";
+    "/repos/octocat/hello/issues/7/comments?per_page=100&since=2026-11-18T09:00:00Z";
 
 /// The end of the later answer of item 7 from the page of its comments since
 /// its time: that page, with its comment, and its IDs.
@@ -1527,7 +1755,7 @@ async fn a_first_answer_of_an_item_stopped_by_the_network_gives_its_error_until_
     assert_eq!(listing.unwrap(), ["30"]);
     assert_eq!(
         requests[0].url,
-        api("/repos/octocat/hello/issues/3/comments?per_page=100&page=1")
+        api("/repos/octocat/hello/issues/3/comments?per_page=100")
     );
 }
 
@@ -1535,7 +1763,8 @@ async fn a_first_answer_of_an_item_stopped_by_the_network_gives_its_error_until_
 /// held across a change of the projection, looks up each segment from the
 /// root: the item takes its answer, and the comment, which the `comments/` of
 /// the item lacks before it is complete, takes the comments of the item
-/// first, so that the comment serves.
+/// first, each page after the first by the link `next` of the one before
+/// it, so that the comment serves.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_of_a_comment_by_its_path_alone_takes_the_comments_of_its_item() {
     let harness = github_harness();
@@ -1545,10 +1774,15 @@ async fn a_read_of_a_comment_by_its_path_alone_takes_the_comments_of_its_item() 
         read_at(&harness, &format!("{comments}/31/body.md")),
         vec![
             ok(&item(3, "Three", "open", "2026-11-18T09:00:00Z", 2, false)),
-            ok(&json!([
-                comment(30, 3, false, "first"),
-                comment(31, 3, false, "second"),
-            ])),
+            answer(
+                200,
+                &[(
+                    "Link",
+                    r#"<https://api.github.com/repositories/1/issues/3/comments?page=2>; rel="next""#,
+                )],
+                &json!([comment(30, 3, false, "first")]),
+            ),
+            ok(&json!([comment(31, 3, false, "second")])),
         ],
     )
     .await;
@@ -1556,7 +1790,11 @@ async fn a_read_of_a_comment_by_its_path_alone_takes_the_comments_of_its_item() 
     assert_eq!(requests[0].url, api("/repos/octocat/hello/issues/3"));
     assert_eq!(
         requests[1].url,
-        api("/repos/octocat/hello/issues/3/comments?per_page=100&page=1")
+        api("/repos/octocat/hello/issues/3/comments?per_page=100")
+    );
+    assert_eq!(
+        requests[2].url,
+        api("/repositories/1/issues/3/comments?page=2")
     );
     assert_eq!(
         served(&harness, names(&harness, comments)).await.unwrap(),
@@ -1698,7 +1936,7 @@ async fn a_first_full_listing_stopped_at_a_comment_by_its_id_continues_from_it()
     assert_eq!(comments.unwrap(), ["10", "11", "12"]);
     assert_eq!(
         requests[0].url,
-        api("/repos/octocat/hello/issues/1/comments?per_page=100&page=1")
+        api("/repos/octocat/hello/issues/1/comments?per_page=100")
     );
 
     let (listing, requests) = answering(
@@ -1734,10 +1972,11 @@ async fn a_first_full_listing_stopped_at_a_comment_by_its_id_continues_from_it()
     );
 }
 
-/// A check that stops at a comment by its ID continues from that comment
-/// alone at each next read: the read of a network that fails again takes its
-/// error. A comment that left its item before its ID was asked, `404`, does
-/// not join the item.
+/// A check takes each comment by its ID that a page of the IDs of a changed
+/// item brought before the next page of its IDs. Stopped at a comment by its
+/// ID, it continues from that comment alone at each next read: the read of a
+/// network that fails again takes its error. A comment that left its item
+/// before its ID was asked, `404`, does not join the item.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_check_stopped_at_a_comment_by_its_id_continues_from_it() {
     let harness = github_harness();
@@ -1764,31 +2003,35 @@ async fn a_check_stopped_at_a_comment_by_its_id_continues_from_it() {
                 false
             )])),
             ok(&json!([])),
+            graphql(&{
+                let mut first_post = counts(1, 0, &[(1, 4)]);
+                first_post["i1"] = ids(
+                    &[(10, "2026-11-18T08:00:00Z"), (11, "2026-11-18T09:30:00Z")],
+                    Some("ids-2"),
+                );
+                first_post
+            }),
+            ok(&comment(11, 1, false, "second")),
             graphql(&json!({
-                "issues": { "totalCount": 1 },
-                "pullRequests": { "totalCount": 0 },
-                "i1": ids(
-                    &[
-                        (10, "2026-11-18T08:00:00Z"),
-                        (11, "2026-11-18T09:30:00Z"),
-                        (12, "2026-11-18T09:40:00Z"),
-                        (13, "2026-11-18T09:50:00Z"),
-                    ],
+                "item": ids(
+                    &[(12, "2026-11-18T09:40:00Z"), (13, "2026-11-18T09:50:00Z")],
                     None,
                 ),
             })),
-            ok(&comment(11, 1, false, "second")),
             empty(502, &[]),
         ],
     )
     .await;
     assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
-    for (request, id) in [(&requests[3], 11), (&requests[4], 12)] {
+    for (request, id) in [(&requests[3], 11), (&requests[5], 12)] {
         assert_eq!(
             request.url,
             api(&format!("/repos/octocat/hello/issues/comments/{id}"))
         );
     }
+    let (_, variables) = graphql_of(&requests[4]);
+    assert_eq!(variables["number"], 1);
+    assert_eq!(variables["after"], "ids-2");
 
     let (stopped, requests) = answering(
         &harness,
@@ -1988,12 +2231,12 @@ async fn a_check_removes_a_changed_item_that_github_graphql_cannot_resolve() {
                 item(2, "Two", "open", "2026-11-18T10:30:00Z", 2, false),
             ])),
             ok(&json!([])),
-            graphql_not_found(&json!({
-                "issues": { "totalCount": 1 },
-                "pullRequests": { "totalCount": 0 },
-                "i1": null,
-                "i2": ids(&[(20, "2026-11-18T08:30:00Z")], Some("ids-2")),
-            })),
+            graphql_not_found(&{
+                let mut first_post = counts(1, 0, &[(3, 0)]);
+                first_post["i1"] = Value::Null;
+                first_post["i2"] = ids(&[(20, "2026-11-18T08:30:00Z")], Some("ids-2"));
+                first_post
+            }),
             graphql_not_found(&json!({ "item": null })),
         ],
     )
@@ -2060,8 +2303,9 @@ async fn a_later_answer_of_an_item_removes_it_when_github_graphql_cannot_resolve
 }
 
 /// A rate limit of GitHub whose window does not parse fails as an invalid
-/// answer, at the REST API and at GitHub GraphQL, and one whose reset passed
-/// has a window of zero.
+/// answer, at the REST API and at GitHub GraphQL, one whose reset passed has
+/// a window of zero, and a secondary one without `Retry-After` has a window
+/// of a minute, whatever the reset of the primary limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rate_limit_whose_window_does_not_parse_fails_as_an_invalid_answer() {
     let harness = github_harness();
@@ -2079,7 +2323,7 @@ async fn a_rate_limit_whose_window_does_not_parse_fails_as_an_invalid_answer() {
     let rate_limited = |reset: &str| {
         answer(
             200,
-            &[("x-ratelimit-reset", reset)],
+            &[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", reset)],
             &json!({
                 "data": null,
                 "errors": [{ "type": "RATE_LIMITED", "message": "API rate limit exceeded" }],
@@ -2125,6 +2369,29 @@ async fn a_rate_limit_whose_window_does_not_parse_fails_as_an_invalid_answer() {
         })
     );
     graphql_of(&requests[0]);
+
+    let later = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + Duration::from_mins(50))
+        .as_secs()
+        .to_string();
+    let (stopped, _) = answering(
+        &harness,
+        names(&harness, "octocat/hello/issues/all"),
+        vec![answer(
+            403,
+            &[
+                ("x-ratelimit-remaining", "4000"),
+                ("x-ratelimit-reset", &later),
+            ],
+            &json!({ "message": "You have exceeded a secondary rate limit." }),
+        )],
+    )
+    .await;
+    assert_eq!(
+        stopped,
+        Err(NsError::RateLimited {
+            retry_after: Some(Duration::from_secs(60))
+        })
+    );
 }
 
 /// `open/` of a mount without its provider serves the facts of `all/` from

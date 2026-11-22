@@ -281,8 +281,9 @@ fn github_owner_listing_tracks_browsed_repos() {
     );
 
     // Listing the owner anchor fetches (1) the owner profile to load its own
-    // canonical (owner.json/profile.md faces), (2) the same profile again to
-    // classify user-vs-org for the repos endpoint, then (3) the repos page.
+    // canonical (owner.json/profile.md faces), (2) the repos of an
+    // organization, which answer 404 for a user, then (3) the repos of the
+    // user.
     let mut owner_listing = harness.list("/octocat").unwrap();
     let owner_load = owner_listing.expect_single_fetch();
     assert!(
@@ -297,17 +298,19 @@ fn github_owner_listing_tracks_browsed_repos() {
             body: br#"{"login":"octocat","type":"User"}"#.to_vec(),
         })])
         .unwrap();
-    let classify_fetch = owner_listing.expect_single_fetch();
+    let org_repos_fetch = owner_listing.expect_single_fetch();
     assert!(
-        classify_fetch.url.ends_with("/users/octocat"),
-        "expected owner classification fetch, got {}",
-        classify_fetch.url
+        org_repos_fetch
+            .url
+            .ends_with("/orgs/octocat/repos?sort=full_name&direction=asc&per_page=100&page=1"),
+        "expected the repos of an organization first, got {}",
+        org_repos_fetch.url
     );
     owner_listing
         .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
+            status: 404,
             headers: Vec::<Header>::new(),
-            body: br#"{"login":"octocat","type":"User"}"#.to_vec(),
+            body: br#"{"message":"Not Found"}"#.to_vec(),
         })])
         .unwrap();
     let repos_fetch = owner_listing.expect_single_fetch();
@@ -528,17 +531,19 @@ fn github_root_and_owner_listings_ignore_unclassified_repo_paths() {
             body: br#"{"login":"open","type":"User"}"#.to_vec(),
         })])
         .unwrap();
-    let classify_fetch = owner_listing.expect_single_fetch();
+    let org_repos_fetch = owner_listing.expect_single_fetch();
     assert!(
-        classify_fetch.url.ends_with("/users/open"),
-        "expected owner classification fetch, got {}",
-        classify_fetch.url
+        org_repos_fetch
+            .url
+            .ends_with("/orgs/open/repos?sort=full_name&direction=asc&per_page=100&page=1"),
+        "expected the repos of an organization first, got {}",
+        org_repos_fetch.url
     );
     owner_listing
         .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
+            status: 404,
             headers: Vec::<Header>::new(),
-            body: br#"{"login":"open","type":"User"}"#.to_vec(),
+            body: br#"{"message":"Not Found"}"#.to_vec(),
         })])
         .unwrap();
     let repos_fetch = owner_listing.expect_single_fetch();
@@ -657,9 +662,7 @@ fn github_provider_missing_item_resources_validate_on_lookup() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn github_pr_lookup_is_fed_and_exposes_diff() {
-    use omnifs_wit::host::types::{
-        BlobFetched, ByteSource, Callout, CalloutError, CalloutResult, ErrorKind,
-    };
+    use omnifs_wit::host::types::{BlobFetched, ByteSource, Callout, CalloutResult};
 
     let harness = github_harness();
 
@@ -707,67 +710,73 @@ fn github_pr_lookup_is_fed_and_exposes_diff() {
         other => panic!("expected PR dir listing, got {other:?}"),
     }
 
-    let mut diff = harness
-        .read("/octocat/Hello-World/pulls/open/7/diff.patch")
-        .unwrap();
-    let diff_fetch = match diff.callouts() {
-        [Callout::FetchBlob(request)] => request,
-        other => panic!("expected fetch-blob callout, got {other:?}"),
-    };
-    assert!(
-        diff_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/pulls/7"),
-        "unexpected PR diff fetch URL: {}",
-        diff_fetch.url
-    );
-    assert!(
-        diff_fetch
-            .headers
-            .iter()
-            .any(|h| h.name.eq_ignore_ascii_case("accept")
-                && h.value == "application/vnd.github.diff"),
-        "expected diff Accept header, got {:?}",
-        diff_fetch.headers
-    );
-
-    diff.answer_callouts(vec![CalloutResult::BlobFetched(BlobFetched {
-        blob: 1,
-        size: 25,
-        content_type: Some("application/octet-stream".to_string()),
-        etag: None,
-        status: 200,
-        response_headers: Vec::new(),
-    })])
-    .unwrap();
-
-    match diff.result().unwrap() {
-        Ok(ReadFileOutcome::Found(file)) => match &file.bytes {
-            ByteSource::Blob(blob) => assert_eq!(*blob, 1),
-            other => panic!("expected blob-backed diff, got {other:?}"),
-        },
-        other => panic!("expected PR diff file after read, got {other:?}"),
-    }
-
-    let mut retry = harness
-        .read("/octocat/Hello-World/pulls/open/7/diff.patch")
-        .unwrap();
-    assert!(
-        retry.is_waiting_for_callouts(),
-        "expected PR diff reread to refetch, got {retry:?}"
-    );
-    retry
-        .answer_callouts(vec![CalloutResult::CalloutError(CalloutError {
-            kind: ErrorKind::Network,
-            message: "network down".to_string(),
-            retryable: true,
+    // The diff is the diff between the base and the head that the pull
+    // request names: the host holds the diff of each pair of commits, so a
+    // read asks GitHub for the diff of a pair once, and a push to the pull
+    // request, which moves its head, asks for another diff.
+    for (head, blob) in [("head-1", 1), ("head-2", 2)] {
+        let mut diff = harness
+            .read("/octocat/Hello-World/pulls/open/7/diff.patch")
+            .unwrap();
+        let pull_fetch = diff.expect_single_fetch();
+        assert!(
+            pull_fetch
+                .url
+                .ends_with("/repos/octocat/Hello-World/pulls/7"),
+            "unexpected pull request URL: {}",
+            pull_fetch.url
+        );
+        diff.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: format!(r#"{{"base":{{"sha":"base-1"}},"head":{{"sha":"{head}"}}}}"#)
+                .into_bytes(),
         })])
         .unwrap();
-    match retry.result().unwrap() {
-        Err(error) => {
-            assert_eq!(error.kind, ErrorKind::Network);
-        },
-        other => panic!("expected Network error on refetch, got {other:?}"),
+        let diff_fetch = match diff.callouts() {
+            [Callout::FetchBlob(request)] => request,
+            other => panic!("expected fetch-blob callout, got {other:?}"),
+        };
+        assert!(
+            diff_fetch
+                .url
+                .ends_with("/repos/octocat/Hello-World/pulls/7"),
+            "unexpected PR diff fetch URL: {}",
+            diff_fetch.url
+        );
+        assert!(
+            diff_fetch
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("accept")
+                    && h.value == "application/vnd.github.diff"),
+            "expected diff Accept header, got {:?}",
+            diff_fetch.headers
+        );
+        let version = format!("base-1..{head}");
+        assert_eq!(diff_fetch.version.as_deref(), Some(version.as_str()));
+
+        diff.answer_callouts(vec![CalloutResult::BlobFetched(BlobFetched {
+            blob,
+            size: 25,
+            content_type: Some("application/octet-stream".to_string()),
+            etag: None,
+            status: 200,
+            response_headers: Vec::new(),
+        })])
+        .unwrap();
+
+        match diff.result().unwrap() {
+            Ok(ReadFileOutcome::Found(file)) => {
+                match &file.bytes {
+                    ByteSource::Blob(found) => assert_eq!(*found, blob),
+                    other => panic!("expected blob-backed diff, got {other:?}"),
+                }
+                assert_eq!(file.attrs.stability, Stability::Dynamic);
+                assert_eq!(file.attrs.version_token.as_deref(), Some(version.as_str()));
+            },
+            other => panic!("expected PR diff file after read, got {other:?}"),
+        }
     }
 }
 
@@ -1043,7 +1052,7 @@ fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
         .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
             status: 200,
             headers: vec![header("ETag", r#""pull-1""#)],
-            body: br#"{"head":{"sha":"abc123"}}"#.to_vec(),
+            body: br#"{"base":{"sha":"base123"},"head":{"sha":"abc123"}}"#.to_vec(),
         })])
         .unwrap();
     let check_fetch = checks.expect_single_fetch();
@@ -1057,16 +1066,17 @@ fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
     let first_page = (700..800)
         .map(|id| {
             let output = if id == 700 {
-                r#", "output":{"title":"CI","summary":"All green"}"#
+                r#"{"title":"CI","summary":"All green","text":null}"#
             } else {
-                ""
+                r#"{"title":null,"summary":null,"text":null}"#
             };
             format!(
                 r#"{{
                     "id":{id},
                     "name":"ci-{id}",
                     "status":"completed",
-                    "conclusion":"success"{output}
+                    "conclusion":"success",
+                    "output":{output}
                 }}"#
             )
         })
@@ -1159,7 +1169,7 @@ fn github_pr_checks_list_from_head_sha_and_read_check_run_objects() {
         .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
             status: 200,
             headers: vec![header("ETag", r#""pull-2""#)],
-            body: br#"{"head":{"sha":"abc123"}}"#.to_vec(),
+            body: br#"{"base":{"sha":"base123"},"head":{"sha":"abc123"}}"#.to_vec(),
         })])
         .unwrap();
     assert_eq!(
@@ -1461,14 +1471,6 @@ fn github_provider_resource_reads_do_not_fall_back_to_provider_cache() {
             ok_body: br#"{"id":99,"status":"completed","conclusion":"success"}"#,
             expected_content: b"success",
         },
-        Case {
-            name: "action log",
-            path: "/octocat/Hello-World/actions/runs/99/log",
-            ok_headers: Vec::new(),
-            // run_log fetches the zip archive; empty body → pass-through raw bytes.
-            ok_body: b"",
-            expected_content: b"",
-        },
     ];
 
     let harness = github_harness();
@@ -1527,6 +1529,120 @@ fn github_provider_resource_reads_do_not_fall_back_to_provider_cache() {
                 case.name
             ),
         }
+    }
+}
+
+/// The CRC-32 of `bytes`, as a ZIP archive has it.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+/// A ZIP archive with `files` stored without compression.
+fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    let mut directory = Vec::new();
+    for (name, data) in files {
+        let offset = u32::try_from(archive.len()).unwrap();
+        let size = u32::try_from(data.len()).unwrap();
+        let name_len = u16::try_from(name.len()).unwrap();
+        // Version 2.0, no flags, stored, no time, the CRC-32, both sizes, the
+        // length of the name, and no extra field: the fields a local header
+        // and an entry of the central directory share.
+        let mut shared = Vec::new();
+        for field in [20_u16, 0, 0, 0, 0] {
+            shared.extend(field.to_le_bytes());
+        }
+        for field in [crc32(data), size, size] {
+            shared.extend(field.to_le_bytes());
+        }
+        shared.extend(name_len.to_le_bytes());
+        shared.extend(0_u16.to_le_bytes());
+
+        archive.extend(b"PK\x03\x04");
+        archive.extend(&shared);
+        archive.extend(name.as_bytes());
+        archive.extend(*data);
+
+        directory.extend(b"PK\x01\x02");
+        directory.extend(20_u16.to_le_bytes());
+        directory.extend(&shared);
+        // No comment, disk 0, no internal and no external attributes.
+        directory.extend([0; 10]);
+        directory.extend(offset.to_le_bytes());
+        directory.extend(name.as_bytes());
+    }
+    let entries = u16::try_from(files.len()).unwrap();
+    let directory_offset = u32::try_from(archive.len()).unwrap();
+    let directory_size = u32::try_from(directory.len()).unwrap();
+    archive.extend(directory);
+    archive.extend(b"PK\x05\x06");
+    archive.extend([0; 4]);
+    archive.extend(entries.to_le_bytes());
+    archive.extend(entries.to_le_bytes());
+    archive.extend(directory_size.to_le_bytes());
+    archive.extend(directory_offset.to_le_bytes());
+    archive.extend(0_u16.to_le_bytes());
+    archive
+}
+
+/// `actions/runs/{id}/log` has the files of the archive of the logs of the
+/// run, each under its name. An answer without the archive is an error and
+/// never a file: the redirect to the storage of the archive, which the host
+/// does not follow, and a body that is no archive.
+#[test]
+fn github_action_log_has_the_files_of_the_archive_and_fails_without_it() {
+    use omnifs_engine::EngineError;
+    use omnifs_wit::host::types::ErrorKind;
+
+    const LOG: &str = "/octocat/Hello-World/actions/runs/99/log";
+    let harness = github_harness();
+    let answer = |status: u16, headers: Vec<Header>, body: Vec<u8>| {
+        let mut read = harness.read(LOG).unwrap();
+        let fetch = read.expect_single_fetch();
+        assert!(
+            fetch
+                .url
+                .ends_with("/repos/octocat/Hello-World/actions/runs/99/logs"),
+            "unexpected logs URL: {}",
+            fetch.url
+        );
+        read.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status,
+            headers,
+            body,
+        })])
+        .unwrap();
+        read.into_ok()
+    };
+
+    let archive = zip(&[
+        ("build/1_checkout.txt", b"checked out\n"),
+        ("build/2_test.txt", b"tested"),
+    ]);
+    match answer(200, Vec::new(), archive).unwrap() {
+        ReadFileOutcome::Found(file) => assert_eq!(
+            String::from_utf8(omnifs_itest::expect_inline(&file).to_vec()).unwrap(),
+            "=== build/1_checkout.txt ===\nchecked out\n=== build/2_test.txt ===\ntested\n"
+        ),
+        other => panic!("expected the log, got {other:?}"),
+    }
+
+    let redirect = answer(
+        302,
+        vec![header("Location", "https://storage.example/logs.zip")],
+        Vec::new(),
+    );
+    assert!(redirect.is_err(), "{redirect:?}");
+    match answer(200, Vec::new(), b"not an archive".to_vec()) {
+        Err(EngineError::ProviderError(error)) => assert_eq!(error.kind, ErrorKind::InvalidInput),
+        other => panic!("expected the error of a body that is no archive, got {other:?}"),
     }
 }
 
@@ -1686,9 +1802,8 @@ fn github_provider_comment_routes_id_dirs_and_refetch() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn github_provider_lookup_owner_validates_and_owner_listing_classifies_with_org_fallback() {
-    use omnifs_wit::host::types::{CalloutResult, Header, HttpResponse};
+fn github_owner_listing_asks_for_the_profile_once_and_the_repos_of_an_organization_first() {
+    use omnifs_wit::host::types::{CalloutResult, HttpResponse};
 
     let harness = github_harness();
     // lookup_child on an owner segment resolves structurally without a fetch.
@@ -1705,78 +1820,21 @@ fn github_provider_lookup_owner_validates_and_owner_listing_classifies_with_org_
         other => panic!("expected immediate Dir entry for owner, got {other:?}"),
     }
 
-    // Listing the owner object first LOADS its canonical (owner.json/profile.md
-    // faces): `Owner::load` probes `/users` then falls back to `/orgs`. Then the
-    // `Owner::repos` collection classifies the owner again (user-vs-org) to pick
-    // the repos endpoint. Both rounds probe users(404) then orgs(200) here.
+    // Listing the owner object loads its canonical (owner.json/profile.md
+    // faces) from `/users/{login}`, which answers an organization too, once.
+    // The first page of its repos then asks the repos of an organization.
     let mut listing = harness.list("/openai").unwrap();
-    let load_user = listing.expect_single_fetch();
+    let load = listing.expect_single_fetch();
     assert!(
-        load_user.url.ends_with("/users/openai"),
-        "expected owner load user probe first, got {}",
-        load_user.url
-    );
-
-    listing
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 404,
-            headers: vec![Header {
-                name: "etag".to_string(),
-                value: "\"miss\"".to_string(),
-            }],
-            body: Vec::new(),
-        })])
-        .unwrap();
-    let load_org = listing.expect_single_fetch();
-    assert!(
-        load_org.url.ends_with("/orgs/openai"),
-        "expected owner load org fallback, got {}",
-        load_org.url
-    );
-
-    listing
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: br#"{
-                "login": "openai",
-                "public_repos": 42
-            }"#
-            .to_vec(),
-        })])
-        .unwrap();
-    // Collection classification: probe users again, fall back to orgs again.
-    let classify_user = listing.expect_single_fetch();
-    assert!(
-        classify_user.url.ends_with("/users/openai"),
-        "expected collection classification user probe, got {}",
-        classify_user.url
-    );
-    listing
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 404,
-            headers: vec![Header {
-                name: "etag".to_string(),
-                value: "\"miss\"".to_string(),
-            }],
-            body: Vec::new(),
-        })])
-        .unwrap();
-    let classify_org = listing.expect_single_fetch();
-    assert!(
-        classify_org.url.ends_with("/orgs/openai"),
-        "expected collection classification org fallback, got {}",
-        classify_org.url
+        load.url.ends_with("/users/openai"),
+        "expected the owner profile, got {}",
+        load.url
     );
     listing
         .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
             status: 200,
             headers: Vec::new(),
-            body: br#"{
-                "login": "openai",
-                "public_repos": 42
-            }"#
-            .to_vec(),
+            body: br#"{"login":"openai","type":"Organization","name":null,"bio":null}"#.to_vec(),
         })])
         .unwrap();
     let repos_fetch = listing.expect_single_fetch();
@@ -1784,7 +1842,7 @@ fn github_provider_lookup_owner_validates_and_owner_listing_classifies_with_org_
         repos_fetch
             .url
             .ends_with("/orgs/openai/repos?sort=full_name&direction=asc&per_page=100&page=1"),
-        "expected repo listing fetch after owner classification, got {}",
+        "expected the repos of the organization after its profile, got {}",
         repos_fetch.url
     );
 
@@ -1805,6 +1863,11 @@ fn github_provider_lookup_owner_validates_and_owner_listing_classifies_with_org_
             assert!(
                 names.contains(&"api"),
                 "expected api in owner listing, got {names:?}"
+            );
+            assert!(result.next_cursor.is_none());
+            assert_eq!(
+                result.validator.as_ref().map(|page| page.token.as_str()),
+                Some(r#"{"kind":"org","etag":"\"page-1\""}"#)
             );
         },
         other => panic!("expected owner listing result, got {other:?}"),
@@ -1918,48 +1981,53 @@ fn github_provider_list_routes_preserve_typed_http_errors() {
     }
 }
 
-/// `item.json` bytes equal the single-item GET body verbatim.
+/// `item.json` bytes equal the single-item GET body verbatim: of the issue
+/// for an issue, and of the pull request for a pull request.
 #[test]
 fn item_json_byte_equals_single_get() {
     use omnifs_wit::host::types::{
         ByteSource, Callout, CalloutResult, HttpResponse, ReadFileOutcome,
     };
 
-    let issue_json = br#"{
+    let item_json = br#"{
         "number": 42,
-        "title": "Issue forty-two",
+        "title": "Item forty-two",
         "body": "Body text",
         "state": "open",
         "user": {"login": "octocat"}
     }"#;
 
-    let item_path = "/octocat/Hello-World/issues/all/42/item.json";
-
     let harness = github_harness();
-    let mut step = harness.read(item_path).unwrap();
-    let [Callout::Fetch(fetch)] = step.callouts() else {
-        panic!("expected issue fetch, got {step:?}");
-    };
-    assert!(
-        fetch.url.ends_with("/repos/octocat/Hello-World/issues/42"),
-        "unexpected URL: {}",
-        fetch.url
-    );
+    for kind in ["issues", "pulls"] {
+        let mut step = harness
+            .read(&format!("/octocat/Hello-World/{kind}/all/42/item.json"))
+            .unwrap();
+        let [Callout::Fetch(fetch)] = step.callouts() else {
+            panic!("expected item fetch, got {step:?}");
+        };
+        assert!(
+            fetch
+                .url
+                .ends_with(&format!("/repos/octocat/Hello-World/{kind}/42")),
+            "unexpected URL: {}",
+            fetch.url
+        );
 
-    step.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-        status: 200,
-        headers: Vec::new(),
-        body: issue_json.to_vec(),
-    })])
-    .unwrap();
-    let Ok(ReadFileOutcome::Found(file)) = step.result().unwrap() else {
-        panic!("expected read terminal, got {step:?}");
-    };
-    assert_eq!(step.effects().unwrap().canonical[0].bytes, issue_json);
-    match &file.bytes {
-        ByteSource::Canonical => {},
-        ByteSource::Inline(bytes) => assert_eq!(bytes.as_slice(), issue_json),
-        other => panic!("expected canonical or inline item.json bytes, got {other:?}"),
+        step.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: item_json.to_vec(),
+        })])
+        .unwrap();
+        let Ok(ReadFileOutcome::Found(file)) = step.result().unwrap() else {
+            panic!("expected read terminal, got {step:?}");
+        };
+        assert_eq!(step.effects().unwrap().canonical[0].bytes, item_json);
+        match &file.bytes {
+            ByteSource::Canonical => {},
+            ByteSource::Inline(bytes) => assert_eq!(bytes.as_slice(), item_json),
+            other => panic!("expected canonical or inline item.json bytes, got {other:?}"),
+        }
     }
 }
 
@@ -2271,7 +2339,7 @@ async fn github_pr_review_comments_page_is_asked_again_with_its_etag_after_its_d
     pull_page_is_asked_again_with_its_etag_after_its_deadline(
         "reviews/80/comments",
         "reviews/80/comments?per_page=100&page=1",
-        br#"[{"id":99,"body":"nit","path":"src/lib.rs","user":{"login":"reviewer"}}]"#,
+        br#"[{"id":99,"body":"nit","path":"src/lib.rs","diff_hunk":"@@ -1 +1 @@","user":{"login":"reviewer"}}]"#,
         &["99"],
     )
     .await;

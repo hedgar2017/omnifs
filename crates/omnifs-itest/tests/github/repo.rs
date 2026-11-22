@@ -10,9 +10,9 @@ const TREE: &str = "/octocat/Hello-World/repo";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const NEXT: &str = "89abcdef0123456789abcdef0123456789abcdef";
 
-/// The request for the commit of `HEAD`, with the commit of the tree in
-/// quotes as its `ETag`.
-fn assert_head_request(request: &HttpRequest) {
+/// The request for the commit of `HEAD`, with the commit `known` of the tree
+/// in quotes as its `ETag`, unconditional without one.
+fn assert_head_request(request: &HttpRequest, known: Option<&str>) {
     assert!(
         request
             .url
@@ -29,7 +29,7 @@ fn assert_head_request(request: &HttpRequest) {
     assert_eq!(accepts, ["application/vnd.github.sha"]);
     assert_eq!(
         request_header(request, "if-none-match"),
-        Some(format!("\"{COMMIT}\"").as_str())
+        known.map(|commit| format!("\"{commit}\"")).as_deref()
     );
 }
 
@@ -38,7 +38,7 @@ fn assert_head_request(request: &HttpRequest) {
 fn github_repo_tree_stands_on_304() {
     let harness = github_harness();
     let mut list = harness.list_page(TREE, None, Some(COMMIT)).unwrap();
-    assert_head_request(list.expect_single_fetch());
+    assert_head_request(list.expect_single_fetch(), Some(COMMIT));
     list.answer_callouts(vec![CalloutResult::HttpResponse(not_modified())])
         .unwrap();
     assert!(matches!(
@@ -47,37 +47,40 @@ fn github_repo_tree_stands_on_304() {
     ));
 }
 
-/// A new commit of `HEAD` opens the clone at it and hands its tree off.
+/// A new commit of `HEAD`, or its commit for a tree without a known commit,
+/// opens the clone at it and hands its tree off.
 #[test]
 fn github_repo_tree_opens_a_new_commit() {
     let harness = github_harness();
-    let mut list = harness.list_page(TREE, None, Some(COMMIT)).unwrap();
-    assert_head_request(list.expect_single_fetch());
-    list.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-        status: 200,
-        headers: Vec::new(),
-        body: NEXT.as_bytes().to_vec(),
-    })])
-    .unwrap();
-    let [Callout::GitOpenRepo(open)] = list.callouts() else {
-        panic!(
-            "expected the open of the new commit, got {:?}",
-            list.callouts()
-        );
-    };
-    assert_eq!(open.clone_url, "git@github.com:octocat/Hello-World.git");
-    assert_eq!(open.reference, None);
-    assert_eq!(open.commit, NEXT);
-    list.answer_callouts(vec![CalloutResult::GitRepoOpened(GitRepoInfo {
-        repo: 7,
-        tree: 7,
-    })])
-    .unwrap();
-    match list.into_ok().unwrap() {
-        ListChildrenResult::Subtree(subtree) => {
-            assert_eq!(subtree.tree, 7);
-            assert_eq!(subtree.commit, NEXT);
-        },
-        other => panic!("expected the tree at the new commit, got {other:?}"),
+    for known in [Some(COMMIT), None] {
+        let mut list = harness.list_page(TREE, None, known).unwrap();
+        assert_head_request(list.expect_single_fetch(), known);
+        list.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: NEXT.as_bytes().to_vec(),
+        })])
+        .unwrap();
+        let [Callout::GitOpenRepo(open)] = list.callouts() else {
+            panic!(
+                "expected the open of the new commit, got {:?}",
+                list.callouts()
+            );
+        };
+        assert_eq!(open.clone_url, "git@github.com:octocat/Hello-World.git");
+        assert_eq!(open.reference, None);
+        assert_eq!(open.commit, NEXT);
+        list.answer_callouts(vec![CalloutResult::GitRepoOpened(GitRepoInfo {
+            repo: 7,
+            tree: 7,
+        })])
+        .unwrap();
+        match list.into_ok().unwrap() {
+            ListChildrenResult::Subtree(subtree) => {
+                assert_eq!(subtree.tree, 7);
+                assert_eq!(subtree.commit, NEXT);
+            },
+            other => panic!("expected the tree at the new commit, got {other:?}"),
+        }
     }
 }
