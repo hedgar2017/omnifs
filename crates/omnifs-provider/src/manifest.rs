@@ -422,9 +422,12 @@ fn validate_scheme(key: &str, scheme: &AuthScheme) -> Result<(), ProviderMetadat
     Ok(())
 }
 
-/// The claims of an assertion of a JWT bearer grant that the host gives,
-/// none of which carries the scopes.
-const ASSERTION_CLAIMS: [&str; 5] = ["iss", "sub", "aud", "iat", "exp"];
+/// The registered claims of a JWT, each of RFC 7519 section 4.1, and `prn`,
+/// the earlier name of `sub` in the drafts of RFC 7523. The host gives
+/// `iss`, `sub`, `aud`, `iat` and `exp` of an assertion of a JWT bearer
+/// grant, and an authorization server reads each other one by its
+/// registered meaning, so none of them carries the scopes.
+const REGISTERED_CLAIMS: [&str; 8] = ["iss", "sub", "aud", "exp", "nbf", "iat", "jti", "prn"];
 
 fn validate_oauth_flow(key: &str, oauth: &OauthScheme) -> Result<(), ProviderMetadataError> {
     validate_https_endpoint(
@@ -447,9 +450,9 @@ fn validate_oauth_flow(key: &str, oauth: &OauthScheme) -> Result<(), ProviderMet
         OAuthFlow::JwtBearer => {},
         OAuthFlow::JwtBearerScopeClaim(flow) => {
             validate_non_empty(&format!("auth.schemes.{key}.flow.claim"), &flow.claim)?;
-            if ASSERTION_CLAIMS.contains(&flow.claim.as_str()) {
+            if REGISTERED_CLAIMS.contains(&flow.claim.as_str()) {
                 return Err(ProviderMetadataError::Validation(format!(
-                    "auth.schemes.{key}.flow.claim must not be {}, a claim of the assertion itself",
+                    "auth.schemes.{key}.flow.claim must not be {}, a registered claim of a JWT",
                     flow.claim
                 )));
             }
@@ -982,19 +985,11 @@ mod tests {
         })
         .expect("a claim for the scopes");
 
-        for (needle, edit) in [
-            (
-                "tokenEndpointAuth must be none",
-                (|oauth| oauth["tokenEndpointAuth"] = "clientSecretPost".into())
-                    as fn(&mut serde_json::Value),
-            ),
-            ("flow.claim must not be sub", |oauth| {
-                oauth["flow"] = serde_json::json!({ "jwtBearerScopeClaim": { "claim": "sub" } });
-            }),
-            ("flow.claim must not be empty", |oauth| {
-                oauth["flow"] = serde_json::json!({ "jwtBearerScopeClaim": { "claim": "" } });
-            }),
-        ] {
+        for (needle, edit) in [(
+            "tokenEndpointAuth must be none",
+            (|oauth| oauth["tokenEndpointAuth"] = "clientSecretPost".into())
+                as fn(&mut serde_json::Value),
+        )] {
             let error = jwt_bearer(edit).unwrap_err();
             assert!(
                 matches!(&error, ProviderMetadataError::Validation(message) if message.contains(needle)),
@@ -1012,6 +1007,52 @@ mod tests {
             matches!(&error, ProviderMetadataError::Validation(message) if message.contains("authorizationEndpoint")),
             "{error}"
         );
+    }
+
+    /// The manifest of `oauth_provider_manifest()` with the flow of a JWT
+    /// bearer grant and no authorization endpoint, after `edit` of its
+    /// scheme.
+    fn jwt_bearer(
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<ProviderManifest, ProviderMetadataError> {
+        let mut manifest = serde_json::to_value(oauth_provider_manifest()).unwrap();
+        let oauth = &mut manifest["auth"]["schemes"][0]["oauth"];
+        oauth["flow"] = "jwtBearer".into();
+        oauth
+            .as_object_mut()
+            .unwrap()
+            .remove("authorizationEndpoint");
+        edit(oauth);
+        ProviderManifest::from_bytes(&json(&manifest))
+    }
+
+    fn validation_error(result: Result<ProviderManifest, ProviderMetadataError>) -> String {
+        match result.unwrap_err() {
+            ProviderMetadataError::Validation(message) => message,
+            error => panic!("no validation error: {error}"),
+        }
+    }
+
+    /// The claim of the scopes of a JWT bearer grant is none of the
+    /// registered claims of a JWT, and is not empty.
+    #[test]
+    fn the_claim_of_the_scopes_is_no_registered_claim_of_a_jwt() {
+        let claim = |claim: &str| {
+            jwt_bearer(|oauth| {
+                oauth["flow"] = serde_json::json!({ "jwtBearerScopeClaim": { "claim": claim } });
+            })
+        };
+        for registered in ["iss", "sub", "aud", "exp", "nbf", "iat", "jti", "prn"] {
+            assert_eq!(
+                validation_error(claim(registered)),
+                format!(
+                    "auth.schemes.oauth.flow.claim must not be {registered}, a registered claim of a JWT"
+                )
+            );
+        }
+        assert!(validation_error(claim("")).contains("flow.claim must not be empty"));
+        claim("scope").expect("a claim of the authorization server");
+        claim("scp").expect("another claim of the authorization server");
     }
 
     /// The probe of a static token sends no second value of the header of
