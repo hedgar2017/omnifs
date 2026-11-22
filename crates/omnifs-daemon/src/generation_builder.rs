@@ -15,7 +15,7 @@ mod revocation;
 pub(crate) use revocation::{PreparedCredentialRevocation, prepare_credential_revocation};
 
 use anyhow::Context as _;
-use auth_fingerprint::auth_fingerprint;
+use auth_fingerprint::{auth_fingerprint, earlier_auth_fingerprint};
 use credential_codec::{CredentialPayload, decode_payload, encode_payload};
 use omnifs_api::{
     CredentialClientOverrides, CredentialMaterial, CredentialSubmission, SecretBytes,
@@ -434,7 +434,8 @@ fn build_mount_input(
 }
 
 /// Whether `provider` declares the auth scheme that `credential` was issued
-/// against with the artifact of its issue.
+/// against with the artifact of its issue: by the fingerprint of this
+/// omnifs, or by the one that an earlier omnifs stored with it.
 fn issued_scheme(
     provider: &LoadedProvider,
     credential: &CredentialRuntime,
@@ -449,7 +450,9 @@ fn issued_scheme(
     };
     Ok(
         auth_fingerprint(credential.provider, scheme, &credential.overrides)?
-            == credential.fingerprint,
+            == credential.fingerprint
+            || earlier_auth_fingerprint(credential.provider, scheme, &credential.overrides)?
+                == credential.fingerprint,
     )
 }
 
@@ -672,34 +675,43 @@ mod tests {
         }
     }
 
-    /// The state of a mount of `provider()` with a stored token whose
-    /// fingerprint is `fingerprint`, or the one of the scheme for none.
-    fn state_with_fingerprint(fingerprint: Option<AuthRuntimeFingerprint>) -> MountBuildState {
-        let provider = provider();
-        let mount = mount(&CredentialId::new("demo", "pat", "default").unwrap());
+    type Fingerprint = fn(
+        ProviderId,
+        &AuthScheme,
+        &CredentialClientOverrides,
+    ) -> anyhow::Result<AuthRuntimeFingerprint>;
+
+    /// The state of a mount of `provider` with a stored credential of
+    /// `kind` for its scheme `scheme`, with `overrides` and with the
+    /// fingerprint that `fingerprint` gives for them.
+    fn state_of_mount(
+        provider: Result<&LoadedProvider, &String>,
+        scheme: &AuthScheme,
+        kind: AuthKind,
+        overrides: CredentialClientOverrides,
+        fingerprint: Fingerprint,
+    ) -> MountBuildState {
+        let key = scheme.key().unwrap();
+        let mount = mount(&CredentialId::new("demo", key, "default").unwrap());
         let id = mount.document.credential.clone().unwrap();
         let provider_id = mount.document.provider.id;
-        let overrides = CredentialClientOverrides {
-            client_id: None,
-            client_secret: None,
-            redirect_uri: None,
-            scopes: None,
-            subject: None,
+        let entry = match kind {
+            AuthKind::StaticToken => {
+                CredentialEntry::static_token(SecretString::from("token".to_owned()))
+            },
+            AuthKind::OAuth => CredentialEntry::oauth(
+                SecretString::from("access".to_owned()),
+                None,
+                None,
+                "Bearer",
+                Vec::new(),
+            ),
         };
-        let scheme = provider
-            .manifest
-            .auth
-            .as_ref()
-            .unwrap()
-            .scheme("pat")
-            .unwrap();
-        let issued = auth_fingerprint(provider_id, scheme, &overrides).unwrap();
-        let entry = CredentialEntry::static_token(SecretString::from("token".to_owned()));
         let runtime = CredentialRuntime {
             id: id.clone(),
             provider: provider_id,
-            kind: AuthKind::StaticToken,
-            fingerprint: fingerprint.unwrap_or(issued),
+            kind,
+            fingerprint: fingerprint(provider_id, scheme, &overrides).unwrap(),
             version: CredentialVersion::initial(),
             generation: CredentialGeneration::initial(),
             entry: entry.clone(),
@@ -717,9 +729,39 @@ mod tests {
             Arc::new(NoRefresh),
         ));
         let credentials = HashMap::from([(id.clone(), runtime)]);
-        build_mount_input(mount, Ok(&provider), &credentials, &service)
+        build_mount_input(mount, provider, &credentials, &service)
             .unwrap()
             .state
+    }
+
+    fn no_overrides_of_a_token() -> CredentialClientOverrides {
+        CredentialClientOverrides {
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
+            scopes: None,
+            subject: None,
+        }
+    }
+
+    /// The state of a mount of `provider()` with a stored token whose
+    /// fingerprint `fingerprint` gives.
+    fn state_with_fingerprint(fingerprint: Fingerprint) -> MountBuildState {
+        let provider = provider();
+        let scheme = provider
+            .manifest
+            .auth
+            .as_ref()
+            .unwrap()
+            .scheme("pat")
+            .unwrap();
+        state_of_mount(
+            Ok(&provider),
+            scheme,
+            AuthKind::StaticToken,
+            no_overrides_of_a_token(),
+            fingerprint,
+        )
     }
 
     /// The subject of a stored credential is the one of its OAuth request,
@@ -741,17 +783,119 @@ mod tests {
     }
 
     /// A credential whose fingerprint is not the one of the auth scheme of
-    /// the provider of its mount, as one that an earlier omnifs stored,
-    /// leaves that mount alone without a credential.
+    /// the provider of its mount leaves that mount alone without a
+    /// credential.
     #[test]
     fn a_credential_of_another_fingerprint_leaves_its_mount_alone_without_one() {
         assert!(matches!(
-            state_with_fingerprint(None),
+            state_with_fingerprint(auth_fingerprint),
             MountBuildState::Active { auth: Some(_), .. }
         ));
         assert!(matches!(
-            state_with_fingerprint(Some(AuthRuntimeFingerprint::from_digest([9; 32]))),
+            state_with_fingerprint(|_, _, _| Ok(AuthRuntimeFingerprint::from_digest([9; 32]))),
             MountBuildState::AuthRequired
         ));
+    }
+
+    /// A credential that an earlier omnifs stored, with the fingerprint of
+    /// that omnifs for the auth scheme of the provider of its mount, stays
+    /// bound to its mount: a new omnifs leaves no mount without its
+    /// credential.
+    #[test]
+    fn a_credential_of_the_fingerprint_of_an_earlier_omnifs_stays_bound() {
+        assert!(matches!(
+            state_with_fingerprint(earlier_auth_fingerprint),
+            MountBuildState::Active { auth: Some(_), .. }
+        ));
+    }
+
+    /// The manifest of an artifact of an earlier omnifs, whose flow
+    /// `jwtBearer` had the scopes in a claim and whose scheme had to declare
+    /// an authorization endpoint.
+    fn earlier_jwt_bearer_manifest() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": "demo",
+            "displayName": "Demo",
+            "provider": "demo.wasm",
+            "defaultMount": "demo",
+            "projection": 1,
+            "refreshIntervalSecs": 0,
+            "capabilities": [{
+                "kind": "domain",
+                "value": "api.demo.test",
+                "why": "Test credential injection."
+            }],
+            "auth": {
+                "default": "service-account",
+                "schemes": [{
+                    "oauth": {
+                        "key": "service-account",
+                        "displayName": "Demo service account",
+                        "authorizationEndpoint": "https://auth.demo.test/authorize",
+                        "tokenEndpoint": "https://auth.demo.test/token",
+                        "defaultScopes": ["read"],
+                        "flow": "jwtBearer",
+                        "injectDomains": ["api.demo.test"],
+                        "injectValuePrefix": "Bearer "
+                    }
+                }],
+                "guidance": {
+                    "service-account": { "setupSteps": ["Pass the client and its key."] }
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    /// A mount on an artifact of an earlier omnifs whose flow `jwtBearer`
+    /// had another meaning is unavailable with the error of its manifest,
+    /// which declares the authorization endpoint that the flow had to have
+    /// then: it does not look ready with the credential of that omnifs, to
+    /// fail at its next assertion.
+    #[test]
+    fn a_mount_of_an_artifact_of_the_earlier_jwt_bearer_grant_is_unavailable() {
+        let document = earlier_jwt_bearer_manifest();
+        let stored = StoredProvider {
+            reference: omnifs_core::ProviderRef {
+                id: ProviderId::from_digest([7; 32]),
+                meta: ProviderMeta {
+                    name: ProviderName::new("demo").unwrap(),
+                    version: None,
+                },
+            },
+            manifest: omnifs_provider::ProviderManifest::from_bytes(&document)
+                .map_err(|error| error.to_string()),
+            bytes: Vec::new(),
+        };
+        let provider = LoadedProvider::try_from(stored);
+        // The scheme as that omnifs read it, for the fingerprint of its
+        // credential.
+        let earlier: omnifs_provider::ProviderManifest = serde_json::from_slice(&document).unwrap();
+        let scheme = earlier
+            .auth
+            .as_ref()
+            .unwrap()
+            .scheme("service-account")
+            .unwrap();
+        let state = state_of_mount(
+            provider.as_ref(),
+            scheme,
+            AuthKind::OAuth,
+            CredentialClientOverrides {
+                client_id: Some("robot@demo.test".to_owned()),
+                client_secret: Some(SecretBytes::new(b"key".to_vec())),
+                redirect_uri: None,
+                scopes: None,
+                subject: None,
+            },
+            earlier_auth_fingerprint,
+        );
+        let MountBuildState::ProviderUnavailable { reason } = state else {
+            panic!("the mount is not unavailable");
+        };
+        assert_eq!(
+            reason,
+            "its provider manifest is invalid: invalid provider metadata: auth.schemes.service-account.authorizationEndpoint must not be declared for the flow of a JWT bearer grant, which has no authorization request"
+        );
     }
 }
