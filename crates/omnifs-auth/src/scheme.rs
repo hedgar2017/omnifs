@@ -292,6 +292,8 @@ pub struct TokenValidation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     pub expect_status: u16,
+    /// The JSON pointer of a value of the answer that holds for a valid
+    /// token: each value but `null`, `false`, and the empty string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_pointer: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

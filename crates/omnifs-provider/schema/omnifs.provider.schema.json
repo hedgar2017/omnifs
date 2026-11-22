@@ -988,6 +988,7 @@
           }
         },
         "jsonPointer": {
+          "description": "The JSON pointer of a value of the answer that holds for a valid\ntoken: each value but `null`, `false`, and the empty string.",
           "type": [
             "string",
             "null"
