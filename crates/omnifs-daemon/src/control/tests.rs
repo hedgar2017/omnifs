@@ -641,6 +641,43 @@ async fn next_phase(phases: &mut tonic::Streaming<wire::PhaseEvent>) -> omnifs_a
     grpc::phase_event(&phases.next().await.unwrap().unwrap()).unwrap()
 }
 
+/// `WatchPhase` gives a running daemon whose store requires recovery as
+/// `recovery_required` with the error of its store, to a subscription at
+/// the change and to one after it, and as `ready` again once its store
+/// serves.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(unsafe_code)]
+async fn watch_phase_gives_a_running_daemon_with_the_recovery_of_its_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = crate::ENV_LOCK.lock().await;
+    let home = std::fs::canonicalize(dir.path()).unwrap();
+    unsafe {
+        std::env::set_var("OMNIFS_HOME", &home);
+    }
+    let runtime = test_daemon(&dir).await;
+    let mut c = client(&home.join("control.sock")).await;
+    let mut phases = c.watch_phase(wire::Empty {}).await.unwrap().into_inner();
+    assert_eq!(next_phase(&mut phases).await, omnifs_api::PhaseEvent::Ready);
+
+    let state = Arc::clone(&runtime.daemon.state);
+    state
+        .mark_recovery_required(None, "a publish failed".to_owned())
+        .await
+        .unwrap();
+    let recovery = omnifs_api::PhaseEvent::RecoveryRequired {
+        error: "a publish failed".to_owned(),
+    };
+    assert_eq!(next_phase(&mut phases).await, recovery);
+    let mut later = c.watch_phase(wire::Empty {}).await.unwrap().into_inner();
+    assert_eq!(next_phase(&mut later).await, recovery);
+
+    let revision = state.mount_revision().await.unwrap();
+    state.mark_serving(revision).await.unwrap();
+    assert_eq!(next_phase(&mut phases).await, omnifs_api::PhaseEvent::Ready);
+    assert_eq!(next_phase(&mut later).await, omnifs_api::PhaseEvent::Ready);
+    runtime.shutdown().await;
+}
+
 /// `WatchPhase` gives a starting daemon as `starting`, then its readiness
 /// once, however often the daemon sets it, and ends with the daemon.
 #[tokio::test(flavor = "multi_thread")]

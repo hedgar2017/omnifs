@@ -100,6 +100,8 @@ pub struct StateStore {
     reads: SqlitePool,
     writer: StateWriter,
     credential_refresh_wakeup: watch::Sender<()>,
+    /// The recovery state of the store, as its last transition left it.
+    recovery: watch::Sender<RecoveryState>,
     provider_import: Arc<tokio::sync::Semaphore>,
 }
 
@@ -164,14 +166,33 @@ impl StateStore {
             .context("open StateStore writer connection")?;
         let (credential_refresh_wakeup, _wakeup_receiver) = watch::channel(());
 
-        Ok(Self {
+        let store = Self {
             paths,
             options,
             reads,
             writer: StateWriter::spawn(writer_connection),
             credential_refresh_wakeup,
+            recovery: watch::Sender::new(RecoveryState::Ready),
             provider_import: Arc::new(tokio::sync::Semaphore::new(1)),
-        })
+        };
+        store
+            .recovery
+            .send_replace(store.serving_state().await?.recovery);
+        Ok(store)
+    }
+
+    /// The recovery state of the store, and each change of it: the store
+    /// requires recovery from a transition to it up to the next transition
+    /// to a serving revision.
+    #[must_use]
+    pub fn watch_recovery(&self) -> watch::Receiver<RecoveryState> {
+        self.recovery.subscribe()
+    }
+
+    /// The recovery state of the store now.
+    #[must_use]
+    pub fn recovery(&self) -> RecoveryState {
+        self.recovery.borrow().clone()
     }
 
     #[must_use]
@@ -280,6 +301,14 @@ impl StateStore {
     }
 
     async fn transition(&self, transition: RecoveryTransition) -> anyhow::Result<()> {
+        let recovery = match &transition {
+            RecoveryTransition::Serving { .. } => RecoveryState::Ready,
+            RecoveryTransition::RecoveryRequired { detail, .. } => {
+                RecoveryState::RecoveryRequired {
+                    detail: detail.clone(),
+                }
+            },
+        };
         self.writer
             .call(move |mut connection| async move {
                 let result = Db::new(&mut connection)
@@ -287,7 +316,9 @@ impl StateStore {
                     .await;
                 (connection, result)
             })
-            .await?
+            .await??;
+        self.recovery.send_replace(recovery);
+        Ok(())
     }
 
     pub async fn begin_provider_upload(

@@ -721,27 +721,52 @@ impl wire::control_server::Control for GrpcControlService {
             let _permit = permit;
             let mut given = None;
             loop {
-                let Some(event) = phases.borrow_and_update().event() else {
-                    return;
+                let phase = phases.borrow_and_update().clone();
+                // The store of a running daemon, whose recovery state is of
+                // the phase of that daemon.
+                let mut recovery = match &phase {
+                    ControlPhase::Ready(daemon) => Some(daemon.state.watch_recovery()),
+                    ControlPhase::Starting
+                    | ControlPhase::Recovery(_)
+                    | ControlPhase::ShuttingDown => None,
                 };
-                if given.as_ref() != Some(&event) {
-                    if sender.send(Ok(grpc::to_phase_event(&event))).await.is_err() {
-                        return;
+                loop {
+                    if let Some(recovery) = recovery.as_mut() {
+                        recovery.mark_unchanged();
                     }
-                    given = Some(event);
-                }
-                tokio::select! {
-                    () = sender.closed() => return,
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
+                    let Some(event) = phase.event() else {
+                        return;
+                    };
+                    if given.as_ref() != Some(&event) {
+                        if sender.send(Ok(grpc::to_phase_event(&event))).await.is_err() {
                             return;
                         }
-                    },
-                    changed = phases.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                    },
+                        given = Some(event);
+                    }
+                    tokio::select! {
+                        () = sender.closed() => return,
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return;
+                            }
+                        },
+                        changed = phases.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            break;
+                        },
+                        Some(changed) = async {
+                            match recovery.as_mut() {
+                                Some(recovery) => Some(recovery.changed().await),
+                                None => None,
+                            }
+                        } => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        },
+                    }
                 }
             }
         });

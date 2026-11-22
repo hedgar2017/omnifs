@@ -365,6 +365,17 @@ impl Daemon {
         })
     }
 
+    /// The phase of this running daemon: ready with a store that serves,
+    /// and the error of a store that requires recovery.
+    pub(crate) fn phase_event(&self) -> omnifs_api::PhaseEvent {
+        match self.state.recovery() {
+            omnifs_state::RecoveryState::Ready => omnifs_api::PhaseEvent::Ready,
+            omnifs_state::RecoveryState::RecoveryRequired { detail } => {
+                omnifs_api::PhaseEvent::RecoveryRequired { error: detail }
+            },
+        }
+    }
+
     /// The recovery of the daemon, whose store health reports the error of a
     /// store that requires recovery.
     pub(crate) async fn recovery(&self) -> anyhow::Result<DaemonRecovery> {

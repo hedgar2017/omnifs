@@ -75,11 +75,13 @@ impl ControlPhase {
     }
 
     /// The phase that `WatchPhase` gives, with the error of a recovery as its
-    /// store health reports it; none once teardown has begun.
+    /// store health reports it; none once teardown has begun. A running
+    /// daemon is ready with a store that serves, and requires recovery with
+    /// the error of a store that requires it.
     fn event(&self) -> Option<PhaseEvent> {
         match self {
             Self::Starting => Some(PhaseEvent::Starting),
-            Self::Ready(_) => Some(PhaseEvent::Ready),
+            Self::Ready(daemon) => Some(daemon.phase_event()),
             Self::Recovery(recovery) => Some(PhaseEvent::RecoveryRequired {
                 error: recovery.store_health.message.clone(),
             }),
