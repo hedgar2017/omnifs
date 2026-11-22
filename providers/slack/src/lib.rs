@@ -16,8 +16,6 @@
 //! a message, which takes it by its `ts` and its replies, and of a file,
 //! which takes its content.
 
-use std::future::Future;
-
 use omnifs_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -128,76 +126,52 @@ pub(crate) struct ReplyFileKey {
 }
 
 /// The workspace of the bot, with its users and the channels that it is in.
-#[omnifs_sdk::object(kind = "slack.workspace", key = WorkspaceKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct Workspace {}
+#[omnifs_sdk::object(kind = "slack.workspace", key = WorkspaceKey, no_load)]
+pub(crate) struct Workspace;
 
 /// The users of the workspace, the object of the listing of `users/`.
-#[omnifs_sdk::object(kind = "slack.users", key = WorkspaceKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct Users {}
+#[omnifs_sdk::object(kind = "slack.users", key = WorkspaceKey, no_load)]
+pub(crate) struct Users;
 
 /// A user of the workspace.
-#[omnifs_sdk::object(kind = "slack.user", key = UserKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct User {}
+#[omnifs_sdk::object(kind = "slack.user", key = UserKey, no_load)]
+pub(crate) struct User;
 
 /// The channels that the bot is in, the object of the listing of
 /// `channels/`.
-#[omnifs_sdk::object(kind = "slack.channels", key = WorkspaceKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct Channels {}
+#[omnifs_sdk::object(kind = "slack.channels", key = WorkspaceKey, no_load)]
+pub(crate) struct Channels;
 
 /// A public or private channel that the bot is in.
-#[omnifs_sdk::object(kind = "slack.channel", key = ChannelKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct Channel {}
+#[omnifs_sdk::object(kind = "slack.channel", key = ChannelKey, no_load)]
+pub(crate) struct Channel;
 
 /// The history of a channel, the object of the listing of its `messages/`.
-#[omnifs_sdk::object(kind = "slack.history", key = ChannelKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct History {}
+#[omnifs_sdk::object(kind = "slack.history", key = ChannelKey, no_load)]
+pub(crate) struct History;
 
 /// A message of the history of a channel.
-#[omnifs_sdk::object(kind = "slack.message", key = MessageKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct Message {}
+#[omnifs_sdk::object(kind = "slack.message", key = MessageKey, no_load)]
+pub(crate) struct Message;
 
 /// A reply of the thread of a message.
-#[omnifs_sdk::object(kind = "slack.reply", key = ReplyKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct Reply {}
+#[omnifs_sdk::object(kind = "slack.reply", key = ReplyKey, no_load)]
+pub(crate) struct Reply;
 
 /// A file of a message.
-#[omnifs_sdk::object(kind = "slack.file", key = FileKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct File {}
+#[omnifs_sdk::object(kind = "slack.file", key = FileKey, no_load)]
+pub(crate) struct File;
 
 /// A file of a reply.
-#[omnifs_sdk::object(kind = "slack.reply_file", key = ReplyFileKey, load = fed_only)]
-#[derive(Deserialize)]
-pub(crate) struct ReplyFile {}
-
-/// The load of an object of the mount, which no face asks for: the objects
-/// have no canonical bytes, and the facts of their faces come from feeds
-/// alone.
-fn fed_only<O: Object>(
-    _cx: &Cx<O::State>,
-    _key: &O::Key,
-    _since: Option<Validator>,
-) -> impl Future<Output = Result<Load<O>>> {
-    std::future::ready(Err(ProviderError::internal(format!(
-        "the object {} has no canonical bytes",
-        O::kind().as_str()
-    ))))
-}
+#[omnifs_sdk::object(kind = "slack.reply_file", key = ReplyFileKey, no_load)]
+pub(crate) struct ReplyFile;
 
 #[omnifs_sdk::provider(
     id = "slack",
     display_name = "Slack",
     description = "users, channels, messages, and files from your workspace",
     mount = "slack",
-    projection = 2,
+    projection = 3,
     capabilities(
         domain(
             "slack.com",
@@ -208,10 +182,7 @@ fn fed_only<O: Object>(
             "Fetch the content of the files of the messages and the replies of a workspace of Slack."
         ),
     ),
-    limits(memory_mb(
-        256,
-        "Leave room for a page of 999 objects of Slack and the replies of a message that a feed token keeps."
-    ),),
+    limits(memory_mb(256, "Leave room for a page of 999 objects of Slack."),),
     auth = r#"{"default":"token","schemes":[{"staticToken":{"key":"token","valuePrefix":"Bearer ","description":"Slack bot token","injectDomains":["slack.com","files.slack.com"],"validation":{"method":"POST","url":"https://slack.com/api/auth.test","expectStatus":200,"jsonPointer":"/bot_id"}}}]}"#
 )]
 impl SlackProvider {

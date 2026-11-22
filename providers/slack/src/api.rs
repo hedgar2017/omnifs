@@ -1,15 +1,13 @@
-//! The typed endpoint of Slack, the answers of its methods, and the objects
+//! The typed endpoints of Slack, the answers of its methods, and the objects
 //! of its answers.
 //!
 //! A method of Slack answers a failure in its JSON, with `ok` of `false` and
-//! its `error`, and a rate limit with the status `429` and the seconds of its
-//! `Retry-After`.
-
-use std::time::Duration;
+//! its `error`, and a rate limit with the status `429` and its `Retry-After`.
 
 use omnifs_sdk::endpoint::HttpResponse;
 use omnifs_sdk::error::ProviderError;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
 
 use crate::{Id, Result, Ts};
@@ -19,22 +17,74 @@ use crate::{Id, Result, Ts};
 #[endpoint(base = "https://slack.com")]
 pub(crate) struct SlackApi;
 
-/// An answer of a method of Slack: `ok`, the `error` of `ok` of `false`, the
-/// cursor of the next page, and the objects of the page, under the name that
-/// the method gives them.
+/// The host of the bytes of the files of Slack.
+#[derive(omnifs_sdk::Endpoint)]
+#[endpoint(base = "https://files.slack.com")]
+pub(crate) struct SlackFiles;
+
 #[derive(Deserialize)]
-struct Envelope {
+pub(crate) struct Metadata {
+    next_cursor: Option<String>,
+}
+
+/// The answer of a method of Slack: `ok`, the `error` of `ok` of `false`,
+/// the cursor of the next page, and the objects of the page, none in an
+/// answer with `ok` of `false`.
+pub(crate) struct Answer {
     ok: bool,
     error: Option<String>,
     response_metadata: Option<Metadata>,
-    #[serde(alias = "members", alias = "channels", alias = "messages")]
     objects: Option<Vec<Box<RawValue>>>,
 }
 
-#[derive(Deserialize)]
-struct Metadata {
-    next_cursor: Option<String>,
+/// A method of Slack, whose answer has its objects under the name that the
+/// method gives them.
+pub(crate) trait Method: DeserializeOwned {
+    fn answer(self) -> Answer;
 }
+
+/// The answer of the method `$method` with its objects under `$objects`.
+macro_rules! method {
+    ($(#[$doc:meta])* $method:ident, $objects:ident) => {
+        $(#[$doc])*
+        #[derive(Deserialize)]
+        pub(crate) struct $method {
+            ok: bool,
+            error: Option<String>,
+            response_metadata: Option<Metadata>,
+            $objects: Option<Vec<Box<RawValue>>>,
+        }
+
+        impl Method for $method {
+            fn answer(self) -> Answer {
+                Answer {
+                    ok: self.ok,
+                    error: self.error,
+                    response_metadata: self.response_metadata,
+                    objects: self.$objects,
+                }
+            }
+        }
+    };
+}
+
+method!(
+    /// The answer of `users.list`, with the users under `members`.
+    UsersList,
+    members
+);
+method!(
+    /// The answer of `users.conversations`, with the conversations under
+    /// `channels`.
+    UsersConversations,
+    channels
+);
+method!(
+    /// The answer of `conversations.history` and of `conversations.replies`,
+    /// with the messages under `messages`.
+    ConversationsMessages,
+    messages
+);
 
 /// A page of a method of Slack: its objects as they came, and the cursor of
 /// the next page.
@@ -72,33 +122,42 @@ impl From<ProviderError> for Refusal {
     }
 }
 
-/// The page of a method of Slack in `response`, with its
+/// The page of the method `M` of Slack in `response`, with its
 /// `response_metadata.next_cursor`, none when empty or absent; else its
-/// refusal: the rate-limited error with the seconds of its `Retry-After` for
-/// `429`, the error of the status for another failing one without the JSON
-/// of Slack, and the refusal of the `error` of `ok` of `false`.
-pub(crate) fn page(response: &HttpResponse) -> std::result::Result<Page, Refusal> {
+/// refusal: the error of the status and of its `Retry-After` for `429` and
+/// for another failing status without the JSON of Slack, and the refusal of
+/// the `error` of `ok` of `false`.
+pub(crate) fn page<M: Method>(response: &HttpResponse) -> std::result::Result<Page, Refusal> {
     let status = response.status();
+    let failed = || {
+        ProviderError::from_http_answer(
+            status,
+            response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?))),
+        )
+    };
     if status == 429 {
-        return Err(rate_limited(response.header("retry-after")).into());
+        return Err(failed().into());
     }
-    let envelope: Envelope = match serde_json::from_slice(response.body()) {
-        Ok(envelope) => envelope,
-        Err(_) if status >= 400 => return Err(ProviderError::from_http_status(status).into()),
+    let answer = match serde_json::from_slice::<M>(response.body()) {
+        Ok(answer) => answer.answer(),
+        Err(_) if !(200..300).contains(&status) => return Err(failed().into()),
         Err(error) => return Err(undecoded(&error).into()),
     };
-    if !envelope.ok {
-        let error = envelope.error.ok_or_else(|| {
+    if !answer.ok {
+        let error = answer.error.ok_or_else(|| {
             ProviderError::invalid_input("an answer of Slack with ok of false has no error")
         })?;
         return Err(refusal(&error));
     }
-    let objects = envelope.objects.ok_or_else(|| {
+    let objects = answer.objects.ok_or_else(|| {
         ProviderError::invalid_input("an answer of Slack with ok of true has no objects")
     })?;
     Ok(Page {
         objects,
-        next: envelope
+        next: answer
             .response_metadata
             .and_then(|metadata| metadata.next_cursor)
             .filter(|cursor| !cursor.is_empty()),
@@ -107,11 +166,13 @@ pub(crate) fn page(response: &HttpResponse) -> std::result::Result<Page, Refusal
 
 /// The refusal of a request that Slack answered with the error `error`, with
 /// the kind of that error: not found for a channel or a thread that the bot
-/// sees no more, a timeout for a cursor that Slack takes no more, a rate
-/// limit, a permission error for a token that Slack takes no more, a denial
-/// for a token without the right of the request, a failure of the network for
-/// a failure of Slack itself, an invalid input for a request that Slack does
-/// not take, and an internal error for each other one.
+/// sees no more, a timeout for a cursor that Slack takes no more, which the
+/// first request again answers, a refused credential for a token that Slack
+/// takes no more, a denial for a token without the right of the request, a
+/// failure of the network for a failure of Slack itself, which Slack asks to
+/// retry, a timeout for a request that Slack did not answer in time, an
+/// invalid input for a request that Slack does not take, and an internal
+/// error for each other one.
 fn refusal(error: &str) -> Refusal {
     let message = format!("Slack answered the error {error}");
     let (of, error) = match error {
@@ -120,53 +181,23 @@ fn refusal(error: &str) -> Refusal {
         },
         "thread_not_found" => (Refused::Thread, ProviderError::not_found(message)),
         "invalid_cursor" => (Refused::Cursor, ProviderError::timeout(message)),
-        "ratelimited" => (Refused::Request, ProviderError::rate_limited(message)),
         "invalid_auth" | "not_authed" | "account_inactive" | "token_revoked" | "token_expired" => {
             (Refused::Request, ProviderError::permission_denied(message))
         },
-        "missing_scope"
-        | "no_permission"
-        | "not_allowed_token_type"
-        | "access_denied"
-        | "ekm_access_denied"
-        | "org_login_required"
-        | "team_access_not_granted"
-        | "enterprise_is_restricted"
-        | "two_factor_setup_required" => (Refused::Request, ProviderError::denied(message)),
-        "internal_error" | "fatal_error" | "service_unavailable" | "team_added_to_org" => {
+        "missing_scope" | "no_permission" | "not_allowed_token_type" | "access_denied" => {
+            (Refused::Request, ProviderError::denied(message))
+        },
+        "internal_error" | "fatal_error" | "service_unavailable" => {
             (Refused::Request, ProviderError::network(message))
         },
         "request_timeout" => (Refused::Request, ProviderError::timeout(message)),
-        "invalid_arguments"
-        | "invalid_arg_name"
-        | "invalid_array_arg"
-        | "invalid_charset"
-        | "invalid_form_data"
-        | "invalid_post_type"
-        | "missing_post_type"
-        | "invalid_limit"
-        | "invalid_ts_latest"
-        | "invalid_ts_oldest"
-        | "invalid_types"
-        | "method_deprecated"
-        | "deprecated_endpoint" => (Refused::Request, ProviderError::invalid_input(message)),
+        "invalid_arguments" | "invalid_arg_name" | "invalid_array_arg" | "invalid_charset"
+        | "invalid_form_data" | "invalid_post_type" | "missing_post_type" => {
+            (Refused::Request, ProviderError::invalid_input(message))
+        },
         _ => (Refused::Request, ProviderError::internal(message)),
     };
     Refusal { of, error }
-}
-
-/// The rate-limited error of an answer `429` with the seconds of its
-/// `Retry-After`.
-pub(crate) fn rate_limited(retry_after: Option<&str>) -> ProviderError {
-    let message = match retry_after {
-        Some(value) => format!("HTTP 429; retry_after={value}"),
-        None => "HTTP 429".to_owned(),
-    };
-    ProviderError::rate_limited(message).with_retry_after(
-        retry_after
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .map(Duration::from_secs),
-    )
 }
 
 fn undecoded(error: &serde_json::Error) -> ProviderError {
@@ -216,15 +247,23 @@ pub(crate) struct MessageObject {
     files: Option<Vec<FileObject>>,
 }
 
-impl MessageObject {
-    /// Whether it has replies: a `reply_count` above `0`.
-    pub(crate) fn has_replies(&self) -> bool {
-        self.reply_count.is_some_and(|count| count > 0)
-    }
+/// The replies of a thread as its parent tells them: their `reply_count`
+/// and the `ts` of the latest one.
+#[derive(PartialEq, Eq)]
+pub(crate) struct Thread<'a> {
+    pub(crate) count: u64,
+    pub(crate) latest: Option<&'a Ts>,
+}
 
-    /// Whether it has the `reply_count` and the `latest_reply` of `other`.
-    pub(crate) fn same_replies(&self, other: &Self) -> bool {
-        self.reply_count == other.reply_count && self.latest_reply == other.latest_reply
+impl MessageObject {
+    /// The replies of its thread, none for a message without a reply.
+    pub(crate) fn thread(&self) -> Option<Thread<'_>> {
+        self.reply_count
+            .filter(|count| *count > 0)
+            .map(|count| Thread {
+                count,
+                latest: self.latest_reply.as_ref(),
+            })
     }
 
     /// Its files with a `url_private_download`, with that URL.
