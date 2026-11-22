@@ -12,8 +12,9 @@
 //! message or a reply, by the ID of Slack of a user, a channel, or a file,
 //! and the `ts` of a message or a reply. Their facts come from feeds alone:
 //! the feeds of full listings of the users and of the channels, the feed of
-//! the history of each channel, and the own feeds of a message, which takes
-//! it by its `ts` and its replies, and of a file, which takes its content.
+//! the history of each channel, which sweeps its pages, and the own feeds of
+//! a message, which takes it by its `ts` and its replies, and of a file,
+//! which takes its content.
 
 use std::future::Future;
 
@@ -28,9 +29,15 @@ mod feed;
 /// The ID of a user, a channel, or a file of Slack: ASCII uppercase letters
 /// and digits.
 #[omnifs_sdk::path_segment(validate = is_id)]
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[serde(try_from = "String")]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Id(String);
+
+impl From<Id> for String {
+    fn from(id: Id) -> Self {
+        id.0
+    }
+}
 
 impl TryFrom<String> for Id {
     type Error = String;
@@ -190,7 +197,7 @@ fn fed_only<O: Object>(
     display_name = "Slack",
     description = "users, channels, messages, and files from your workspace",
     mount = "slack",
-    projection = 1,
+    projection = 2,
     capabilities(
         domain(
             "slack.com",
@@ -203,7 +210,7 @@ fn fed_only<O: Object>(
     ),
     limits(memory_mb(
         256,
-        "Leave room for a page of 999 objects of Slack and the objects of a listing that a feed token keeps."
+        "Leave room for a page of 999 objects of Slack and the replies of a message that a feed token keeps."
     ),),
     auth = r#"{"default":"token","schemes":[{"staticToken":{"key":"token","valuePrefix":"Bearer ","description":"Slack bot token","injectDomains":["slack.com","files.slack.com"],"validation":{"method":"POST","url":"https://slack.com/api/auth.test","expectStatus":200,"jsonPointer":"/bot_id"}}}]}"#
 )]
@@ -262,8 +269,7 @@ impl SlackProvider {
         })?;
 
         // No start of the anchor or of an own face: no lookup of a message
-        // asks its feed after the end of the first full listing of its
-        // channel.
+        // asks its feed after the end of the first sweep of its channel.
         r.object::<Message>("/channels/{id}/messages/{ts}", |o| {
             o.dynamic();
             o.fed();
