@@ -367,8 +367,9 @@ pub(crate) async fn assemble_mount_build(
     // whatever credential is stored.
     let given = token.is_some() || args.gives_credential();
     // A credential of the invocation is stored for its account alone: one
-    // that another mount holds stays, as of another client of the provider.
-    if args.gives_credential()
+    // that another mount holds stays, as of another client of the provider,
+    // whatever way the invocation gives its own.
+    if given
         && let Some(auth) = auth.as_ref()
         && let Some(holder) = credential_holder(
             &mounts,

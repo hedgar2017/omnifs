@@ -76,11 +76,19 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_with(args, &[])
+    }
+
+    /// `omnifs` with `args` and with each variable of `env`, without a
+    /// terminal.
+    fn run_with(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         Command::new(omnifs_bin())
             .args(args)
             .env("OMNIFS_HOME", self.home_path())
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "warn")
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
             .output()
             .unwrap_or_else(|error| panic!("spawn omnifs {}: {error}", args.join(" ")))
     }
@@ -842,4 +850,278 @@ async fn no_input_setup_boots_and_orients_without_mounting_or_attaching() {
 
     let down = fixture.run(&["down"]);
     assert_success(&down, "down");
+}
+
+/// A provider artifact without a component, whose manifest declares a
+/// static token with the ambient source `DEMO_AMBIENT_TOKEN` and with a
+/// validation at `probe`.
+fn token_provider_wasm(probe: std::net::SocketAddr) -> Vec<u8> {
+    fn append_uleb(output: &mut Vec<u8>, mut value: usize) {
+        loop {
+            let byte = u8::try_from(value & 0x7f).unwrap();
+            value >>= 7;
+            if value == 0 {
+                output.push(byte);
+                return;
+            }
+            output.push(byte | 0x80);
+        }
+    }
+    let metadata = serde_json::to_vec(&serde_json::json!({
+        "id": "demo",
+        "displayName": "Demo",
+        "provider": "demo.wasm",
+        "defaultMount": "demo",
+        "projection": 1,
+        "refreshIntervalSecs": 0,
+        "capabilities": [{
+            "kind": "domain",
+            "value": "api.demo.test",
+            "why": "Fetch the objects of the demo."
+        }],
+        "auth": {
+            "default": "token",
+            "schemes": [{
+                "staticToken": {
+                    "key": "token",
+                    "valuePrefix": "Bearer ",
+                    "description": "Demo token",
+                    "injectDomains": ["api.demo.test"],
+                    "validation": {
+                        "method": "GET",
+                        "url": format!("http://{probe}/me"),
+                        "expectStatus": 200
+                    },
+                    "ambientSources": [{ "kind": { "envVar": { "name": "DEMO_AMBIENT_TOKEN" } } }]
+                }
+            }]
+        }
+    }))
+    .unwrap();
+    let name = omnifs_provider::PROVIDER_METADATA_SECTION_NAME.as_bytes();
+    let mut payload = Vec::new();
+    append_uleb(&mut payload, name.len());
+    payload.extend_from_slice(name);
+    payload.extend_from_slice(&metadata);
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.push(0);
+    append_uleb(&mut wasm, payload.len());
+    wasm.extend_from_slice(&payload);
+    wasm
+}
+
+/// A local server that answers each probe of a token with 200, and keeps the
+/// value of the `Authorization` header of each.
+struct TokenProbes {
+    address: std::net::SocketAddr,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl TokenProbes {
+    fn start() -> Self {
+        use std::io::{BufRead as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the probe server");
+        let address = listener.local_addr().expect("address of the probe server");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("authorization: ") {
+                        record
+                            .lock()
+                            .expect("probes")
+                            .push(value.trim_end().to_owned());
+                    }
+                    line.clear();
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        Self { address, seen }
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().expect("probes").clone()
+    }
+}
+
+/// The version of the stored credential of the account `account` of the
+/// provider `demo`, none without one.
+fn credential_version(fixture: &Fixture, account: &str) -> Option<u64> {
+    let status = ready_status(fixture);
+    status["daemon"]["status"]["credentials"]
+        .as_array()
+        .expect("the credentials of the daemon")
+        .iter()
+        .find(|credential| credential["key"]["account_label"] == account)
+        .map(|credential| credential["version"].as_u64().expect("credential version"))
+}
+
+/// The names of the mounts of the daemon.
+fn mount_names(fixture: &Fixture) -> Vec<String> {
+    ready_status(fixture)["mounts"]
+        .as_array()
+        .expect("the mounts of the status")
+        .iter()
+        .map(|mount| mount["name"].as_str().expect("mount name").to_owned())
+        .collect()
+}
+
+/// `mount add` with a token of its own submits that token whatever
+/// credential is stored: after `mount rm`, which keeps the credential of its
+/// mount, the token of the next `mount add` is the one that is probed and
+/// stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn mount_add_submits_the_token_of_its_invocation_over_a_stored_credential() {
+    let fixture = Fixture::new();
+    let probes = TokenProbes::start();
+    let wasm = fixture.home_path().join("demo.wasm");
+    std::fs::create_dir_all(fixture.home_path()).expect("profile folder");
+    std::fs::write(&wasm, token_provider_wasm(probes.address)).expect("provider artifact");
+    let wasm = wasm.to_str().expect("artifact path");
+    let mut daemon = fixture.start_daemon().await;
+
+    let add = [
+        "--no-input",
+        "mount",
+        "add",
+        wasm,
+        "--token-env",
+        "DEMO_TOKEN",
+    ];
+    let first = fixture.run_with(&add, &[("DEMO_TOKEN", "first-token")]);
+    assert_success(&first, "mount add with the first token");
+    assert_eq!(probes.seen(), ["bearer first-token"]);
+    let stored = credential_version(&fixture, "default").expect("the first credential");
+
+    assert_success(
+        &fixture.run(&["--yes", "mount", "rm", "demo"]),
+        "mount rm demo",
+    );
+    assert_eq!(
+        credential_version(&fixture, "default"),
+        Some(stored),
+        "mount rm keeps the credential of its mount"
+    );
+
+    let second = fixture.run_with(&add, &[("DEMO_TOKEN", "second-token")]);
+    assert_success(&second, "mount add with the second token");
+    assert_eq!(
+        probes.seen(),
+        ["bearer first-token", "bearer second-token"],
+        "the token of the invocation is the one that is probed"
+    );
+    let replaced = credential_version(&fixture, "default").expect("the second credential");
+    assert!(
+        replaced > stored,
+        "the token of the invocation is stored: version {replaced} after {stored}"
+    );
+    daemon.stop().await;
+}
+
+/// `mount add` refuses a credential of its invocation, a token that it reads
+/// or one that it imports from an ambient source, for the account whose
+/// stored credential another mount holds, and stores it for another account.
+#[tokio::test(flavor = "multi_thread")]
+async fn mount_add_refuses_each_credential_for_the_account_that_another_mount_holds() {
+    let fixture = Fixture::new();
+    let probes = TokenProbes::start();
+    let wasm = fixture.home_path().join("demo.wasm");
+    std::fs::create_dir_all(fixture.home_path()).expect("profile folder");
+    std::fs::write(&wasm, token_provider_wasm(probes.address)).expect("provider artifact");
+    let wasm = wasm.to_str().expect("artifact path");
+    let mut daemon = fixture.start_daemon().await;
+
+    let first = fixture.run_with(
+        &[
+            "--no-input",
+            "mount",
+            "add",
+            wasm,
+            "--token-env",
+            "DEMO_TOKEN",
+        ],
+        &[("DEMO_TOKEN", "first-token")],
+    );
+    assert_success(&first, "mount add of the first mount");
+    let stored = credential_version(&fixture, "default").expect("the first credential");
+
+    let refused = |args: &[&str], env: &[(&str, &str)]| {
+        let output = fixture.run_with(args, env);
+        assert!(
+            !output.status.success(),
+            "omnifs {} replaces the credential of another mount",
+            args.join(" ")
+        );
+        let error = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            error.contains("mount demo holds the stored credential of the account default"),
+            "{error}"
+        );
+        assert_eq!(credential_version(&fixture, "default"), Some(stored));
+        assert_eq!(mount_names(&fixture), ["demo"]);
+    };
+    // A token that the invocation reads.
+    refused(
+        &[
+            "--no-input",
+            "mount",
+            "add",
+            wasm,
+            "--name",
+            "second",
+            "--token-env",
+            "DEMO_TOKEN",
+        ],
+        &[("DEMO_TOKEN", "second-token")],
+    );
+    // A token that the invocation imports from an ambient source.
+    refused(
+        &[
+            "--yes",
+            "--no-input",
+            "mount",
+            "add",
+            wasm,
+            "--name",
+            "second",
+        ],
+        &[("DEMO_AMBIENT_TOKEN", "ambient-token")],
+    );
+    assert_eq!(
+        probes.seen(),
+        ["bearer first-token"],
+        "a refused credential is not probed"
+    );
+
+    // Another account stores the imported token apart.
+    let apart = fixture.run_with(
+        &[
+            "--yes",
+            "--no-input",
+            "mount",
+            "add",
+            wasm,
+            "--name",
+            "second",
+            "--account",
+            "other",
+        ],
+        &[("DEMO_AMBIENT_TOKEN", "ambient-token")],
+    );
+    assert_success(&apart, "mount add for another account");
+    assert_eq!(
+        probes.seen(),
+        ["bearer first-token", "bearer ambient-token"]
+    );
+    assert_eq!(credential_version(&fixture, "default"), Some(stored));
+    assert!(credential_version(&fixture, "other").is_some());
+    assert_eq!(mount_names(&fixture), ["demo", "second"]);
+    daemon.stop().await;
 }
