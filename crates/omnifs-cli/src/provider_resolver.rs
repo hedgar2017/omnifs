@@ -1,7 +1,9 @@
 //! Exact provider selection for mount creation.
 //!
 //! A selector is either a local artifact path, an embedded provider name, or
-//! a lowercase digest prefix. Resolution always ends at one validated
+//! a lowercase digest prefix. Only a selector with a path separator or the
+//! `.wasm` extension is a path, so no entry of the working directory takes
+//! the name of an embedded provider. Resolution always ends at one validated
 //! `ProviderRef` and its manifest. Provider names never select retained
 //! artifacts by recency.
 
@@ -11,7 +13,6 @@ use omnifs_core::{ProviderId, ProviderMeta, ProviderName, ProviderRef, ProviderV
 use omnifs_provider::ProviderManifest;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
 use std::path::Path;
 
 use crate::rpc::RpcClient;
@@ -38,13 +39,12 @@ impl<'a> ProviderResolver<'a> {
         selector: &str,
         embedded: &[ProviderMetadata],
     ) -> anyhow::Result<ResolvedProvider> {
-        let path = Path::new(selector);
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => return self.resolve_path(path, &metadata).await,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-            Err(error) => return Err(error).with_context(|| format!("stat provider `{selector}`")),
+        if is_path(selector) {
+            let path = Path::new(selector);
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("stat provider `{selector}`"))?;
+            return self.resolve_path(path, &metadata).await;
         }
-
         if let Some(metadata) = embedded
             .iter()
             .find(|metadata| metadata.reference.name == selector)
@@ -55,7 +55,7 @@ impl<'a> ProviderResolver<'a> {
             return self.resolve_digest(selector).await;
         }
         bail!(
-            "provider selector `{selector}` is not an existing WASM path, embedded provider name, or lowercase digest prefix"
+            "provider selector `{selector}` is not an embedded provider name or a lowercase digest prefix; a path has a path separator or the `.wasm` extension"
         )
     }
 
@@ -248,6 +248,15 @@ fn provider_reference(metadata: &ProviderMetadata) -> anyhow::Result<ProviderRef
     })
 }
 
+/// Whether `selector` is a path: it has a path separator or the `.wasm`
+/// extension.
+fn is_path(selector: &str) -> bool {
+    selector.contains(std::path::MAIN_SEPARATOR)
+        || Path::new(selector)
+            .extension()
+            .is_some_and(|extension| extension == "wasm")
+}
+
 fn is_digest_prefix(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -259,6 +268,18 @@ fn is_digest_prefix(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare name is the name of an embedded provider or a digest prefix,
+    /// whatever entry of the working directory has that name.
+    #[test]
+    fn only_a_selector_with_a_separator_or_the_wasm_extension_is_a_path() {
+        for name in ["github", "google-drive", "abc123", ".", ".."] {
+            assert!(!is_path(name), "{name}");
+        }
+        for path in ["./github", "providers/github", "/tmp/github", "github.wasm"] {
+            assert!(is_path(path), "{path}");
+        }
+    }
 
     #[test]
     fn digest_prefix_accepts_only_lowercase_hex() {
