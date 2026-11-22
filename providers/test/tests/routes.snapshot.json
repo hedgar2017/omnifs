@@ -203,6 +203,12 @@
     "captures": []
   },
   {
+    "template": "/hello/blob-of-md5",
+    "kind": "File",
+    "object_kind": null,
+    "captures": []
+  },
+  {
     "template": "/hello/blob-then-error",
     "kind": "File",
     "object_kind": null,

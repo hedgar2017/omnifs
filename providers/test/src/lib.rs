@@ -1034,6 +1034,7 @@ impl TestProvider {
         // coalesce) let the host concurrency test hold two ops in flight at once
         // to prove independent ops interleave on one instance.
         r.file("/hello/blob").handler(blob)?;
+        r.file("/hello/blob-of-md5").handler(blob_of_md5)?;
         r.file("/hello/blob-then-error").handler(blob_then_error)?;
         r.file("/hello/blob-of-another-size")
             .handler(blob_of_another_size)?;
@@ -1176,6 +1177,22 @@ async fn fixture_blob(cx: &Cx<State>) -> Result<omnifs_sdk::blob::BlobRef> {
         .send()
         .await?
         .error_for_status()
+}
+
+/// A file of the bytes of a blob of the MD5 of `hello`, which the host
+/// answers with those bytes alone.
+async fn blob_of_md5(cx: Cx<State>) -> Result<FileProjection> {
+    let blob = cx
+        .http()
+        .get("https://httpbin.org/bytes")
+        .into_blob()
+        .md5("5d41402abc4b2a76b9719d911017c592")
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(FileProjection::blob(blob.id)
+        .size(FileSize::Exact(blob.size))
+        .build())
 }
 
 /// A file of the bytes of a blob, which never cross to the provider.
