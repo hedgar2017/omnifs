@@ -524,11 +524,11 @@ async fn a_message_by_its_ts_before_the_end_of_the_first_full_listing() {
 
 /// The replies by `next_cursor` at the first read of `replies/`, with the
 /// message itself as the message and without a reply of another thread, no
-/// request for a `reply_count` of `0`, the removal of the message for
-/// `thread_not_found`, and, before the end of the first full listing of its
-/// channel, the replies again for a read of `replies/` by its path alone past
-/// the deadline of a message with another `latest_reply`, without a reply
-/// that they lack.
+/// request for a reply that they lack or for a `reply_count` of `0`, the
+/// removal of the message for `thread_not_found`, and, before the end of the
+/// first full listing of its channel, the replies again for a read of
+/// `replies/` by its path alone past the deadline of a message with another
+/// `latest_reply`, without a reply that they lack.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_replies_take_the_pages_of_conversations_replies() {
@@ -588,6 +588,16 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
         .await
         .unwrap(),
         "An answer"
+    );
+    // A reply that the complete `replies/` lacks asks Slack for nothing.
+    assert!(
+        served(
+            &harness,
+            lookup(&harness, &format!("{}/{}", replies(1), ts(8)))
+        )
+        .await
+        .unwrap()
+        .is_missing()
     );
     // The message itself of the replies is the message of the last answer
     // with it.

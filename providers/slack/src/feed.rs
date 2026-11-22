@@ -12,11 +12,12 @@
 //! the new messages after the `ts` of the latest message of the channel. Its
 //! first full listing gives the feed of each message its state, so that the
 //! feed of a message takes it by its `ts` past its deadline before the end
-//! of that listing. The own feed of a message takes it by its `ts`, and its
-//! replies with the message itself from the pages of
-//! `conversations.replies`, kept in its token until the last page, and the
-//! own feed of a file of a message or a reply takes its content from the URL
-//! that the feed that took the file gives it.
+//! of that listing. The own feed of a message takes it by its `ts`, and, for
+//! a `replies/` that the projection has not complete, its replies with the
+//! message itself from the pages of `conversations.replies`, kept in its
+//! token until the last page, and the own feed of a file of a message or a
+//! reply takes its content from the URL that the feed that took the file
+//! gives it.
 //!
 //! The take of a message or a reply writes its files against its
 //! `message.json` in the projection, with the removal of the `content` of a
@@ -687,10 +688,10 @@ struct MessageFeed<'a> {
 
 impl Message {
     /// The feed of a message: the next request of the replies of its token;
-    /// else its replies for a start in `replies`; else the message by its
-    /// `ts`, and after it, in the same answer, its replies for a due start
-    /// in `replies` of a message with another `latest_reply` or
-    /// `reply_count`.
+    /// else its replies for a start in `replies` of a message without
+    /// `replies/` complete in the projection; else the message by its `ts`,
+    /// and after it, in the same answer, its replies for a due start in
+    /// `replies` of a message with another `latest_reply` or `reply_count`.
     pub(crate) async fn feed(cx: FeedCx<MessageKey>) -> Result<Feed> {
         let token = cx.token().map(decode_token::<MessageToken>).transpose()?;
         let key = cx.key();
@@ -723,10 +724,18 @@ impl MessageFeed<'_> {
         message_path(self.channel, self.ts)
     }
 
-    /// The replies of the message: `replies/` complete without a request for
-    /// a `reply_count` of `0` or none in its `message.json` in the
-    /// projection, else their first request.
+    /// The replies of the message for a start in `replies`: nothing for
+    /// `replies/` complete in the projection, which has each reply, as for a
+    /// lookup of a reply that it lacks; `replies/` complete without a
+    /// request for a `reply_count` of `0` or none in its `message.json` in
+    /// the projection; else their first request.
     async fn thread(&mut self) -> Result<Feed> {
+        let replies = self
+            .cx
+            .listing(format!("{}/replies", self.path()), ListingForm::Count)?;
+        if replies.is_some_and(|facts| facts.complete) {
+            return self.part(None);
+        }
         let projected = self
             .cx
             .read(format!("{}/message.json", self.path()))?
