@@ -21,7 +21,8 @@ host to answer it from the projection: the host asks the upstream for a request
 without one each time. The host follows the redirects of a `GET` or a `HEAD`
 to a URL that the authority of the mount approves, the answer of a status
 other than 2xx is no content of a file, and `error_for_status` of the SDK
-takes each such status as an error.
+takes each such status as an error, but the `304` of a conditional request
+that is no blob fetch.
 
 Repeated provider boilerplate is evidence of a missing SDK construct. Fix the shared construct rather than normalizing local scaffolding across providers.
 
