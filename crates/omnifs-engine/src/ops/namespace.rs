@@ -505,17 +505,6 @@ impl Runtime {
         self.run_open_file(path, captured_epoch).await
     }
 
-    pub(crate) async fn read_chunk(
-        &self,
-        handle: u64,
-        offset: u64,
-        length: u32,
-        captured_epoch: u64,
-    ) -> Result<ChunkOutcome> {
-        self.run_read_chunk(None, None, handle, offset, length, captured_epoch)
-            .await
-    }
-
     pub(crate) async fn read_chunk_with_attrs(
         &self,
         path: &Path,

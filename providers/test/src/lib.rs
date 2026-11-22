@@ -1059,6 +1059,7 @@ impl TestProvider {
         r.dir("/hello/validated").handler(validated)?;
         r.file("/hello/validated-calls").handler(validated_calls)?;
         r.dir("/hello/unbounded").handler(unbounded_feed)?;
+        r.dir("/hello/many").handler(many_pages)?;
         r.dir("/hello/throttled").handler(throttled)?;
         r.dir("/hello/snapshot").handler(snapshot)?;
         r.dir("/hello/snapshot/comments")
@@ -1397,6 +1398,18 @@ async fn unbounded_feed(cx: DirCx<State>) -> Result<DirListing> {
     Ok(DirListing::paged(entries, Cursor::Page(page + 1)))
 }
 
+/// A listing of 25 pages of one entry each: more than any count of pages
+/// that the host could take as enough.
+async fn many_pages(cx: DirCx<State>) -> Result<DirListing> {
+    let page = cx.page_cursor(0);
+    let entries = [Entry::dir(format!("m-{page}"))];
+    if page >= 24 {
+        Ok(DirListing::open(entries))
+    } else {
+        Ok(DirListing::paged(entries, Cursor::Page(page + 1)))
+    }
+}
+
 async fn throttled(_cx: DirCx<State>) -> Result<DirListing> {
     Err(ProviderError::rate_limited("test throttle").with_retry_after(Some(Duration::from_secs(2))))
 }
@@ -1499,40 +1512,29 @@ impl RangeReader for ItemLogReader {
     }
 }
 
-/// A genuinely growing live file for follow-mode conformance (`tail -f`).
-///
-/// Unlike [`LiveTailReader`], which fabricates bytes at ANY offset and never
-/// signals EOF (so a reader scanning to end-of-file never terminates), this
-/// models a real log: the current extent is wall-clock-driven (one fixed-width
-/// line at first read, one more every 500ms, capped), a read below the extent
-/// serves bytes bounded at the extent, and a read at or past the extent
-/// returns the contract's "no more right now" shape: an empty chunk with
-/// `eof = true`, which for a live file marks the current end without ending it
-/// (`RangedHandle::read` grows the observed end monotonically and
-/// `probe_live_growth` keeps polling).
+/// A live log that grows by one line at each read that reaches its end: a
+/// read below the extent serves bytes bounded at the extent, and a read at or
+/// past it returns the contract's "no more right now" shape, an empty chunk
+/// with `eof = true`, which for a live file marks the current end without
+/// ending it. The log grows by an event of its own, a read, and at no time.
 #[derive(Clone, Debug)]
 struct GrowingLogReader;
 
 /// `line 000042\n`: 12 bytes per line, so extent math is exact.
 const LOG_LINE_LEN: u64 = 12;
-const LOG_LINE_CAP: u64 = 10_000;
-const LOG_LINE_INTERVAL_MS: u64 = 500;
+
+/// The lines of the log so far.
+static LOG_LINES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 impl GrowingLogReader {
-    /// Wall-clock epoch, fixed at the first read so growth is measured from
-    /// first observation rather than provider start.
-    fn epoch() -> std::time::SystemTime {
-        static EPOCH: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
-        *EPOCH.get_or_init(std::time::SystemTime::now)
+    /// The extent of the log now, in bytes.
+    fn extent_now() -> u64 {
+        LOG_LINES.load(core::sync::atomic::Ordering::Relaxed) * LOG_LINE_LEN
     }
 
-    /// Current extent in bytes: 1 line plus one per elapsed interval, capped.
-    fn extent_now() -> u64 {
-        let elapsed_ms = Self::epoch().elapsed().map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        });
-        let lines = (1 + elapsed_ms / LOG_LINE_INTERVAL_MS).min(LOG_LINE_CAP);
-        lines * LOG_LINE_LEN
+    /// One more line, after a read that reached the end.
+    fn grow() {
+        LOG_LINES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1546,6 +1548,7 @@ impl RangeReader for GrowingLogReader {
         Box::pin(async move {
             let extent = Self::extent_now();
             if offset >= extent {
+                Self::grow();
                 return Ok(FileChunk::new(Vec::new(), true));
             }
             let end = offset.saturating_add(u64::from(length)).min(extent);
@@ -1558,6 +1561,9 @@ impl RangeReader for GrowingLogReader {
             let skip = usize::try_from(offset - first_line * LOG_LINE_LEN)
                 .expect("line-relative offset fits usize");
             let take = usize::try_from(end - offset).expect("chunk length fits usize");
+            if end >= extent {
+                Self::grow();
+            }
             Ok(FileChunk::new(
                 lines[skip..skip + take].to_vec(),
                 end >= extent,

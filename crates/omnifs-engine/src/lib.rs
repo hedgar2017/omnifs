@@ -63,7 +63,7 @@ pub use runtime::{
     RuntimeMountConfig,
 };
 #[cfg(feature = "runtime")]
-pub(crate) use tree::{Cursor, Node, RequestCtx, TreeError, TreeErrorKind, spawn_live_follow_pump};
+pub(crate) use tree::{Cursor, Node, RequestCtx, TreeError, TreeErrorKind};
 
 #[cfg(feature = "runtime")]
 pub(crate) use callouts::wit_convert as wit_protocol;

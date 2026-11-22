@@ -10,14 +10,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
-use crate::registry::MountTable;
 use crate::view as view_types;
 use crate::view::FileAttrsCache;
 use crate::{EngineError, Runtime};
 use omnifs_core::path::Path;
-use tokio::runtime::Handle;
 
 use super::error::{Result, TreeError};
 use super::node::Node;
@@ -44,17 +41,6 @@ pub struct RangedHandle {
 impl RangedHandle {
     pub(crate) fn attrs(&self) -> &FileAttrsCache {
         &self.attrs
-    }
-
-    pub(crate) fn provider_handle(&self) -> u64 {
-        self.provider_handle
-    }
-
-    /// Shared monotonic high-water mark of the observed upstream end. The
-    /// renderer clones this to drive a live-follow loop (see
-    /// [`probe_live_growth`]) and to report the live size from its getattr.
-    pub(crate) fn observed_end(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.observed_end)
     }
 
     /// Drive provider `read_chunk` for one ranged read; learn the exact size on
@@ -182,67 +168,4 @@ impl EngineNamespace {
         validation?;
         Ok(Some(attrs))
     }
-}
-
-/// Probe a live file's upstream end without serving bytes to a reader: read
-/// `probe_len` at the current `observed_end` purely to learn whether the file
-/// grew, advancing `observed_end` monotonically. Returns the new end when it
-/// grew, `None` when it did not. The renderer's follow loop calls this on its
-/// own cadence; both filesystems share this learning so a live file's size source
-/// is neutral and the reporting stays filesystem-specific.
-pub(crate) async fn probe_live_growth(
-    runtime: &Runtime,
-    provider_handle: u64,
-    observed_end: &AtomicU64,
-    probe_len: u32,
-    open_epoch: u64,
-) -> Result<Option<u64>> {
-    let known_end = observed_end.load(Ordering::Relaxed);
-    let chunk = runtime
-        .read_chunk(provider_handle, known_end, probe_len, open_epoch)
-        .await?;
-    let advanced = u64::try_from(chunk.content.len()).unwrap_or(0);
-    if advanced == 0 {
-        return Ok(None);
-    }
-    let new_end = known_end.saturating_add(advanced);
-    observed_end.fetch_max(new_end, Ordering::Relaxed);
-    Ok(Some(new_end))
-}
-
-/// Spawn the shared live-file growth probe loop. Renderers own the reported
-/// size table, so `record_growth` is filesystem-specific.
-pub(crate) fn spawn_live_follow_pump(
-    rt: &Handle,
-    registry: Arc<MountTable>,
-    mount_name: String,
-    provider_handle: u64,
-    observed_end: Arc<AtomicU64>,
-    open_epoch: u64,
-    mut record_growth: impl FnMut(u64) + Send + 'static,
-) -> tokio::task::AbortHandle {
-    const PROBE_LEN: u32 = 64 * 1024;
-    const INTERVAL: Duration = Duration::from_secs(1);
-    let task = rt.spawn(async move {
-        loop {
-            tokio::time::sleep(INTERVAL).await;
-            let Some(runtime) = registry.get(&mount_name) else {
-                break;
-            };
-            match probe_live_growth(
-                &runtime,
-                provider_handle,
-                &observed_end,
-                PROBE_LEN,
-                open_epoch,
-            )
-            .await
-            {
-                Ok(Some(new_end)) => record_growth(new_end),
-                Ok(None) => {},
-                Err(_) => break,
-            }
-        }
-    });
-    task.abort_handle()
 }

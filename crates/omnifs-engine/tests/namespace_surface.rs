@@ -17,7 +17,6 @@
 #![allow(clippy::doc_markdown)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use omnifs_core::path::Path;
 use omnifs_engine::test_support::cache::publish_effects_for_test;
@@ -362,6 +361,27 @@ async fn missing_child_is_a_lookup_answer_that_the_kernel_asks_again() {
 
 // --- invalidation events -----------------------------------------------------
 
+/// A record of an invalidation reaches a subscriber without an operation of
+/// the namespace and without a time: the drain runs at its notification.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_invalidation_reaches_a_subscriber_without_an_operation() {
+    let t = test_ns();
+    let ns = &t.ns;
+    let hello = mount_child(ns.as_ref(), "hello").await;
+    let message = ns.lookup(hello.path.clone(), "message").await.unwrap();
+    let mut events = ns.subscribe();
+    publish_effects_for_test(
+        &t.runtime,
+        &path_invalidation("/hello/message"),
+        t.runtime.resources.current_epoch(),
+    )
+    .expect("test effects should publish");
+    match events.recv().await.expect("event stream is live") {
+        NsEvent::InvalidateSubtree { path } => assert_eq!(path, message.path),
+        NsEvent::AttrsChanged { .. } => panic!("expected InvalidateSubtree"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn invalidation_bumps_epoch_and_notifies_subscriber() {
     let t = test_ns();
@@ -397,12 +417,9 @@ async fn invalidation_bumps_epoch_and_notifies_subscriber() {
         .expect("getattr after invalidation");
 
     // The subscriber observes an InvalidateSubtree for the message node with a
-    // bumped epoch (the background tick may have delivered it first; either way
-    // the event is buffered for this receiver).
-    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
-        .await
-        .expect("an invalidation event arrives")
-        .expect("event stream is live");
+    // bumped epoch (the drain of its record may have delivered it first;
+    // either way the event is buffered for this receiver).
+    let event = events.recv().await.expect("event stream is live");
     match event {
         NsEvent::InvalidateSubtree { path } => {
             assert_eq!(

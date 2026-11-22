@@ -8,23 +8,29 @@ pub(crate) struct InvalidationState {
     invalidated_paths: Mutex<Vec<Path>>,
     changed_dirs: Mutex<Vec<(Path, bool)>>,
     changed_files: Mutex<Vec<Path>>,
+    /// Notified at each record, for the drain of the namespace.
+    recorded: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl InvalidationState {
     pub(crate) fn record_prefix(&self, prefix: Path) {
         self.invalidated_prefixes.lock().push(prefix);
+        self.recorded.notify_one();
     }
 
     pub(crate) fn record_path(&self, path: Path) {
         self.invalidated_paths.lock().push(path);
+        self.recorded.notify_one();
     }
 
     pub(crate) fn record_changed_dir(&self, path: Path, fed: bool) {
         self.changed_dirs.lock().push((path, fed));
+        self.recorded.notify_one();
     }
 
     pub(crate) fn record_changed_file(&self, path: Path) {
         self.changed_files.lock().push(path);
+        self.recorded.notify_one();
     }
 
     fn drain_changed_files(&self) -> Vec<Path> {
@@ -49,6 +55,12 @@ impl InvalidationState {
 }
 
 impl Runtime {
+    /// The notification of a record of an invalidation or a change of the
+    /// mount, which a drain takes.
+    pub(crate) fn recorded(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.invalidation.recorded)
+    }
+
     pub fn cache_delete_prefix(&self, prefix: &Path) {
         self.resources.memory.invalidate_prefix(prefix);
         self.invalidation.record_prefix(prefix.clone());

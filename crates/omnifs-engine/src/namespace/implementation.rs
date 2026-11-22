@@ -31,7 +31,6 @@ const TTL_STATIC: Duration = Duration::from_secs(u32::MAX as u64);
 /// Zero TTL for entries whose size or content can move under the reader.
 const TTL_DYNAMIC: Duration = Duration::ZERO;
 const EVENT_CAPACITY: usize = 1024;
-const DRAIN_TICK: Duration = Duration::from_millis(100);
 #[allow(clippy::duration_suboptimal_units)] // 60s reads clearer than 1min here.
 const HANDLE_IDLE: Duration = Duration::from_secs(60);
 const MOUNT_ENUMERATION_MOUNT: &str = "";
@@ -241,18 +240,14 @@ struct HostRecord {
     kind: HostKind,
 }
 
-/// A cached ranged read handle, its live-follow pump, and its idle clock.
+/// A cached ranged read handle and its idle clock.
 struct HandleRecord {
     handle: Arc<RangedHandle>,
-    pump: Option<tokio::task::AbortHandle>,
     last_use: Instant,
 }
 
 impl Drop for HandleRecord {
     fn drop(&mut self) {
-        if let Some(pump) = self.pump.take() {
-            pump.abort();
-        }
         // Release the provider handle by reference; the cache owns the sole
         // reference at eviction, so this closes it exactly once.
         let _ = self.handle.release();
@@ -394,10 +389,29 @@ impl EngineNamespace {
         }
         let weak = Arc::downgrade(self);
         let mut shutdown = self.tick_shutdown.subscribe();
+        // The notifications of the records of each mount: the drain runs
+        // when a publication records a change, and at no time of its own.
+        let recorded: Vec<_> = self
+            .registry
+            .mounts()
+            .iter()
+            .filter_map(|mount| self.registry.get(mount))
+            .map(|runtime| runtime.recorded())
+            .collect();
         let handle = self.rt.spawn(async move {
             loop {
+                type Waiting<'a> =
+                    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+                let any = futures::future::select_all(
+                    recorded
+                        .iter()
+                        .map(|notify| Box::pin(notify.notified()) as Waiting<'_>)
+                        .chain(std::iter::once(
+                            Box::pin(std::future::pending::<()>()) as Waiting<'_>
+                        )),
+                );
                 tokio::select! {
-                    () = tokio::time::sleep(DRAIN_TICK) => {},
+                    _ = any => {},
                     changed = shutdown.changed() => {
                         if changed.is_ok() {
                             break;
@@ -694,7 +708,7 @@ impl EngineNamespace {
                 record.attrs = None;
                 record.host = None;
             }
-            // Evicting the handle closes it and aborts its pump (Drop).
+            // Evicting the handle closes it (Drop).
             let _ = self.events.send(NsEvent::InvalidateSubtree { path: id });
         }
 
@@ -914,7 +928,7 @@ impl EngineNamespace {
                 && let Some(handle) = self.open(&node).await?
             {
                 self.open_count.fetch_add(1, Ordering::Relaxed);
-                let handle = self.cache_handle(&id, &node, handle);
+                let handle = self.cache_handle(&id, handle);
                 return self.read_ranged(&id, &handle, offset, len).await;
             }
 
@@ -1024,67 +1038,18 @@ impl EngineNamespace {
         Some(Arc::clone(&record.handle))
     }
 
-    /// Cache a freshly opened ranged handle, spawning a live-follow pump for a
-    /// live file when a registry is available (the production form). The pump
-    /// grows the node's attrs and emits an `AttrsChanged` event.
-    fn cache_handle(
-        &self,
-        id: &Path,
-        node: &crate::Node,
-        handle: RangedHandle,
-    ) -> Arc<RangedHandle> {
+    /// Cache a freshly opened ranged handle. Nothing follows a live file:
+    /// its growth is learned when a read or a getattr asks for it.
+    fn cache_handle(&self, id: &Path, handle: RangedHandle) -> Arc<RangedHandle> {
         let handle = Arc::new(handle);
-        let pump = self.spawn_pump(id, node, &handle);
         self.handles.insert(
             id.clone(),
             HandleRecord {
                 handle: Arc::clone(&handle),
-                pump,
                 last_use: Instant::now(),
             },
         );
         handle
-    }
-
-    fn spawn_pump(
-        &self,
-        id: &Path,
-        node: &crate::Node,
-        handle: &Arc<RangedHandle>,
-    ) -> Option<tokio::task::AbortHandle> {
-        if !matches!(handle.attrs().stability(), view_types::Stability::Live) {
-            return None;
-        }
-        let registry = Arc::clone(&self.registry);
-        let mount = node.mount().to_string();
-        let base = handle.attrs().clone();
-        let events = self.events.clone();
-        let node_epoch = self.epoch_of(id);
-        // The pump is a detached task; it reports growth by cloning the shared
-        // pieces it needs (no back-reference to `self`).
-        let id = id.clone();
-        let record_growth = move |new_end: u64| {
-            let grown = base.clone().with_exact_size(new_end);
-            let attrs = attrs_from_cache(
-                EntryKind::File,
-                Some(&grown),
-                change_counter_parts(&id, Some(&grown), node_epoch),
-                false,
-            );
-            let _ = events.send(NsEvent::AttrsChanged {
-                path: id.clone(),
-                attrs,
-            });
-        };
-        Some(crate::spawn_live_follow_pump(
-            &self.rt,
-            registry,
-            mount,
-            handle.provider_handle(),
-            handle.observed_end(),
-            handle.open_epoch,
-            record_growth,
-        ))
     }
 
     // --- readdir ------------------------------------------------------------
