@@ -175,7 +175,9 @@ impl<K, S> FeedCx<K, S> {
 
     /// Write a stable file at the mount-absolute `path` as a fact of this
     /// part, with the bytes of `blob`, which the host fetched and holds: no
-    /// size bounds the file, and its bytes cross no boundary of the provider.
+    /// size bounds the file beside the limit that its mount declares for a
+    /// blob fetch, and its bytes cross no boundary of the provider. The host
+    /// refuses the blob of a status other than 2xx.
     pub fn blob(&self, path: impl AsRef<str>, blob: &crate::endpoint::BlobHandle) -> Result<()> {
         self.facts
             .borrow_mut()

@@ -1,4 +1,4 @@
-package omnifs:provider@0.10.0;
+package omnifs:provider@0.11.0;
 
 // === Shared types ===
 
@@ -433,7 +433,13 @@ interface types {
     /// provider asks for with a request that is the same for each content,
     /// and from `version`, the version of the bytes of a request that is the
     /// same for each version: the host answers a successful status with
-    /// bytes of that MD5 alone, and other bytes are the error of the fetch.
+    /// bytes of that MD5 alone, and other bytes are the `version-mismatch`
+    /// error of the fetch, which is not retryable. The host keeps the answer
+    /// of a successful status of a request with `md5` or `version`, and
+    /// answers that request with it from then on; it asks the upstream for a
+    /// request without either each time, and keeps the answer of no other
+    /// status. It follows the redirects of a `GET` or a `HEAD` to a URL that
+    /// the authority of the mount approves.
     record blob-fetch-request {
         method: string,
         url: string,
@@ -443,8 +449,9 @@ interface types {
         version: option<string>,
     }
 
-    /// Result of a successful `fetch-blob`. The body is on disk; only the
-    /// metadata crosses the WIT.
+    /// The answer of a `fetch-blob`, of any status. The body is on disk;
+    /// only the metadata crosses the WIT. The body of a status other than
+    /// 2xx is no content: the host refuses it as the bytes of a file.
     record blob-fetched {
         blob: blob-id,
         size: u64,
