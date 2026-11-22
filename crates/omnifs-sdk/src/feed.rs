@@ -13,6 +13,12 @@
 //! below the anchor of the answering feed that is not complete, takes the
 //! answer of that listing first.
 //!
+//! An object without faces of its own may anchor at the template of a fed
+//! dir face of another object, as the object of the listing of that dir:
+//! the dir and each fed face below it have the claims of its feed and of the
+//! feeds of the objects below it alone, without the feeds of the objects
+//! outer to it.
+//!
 //! `o.feed(method).own().starts([...])` makes the feed answer the facts of
 //! its own starting paths for an upstream without an inventory of them: a
 //! lookup below its anchor without its positive lookup starts it as a read or

@@ -1023,6 +1023,100 @@ fn a_feed_answers_for_the_fed_faces_beneath_the_paths_its_object_routes() {
     assert_eq!(error.kind(), ProviderErrorKind::NotFound);
 }
 
+/// The notes of an item, an object without faces of its own.
+#[derive(serde::Deserialize)]
+struct NotesObj {}
+
+impl Object for NotesObj {
+    type Key = DemoKey;
+    type State = ();
+    type Canonical = Json;
+
+    fn load(
+        _cx: &Cx<()>,
+        _key: &DemoKey,
+        _since: Option<Validator>,
+    ) -> impl Future<Output = Result<Load<Self>>> {
+        std::future::ready(Ok(Load::fresh(
+            NotesObj {},
+            Canonical::new(b"{}".to_vec(), None),
+        )))
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        crate::object::decode_json(bytes)
+    }
+
+    fn kind() -> ObjectKind {
+        ObjectKind("demo.notes")
+    }
+}
+
+#[test]
+fn an_object_without_faces_at_a_fed_dir_answers_for_it_and_for_the_fed_faces_below_it_alone() {
+    let mut router = Router::<()>::new();
+    router
+        .object::<DemoObj>("/items/{id}", |o| {
+            o.dynamic();
+            o.file("item.json").canonical::<Json>()?;
+            o.file("summary").fed()?;
+            o.dir("notes").fed()?;
+            o.feed(demo_feed).starts(["summary"])?;
+            Ok(())
+        })
+        .unwrap();
+    router
+        .object::<NotesObj>("/items/{id}/notes", |o| {
+            o.dynamic();
+            o.feed(demo_feed).starts([""])?;
+            Ok(())
+        })
+        .unwrap();
+    router
+        .object::<NoteObj>("/{group}/{id}/notes/{note}", |o| {
+            o.dynamic();
+            o.fed();
+            o.file("note.json").canonical::<Json>()?;
+            o.file("text").fed()?;
+            Ok(())
+        })
+        .unwrap();
+    let router = router.compile().unwrap();
+    let cx = Cx::new(1, Rc::new(RefCell::new(())));
+
+    // The fed dir answers the feed of the object at its template alone.
+    let (list, _) = poll_ready(router.list_children(&cx, "/items/7/notes", None))
+        .unwrap()
+        .into_result_and_effects();
+    let wit_types::ListChildrenResult::Feed(claims) = list else {
+        panic!("expected a fed listing, got {list:?}");
+    };
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].object.id.kind, "demo.notes");
+    assert_eq!(claims[0].object.path, "/items/7/notes");
+    assert!(claims[0].starts, "the dir is a starting path");
+
+    // A fed face below it, without the feed of the item.
+    let outcome = poll_ready(router.read_file(&cx, "/items/7/notes/3/text", "", None)).unwrap();
+    let crate::browse::ReadOutcome::Feed(claims) = outcome else {
+        panic!("a note reads through the feed of the notes");
+    };
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].id.kind.as_str(), "demo.notes");
+    assert_eq!(claims[0].path.as_str(), "/items/7/notes");
+    assert!(!claims[0].starts);
+
+    // A fed face of the item has the feed of the item.
+    let (lookup, _) = poll_ready(router.lookup_child(&cx, "/items/7", "summary"))
+        .unwrap()
+        .into_result_and_effects();
+    let claims = claims_of(lookup);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].object.id.kind, "demo.obj");
+    assert_eq!(claims[0].object.path, "/items/7");
+    assert!(claims[0].starts, "summary is a starting path");
+}
+
 /// The bytes of the fed file `summary` of `effects`.
 fn summary_of(effects: &wit_types::Effects) -> &[u8] {
     let summary = effects

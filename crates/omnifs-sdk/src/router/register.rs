@@ -60,6 +60,8 @@ struct ObjectMountMetadata {
     facet_axes: &'static [FacetAxis],
     canonical_view_leaf_names: Vec<String>,
     capture_descriptors: Vec<CaptureDescriptor>,
+    /// The object declares no face of its own.
+    faceless: bool,
 }
 
 /// A collection declaration specialized to one mounted object face. It is
@@ -285,6 +287,7 @@ impl<S> Router<S> {
             capture_descriptors: super::handlers::captures_validator::<O::Key>()
                 .capture_descriptors()
                 .to_vec(),
+            faceless: handle.faceless(),
         });
         self.objects.push(entry);
         Ok(())
@@ -356,11 +359,16 @@ impl<S> Router<S> {
     }
 
     fn route_claims(&self) -> Result<Vec<Pattern>> {
+        let fed_dir_anchors = self.fed_dir_anchors();
         let mut claims = Vec::new();
         claims.extend(self.dirs.iter().map(|entry| entry.pattern.clone()));
         claims.extend(self.files.iter().map(|entry| entry.pattern.clone()));
         for entry in &self.objects {
-            claims.push(entry.pattern.clone());
+            // The fed dir route claims the anchor of an object without faces
+            // of its own at its template.
+            if !fed_dir_anchors.contains(&entry.pattern.template()) {
+                claims.push(entry.pattern.clone());
+            }
             if entry.shape == AnchorShape::Dir {
                 for leaf in &entry.leaves {
                     claims.push(Pattern::parse(&format!(
@@ -476,9 +484,14 @@ impl<S> Router<S> {
     /// Resolve the feeds: check that each starting path names a fed face of
     /// its object's subtree, give each fed face the claims of the feeds of
     /// its ancestry, the outer object first, and validate the captures of a
-    /// fed dir route through the object routes beneath it.
+    /// fed dir route through the object routes beneath it. A fed face at or
+    /// below the anchor of an object without faces of its own at a fed dir
+    /// face of another object has the claims of the feeds at or below the
+    /// innermost such anchor alone, without the feeds of the objects outer
+    /// to it.
     fn resolve_feeds(&mut self) -> Result<()> {
         let fed_faces = self.fed_face_templates();
+        let fed_dir_anchors = self.fed_dir_anchors();
 
         // (object index, anchor template, declared starts) of every feed.
         let feeds = self
@@ -515,8 +528,15 @@ impl<S> Router<S> {
         }
 
         let claims_of = |face: &str| -> Result<Vec<super::object::ClaimSpec>> {
+            let boundary = fed_dir_anchors
+                .iter()
+                .filter(|anchor| leading_template(anchor, face).is_some())
+                .max_by_key(|anchor| anchor.split('/').count());
             let mut claims = feeds
                 .iter()
+                .filter(|(_, anchor, _)| {
+                    boundary.is_none_or(|boundary| leading_template(boundary, anchor).is_some())
+                })
                 .filter_map(|(index, anchor, declared)| {
                     let rest = leading_template(anchor, face)?;
                     Some((
@@ -597,6 +617,23 @@ impl<S> Router<S> {
             }
         }
         fed_faces
+    }
+
+    /// The anchor templates of the objects without faces of their own that
+    /// anchor at the template of a fed dir face of another object.
+    fn fed_dir_anchors(&self) -> Vec<String> {
+        self.objects
+            .iter()
+            .zip(&self.object_metadata)
+            .filter(|(entry, object)| {
+                object.faceless
+                    && self
+                        .dirs
+                        .iter()
+                        .any(|dir| dir.fed_claims().is_some() && dir.pattern == entry.pattern)
+            })
+            .map(|(entry, _)| entry.pattern.template())
+            .collect()
     }
 
     /// Resolve every mounted collection against the object entries and lower it

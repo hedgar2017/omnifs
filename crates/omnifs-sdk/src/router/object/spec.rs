@@ -182,6 +182,18 @@ impl<O: Object> ObjectHandle<O> {
         &self.definition.fed_dirs
     }
 
+    /// Whether the object declares no face of its own: no file face, no fed
+    /// anchor, and no dir face.
+    pub(in crate::router) fn faceless(&self) -> bool {
+        let definition = &self.definition;
+        definition.leaves.is_empty()
+            && !definition.fed_anchor
+            && definition.fed_dirs.is_empty()
+            && definition.tree_faces.is_empty()
+            && definition.choices_faces.is_empty()
+            && definition.collections.is_empty()
+    }
+
     /// The canonical and representation leaves that a mounted face exposes
     /// to the host's canonical store. Compilation copies this into its local
     /// collection-resolution metadata; the executable entry only needs the
