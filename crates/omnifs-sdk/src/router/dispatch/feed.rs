@@ -229,6 +229,7 @@ fn wit_part(
             id: LogicalId::new(state.kind, state.identity).into(),
             token: state.token,
             unlisted: state.unlisted,
+            error: state.error.map(Into::into),
         })
         .collect();
     (

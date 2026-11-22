@@ -421,6 +421,10 @@ impl Shelf {
             ));
             state.shelf_version
         });
+        if shelf == "refused" {
+            // The upstream of the `refused` shelf refuses each request.
+            return Err(ProviderError::denied("the shelf is refused"));
+        }
         let books = format!("/shelves/{shelf}/books");
         let book = |number: u64, title: &str| -> Result<()> {
             cx.dir(format!("{books}/{number}"), ListingWrite::Partial)?;
@@ -726,6 +730,19 @@ impl Desk {
             return Ok(Feed::unchanged());
         }
         let notes = format!("/desks/{desk}/notes");
+        if desk == "lent" {
+            // The `lent` desk lists note 2, whose upstream refused it in the
+            // answer of the desk: the desk hands its feed that failure.
+            cx.dir(&notes, ListingWrite::Complete)?;
+            cx.dir(format!("{notes}/2"), ListingWrite::Partial)?;
+            return Ok(Feed::part(&1_u64)?
+                .inner_failed::<Note>(
+                    &NoteKey { desk, note: 2 },
+                    &0_u64,
+                    ProviderError::denied("note 2 is lent"),
+                )?
+                .into());
+        }
         cx.dir(&notes, ListingWrite::Complete)?;
         cx.dir(format!("{notes}/1"), ListingWrite::Partial)?;
         cx.file(format!("{notes}/1/text"), b"Note 1".to_vec())?;

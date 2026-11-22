@@ -559,6 +559,28 @@ impl FeedPart {
             identity: key.identity_captures(),
             token: encode(token)?,
             unlisted: false,
+            error: None,
+        });
+        Ok(self)
+    }
+
+    /// As [`FeedPart::inner`], with the failure `error` of the inner feed
+    /// for this sync, as of an item whose upstream refused it in the
+    /// answer of this feed: each operation that needs a fact of the inner
+    /// feed has the error without a request for the rest of the sync, and
+    /// the inner feed is asked again in the next one.
+    pub fn inner_failed<O: Object>(
+        mut self,
+        key: &O::Key,
+        token: &impl Serialize,
+        error: ProviderError,
+    ) -> Result<Self> {
+        self.inner.push(InnerState {
+            kind: O::kind(),
+            identity: key.identity_captures(),
+            token: encode(token)?,
+            unlisted: false,
+            error: Some(error),
         });
         Ok(self)
     }
@@ -578,6 +600,7 @@ impl FeedPart {
             identity: key.identity_captures(),
             token: encode(token)?,
             unlisted: true,
+            error: None,
         });
         Ok(self)
     }
@@ -615,6 +638,7 @@ pub(crate) struct InnerState {
     pub(crate) identity: Vec<(&'static str, String)>,
     pub(crate) token: String,
     pub(crate) unlisted: bool,
+    pub(crate) error: Option<ProviderError>,
 }
 
 /// The feed method of an object, erased over its future.

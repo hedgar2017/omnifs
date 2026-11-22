@@ -192,6 +192,7 @@ async fn the_first_full_listing_takes_the_search_with_the_ids_that_it_lacks() {
     assert!(matches!(stopped, Err(NsError::Invalid)), "{stopped:?}");
     expect_search(&requests[0], 100, Some("cursor-2"));
     expect(&requests[1], "GET", &format!("/v1/pages/{}", id(7)), None);
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/notion/pages"),
@@ -1305,6 +1306,8 @@ async fn a_529_waits_its_retry_after_and_a_blocked_connection_does_not() {
     )
     .await;
     assert!(matches!(found, Err(NsError::Permission)), "{found:?}");
+    // The refusal stands for the rest of the sync, and the next one asks.
+    harness.begin_sync();
     assert!(found_by_id(&harness, "pages", 2, &page(2, "Page 2", EDITED)).await);
 }
 

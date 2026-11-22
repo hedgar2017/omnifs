@@ -270,17 +270,7 @@ fn fail_for_now(
     claim: &FeedClaim,
     error: &wit_types::ProviderError,
 ) -> Result<()> {
-    // A rate limit with the time of its upstream holds the feed back for
-    // that time alone, by the window of the mount: after it, the feed is
-    // asked once more in the same sync.
-    if error.kind == wit_types::ErrorKind::RateLimited && error.retry_after.is_some() {
-        return Ok(());
-    }
-    runtime.record_failure(claim.object.id.as_bytes(), error)?;
-    runtime
-        .resources
-        .defer_feed(claim.object.id.as_bytes())
-        .map_err(|error| TreeError::internal(error.to_string()))
+    Ok(runtime.stand_failure(claim.object.id.as_bytes(), error)?)
 }
 
 /// Whether the operation on `path`, with its fact at `at`, asks the feed of

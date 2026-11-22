@@ -381,6 +381,22 @@ impl Runtime {
         Ok(())
     }
 
+    /// Let the failure `error` of an answer of the feed of the object `id`
+    /// stand for the rest of the sync: each operation that needs a fact of
+    /// the feed has it without a request, and the feed is asked again in
+    /// the next sync. A rate limit with the time of its upstream holds the
+    /// feed back by the window of the mount alone, after which the feed is
+    /// asked once more in the same sync.
+    pub(crate) fn stand_failure(&self, id: &[u8], error: &wit_types::ProviderError) -> Result<()> {
+        if error.kind == wit_types::ErrorKind::RateLimited && error.retry_after.is_some() {
+            return Ok(());
+        }
+        self.record_failure(id, error)?;
+        self.resources
+            .defer_feed(id)
+            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))
+    }
+
     /// The error of the check of the feed of the object `id` that failed in
     /// the last sync begun, none for a feed that did not.
     pub(crate) fn failure(&self, id: &[u8]) -> Result<Option<wit_types::ProviderError>> {

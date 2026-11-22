@@ -1011,14 +1011,23 @@ async fn the_content_of_a_file_is_the_blob_of_its_edit_timestamp() {
         "{refused:?}"
     );
     expect_file(&requests[0], "F01", "notes.txt", Some("1700000000"));
+    // The refusal stands for the rest of the sync; the next sync asks the
+    // history of the channel, and then the content again.
+    let held = served(&harness, read(&harness, &content)).await;
+    assert!(matches!(held, Err(NsError::Internal { .. })), "{held:?}");
+    harness.begin_sync();
     let (bytes, requests) = answering(
         &harness,
         read(&harness, &content),
-        vec![blob(200, b"notes")],
+        vec![
+            ok(&page("messages", std::slice::from_ref(&first), None)),
+            blob(200, b"notes"),
+        ],
     )
     .await;
     assert_eq!(bytes.unwrap(), "notes");
-    expect_file(&requests[0], "F01", "notes.txt", Some("1700000000"));
+    expect_history(&requests[0], "C01", None);
+    expect_file(&requests[1], "F01", "notes.txt", Some("1700000000"));
     assert_eq!(
         served(&harness, read(&harness, &content)).await.unwrap(),
         "notes"
@@ -1335,10 +1344,9 @@ async fn the_errors_of_slack_remove_fail_and_wait() {
         let refused = listing.unwrap_err();
         assert!(refused.to_string().starts_with(kind), "{error}: {refused}");
         expect_history(&requests[0], "C03", None);
-        // A failure for now is asked again in the next sync.
-        if matches!(kind, "network error" | "timeout") {
-            harness.begin_sync();
-        }
+        // Each failure stands for the rest of its sync, and is asked again
+        // in the next one.
+        harness.begin_sync();
     }
 
     // An error that the provider does not know is the failure of its
@@ -1353,6 +1361,7 @@ async fn the_errors_of_slack_remove_fail_and_wait() {
         matches!(&listing, Err(NsError::Internal { message }) if message.contains("an_error_of_another_name")),
         "{listing:?}"
     );
+    harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, "/slack/channels/C03/messages"),

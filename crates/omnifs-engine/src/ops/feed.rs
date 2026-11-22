@@ -568,6 +568,11 @@ impl Runtime {
             })
             .map_err(EngineError::ProviderProtocol)?;
             super::lifecycle::inspect_result(&span, &wire_result);
+            // A failure of the call stands for the rest of the sync, as
+            // each failure of an answer of the feed does.
+            if let Err(error) = &wire_result {
+                self.stand_failure(object.id.as_bytes(), error)?;
+            }
             let answer = self.provider_result(wire_result)?;
             // The facts of an unsettled part of this call under the anchor
             // of its object, which count as lacking from the next sync: a
@@ -653,13 +658,33 @@ impl Runtime {
             };
             // A part with an error ends the answer with it once its facts
             // publish: each operation that waits for the answer has it.
+            // A part with an error ends the answer with it, and the error
+            // stands for the rest of the sync; a restart is the error of
+            // the operations that wait for it alone, and the next operation
+            // begins the answer again. The error that a part gives an inner
+            // feed with its state stands for that feed.
             let step = match &answer {
                 wit_types::FeedAnswer::Part(part) => part
                     .error
                     .clone()
-                    .map_or(Ok(FeedStep::Part { more: part.more }), Err),
+                    .map_or(Ok(FeedStep::Part { more: part.more }), |error| {
+                        Err((error, true))
+                    }),
                 wit_types::FeedAnswer::Unchanged => Ok(FeedStep::Unchanged),
-                wit_types::FeedAnswer::Restart(restart) => Err(restart.error.clone()),
+                wit_types::FeedAnswer::Restart(restart) => Err((restart.error.clone(), false)),
+            };
+            let inner_failures: Vec<(Vec<u8>, wit_types::ProviderError)> = match &answer {
+                wit_types::FeedAnswer::Part(part) => {
+                    part.inner
+                        .iter()
+                        .filter_map(|state| {
+                            state.error.clone().map(|error| {
+                                (ObjectId::from_wit(&state.id).as_bytes().to_vec(), error)
+                            })
+                        })
+                        .collect()
+                },
+                _ => Vec::new(),
             };
             let calls = parts
                 .iter()
@@ -677,12 +702,18 @@ impl Runtime {
                 return Ok(FeedStep::Moved);
             };
             self.record_feed_changes(changes, &published)?;
+            for (inner, error) in &inner_failures {
+                self.stand_failure(inner, error)?;
+            }
             match step {
                 Ok(step) => {
                     inspector::record_outcome(&span, InspectorOutcome::Ok);
                     Ok(step)
                 },
-                Err(error) => {
+                Err((error, stands)) => {
+                    if stands {
+                        self.stand_failure(object.id.as_bytes(), &error)?;
+                    }
                     inspector::record_outcome(&span, inspector::outcome_for_provider_error(&error));
                     self.provider_result(Err(error))
                 },

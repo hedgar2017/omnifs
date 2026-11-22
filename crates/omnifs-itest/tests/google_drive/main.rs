@@ -628,6 +628,7 @@ async fn the_changes_take_the_items_after_the_token_of_the_answer_before() {
     expect_changes(&requests[0], "changes-2");
 
     // The next changes come from the token after the last page.
+    harness.begin_sync();
     let (_, requests) = answering(
         &harness,
         names(&harness, &at("files")),
@@ -717,6 +718,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
             .await;
             assert!(matches!(denied, Err(NsError::Permission)), "{denied:?}");
             expect_changes(&requests[0], "changes-1");
+            harness.begin_sync();
 
             let (refused, requests) = answering(
                 &harness,
@@ -731,6 +733,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
             // and the listing begins again from the token of the changes
             // after now.
             let first = files(std::slice::from_ref(&notes), Some("page-2"));
+            harness.begin_sync();
             let (refused, requests) = answering(
                 &harness,
                 names(&harness, &at("files")),
@@ -750,6 +753,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
             // ends no listing.
             let mut incomplete = files(&[], None);
             incomplete["incompleteSearch"] = true.into();
+            harness.begin_sync();
             let (stopped, requests) = answering(
                 &harness,
                 names(&harness, &at("files")),
@@ -765,6 +769,7 @@ async fn a_refused_token_of_the_changes_begins_a_full_listing_again() {
             expect_listing(&requests[1], Corpus::User, None);
             expect_listing(&requests[2], Corpus::User, Some("page-2"));
 
+            harness.begin_sync();
             let files_path = at("files");
             let (listing, ()) = tokio::join!(names(&harness, &files_path), async {
                 let page = next_callout(&harness).await;
@@ -1100,18 +1105,27 @@ async fn a_refused_content_is_the_error_of_its_read_and_a_missing_one_removes_it
     )
     .await;
 
-    for _ in 0..2 {
-        let (refused, requests) = reading(
-            &harness,
-            "files/file-1/content",
-            [blob(403, b"{}"), failure(403, "cannotDownloadFile")],
-        )
-        .await;
-        assert!(matches!(refused, Err(NsError::Permission)), "{refused:?}");
-        expect_bytes(&requests[0], "file-1", md5("bytes"));
-        expect_first_byte(&requests[1], "file-1");
-    }
-    let (content, _) = reading(&harness, "files/file-1/content", [blob(200, b"bytes")]).await;
+    // The refusal stands for the rest of the sync: the next read has it
+    // without a request, and the next sync asks again, after its changes.
+    let (refused, requests) = reading(
+        &harness,
+        "files/file-1/content",
+        [blob(403, b"{}"), failure(403, "cannotDownloadFile")],
+    )
+    .await;
+    assert!(matches!(refused, Err(NsError::Permission)), "{refused:?}");
+    expect_bytes(&requests[0], "file-1", md5("bytes"));
+    expect_first_byte(&requests[1], "file-1");
+    let held = served(&harness, read(&harness, &at("files/file-1/content"))).await;
+    assert!(matches!(held, Err(NsError::Permission)), "{held:?}");
+    harness.begin_sync();
+    let (content, requests) = reading(
+        &harness,
+        "files/file-1/content",
+        [ok(&changes(&[], "changes-1")), blob(200, b"bytes")],
+    )
+    .await;
+    expect_changes(&requests[0], "changes-1");
     assert_eq!(content.unwrap(), "bytes");
 
     // The refusal as it came for a file whose first byte Google Drive gives,
@@ -1190,14 +1204,22 @@ async fn a_refused_content_is_the_error_of_its_read_and_a_missing_one_removes_it
     // The refused content is asked again at the next sync alone.
     let held = served(&harness, read(&harness, &at("files/file-3/content"))).await;
     assert!(matches!(held, Err(NsError::RateLimited { .. })), "{held:?}");
+    // The export of sheet 1, refused before in this sync, is asked again in
+    // the next one.
+    harness.begin_sync();
     let (asked, requests) = reading(
         &harness,
         "files/sheet-1/content",
-        [blob(403, b"{}"), failure(403, "exportSizeLimitExceeded")],
+        [
+            ok(&changes(&[], "changes-1")),
+            blob(403, b"{}"),
+            failure(403, "exportSizeLimitExceeded"),
+        ],
     )
     .await;
     assert!(matches!(asked, Err(NsError::Permission)), "{asked:?}");
-    expect_export(&requests[0], "sheet-1", "text/csv", EDITED);
+    expect_changes(&requests[0], "changes-1");
+    expect_export(&requests[1], "sheet-1", "text/csv", EDITED);
     harness.begin_sync();
     let (content, requests) = reading(
         &harness,

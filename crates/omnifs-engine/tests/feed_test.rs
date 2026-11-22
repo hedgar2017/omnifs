@@ -742,3 +742,47 @@ async fn a_part_with_an_error_publishes_its_facts_and_gives_its_operation_the_er
         "served from the projection"
     );
 }
+
+/// A failure of the answer of a feed for a fact that the projection lacks,
+/// a refusal too, stands for the rest of the sync: each operation that
+/// needs the fact has it without a request, and the next sync asks again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_answer_stands_for_the_rest_of_its_sync() {
+    let harness = make_initialized_runtime(CONFIG);
+    let segments = ["shelves", "refused", "books"];
+    let refused = |error: NsError| assert!(matches!(error, NsError::Permission), "{error:?}");
+    refused(names(&harness, &segments).await.unwrap_err());
+    let calls = log(&harness).await.len();
+    refused(names(&harness, &segments).await.unwrap_err());
+    assert_eq!(
+        log(&harness).await.len(),
+        calls,
+        "no request within the sync"
+    );
+    harness.begin_sync();
+    refused(names(&harness, &segments).await.unwrap_err());
+    assert_eq!(
+        log(&harness).await.len(),
+        calls + 1,
+        "the next sync asks again"
+    );
+    refused(names(&harness, &segments).await.unwrap_err());
+    assert_eq!(log(&harness).await.len(), calls + 1);
+}
+
+/// An outer feed hands an inner feed its failure for the sync with its
+/// state: the fact of the inner feed has the error without a request of
+/// the inner feed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inner_failure_that_an_outer_feed_hands_stands_for_the_inner_feed() {
+    let harness = make_initialized_runtime(CONFIG);
+    assert_eq!(
+        names(&harness, &["desks", "lent", "notes"]).await.unwrap(),
+        ["2"]
+    );
+    let calls = log(&harness).await;
+    let text = path(&harness, &["desks", "lent", "notes", "2", "text"]).await;
+    let error = harness.namespace.read(text, 0, 64).await.unwrap_err();
+    assert!(matches!(error, NsError::Permission), "{error:?}");
+    assert_eq!(log(&harness).await, calls, "the inner feed is not asked");
+}

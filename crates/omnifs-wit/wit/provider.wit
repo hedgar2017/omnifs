@@ -389,6 +389,9 @@ interface types {
         id: logical-id,
         token: feed-token,
         unlisted: bool,
+        /// The failure of the answer of the inner feed for this sync, which
+        /// stands for the facts of that feed up to the next sync.
+        error: option<provider-error>,
     }
 
     /// The names of a listing of the projection, whether the listing is
