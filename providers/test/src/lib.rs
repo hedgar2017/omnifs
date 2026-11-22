@@ -398,7 +398,9 @@ impl Shelf {
     /// part. After the first answer, an answer is `unchanged` until the
     /// shelf version moves, and then renames book 1, adds book 3, writes the
     /// canonical bytes of print 1 at that version, and records
-    /// in `seen` the names the host listed for `books` and in `listed` the
+    /// in `kept` the books that the kept parts of the answer wrote and
+    /// removed at its last part, in `seen` the names the host listed for
+    /// `books` and in `listed` the
     /// completeness, the time and the count of that listing in a part, and removes
     /// book 2 in its last part. The last part of the first answer writes
     /// `catalog`, unsettled for the `dated` shelf, and the part of a change
@@ -428,6 +430,16 @@ impl Shelf {
             shelf: shelf.clone(),
             book: number,
         };
+        if shelf == "faulty" && token.is_none() {
+            // The first answer of the `faulty` shelf ends with an error of
+            // an item that its upstream gave without what names it, after
+            // the facts of book 1.
+            cx.dir(&books, ListingWrite::Complete)?;
+            book(1, "Book 1")?;
+            return Ok(Feed::part(&ShelfToken::Version(version))?
+                .error(ProviderError::invalid_input("an item without an id"))
+                .into());
+        }
         match token {
             None => {
                 let cards = format!("/shelves/{shelf}/cards");
@@ -474,6 +486,11 @@ impl Shelf {
                     return Err(ProviderError::rate_limited("the shelf upstream is busy")
                         .with_retry_after(Some(core::time::Duration::from_secs(1))));
                 }
+                let kept = cx.kept::<u64>(&books)?;
+                cx.file(
+                    format!("/shelves/{shelf}/kept"),
+                    format!("written {:?} removed {:?}", kept.written, kept.removed).into_bytes(),
+                )?;
                 cx.dir(&books, ListingWrite::Complete)?;
                 cx.remove(format!("{books}/2"))?;
                 let part = Feed::part(&ShelfToken::Version(version))?;
@@ -1592,6 +1609,7 @@ fn fed_objects(r: &mut Router<State>) -> Result<()> {
         o.stable();
         o.file("shelf.json").canonical::<Json>()?;
         o.file("seen").fed()?;
+        o.file("kept").fed()?;
         o.file("listed").fed()?;
         o.file("catalog").fed()?;
         o.file("catalog-read").fed()?;

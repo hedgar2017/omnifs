@@ -221,6 +221,7 @@ fn wit_part(
         unsettled,
         unlisted,
         anew,
+        error,
     } = part.into_parts();
     let inner = inner
         .into_iter()
@@ -238,6 +239,7 @@ fn wit_part(
             anchors,
             unlisted,
             anew,
+            error: error.map(Into::into),
         },
         unsettled,
     )

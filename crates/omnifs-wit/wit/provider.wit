@@ -367,6 +367,11 @@ interface types {
         anchors: list<facet-anchor>,
         unlisted: bool,
         anew: bool,
+        /// The error of each operation that waits for the answer, which the
+        /// part ends after its facts publish, as of an item of the answer
+        /// that its upstream gave without what names it: the part has no
+        /// `more`, and the feed has its token.
+        error: option<provider-error>,
     }
 
     /// An anchor of an object at another choice of a facet than the first,
@@ -403,6 +408,14 @@ interface types {
         count: u64,
         complete: bool,
         unsettled: bool,
+    }
+
+    /// The names directly under a path that the kept parts of the answer of
+    /// a feed in progress wrote, and the ones that they removed, each by the
+    /// last kept part that names it.
+    record kept-names {
+        written: list<string>,
+        removed: list<string>,
     }
 
     /// A range of the body of a fed file of the projection: at most the
@@ -573,7 +586,7 @@ interface log {
 
 /// Reads of the projection the host keeps, for a feed operation.
 interface projection {
-    use types.{correlation-id, file-range, listing-count, listing-names, provider-error};
+    use types.{correlation-id, file-range, kept-names, listing-count, listing-names, provider-error};
 
     /// The names of the listing of `path` in the projection, for a path in
     /// the subtree of the object of the feed operation `id`; none for a path
@@ -590,6 +603,10 @@ interface projection {
     /// reads no more of the body than the range.
     file: func(id: correlation-id, path: string, offset: u64, len: u32)
         -> result<option<file-range>, provider-error>;
+    /// The names directly under `path` that the kept parts of the answer of
+    /// the feed of the operation `id` wrote and removed, for the paths of
+    /// `names`: empty lists before a kept part.
+    kept: func(id: correlation-id, path: string) -> result<kept-names, provider-error>;
 }
 
 interface callouts {

@@ -224,6 +224,31 @@ impl<K, S> FeedCx<K, S> {
         )
     }
 
+    /// The names directly under the mount-absolute `path` that the kept
+    /// parts of the answer in progress wrote and removed, each by the last
+    /// kept part that names it, parsed as a `T`: the part that ends a full
+    /// listing removes what the projection lists and neither the kept parts
+    /// nor itself wrote, without a token that carries the names. Empty
+    /// before a kept part. The host answers only for a path in the subtree
+    /// of the feed's object.
+    pub fn kept<T: FromStr>(&self, path: impl AsRef<str>) -> Result<KeptNames<T>> {
+        let path = path.as_ref();
+        let kept = crate::omnifs::provider::projection::kept(self.cx.id(), path)?;
+        let parse = |names: Vec<String>| {
+            names
+                .iter()
+                .map(|name| {
+                    name.parse()
+                        .map_err(|_| ProviderError::internal(format!("{path} keeps {name}")))
+                })
+                .collect::<Result<Vec<T>>>()
+        };
+        Ok(KeptNames {
+            written: parse(kept.written)?,
+            removed: parse(kept.removed)?,
+        })
+    }
+
     /// At most `len` bytes from `offset` of the fed file at the
     /// mount-absolute `path` in the host projection, without the kept parts
     /// of an answer, with the length of the whole file; `None` for a path
@@ -367,6 +392,14 @@ pub struct ListedNames<T> {
     pub unsettled: bool,
 }
 
+/// The names under a path that the kept parts of an answer in progress
+/// wrote and removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptNames<T> {
+    pub written: Vec<T>,
+    pub removed: Vec<T>,
+}
+
 /// The count of the names of a listing of the host projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListedCount {
@@ -424,6 +457,7 @@ impl Feed {
             unsettled: false,
             unlisted: false,
             anew: false,
+            error: None,
         })
     }
 
@@ -458,6 +492,7 @@ pub struct FeedPart {
     unsettled: bool,
     unlisted: bool,
     anew: bool,
+    error: Option<ProviderError>,
 }
 
 /// A [`FeedPart`] taken apart for the host.
@@ -472,6 +507,7 @@ pub(crate) struct FeedPartParts {
     pub(crate) unsettled: bool,
     pub(crate) unlisted: bool,
     pub(crate) anew: bool,
+    pub(crate) error: Option<ProviderError>,
 }
 
 impl FeedPart {
@@ -482,6 +518,18 @@ impl FeedPart {
     #[must_use]
     pub fn unlisted(mut self) -> Self {
         self.unlisted = true;
+        self
+    }
+
+    /// End the answer with `error` for each operation that waits for it,
+    /// after the facts of this part and of the kept parts before it
+    /// publish with its token, as for an item of a page that its upstream
+    /// gave without what names it: the facts of the other items stand, and
+    /// the next sync asks the feed from this token. A part with an error has
+    /// no [`FeedPart::more`].
+    #[must_use]
+    pub fn error(mut self, error: ProviderError) -> Self {
+        self.error = Some(error);
         self
     }
 
@@ -555,6 +603,7 @@ impl FeedPart {
             unsettled: self.unsettled,
             unlisted: self.unlisted,
             anew: self.anew,
+            error: self.error,
         }
     }
 }

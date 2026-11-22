@@ -557,6 +557,13 @@ async fn a_feed_reads_the_names_and_the_count_of_a_listing_with_its_completeness
                 .unwrap(),
             format!("names true {unsettled}, count 2 true {unsettled}")
         );
+        // The last part of the answer read what its kept part wrote.
+        assert_eq!(
+            support::read(&harness, &format!("/test/shelves/{shelf}/kept"))
+                .await
+                .unwrap(),
+            "written [1, 3] removed []"
+        );
     }
 }
 
@@ -712,4 +719,26 @@ async fn a_sync_of_a_mount_begins_and_ends_by_its_number() {
         harness.registry.begin_sync("none"),
         Err(omnifs_engine::SyncError::UnknownMount(_))
     ));
+}
+
+/// A part with an error publishes its facts and ends its answer with the
+/// error, which each operation that waits for the answer has; the next
+/// operation is served the facts of the part, without the provider.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_part_with_an_error_publishes_its_facts_and_gives_its_operation_the_error() {
+    let harness = make_initialized_runtime(CONFIG);
+    let segments = ["shelves", "faulty", "books"];
+    let error = names(&harness, &segments).await.unwrap_err();
+    assert!(matches!(error, NsError::Invalid), "{error:?}");
+    let calls = log(&harness).await.len();
+    assert_eq!(names(&harness, &segments).await.unwrap(), ["1"]);
+    assert_eq!(
+        read(&harness, &["shelves", "faulty", "books", "1", "title"]).await,
+        "Book 1"
+    );
+    assert_eq!(
+        log(&harness).await.len(),
+        calls,
+        "served from the projection"
+    );
 }

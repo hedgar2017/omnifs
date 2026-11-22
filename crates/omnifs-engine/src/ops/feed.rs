@@ -204,7 +204,8 @@ pub(crate) struct FeedChanges {
 /// and only under that path.
 #[derive(Default)]
 pub(crate) struct FeedOperations {
-    paths: dashmap::DashMap<u64, Path>,
+    /// The path and the id of the object of each feed operation.
+    paths: dashmap::DashMap<u64, (Path, Vec<u8>)>,
 }
 
 /// Removes a feed operation from [`FeedOperations`] when its call returns.
@@ -220,8 +221,8 @@ impl Drop for FeedOperation<'_> {
 }
 
 impl FeedOperations {
-    fn begin(&self, id: u64, path: Path) -> FeedOperation<'_> {
-        self.paths.insert(id, path);
+    fn begin(&self, id: u64, path: Path, object: Vec<u8>) -> FeedOperation<'_> {
+        self.paths.insert(id, (path, object));
         FeedOperation {
             operations: self,
             id,
@@ -252,7 +253,7 @@ impl ProjectionReads {
         id: u64,
         path: &str,
     ) -> std::result::Result<Path, wit_types::ProviderError> {
-        let Some(object) = self.operations.paths.get(&id).map(|entry| entry.clone()) else {
+        let Some(object) = self.operations.paths.get(&id).map(|entry| entry.0.clone()) else {
             return Err(refusal(
                 wit_types::ErrorKind::Denied,
                 "the projection answers only within a feed operation",
@@ -337,6 +338,47 @@ impl ProjectionReads {
                 })
             })
             .transpose()
+    }
+
+    /// The names directly under `path` that the kept parts of the answer of
+    /// the feed of the operation `id` wrote and removed, each by the last
+    /// kept part that names it, for the paths of [`Self::names`].
+    pub(crate) fn kept(
+        &self,
+        id: u64,
+        path: &str,
+    ) -> std::result::Result<wit_types::KeptNames, wit_types::ProviderError> {
+        let path = self.feed_path(id, path)?;
+        let object = self
+            .operations
+            .paths
+            .get(&id)
+            .map(|entry| entry.1.clone())
+            .unwrap_or_default();
+        let mut names = std::collections::BTreeMap::new();
+        for bytes in self.resources.kept_parts(&object).map_err(internal)? {
+            let kept: KeptPart = postcard::from_bytes(&bytes).map_err(internal)?;
+            let under = |at: &str| -> Option<String> {
+                let at = Path::parse(at).ok()?;
+                (at.parent().as_ref() == Some(&path)).then(|| at.name().to_owned())
+            };
+            for write in &kept.effects.fs {
+                if let Some(name) = under(&write.path) {
+                    names.insert(name, true);
+                }
+            }
+            for removal in &kept.effects.removals {
+                if let Some(name) = under(removal) {
+                    names.insert(name, false);
+                }
+            }
+        }
+        let (written, removed): (Vec<_>, Vec<_>) =
+            names.into_iter().partition(|(_, written)| *written);
+        Ok(wit_types::KeptNames {
+            written: written.into_iter().map(|(name, _)| name).collect(),
+            removed: removed.into_iter().map(|(name, _)| name).collect(),
+        })
     }
 
     /// The listing of `path` in the projection, for the feed operation `id`
@@ -504,7 +546,9 @@ impl Runtime {
             lacked: lacked.cloned(),
         };
         async {
-            let operation = self.feed_operations.begin(id, object.path.clone());
+            let operation =
+                self.feed_operations
+                    .begin(id, object.path.clone(), object.id.as_bytes().to_vec());
             let (wire_result, effects, unsettled) = self
                 .instance
                 .feed(
@@ -548,6 +592,7 @@ impl Runtime {
                     anchors: Vec::new(),
                     unlisted: false,
                     anew: false,
+                    error: None,
                 },
                 effects,
                 bodies: Vec::new(),
@@ -606,8 +651,13 @@ impl Runtime {
                 },
                 answer => (answer, vec![last]),
             };
+            // A part with an error ends the answer with it once its facts
+            // publish: each operation that waits for the answer has it.
             let step = match &answer {
-                wit_types::FeedAnswer::Part(part) => Ok(FeedStep::Part { more: part.more }),
+                wit_types::FeedAnswer::Part(part) => part
+                    .error
+                    .clone()
+                    .map_or(Ok(FeedStep::Part { more: part.more }), Err),
                 wit_types::FeedAnswer::Unchanged => Ok(FeedStep::Unchanged),
                 wit_types::FeedAnswer::Restart(restart) => Err(restart.error.clone()),
             };
@@ -757,6 +807,7 @@ mod tests {
                 anchors: Vec::new(),
                 unlisted: false,
                 anew: false,
+                error: None,
             },
             effects: wit_types::Effects {
                 canonical: Vec::new(),

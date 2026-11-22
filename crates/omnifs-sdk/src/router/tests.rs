@@ -523,10 +523,7 @@ impl Object for FacetObj {
     type State = ();
     type Canonical = Json;
 
-    #[allow(
-        clippy::manual_async_fn,
-        reason = "the signature of the trait method"
-    )]
+    #[allow(clippy::manual_async_fn, reason = "the signature of the trait method")]
     fn load(
         _cx: &Cx<()>,
         _key: &FacetedKey,
@@ -547,9 +544,7 @@ impl Object for FacetObj {
 /// A part that writes the canonical bytes of issue 7 as a closed issue, at
 /// its anchor under `all`.
 #[allow(clippy::unused_async)]
-async fn closed_issue_feed(
-    cx: crate::feed::FeedCx<FacetedKey, ()>,
-) -> Result<crate::feed::Feed> {
+async fn closed_issue_feed(cx: crate::feed::FeedCx<FacetedKey, ()>) -> Result<crate::feed::Feed> {
     cx.canonical::<FacetObj>(
         "/acme/issues/all/7",
         Canonical::new(br#"{"state":"closed"}"#.to_vec(), None),
@@ -577,8 +572,7 @@ fn a_fed_canonical_has_its_view_leaves_under_its_anchor_alone() {
     let start = Some(wit_types::FeedStart::Lacks(
         "/acme/issues/all/7/summary".to_string(),
     ));
-    let (_, effects, _) =
-        poll_ready(router.feed(&cx, "/acme/issues/all/7", None, start)).unwrap();
+    let (_, effects, _) = poll_ready(router.feed(&cx, "/acme/issues/all/7", None, start)).unwrap();
     let effects = effects.into_wit();
     assert_eq!(effects.canonical.len(), 1);
     assert_eq!(
@@ -586,9 +580,16 @@ fn a_fed_canonical_has_its_view_leaves_under_its_anchor_alone() {
         ["/acme/issues/all/7/item.json"]
     );
     assert!(
-        effects.fs.iter().all(|write| !write.path.contains("/open/")),
+        effects
+            .fs
+            .iter()
+            .all(|write| !write.path.contains("/open/")),
         "{:?}",
-        effects.fs.iter().map(|write| &write.path).collect::<Vec<_>>()
+        effects
+            .fs
+            .iter()
+            .map(|write| &write.path)
+            .collect::<Vec<_>>()
     );
 }
 

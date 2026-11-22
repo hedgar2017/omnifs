@@ -129,4 +129,12 @@ impl ProjectionHost for HostState {
     ) -> Result<Option<wit_types::FileRange>, wit_types::ProviderError> {
         self.projection()?.file(id, &path, offset, len)
     }
+
+    fn kept(
+        &mut self,
+        id: u64,
+        path: String,
+    ) -> Result<wit_types::KeptNames, wit_types::ProviderError> {
+        self.projection()?.kept(id, &path)
+    }
 }

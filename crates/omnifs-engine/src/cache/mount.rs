@@ -4841,6 +4841,7 @@ mod tests {
                 anchors: Vec::new(),
                 unlisted: false,
                 anew: false,
+                error: None,
             },
             wit::Effects {
                 canonical: Vec::new(),

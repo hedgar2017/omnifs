@@ -115,6 +115,9 @@ where
                 Err("a feed restart must not carry effects".to_string())
             },
             wit_types::FeedAnswer::Restart(restart) => Self::feed_token(&restart.token),
+            wit_types::FeedAnswer::Part(part) if part.more && part.error.is_some() => {
+                Err("a feed part with an error has no more parts".to_string())
+            },
             wit_types::FeedAnswer::Part(part) => {
                 Self::feed_token(&part.token)?;
                 for state in &part.inner {
@@ -939,6 +942,7 @@ mod tests {
                 anchors: Vec::new(),
                 unlisted: false,
                 anew: false,
+                error: None,
             }))
         };
         let large = "t".repeat(64 * 1024 * 1024 + 1);
@@ -960,6 +964,7 @@ mod tests {
             anchors: Vec::new(),
             unlisted: false,
             anew: false,
+            error: None,
         }));
         let id = |value: &str| wit_types::LogicalId {
             kind: "test.print".to_string(),
