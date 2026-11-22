@@ -431,7 +431,7 @@ fn validate_oauth_flow(key: &str, oauth: &OauthScheme) -> Result<(), ProviderMet
         &format!("auth.schemes.{key}.flow.tokenEndpoint"),
         &oauth.token_endpoint,
     )?;
-    // A flow without a user, as a JWT bearer grant, has no authorization
+    // A flow without a sign-in, as a JWT bearer grant, has no authorization
     // request, and its assertion authenticates the client.
     if oauth.flow.needs_user() {
         validate_https_endpoint(

@@ -282,7 +282,7 @@ impl AuthBinding {
         if failures > 0 && !CredentialService::is_fresh(&entry, now) {
             return CredentialHealth::RefreshFailed { attempts: failures };
         }
-        // A flow without a user asserts for the next request by itself: its
+        // A flow without a sign-in asserts for the next request by itself: its
         // credential is ready whatever the time of its last token.
         if self
             .request
@@ -571,7 +571,7 @@ impl CredentialService {
                 persist_durable_refresh(&self.backend, id, expected_version, &stored, refreshed)
                     .await
             },
-            // A flow without a user has no consent to ask again: the token
+            // A flow without a sign-in has no consent to ask again: the token
             // endpoint takes the next assertion of a client whose key or
             // clock it refused.
             Err(AuthError::TokenEndpoint { error, .. })

@@ -326,7 +326,7 @@ pub(crate) async fn assemble_mount_build(
     };
     let ImportOutcome { auth, token } = import_outcome;
 
-    // An OAuth flow without a user, as the JWT bearer grant of a service
+    // An OAuth flow without a sign-in, as the JWT bearer grant of a service
     // account, completes without a terminal.
     let needs_user = auth
         .as_ref()
@@ -440,7 +440,7 @@ fn credential_holder<'a>(
 }
 
 /// Whether a user signs in for the OAuth scheme of `auth`: not for a flow
-/// without a user, as the JWT bearer grant of a service account.
+/// without a sign-in, as the JWT bearer grant of a service account.
 pub(super) fn oauth_needs_user(
     auth_manifest: Option<&omnifs_auth::AuthManifest>,
     auth: &Auth,

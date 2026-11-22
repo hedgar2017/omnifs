@@ -616,7 +616,7 @@ async fn jwt_bearer_binding_asserts_again_after_a_refused_assertion() {
         .unwrap();
 
     // The token endpoint refuses the assertion with `invalid_grant`, which
-    // asks no consent of a flow without a user: the next request asserts
+    // asks no consent of a flow without a sign-in: the next request asserts
     // again.
     for attempts in 1..=2 {
         let error = binding
