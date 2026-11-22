@@ -35,9 +35,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -51,12 +50,6 @@ use omnifs_core::path::Path as CorePath;
 /// restart must find its predecessor by a name stable across pids, so this is a
 /// fixed name; the restartable runner is given its own state directory per mount.
 pub(crate) const FH_STATE_FILE: &str = "filehandles.json";
-
-/// Debounced write-behind delay: a burst of table mutations coalesces into one
-/// write this long after the last mutation. Short enough that a client rarely
-/// races a `SIGKILL` before its just-allocated handle is durable; long enough
-/// that a directory walk does not fsync per entry.
-pub(crate) const DEBOUNCE: Duration = Duration::from_millis(100);
 
 /// The persisted filehandle-identity table.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -252,37 +245,35 @@ impl Drop for Persister {
     }
 }
 
-/// The persister thread loop: block for the first mutation, then debounce a burst
-/// into one write; a flush writes immediately and acks.
+/// The persister thread loop: block for the next command, then take every
+/// command already queued, so that a burst of mutations is one write, and
+/// write once; a flush writes and acks. No time waits for more commands.
 fn run(path: &Path, tables: &PersistTables, rx: &mpsc::Receiver<Cmd>) {
-    let mut dirty = false;
-    loop {
-        let cmd = if dirty {
-            match rx.recv_timeout(DEBOUNCE) {
-                Ok(cmd) => cmd,
-                Err(RecvTimeoutError::Timeout) => {
-                    tables.persist(path);
-                    dirty = false;
-                    continue;
-                },
-                Err(RecvTimeoutError::Disconnected) => {
-                    tables.persist(path);
-                    return;
-                },
-            }
-        } else {
-            match rx.recv() {
-                Ok(cmd) => cmd,
-                Err(_) => return,
+    while let Ok(first) = rx.recv() {
+        let mut acks = Vec::new();
+        let mut take = |cmd: Cmd| {
+            if let Cmd::Flush(ack) = cmd {
+                acks.push(ack);
             }
         };
-        match cmd {
-            Cmd::Dirty => dirty = true,
-            Cmd::Flush(ack) => {
-                tables.persist(path);
-                dirty = false;
-                let _ = ack.send(());
-            },
+        take(first);
+        let mut ended = false;
+        loop {
+            match rx.try_recv() {
+                Ok(cmd) => take(cmd),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    ended = true;
+                    break;
+                },
+            }
+        }
+        tables.persist(path);
+        for ack in acks {
+            let _ = ack.send(());
+        }
+        if ended {
+            return;
         }
     }
 }
