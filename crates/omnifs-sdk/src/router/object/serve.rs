@@ -2,8 +2,8 @@
 
 use super::super::pattern::Pattern;
 use super::dispatch::{
-    BoxedObjectList, BoxedObjectRead, FacetExpansion, ObjectLeaf, ObjectListing, ObjectReadTarget,
-    SourceLeafAttrs,
+    BoxedObjectList, BoxedObjectRead, BoxedObjectStore, FacetExpansion, ObjectLeaf, ObjectListing,
+    ObjectReadTarget, SourceLeafAttrs,
 };
 use super::spec::{AnchorShape, ObjectDefinition};
 use crate::browse::{CachedCanonical, Effects, FileContent, ReadOutcome};
@@ -86,6 +86,38 @@ where
                 Box::pin(async move { route.list(cx, caps, list_path).await })
             },
         )
+    }
+
+    pub(super) fn store_handler(self) -> BoxedObjectStore {
+        Box::new(move |caps, anchor, canonical| self.store(caps, anchor, canonical))
+    }
+
+    /// The effects of `canonical`, which a feed part writes for the object
+    /// anchored at `anchor`: its store, with each face that serves canonical
+    /// bytes as a view leaf, and each of those leaves as a file of the
+    /// object without bytes of its own, which the host keeps as a fed fact
+    /// of the part.
+    fn store(
+        &self,
+        caps: &Captures,
+        anchor: &str,
+        canonical: crate::object::Canonical,
+    ) -> Result<Effects> {
+        if !self.has_canonical {
+            return Err(ProviderError::invalid_input(format!(
+                "object route {} has no canonical face for the canonical bytes that a feed writes",
+                self.pattern.template()
+            )));
+        }
+        let key = O::Key::from_captures(caps)?;
+        let id = key.anchor(O::kind());
+        let view_leaves = self.view_leaves_for_base(anchor)?;
+        let mut effects = Effects::new();
+        for leaf in &view_leaves {
+            effects.fed_view_leaf(leaf, &id)?;
+        }
+        effects.canonical_store(&id, canonical.validator, canonical.bytes, view_leaves);
+        Ok(effects)
     }
 
     /// The anchor-listing side effects: load the object and emit the

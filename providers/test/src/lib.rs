@@ -40,8 +40,8 @@ struct State {
     /// Whether a revalidation of the first page of `hello/validated` has
     /// answered `unchanged`; the next one answers a changed page.
     validated_first_page_stood: bool,
-    /// Each call of a shelf or book feed as `object token start`, which
-    /// `shelf-log` reads.
+    /// Each call of a shelf or book feed as `object token start`, and each
+    /// load of a print as `print load`, which `shelf-log` reads.
     shelf_log: Vec<String>,
     /// The upstream version of the shelves, which a read of `shelf-change`
     /// advances.
@@ -393,15 +393,17 @@ impl Shelf {
 
     /// The feed of a shelf: its first answer lists books 1 and 2 in two
     /// parts, each with the inner token of its book, the first with card 1
-    /// too, and a third part completes `books`; the `flaky` shelf stops once before its second
+    /// and with the canonical bytes of print 1 too, and a third part
+    /// completes `books`; the `flaky` shelf stops once before its second
     /// part. After the first answer, an answer is `unchanged` until the
-    /// shelf version moves, and then renames book 1, adds book 3, and records
+    /// shelf version moves, and then renames book 1, adds book 3, writes the
+    /// canonical bytes of print 1 at that version, and records
     /// in `seen` the names the host listed for `books` and in `listed` the
     /// completeness, the time and the count of that listing in a part, and removes
     /// book 2 in its last part. The last part of the first answer writes
     /// `catalog`, with a time for the `dated` shelf, and the part of a change
-    /// records in `catalog-read` what it reads of the fed files; the `wobbly` shelf stops once at a rate limit
-    /// of a second before that last part.
+    /// records in `catalog-read` what it reads of the fed files; the `wobbly`
+    /// shelf stops once at a rate limit of a second before that last part.
     fn feed(cx: FeedCx<ShelfKey, State>) -> impl core::future::Future<Output = Result<Feed>> {
         core::future::ready(Self::answer(&cx))
     }
@@ -432,6 +434,7 @@ impl Shelf {
                 cx.dir(&cards, ListingWrite::Complete)?;
                 cx.dir(format!("{cards}/1"), ListingWrite::Complete)?;
                 cx.file(format!("{cards}/1/text"), b"Card 1".to_vec())?;
+                Self::print(cx, &shelf, version)?;
                 cx.dir(&books, ListingWrite::Partial)?;
                 book(1, "Book 1")?;
                 Ok(Feed::part(&ShelfToken::Page(1))?
@@ -476,33 +479,12 @@ impl Shelf {
                 Ok(Feed::part(&ShelfToken::Version(version))?.into())
             },
             Some(ShelfToken::Version(_) | ShelfToken::Change(_)) => {
-                let (Some(seen), Some(listed)) = (cx.names::<u64>(&books)?, cx.count(&books)?)
-                else {
-                    return Err(ProviderError::internal(format!("no listing of {books}")));
-                };
-                let names = seen
-                    .names
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                cx.file(format!("/shelves/{shelf}/seen"), names.into_bytes())?;
-                cx.file(
-                    format!("/shelves/{shelf}/listed"),
-                    format!(
-                        "names {} {:?}, count {} {} {:?}",
-                        seen.complete,
-                        seen.until.map(epoch_seconds),
-                        listed.count,
-                        listed.complete,
-                        listed.until.map(epoch_seconds),
-                    )
-                    .into_bytes(),
-                )?;
+                Self::listing_read(cx, &shelf, &books)?;
                 cx.file(
                     format!("/shelves/{shelf}/catalog-read"),
                     Self::catalog_read(cx, &shelf)?.into_bytes(),
                 )?;
+                Self::print(cx, &shelf, version)?;
                 cx.dir(&books, ListingWrite::Complete)?;
                 book(1, &format!("Book 1 v{version}"))?;
                 book(3, "Book 3")?;
@@ -513,6 +495,47 @@ impl Shelf {
 }
 
 impl Shelf {
+    /// Print 1 of the shelf at `version`, with its canonical bytes as the
+    /// feed has them.
+    fn print(cx: &FeedCx<ShelfKey, State>, shelf: &str, version: u64) -> Result<()> {
+        let prints = format!("/shelves/{shelf}/prints");
+        cx.dir(&prints, ListingWrite::Complete)?;
+        cx.dir(format!("{prints}/1"), ListingWrite::Complete)?;
+        cx.canonical::<Print>(
+            format!("{prints}/1"),
+            Canonical::new(Print::bytes(1, version), None),
+        );
+        Ok(())
+    }
+
+    /// Write what a feed reads of the listing of `books` in the projection:
+    /// its names, as numbers, in `seen`, and its completeness, its time, and
+    /// its count in `listed`.
+    fn listing_read(cx: &FeedCx<ShelfKey, State>, shelf: &str, books: &str) -> Result<()> {
+        let (Some(seen), Some(listed)) = (cx.names::<u64>(books)?, cx.count(books)?) else {
+            return Err(ProviderError::internal(format!("no listing of {books}")));
+        };
+        let names = seen
+            .names
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        cx.file(format!("/shelves/{shelf}/seen"), names.into_bytes())?;
+        cx.file(
+            format!("/shelves/{shelf}/listed"),
+            format!(
+                "names {} {:?}, count {} {} {:?}",
+                seen.complete,
+                seen.until.map(epoch_seconds),
+                listed.count,
+                listed.complete,
+                listed.until.map(epoch_seconds),
+            )
+            .into_bytes(),
+        )
+    }
+
     /// What a feed reads of the fed files of the projection: the catalog by
     /// its ranges of [`CATALOG_RANGE`] bytes, the catalog as a record of one
     /// range, which it is too large for, and the title of book 1 as a
@@ -534,9 +557,10 @@ impl Shelf {
                 break (range.length, range.until);
             }
         };
-        let record = cx
-            .read_record(&at, CATALOG_RANGE)
-            .map_or_else(|error| format!("{:?}", error.kind()), |_| "a record".to_owned());
+        let record = cx.read_record(&at, CATALOG_RANGE).map_or_else(
+            |error| format!("{:?}", error.kind()),
+            |_| "a record".to_owned(),
+        );
         let title = cx
             .read_record(format!("/shelves/{shelf}/books/1/title"), CATALOG_RANGE)?
             .map(|record| String::from_utf8_lossy(&record.bytes).into_owned());
@@ -608,6 +632,52 @@ impl core::fmt::Display for BookToken {
 #[omnifs_sdk::path_captures]
 struct ShelfKey {
     shelf: String,
+}
+
+/// A print of a shelf, whose canonical bytes the feed of its shelf writes:
+/// its faces render from those bytes without a load.
+#[omnifs_sdk::object(kind = "test.print", key = PrintKey)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Print {
+    print: u64,
+    version: u64,
+}
+
+impl Print {
+    /// The canonical bytes of the print `print` at `version`.
+    fn bytes(print: u64, version: u64) -> Vec<u8> {
+        format!(r#"{{"print":{print},"version":{version}}}"#).into_bytes()
+    }
+
+    /// The load of a print, which the log of the feeds records: the print
+    /// of an upstream at the version 1000, which no feed writes.
+    fn load(
+        cx: &Cx<State>,
+        key: &PrintKey,
+        _since: Option<Validator>,
+    ) -> impl core::future::Future<Output = Result<Load<Self>>> {
+        cx.state_mut(|state| {
+            state
+                .shelf_log
+                .push(format!("{}/prints/{} load", key.shelf, key.print));
+        });
+        let bytes = Self::bytes(key.print, 1000);
+        core::future::ready(
+            Self::decode(&bytes).map(|print| Load::fresh(print, Canonical::new(bytes, None))),
+        )
+    }
+}
+
+impl Representable<Markdown> for Print {
+    fn represent(&self) -> Vec<u8> {
+        format!("# Print {} v{}\n", self.print, self.version).into_bytes()
+    }
+}
+
+#[omnifs_sdk::path_captures]
+struct PrintKey {
+    shelf: String,
+    print: u64,
 }
 
 /// A card of a shelf, whose facts come from the feed of its shelf alone: an
@@ -864,7 +934,15 @@ impl TestProvider {
             o.file("catalog-read").fed()?;
             o.dir("books").fed()?;
             o.dir("cards").fed()?;
-            o.feed(Shelf::feed).starts(["books", "cards"])?;
+            o.dir("prints").fed()?;
+            o.feed(Shelf::feed).starts(["books", "cards", "prints"])?;
+            Ok(())
+        })?;
+        r.object::<Print>("/shelves/{shelf}/prints/{print}", |o| {
+            o.dynamic();
+            o.fed();
+            o.file("print.json").canonical::<Json>()?;
+            o.file("print.md").representation::<Markdown>()?;
             Ok(())
         })?;
         r.object::<Card>("/shelves/{shelf}/cards/{card}", |o| {

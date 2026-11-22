@@ -113,6 +113,18 @@
     ]
   },
   {
+    "template": "/shelves/{shelf}/prints",
+    "kind": "Dir",
+    "object_kind": null,
+    "captures": [
+      {
+        "name": "shelf",
+        "type_name": "String",
+        "choices": null
+      }
+    ]
+  },
+  {
     "template": "/repos/{repo}/tree",
     "kind": "Dir",
     "object_kind": null,
@@ -328,6 +340,23 @@
       {
         "name": "shelf",
         "type_name": "String",
+        "choices": null
+      }
+    ]
+  },
+  {
+    "template": "/shelves/{shelf}/prints/{print}",
+    "kind": "Object",
+    "object_kind": "test.print",
+    "captures": [
+      {
+        "name": "shelf",
+        "type_name": "String",
+        "choices": null
+      },
+      {
+        "name": "print",
+        "type_name": "u64",
         "choices": null
       }
     ]

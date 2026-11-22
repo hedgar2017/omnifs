@@ -67,8 +67,11 @@ impl<'a> EffectApplier<'a> {
     }
 
     /// Lower the effects of a terminal. The writes of a feed part are fed
-    /// facts: a file is a stable file whose bytes the projection holds, and
-    /// no written path has a deadline.
+    /// facts: a file is a stable file whose bytes the projection holds, or a
+    /// view leaf of the canonical bytes that the part stores for its object,
+    /// and no written path has a deadline, so that a read of a view leaf
+    /// renders from those bytes until a part writes other ones: the deadline
+    /// of the load of an object is not of the bytes of a feed.
     fn lower_writes(
         &self,
         effects: &wit_types::Effects,
@@ -76,6 +79,11 @@ impl<'a> EffectApplier<'a> {
         fed: bool,
     ) -> anyhow::Result<ProjectionTransition> {
         let mut transition = ProjectionTransition::default();
+        let stored = if fed {
+            canonical_versions(effects)
+        } else {
+            HashMap::new()
+        };
         for canonical in &effects.canonical {
             transition.objects.push(ObjectMutation::Canonical {
                 id: ObjectId::from_wit(&canonical.id).as_bytes().to_vec(),
@@ -97,7 +105,11 @@ impl<'a> EffectApplier<'a> {
             let meta = match (&write.kind, fed) {
                 (wit_types::FsKind::Directory(_), _) => EntryMeta::directory(),
                 (wit_types::FsKind::File(file), true) => {
-                    self.fed_file(&mut transition, &path, file)?
+                    let view_of = write
+                        .id
+                        .as_ref()
+                        .and_then(|id| stored.get(ObjectId::from_wit(id).as_bytes()));
+                    self.fed_file(&mut transition, &path, file, view_of)?
                 },
                 (wit_types::FsKind::File(file), false) => EntryMeta::file(self.file_meta(file)?),
             };
@@ -626,14 +638,33 @@ impl<'a> EffectApplier<'a> {
     /// A fed file: a stable file of its exact size whose bytes the projection
     /// holds in its file record, the inline bytes of the write or the body of
     /// its blob, so a read serves it without the eager cap of an inline
-    /// preload.
+    /// preload; or, without bytes, a view leaf of the canonical bytes that
+    /// the part stores for its object, of the version `view_of` of those
+    /// bytes, so that the fact of the leaf changes with them alone, whose
+    /// read the provider renders from them.
     fn fed_file(
         &self,
         transition: &mut ProjectionTransition,
         path: &Path,
         file: &wit_types::FileOut,
+        view_of: Option<&String>,
     ) -> anyhow::Result<EntryMeta> {
         let (size, fact) = match &file.bytes {
+            wit_types::ByteSource::Deferred(wit_types::ReadMode::Full) => {
+                let version = view_of.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "fed file {path} has no bytes and is no view leaf of a canonical of its part"
+                    )
+                })?;
+                return FileAttrsCache::deferred(
+                    crate::view::FileSize::Unknown,
+                    crate::view::ReadMode::Full,
+                    Stability::Stable,
+                    Some(version.clone()),
+                )
+                .map(EntryMeta::file)
+                .map_err(anyhow::Error::msg);
+            },
             wit_types::ByteSource::Inline(bytes) => (
                 u64::try_from(bytes.len())?,
                 FactPayload::File(
@@ -660,7 +691,8 @@ impl<'a> EffectApplier<'a> {
                     },
                 )
             },
-            wit_types::ByteSource::Canonical | wit_types::ByteSource::Deferred(_) => {
+            wit_types::ByteSource::Canonical
+            | wit_types::ByteSource::Deferred(wit_types::ReadMode::Ranged) => {
                 anyhow::bail!("fed file {path} has no inline bytes and no blob");
             },
         };
@@ -678,6 +710,21 @@ impl<'a> EffectApplier<'a> {
         });
         Ok(EntryMeta::file(attrs))
     }
+}
+
+/// The version of the canonical bytes that the effects of a feed part store
+/// for each object, by its id: of each view leaf of the object.
+fn canonical_versions(effects: &wit_types::Effects) -> HashMap<Vec<u8>, String> {
+    effects
+        .canonical
+        .iter()
+        .map(|canonical| {
+            (
+                ObjectId::from_wit(&canonical.id).as_bytes().to_vec(),
+                crate::view::BodyId::from_bytes(&canonical.bytes).hex(),
+            )
+        })
+        .collect()
 }
 
 /// The facts of a subtree answer at `path`: its Git fact with the commit of

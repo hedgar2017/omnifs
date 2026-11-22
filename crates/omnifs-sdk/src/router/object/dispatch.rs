@@ -128,10 +128,14 @@ impl<O: Object> ObjectLeaf<O> {
 /// The mounted, type-erased object route the dispatch tables hold.
 pub(in crate::router) struct ObjectRouteEntry<S> {
     pub pattern: Pattern,
+    pub kind: ObjectKind,
     pub shape: AnchorShape,
     pub leaves: Vec<ListingLeaf>,
     pub read: BoxedObjectRead<S>,
     pub list: BoxedObjectList<S>,
+    /// The effects of the canonical bytes that a feed part writes for the
+    /// object anchored at a path of this route.
+    pub store: BoxedObjectStore,
     /// Per-leaf live-face handlers (direct/blob/stream/object), keyed by leaf
     /// name. Shared with the spec so an alias mount replays the same closures.
     pub face_handlers: std::rc::Rc<std::collections::BTreeMap<String, FaceHandler<S>>>,
@@ -283,6 +287,9 @@ pub(in crate::router) type BoxedObjectList<S> = Box<
     ) -> Pin<Box<dyn Future<Output = Result<ObjectListing>> + 'a>>,
 >;
 
+pub(in crate::router) type BoxedObjectStore =
+    Box<dyn Fn(&Captures, &str, crate::object::Canonical) -> Result<Effects>>;
+
 /// What an anchor's list dispatch needs.
 pub(in crate::router) struct ObjectListing {
     pub effects: Effects,
@@ -365,9 +372,11 @@ where
 
     let entry = ObjectRouteEntry {
         pattern: pattern.clone(),
+        kind: O::kind(),
         shape: definition.shape,
         leaves: listing_leaves,
         read: route.clone().read_handler(),
+        store: route.clone().store_handler(),
         list: route.list_handler(),
         face_handlers: definition.face_handlers.clone(),
         anchor_collection: None,

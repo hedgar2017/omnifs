@@ -59,7 +59,7 @@ use crate::browse::{Effects, ListingWrite};
 use crate::cx::Cx;
 use crate::error::{ProviderError, Result};
 use crate::identity::IdentityCaptures;
-use crate::object::{Key, Object, ObjectKind};
+use crate::object::{Canonical, Key, Object, ObjectKind};
 use omnifs_core::path::Path;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -88,7 +88,7 @@ pub struct FeedCx<K, S = ()> {
     key: K,
     token: Option<String>,
     start: Option<FeedStart>,
-    facts: Rc<RefCell<Effects>>,
+    facts: Rc<RefCell<FeedFacts>>,
 }
 
 impl<K, S> FeedCx<K, S> {
@@ -98,7 +98,7 @@ impl<K, S> FeedCx<K, S> {
         key: K,
         token: Option<String>,
         start: Option<FeedStart>,
-        facts: Rc<RefCell<Effects>>,
+        facts: Rc<RefCell<FeedFacts>>,
     ) -> Self {
         Self {
             cx,
@@ -265,6 +265,7 @@ impl<K, S> FeedCx<K, S> {
     pub fn file(&self, path: impl AsRef<str>, bytes: impl Into<Vec<u8>>) -> Result<()> {
         self.facts
             .borrow_mut()
+            .effects
             .fed_file(path.as_ref(), bytes.into())?;
         Ok(())
     }
@@ -277,22 +278,43 @@ impl<K, S> FeedCx<K, S> {
     pub fn blob(&self, path: impl AsRef<str>, blob: &crate::endpoint::BlobHandle) -> Result<()> {
         self.facts
             .borrow_mut()
+            .effects
             .fed_blob(path.as_ref(), blob.id, blob.size)?;
         Ok(())
+    }
+
+    /// Write `canonical` as the canonical bytes of the object of type `O`
+    /// anchored at the mount-absolute `path`, as a fact of this part: the
+    /// bytes that [`Object::load`] of that object stores, which the feed has
+    /// from its own request. Each face of the object that serves canonical
+    /// bytes, a canonical, representation, or computed face, is a fed fact
+    /// from then on: its read renders from these bytes without a load and
+    /// without a deadline, until a part writes other bytes or removes the
+    /// object. The call fails at the end of the part for a path that is no
+    /// anchor of an object of type `O` with a canonical face.
+    pub fn canonical<O: Object>(&self, path: impl AsRef<str>, canonical: Canonical) {
+        self.facts.borrow_mut().canonicals.push(FedCanonical {
+            kind: O::kind(),
+            path: path.as_ref().to_owned(),
+            canonical,
+        });
     }
 
     /// Write the directory at the mount-absolute `path`; the files and
     /// directories this part writes directly under it join its listing as
     /// `write` says.
     pub fn dir(&self, path: impl AsRef<str>, write: ListingWrite) -> Result<()> {
-        self.facts.borrow_mut().directory(path.as_ref(), write)?;
+        self.facts
+            .borrow_mut()
+            .effects
+            .directory(path.as_ref(), write)?;
         Ok(())
     }
 
     /// Retract the facts of the mount-absolute `path` and of everything
     /// beneath it, leaving its parent listing as complete as it was.
     pub fn remove(&self, path: impl AsRef<str>) -> Result<()> {
-        self.facts.borrow_mut().remove(path)?;
+        self.facts.borrow_mut().effects.remove(path)?;
         Ok(())
     }
 }
@@ -303,6 +325,23 @@ impl<K, S> Deref for FeedCx<K, S> {
     fn deref(&self) -> &Cx<S> {
         &self.cx
     }
+}
+
+/// The facts that the writes of a [`FeedCx`] make: its effects, and the
+/// canonical bytes of objects, which the router lowers with the routes of
+/// their objects.
+#[derive(Default)]
+pub(crate) struct FeedFacts {
+    pub(crate) effects: Effects,
+    pub(crate) canonicals: Vec<FedCanonical>,
+}
+
+/// The canonical bytes that a feed part writes for the object of `kind`
+/// anchored at `path`.
+pub(crate) struct FedCanonical {
+    pub(crate) kind: ObjectKind,
+    pub(crate) path: String,
+    pub(crate) canonical: Canonical,
 }
 
 /// The names of a listing of the host projection.
@@ -489,7 +528,7 @@ where
               caps: &crate::captures::Captures,
               token: Option<String>,
               start: Option<FeedStart>,
-              facts: Rc<RefCell<Effects>>| {
+              facts: Rc<RefCell<FeedFacts>>| {
             match <O::Key as crate::captures::FromCaptures>::from_captures(caps) {
                 Ok(key) => {
                     Box::pin(method(FeedCx::new(cx, path, key, token, start, facts))) as FeedFuture
@@ -509,5 +548,5 @@ pub(crate) type FeedHandlerFn<S> = dyn Fn(
     &crate::captures::Captures,
     Option<String>,
     Option<FeedStart>,
-    Rc<RefCell<Effects>>,
+    Rc<RefCell<FeedFacts>>,
 ) -> FeedFuture;

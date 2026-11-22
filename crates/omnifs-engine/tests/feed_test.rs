@@ -514,3 +514,47 @@ async fn an_object_without_a_load_serves_its_fed_faces() {
         "Card 1"
     );
 }
+
+/// The faces of an object whose canonical bytes a feed writes render from
+/// those bytes without a load of the object, within and past the deadline
+/// of a loaded object, and from the bytes that a later part writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_faces_of_an_object_render_from_the_canonical_bytes_of_a_feed_without_a_load() {
+    let harness = &make_initialized_runtime(CONFIG);
+    let print = ["shelves", "oak", "prints", "1"];
+    let faces = |version: u64| async move {
+        assert_eq!(
+            read(harness, &[&print[..], &["print.json"]].concat()).await,
+            format!(r#"{{"print":1,"version":{version}}}"#)
+        );
+        assert_eq!(
+            read(harness, &[&print[..], &["print.md"]].concat()).await,
+            format!("# Print 1 v{version}\n")
+        );
+        let log = read(harness, &["hello", "shelf-log"]).await;
+        assert!(!log.contains("load"), "no load of the print: {log}");
+    };
+    assert_eq!(
+        names(harness, &["shelves", "oak", "prints"]).await.unwrap(),
+        ["1"]
+    );
+    assert_eq!(
+        names(harness, &print).await.unwrap(),
+        ["print.json", "print.md"]
+    );
+    faces(0).await;
+
+    // Past the deadline of a loaded object, the bytes of the feed stand.
+    tokio::time::sleep(PAST_DEADLINE).await;
+    faces(0).await;
+    faces(0).await;
+
+    // The next answer of the feed writes other bytes.
+    read(harness, &["hello", "shelf-change"]).await;
+    tokio::time::sleep(PAST_DEADLINE).await;
+    assert_eq!(
+        names(harness, &["shelves", "oak", "prints"]).await.unwrap(),
+        ["1"]
+    );
+    faces(1).await;
+}

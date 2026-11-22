@@ -1326,3 +1326,103 @@ fn an_object_without_a_load_declares_no_face_that_serves_canonical_bytes() {
         "{error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Canonical bytes that a feed writes
+// ---------------------------------------------------------------------------
+
+/// A part that writes the canonical bytes of the object of the path that
+/// its token names.
+#[allow(clippy::unused_async)]
+async fn canonical_feed(cx: crate::feed::FeedCx<DemoKey, ()>) -> Result<crate::feed::Feed> {
+    let Some(path) = cx.token::<String>()? else {
+        return Err(ProviderError::internal("the test names a path"));
+    };
+    cx.canonical::<DemoObj>(
+        &path,
+        Canonical::new(
+            br#"{"title":"fed"}"#.to_vec(),
+            Some(crate::file_attrs::VersionToken("v1".to_string())),
+        ),
+    );
+    Ok(crate::feed::Feed::part(&path)?.into())
+}
+
+#[test]
+fn a_feed_writes_the_canonical_bytes_of_an_object_with_its_view_leaves_as_fed_files() {
+    let mut router = Router::<()>::new();
+    router
+        .object::<DemoObj>("/items/{id}", |o| {
+            o.dynamic();
+            o.fed();
+            o.file("item.json").canonical::<Json>()?;
+            o.file("item.md").representation::<Markdown>()?;
+            o.file("title").computed(DemoObj::title)?;
+            o.file("summary").fed()?;
+            o.file("live").direct(demo_direct)?;
+            o.feed(canonical_feed).starts(["summary"])?;
+            Ok(())
+        })
+        .unwrap();
+    router
+        .object::<FedObj>("/fed/{id}", |o| {
+            o.stable();
+            o.file("live").direct(fed_obj_direct)?;
+            Ok(())
+        })
+        .unwrap();
+    router
+        .object::<DemoObj>("/bare/{id}", |o| {
+            o.dynamic();
+            o.file("live").direct(demo_direct)?;
+            Ok(())
+        })
+        .unwrap();
+    let router = router.compile().unwrap();
+    let cx = Cx::new(1, Rc::new(RefCell::new(())));
+    let token = |path: &str| Some(format!("{path:?}"));
+
+    let (_, effects, _) =
+        poll_ready(router.feed(&cx, "/items/7", token("/items/9"), None)).unwrap();
+    let effects = effects.into_wit();
+    let leaves = ["/items/9/item.json", "/items/9/item.md", "/items/9/title"];
+    assert_eq!(effects.canonical.len(), 1);
+    let stored = &effects.canonical[0];
+    assert_eq!(stored.id.kind, "demo.obj");
+    assert_eq!(stored.id.captures[0].value, "9");
+    assert_eq!(stored.bytes, br#"{"title":"fed"}"#);
+    assert_eq!(stored.validator.as_deref(), Some("v1"));
+    assert_eq!(stored.view_leaves, leaves);
+    // Each view leaf is a file of the object without bytes of its own.
+    assert_eq!(
+        effects
+            .fs
+            .iter()
+            .map(|write| write.path.as_str())
+            .collect::<Vec<_>>(),
+        leaves
+    );
+    for write in &effects.fs {
+        assert_eq!(write.id.as_ref().unwrap().captures[0].value, "9");
+        let wit_types::FsKind::File(file) = &write.kind else {
+            panic!("a view leaf is a file");
+        };
+        assert!(matches!(
+            file.bytes,
+            wit_types::ByteSource::Deferred(wit_types::ReadMode::Full)
+        ));
+        assert!(matches!(file.attrs.size, wit_types::FileSize::Unknown));
+    }
+
+    // A path that is no anchor of an object of the type, and an object
+    // without a canonical face, fail the part.
+    for (path, message) in [
+        ("/elsewhere/9", "is no anchor of an object demo.obj"),
+        ("/fed/9", "is no anchor of an object demo.obj"),
+        ("/bare/9", "object route /bare/{id} has no canonical face"),
+    ] {
+        let error = poll_ready(router.feed(&cx, "/items/7", token(path), None)).unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidInput);
+        assert!(error.message().contains(message), "{error}");
+    }
+}

@@ -6,7 +6,7 @@ use std::rc::Rc;
 use crate::browse::{Effects, FeedClaim};
 use crate::cx::Cx;
 use crate::error::{ProviderError, Result};
-use crate::feed::{Feed, FeedStart};
+use crate::feed::{Feed, FeedFacts, FeedStart};
 use crate::identity::LogicalId;
 use omnifs_core::path::Path;
 use omnifs_wit::provider::types as wit_types;
@@ -55,7 +55,7 @@ impl<S> CompiledRouter<S> {
             })
             .transpose()?;
 
-        let facts = Rc::new(RefCell::new(Effects::new()));
+        let facts = Rc::new(RefCell::new(FeedFacts::default()));
         let answer = super::route_future(
             route.entry.pattern.template(),
             (feed.handler)(
@@ -69,7 +69,28 @@ impl<S> CompiledRouter<S> {
         )
         .await
         .map_err(|error| error.with_context("feed", &abs))?;
-        let effects = facts.take();
+        let FeedFacts {
+            mut effects,
+            canonicals,
+        } = facts.take();
+        for fed in canonicals {
+            let anchor = Path::parse(&fed.path)
+                .map_err(|error| ProviderError::invalid_input(error.to_string()))?;
+            let route = shape
+                .object_route(&anchor)
+                .filter(|route| route.entry.kind == fed.kind)
+                .ok_or_else(|| {
+                    ProviderError::invalid_input(format!(
+                        "{anchor} is no anchor of an object {}, whose canonical bytes the feed at {abs} writes",
+                        fed.kind.as_str()
+                    ))
+                })?;
+            effects.extend((route.entry.store)(
+                &route.captures,
+                anchor.as_str(),
+                fed.canonical,
+            )?);
+        }
         match answer {
             Feed::Unchanged => Ok((wit_types::FeedAnswer::Unchanged, effects, None)),
             Feed::Part(part) => {

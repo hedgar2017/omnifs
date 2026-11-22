@@ -292,7 +292,11 @@ where
             }
             if let wit_types::FsKind::File(file) = &write.kind {
                 if self.fed {
-                    Self::fed_file(file)
+                    let view_leaf = write.id.as_ref().is_some_and(|id| {
+                        canonical_path_to_id.get(&write.path).map(Vec::as_slice)
+                            == Some(ObjectId::from_wit(id).as_bytes())
+                    });
+                    Self::fed_file(file, view_leaf)
                 } else {
                     self.file_out(file)
                 }
@@ -385,13 +389,25 @@ where
 
     /// A fed file: a stable file of its declared exact size without a
     /// version, with inline bytes, which the projection holds whole, or with
-    /// a blob of the host, which no size bounds. Fed files are facts, not
-    /// eager preloads.
-    fn fed_file(file: &wit_types::FileOut) -> std::result::Result<(), String> {
+    /// a blob of the host, which no size bounds; or, for a `view_leaf` of
+    /// the canonical bytes that the effects store for the object of its
+    /// write, a stable file without a version, a size, or bytes, which a
+    /// full read renders. Fed files are facts, not eager preloads.
+    fn fed_file(file: &wit_types::FileOut, view_leaf: bool) -> std::result::Result<(), String> {
         if !matches!(file.attrs.stability, wit_types::Stability::Stable)
             || file.attrs.version_token.is_some()
         {
             return Err("a fed file is a stable file without a version".into());
+        }
+        if matches!(
+            file.bytes,
+            wit_types::ByteSource::Deferred(wit_types::ReadMode::Full)
+        ) {
+            return if view_leaf && matches!(file.attrs.size, wit_types::FileSize::Unknown) {
+                Ok(())
+            } else {
+                Err("a fed file without bytes is a view leaf, without a size, of the canonical bytes that its part stores for its object".into())
+            };
         }
         let wit_types::FileSize::Exact(size) = file.attrs.size else {
             return Err("a fed file has its exact size".into());
@@ -927,5 +943,64 @@ mod tests {
             Ok(())
         );
         assert!(validate_feed(&part(String::new()), &effects(), None, false, |_| false).is_err());
+    }
+
+    /// A fed file without bytes is a view leaf of the canonical bytes that
+    /// its part stores for the object of its write, and no other file.
+    #[test]
+    fn a_fed_file_without_bytes_is_a_view_leaf_of_a_canonical_of_its_part() {
+        let part = Ok(wit_types::FeedAnswer::Part(wit_types::FeedPart {
+            token: "t".to_string(),
+            more: false,
+            inner: Vec::new(),
+            anchors: Vec::new(),
+        }));
+        let id = |value: &str| wit_types::LogicalId {
+            kind: "test.print".to_string(),
+            captures: vec![wit_types::IdCapture {
+                name: "print".to_string(),
+                value: value.to_string(),
+            }],
+        };
+        let leaf = |of: Option<&str>, size: wit_types::FileSize| wit_types::Effects {
+            canonical: vec![wit_types::CanonicalStore {
+                id: id("1"),
+                validator: None,
+                bytes: b"{}".to_vec(),
+                view_leaves: vec!["/prints/1/print.json".to_string()],
+            }],
+            fs: vec![wit_types::FsWrite {
+                id: of.map(id),
+                path: "/prints/1/print.json".to_string(),
+                kind: wit_types::FsKind::File(file_out(
+                    size,
+                    wit_types::ByteSource::Deferred(wit_types::ReadMode::Full),
+                    wit_types::Stability::Stable,
+                )),
+            }],
+            ..effects()
+        };
+        let valid =
+            |effects: &wit_types::Effects| validate_feed(&part, effects, None, false, |_| false);
+        assert_eq!(
+            valid(&leaf(Some("1"), wit_types::FileSize::Unknown)),
+            Ok(())
+        );
+        for other in [
+            leaf(None, wit_types::FileSize::Unknown),
+            leaf(Some("1"), wit_types::FileSize::Exact(2)),
+            wit_types::Effects {
+                canonical: Vec::new(),
+                ..leaf(Some("1"), wit_types::FileSize::Unknown)
+            },
+        ] {
+            let error = valid(&other).unwrap_err();
+            assert!(
+                error.contains("a fed file without bytes is a view leaf"),
+                "{error}"
+            );
+        }
+        // Another id at the path of a view leaf is the conflict of each return.
+        assert!(valid(&leaf(Some("2"), wit_types::FileSize::Unknown)).is_err());
     }
 }

@@ -172,6 +172,22 @@ impl Effects {
         Ok(self)
     }
 
+    /// A fed view leaf: a file of the object `id` without bytes of its own,
+    /// whose read renders from the canonical bytes that the same feed part
+    /// stores for the object.
+    pub(crate) fn fed_view_leaf(&mut self, path: &str, id: &LogicalId) -> Result<&mut Self> {
+        self.fs.push(wit_types::FsWrite {
+            id: Some(id.into()),
+            path: wire_path(path)?.into(),
+            kind: wit_types::FsKind::File(wit_types::FileOut {
+                content_type: None,
+                attrs: FileAttrs::new(FileSize::Unknown, Stability::Stable).into(),
+                bytes: wit_types::ByteSource::Deferred(wit_types::ReadMode::Full),
+            }),
+        });
+        Ok(self)
+    }
+
     /// Retract the facts of `path` and of everything beneath it, leaving the
     /// parent listing as complete as it was.
     pub(crate) fn remove(&mut self, path: impl AsRef<str>) -> Result<&mut Self> {
