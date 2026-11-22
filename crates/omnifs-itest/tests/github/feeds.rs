@@ -1305,10 +1305,10 @@ async fn a_check_takes_by_its_number_an_item_made_after_its_rows() {
 
 /// A check makes a part of each request and publishes its parts with its
 /// last one. A `RATE_LIMITED` answer of GitHub GraphQL after its rows and
-/// comments stops it with the window of its `x-ratelimit-reset`, in which a
-/// read asks GitHub nothing and the files from before the check serve; the
-/// first read after the window continues the check with its next `POST`
-/// alone.
+/// comments stops it with the window of its `x-ratelimit-reset`: its listing
+/// serves what the projection has, and in the window a read asks GitHub
+/// nothing and the files from before the check serve; the first read after
+/// the window continues the check with its next `POST` alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_check_stopped_by_the_rate_limit_of_github_graphql_continues_with_its_next_post() {
     let harness = github_harness();
@@ -1352,13 +1352,8 @@ async fn a_check_stopped_by_the_rate_limit_of_github_graphql_continues_with_its_
         ],
     )
     .await;
-    let Err(NsError::RateLimited { retry_after }) = stopped else {
-        panic!("{stopped:?}");
-    };
-    assert!(
-        retry_after.is_some_and(|window| window <= Duration::from_secs(2)),
-        "{retry_after:?}"
-    );
+    assert_eq!(stopped.unwrap(), ["1"]);
+    assert_eq!(requests.len(), 3);
     graphql_of(&requests[2]);
     assert_eq!(
         served(&harness, read(&harness, "octocat/hello/issues/all/1/title"))
@@ -1388,11 +1383,12 @@ async fn a_check_stopped_by_the_rate_limit_of_github_graphql_continues_with_its_
     );
 }
 
-/// A check stopped by the network gives a read its error, and each next read
-/// continues it with its next request alone, whatever its deadline: the read
-/// of a network that fails again takes its error.
+/// A check stopped by the network serves a read what the projection has, as
+/// does each read in its window, without a request, and the next read after
+/// the window continues it with its next request alone: the read of a network
+/// that fails again is served too.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_check_stopped_by_the_network_gives_its_error_to_a_read() {
+async fn a_check_stopped_by_the_network_serves_a_read_what_the_projection_has() {
     let harness = github_harness();
     first_full_listing(
         &harness,
@@ -1404,7 +1400,7 @@ async fn a_check_stopped_by_the_network_gives_its_error_to_a_read() {
     .await;
 
     tokio::time::sleep(PAST_DEADLINE).await;
-    let (stopped, _) = answering(
+    let (stopped, requests) = answering(
         &harness,
         read(&harness, "octocat/hello/issues/all/1/title"),
         vec![
@@ -1420,8 +1416,16 @@ async fn a_check_stopped_by_the_network_gives_its_error_to_a_read() {
         ],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert_eq!(stopped.unwrap(), "One");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        served(&harness, read(&harness, "octocat/hello/issues/all/1/title"))
+            .await
+            .unwrap(),
+        "One"
+    );
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let comments = api(COMMENTS);
     let (stopped, requests) = answering(
         &harness,
@@ -1429,9 +1433,10 @@ async fn a_check_stopped_by_the_network_gives_its_error_to_a_read() {
         vec![empty(502, &[])],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert_eq!(stopped.unwrap(), "One");
     assert_eq!(requests[0].url, comments);
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (title, requests) = answering(
         &harness,
         read(&harness, "octocat/hello/issues/all/1/title"),
@@ -1539,9 +1544,9 @@ async fn a_check_asks_github_graphql_for_a_hundred_changed_items_a_post() {
 }
 
 /// A first full listing stopped by the network at a page of its rows gives
-/// each read of its folders the error of the network of its next page alone,
-/// the rows since the time of its last row, and the next read continues it
-/// from that page.
+/// each read of its folders after the window of the stop the error of the
+/// network of its next page alone, the rows since the time of its last row,
+/// and the next read after that window continues it from that page.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_first_full_listing_stopped_by_the_network_continues_from_its_next_page() {
     let harness = github_harness();
@@ -1562,6 +1567,7 @@ async fn a_first_full_listing_stopped_by_the_network_continues_from_its_next_pag
     assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
     assert_eq!(requests[1].url, next);
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/pulls/all"),
@@ -1571,6 +1577,7 @@ async fn a_first_full_listing_stopped_by_the_network_continues_from_its_next_pag
     assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
     assert_eq!(requests[0].url, next);
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/issues/all"),
@@ -1596,8 +1603,9 @@ async fn a_first_full_listing_stopped_by_the_network_continues_from_its_next_pag
 /// The first answer of item 7, `Seven`, with the count `comments` `0`, and,
 /// past its deadline, the request of its later answer for a change to
 /// `Seven again` with one comment: its `GET` and the page of its comments
-/// since its time, which `stop` answers.
-async fn later_answer_stopped(harness: &RuntimeHarness, stop: HttpResponse) -> NsError {
+/// since its time, which `stop` answers: the read serves the title from
+/// before it.
+async fn later_answer_stopped(harness: &RuntimeHarness, stop: HttpResponse) {
     let (title, _) = answering(
         harness,
         read(harness, "octocat/hello/issues/all/7/title"),
@@ -1625,7 +1633,8 @@ async fn later_answer_stopped(harness: &RuntimeHarness, stop: HttpResponse) -> N
     )
     .await;
     assert_eq!(requests[1].url, api(ITEM_7_SINCE));
-    stopped.unwrap_err()
+    assert_eq!(stopped.unwrap(), "Seven");
+    assert_eq!(requests.len(), 2);
 }
 
 /// The page of the comments of item 7 since the time of its first answer.
@@ -1659,18 +1668,20 @@ async fn later_answer_continued(harness: &RuntimeHarness) {
 
 /// A later answer of an item stopped at a rate limit at the page of its
 /// comments since its time serves the facts from before it in the window,
-/// without a request, and continues from that page alone after the window.
+/// without a request, gives a read of an item that the projection lacks the
+/// error of the window, and continues from that page alone after the window.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_later_answer_of_an_item_stopped_at_a_rate_limit_continues_from_its_next_request() {
     let harness = github_harness();
-    let stopped = later_answer_stopped(
+    later_answer_stopped(
         &harness,
         empty(403, &[("x-ratelimit-remaining", "0"), ("retry-after", "2")]),
     )
     .await;
+    let lacking = served(&harness, read(&harness, "octocat/hello/issues/all/8/title")).await;
     assert!(
-        matches!(stopped, NsError::RateLimited { .. }),
-        "{stopped:?}"
+        matches!(lacking, Err(NsError::RateLimited { .. })),
+        "{lacking:?}"
     );
     assert_eq!(
         served(&harness, read(&harness, "octocat/hello/issues/all/7/title"))
@@ -1684,31 +1695,37 @@ async fn a_later_answer_of_an_item_stopped_at_a_rate_limit_continues_from_its_ne
 }
 
 /// A later answer of an item stopped by the network at the page of its
-/// comments since its time gives each next read the error of the network of
-/// that page alone, and the next read continues it from that page.
+/// comments since its time gives a read of an item that the projection lacks
+/// the error of the network in the window, without a request; each next read
+/// after a window asks for that page alone, served what the projection has
+/// when the network fails again, and continues it from that page.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_later_answer_of_an_item_stopped_by_the_network_continues_from_its_next_request() {
     let harness = github_harness();
-    let stopped = later_answer_stopped(&harness, empty(502, &[])).await;
-    assert!(matches!(stopped, NsError::Network), "{stopped:?}");
+    later_answer_stopped(&harness, empty(502, &[])).await;
+    let lacking = served(&harness, read(&harness, "octocat/hello/issues/all/8/title")).await;
+    assert!(matches!(lacking, Err(NsError::Network)), "{lacking:?}");
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (stopped, requests) = answering(
         &harness,
         read(&harness, "octocat/hello/issues/all/7/title"),
         vec![empty(502, &[])],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert_eq!(stopped.unwrap(), "Seven");
     assert_eq!(requests[0].url, api(ITEM_7_SINCE));
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     later_answer_continued(&harness).await;
 }
 
 /// The first answer of an item, which the lookup of its folder starts for a
 /// read of its `title` or of its `comments/`, takes its `GET` alone. Stopped
-/// by the network at that `GET`, it gives each such read its error until its
-/// end, and the next read continues it with that `GET` alone; its
-/// `comments/` then takes the pages of its comments.
+/// by the network at that `GET`, it gives each such read after the window of
+/// the stop its error until its end, and the next read after that window
+/// continues it with that `GET` alone; its `comments/` then takes the pages
+/// of its comments.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_first_answer_of_an_item_stopped_by_the_network_gives_its_error_until_its_end() {
     let harness = github_harness();
@@ -1720,6 +1737,7 @@ async fn a_first_answer_of_an_item_stopped_by_the_network_gives_its_error_until_
         vec![empty(502, &[])],
     )
     .await;
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, listing_requests) =
         answering(&harness, names(&harness, comments), vec![empty(502, &[])]).await;
     for (stopped, requests) in [
@@ -1731,6 +1749,7 @@ async fn a_first_answer_of_an_item_stopped_by_the_network_gives_its_error_until_
         assert_eq!(requests[0].url, get);
     }
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (title, requests) = answering(
         &harness,
         read(&harness, "octocat/hello/issues/all/3/title"),
@@ -1869,8 +1888,9 @@ fn graphql_not_found(repository: &Value) -> HttpResponse {
 }
 
 /// A first full listing that stops at a comment by its ID continues from that
-/// comment alone at each next read of its folders: the read of a network that
-/// fails again takes its error. Meanwhile the `comments/` of the item is not
+/// comment alone at each next read of its folders after the window of the
+/// stop: the read of a network that fails again takes its error. Meanwhile
+/// the `comments/` of the item is not
 /// complete, so that a read of it takes its comments whole from the item, and
 /// the listing then takes no comment by its ID that this read brought.
 #[tokio::test(flavor = "multi_thread")]
@@ -1913,6 +1933,7 @@ async fn a_first_full_listing_stopped_at_a_comment_by_its_id_continues_from_it()
         );
     }
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (stopped, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/pulls/all"),
@@ -1925,19 +1946,24 @@ async fn a_first_full_listing_stopped_at_a_comment_by_its_id_continues_from_it()
         api("/repos/octocat/hello/issues/comments/12")
     );
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (comments, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/issues/all/1/comments"),
-        vec![ok(&json!([
-            comment(10, 1, false, "first"),
-            comment(11, 1, false, "second"),
-            comment(12, 1, false, "third"),
-        ]))],
+        vec![
+            not_modified(),
+            ok(&json!([
+                comment(10, 1, false, "first"),
+                comment(11, 1, false, "second"),
+                comment(12, 1, false, "third"),
+            ])),
+        ],
     )
     .await;
     assert_eq!(comments.unwrap(), ["10", "11", "12"]);
+    assert_eq!(requests[0].url, api("/repos/octocat/hello/issues/1"));
     assert_eq!(
-        requests[0].url,
+        requests[1].url,
         api("/repos/octocat/hello/issues/1/comments?per_page=100")
     );
 
@@ -1976,10 +2002,12 @@ async fn a_first_full_listing_stopped_at_a_comment_by_its_id_continues_from_it()
 
 /// A check takes each comment by its ID that a page of the IDs of a changed
 /// item brought before the next page of its IDs. Stopped at a comment by its
-/// ID, it continues from that comment alone at each next read: the read of a
-/// network that fails again takes its error. A comment that left its item
+/// ID, it serves its read what the projection has and continues from that
+/// comment alone at each next read after the window of the stop: the read of
+/// a network that fails again is served too. A comment that left its item
 /// before its ID was asked, `404`, does not join the item.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn a_check_stopped_at_a_comment_by_its_id_continues_from_it() {
     let harness = github_harness();
     first_full_listing(
@@ -2024,7 +2052,8 @@ async fn a_check_stopped_at_a_comment_by_its_id_continues_from_it() {
         ],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert_eq!(stopped.unwrap(), ["1"]);
+    assert_eq!(requests.len(), 6);
     for (request, id) in [(&requests[3], 11), (&requests[5], 12)] {
         assert_eq!(
             request.url,
@@ -2035,18 +2064,20 @@ async fn a_check_stopped_at_a_comment_by_its_id_continues_from_it() {
     assert_eq!(variables["number"], 1);
     assert_eq!(variables["after"], "ids-2");
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (stopped, requests) = answering(
         &harness,
         read(&harness, "octocat/hello/issues/all/1/title"),
         vec![empty(502, &[])],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert_eq!(stopped.unwrap(), "One");
     assert_eq!(
         requests[0].url,
         api("/repos/octocat/hello/issues/comments/12")
     );
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "octocat/hello/issues/all"),
@@ -2084,9 +2115,10 @@ async fn a_check_stopped_at_a_comment_by_its_id_continues_from_it() {
     }
 }
 
-/// A later answer of an item that stops at a comment by its ID continues from
-/// that comment alone at each next read: the read of a network that fails
-/// again takes its error.
+/// A later answer of an item that stops at a comment by its ID serves its
+/// read what the projection has and continues from that comment alone at each
+/// next read after the window of the stop: the read of a network that fails
+/// again is served too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_later_answer_of_an_item_stopped_at_a_comment_by_its_id_continues_from_it() {
     let harness = github_harness();
@@ -2124,7 +2156,8 @@ async fn a_later_answer_of_an_item_stopped_at_a_comment_by_its_id_continues_from
         ],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert_eq!(stopped.unwrap(), "Seven");
+    assert_eq!(requests.len(), 5);
     for (request, id) in [(&requests[3], 71), (&requests[4], 72)] {
         assert_eq!(
             request.url,
@@ -2132,18 +2165,20 @@ async fn a_later_answer_of_an_item_stopped_at_a_comment_by_its_id_continues_from
         );
     }
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (stopped, requests) = answering(
         &harness,
         read(&harness, "octocat/hello/issues/all/7/title"),
         vec![empty(502, &[])],
     )
     .await;
-    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    assert_eq!(stopped.unwrap(), "Seven");
     assert_eq!(
         requests[0].url,
         api("/repos/octocat/hello/issues/comments/72")
     );
 
+    tokio::time::sleep(PAST_DEADLINE).await;
     let (title, requests) = answering(
         &harness,
         read(&harness, "octocat/hello/issues/all/7/title"),
