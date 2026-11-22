@@ -726,3 +726,75 @@ impl Runtime {
             .is_some())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::KeptPart;
+    use crate::cache::Caches;
+    use crate::cache::identity::ProjectionId;
+    use omnifs_core::MountName;
+    use omnifs_wit::host::types as wit_types;
+
+    /// A kept part names the body of each blob of its effects, so that the
+    /// operation that publishes it, of another process too, has a handle of
+    /// that body: the handle of the call that kept the part is gone.
+    #[test]
+    fn a_kept_part_names_the_body_of_its_blob_for_the_operation_that_publishes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let caches = Caches::open(dir.path()).unwrap();
+        let store = caches
+            .mount(&MountName::new("m").unwrap(), ProjectionId::new(b"m"), b"m")
+            .unwrap();
+        let body = store.body.publish(b"blob").unwrap();
+        let blob = |kept: &KeptPart| match &kept.effects.fs[0].kind {
+            wit_types::FsKind::File(wit_types::FileOut {
+                bytes: wit_types::ByteSource::Blob(handle),
+                ..
+            }) => *handle,
+            other => panic!("{other:?}"),
+        };
+
+        let keeping = store.operation_blobs(1);
+        let handle = store.body_handle(1, body, 4).unwrap();
+        let part = KeptPart {
+            part: wit_types::FeedPart {
+                token: "token".into(),
+                more: true,
+                inner: Vec::new(),
+                anchors: Vec::new(),
+                unlisted: false,
+                anew: false,
+            },
+            effects: wit_types::Effects {
+                canonical: Vec::new(),
+                fs: vec![wit_types::FsWrite {
+                    id: None,
+                    path: "/file".into(),
+                    kind: wit_types::FsKind::File(wit_types::FileOut {
+                        content_type: None,
+                        attrs: wit_types::FileAttrs {
+                            size: wit_types::FileSize::Exact(4),
+                            stability: wit_types::Stability::Stable,
+                            version_token: None,
+                        },
+                        bytes: wit_types::ByteSource::Blob(handle),
+                    }),
+                }],
+                invalidations: Vec::new(),
+                removals: Vec::new(),
+            },
+            bodies: Vec::new(),
+            began: 3,
+            ended: 4,
+        };
+        let bytes = part.encode(&store).unwrap();
+        drop(keeping);
+        assert!(store.body_for_handle(handle).is_err());
+
+        let _publishing = store.operation_blobs(2);
+        let kept = KeptPart::decode(&bytes, &store, 2).unwrap();
+        assert_eq!(store.body_for_handle(blob(&kept)).unwrap(), (body, 4));
+        assert_eq!((kept.began, kept.ended), (3, 4));
+        assert_eq!(kept.part.token, "", "the projection has the token apart");
+    }
+}
