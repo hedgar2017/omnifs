@@ -4318,6 +4318,42 @@ mod tests {
         assert_eq!(store.listing_feed(&books).unwrap(), None);
     }
 
+    /// The change of the attributes of a path is of the projection: it
+    /// stands over a restart of the daemon, which opens the projection again.
+    #[test]
+    fn the_change_of_the_attributes_of_a_path_stands_over_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = MountName::new("restart").unwrap();
+        let open = || {
+            let caches = Caches::open(dir.path()).unwrap();
+            let store = caches
+                .mount(&name, ProjectionId::new(b"restart"), b"restart")
+                .unwrap();
+            (caches, store)
+        };
+        let books = p("/shelf/books");
+        let (caches, store) = open();
+        publish_from_state(&store, fed_dir(&books, &["1"], ListingWrite::Complete));
+        publish_from_state(&store, fed_dir(&books, &["1", "2"], ListingWrite::Complete));
+        let before = (
+            store.changed_at(&books).unwrap(),
+            store.listing_due(&books, 500).unwrap(),
+            store.listing_due(&books, 1_000).unwrap(),
+        );
+        assert!(before.0 > 0 && before.1 != before.2);
+        drop((store, caches));
+
+        let (_caches, store) = open();
+        assert_eq!(
+            (
+                store.changed_at(&books).unwrap(),
+                store.listing_due(&books, 500).unwrap(),
+                store.listing_due(&books, 1_000).unwrap(),
+            ),
+            before
+        );
+    }
+
     fn answer_first(store: &MountResources, books: &Path) {
         publish_from_state(store, fed_dir(books, &["1"], ListingWrite::Complete));
     }
