@@ -4879,6 +4879,8 @@ mod tests {
                 more: true,
                 inner: Vec::new(),
                 anchors: Vec::new(),
+                unlisted: false,
+                anew: false,
             },
             wit::Effects {
                 canonical: Vec::new(),
@@ -4887,6 +4889,8 @@ mod tests {
                 removals: Vec::new(),
             },
             vec![(*body.as_bytes(), 14_u64)],
+            0_u64,
+            0_u64,
         ))
         .unwrap();
         let mut bodies = HashSet::new();

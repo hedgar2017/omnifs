@@ -65,7 +65,10 @@ pub async fn answering<T>(
                 },
                 (Callout::FetchBlob(request), Answer::Blob(status, body)) => {
                     requests.push(Request::Blob(request));
-                    harness.runtime.answer_test_blob(callout, status, &body);
+                    harness
+                        .runtime
+                        .answer_test_blob(callout, status, &body)
+                        .await;
                 },
                 (callout, _) => panic!("another callout than its answer: {callout:?}"),
             }
