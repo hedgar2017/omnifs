@@ -361,6 +361,66 @@ mod tests {
         assert!(!rendered.contains("fix:"), "{rendered}");
     }
 
+    /// A mount whose credential its upstream rejected, as the daemon gives
+    /// it from the answer of the upstream on, requires authentication in the
+    /// status, which `omnifs status` and `omnifs status --ready` end with as
+    /// degraded.
+    #[test]
+    fn a_mount_whose_credential_the_upstream_rejected_requires_authentication() {
+        let record = |auth_health| omnifs_api::MountRecord {
+            definition: omnifs_api::MountDefinition {
+                name: omnifs_core::MountName::try_from("slack").unwrap(),
+                provider: omnifs_core::ProviderId::from_digest([0x12; 32]),
+                auth: Some(omnifs_api::MountCredential {
+                    scheme: "token".to_owned(),
+                    account_label: "default".to_owned(),
+                }),
+                limits: None,
+                config: b"{}".to_vec(),
+            },
+            provider: omnifs_api::ProviderReference {
+                id: omnifs_core::ProviderId::from_digest([0x12; 32]),
+                name: "slack".to_owned(),
+                version: None,
+            },
+            version: omnifs_core::MountVersion::from_digest([0x34; 32]),
+            revision: omnifs_core::MountRevision::new(1),
+            health: omnifs_api::MountHealth::Active,
+            auth_health: Some(auth_health),
+            last_mutation_id: omnifs_core::MutationId::from_bytes([0x56; 16]),
+        };
+        let report = |auth_health| InventoryReport {
+            inventory: Inventory::test(
+                DaemonHealth::Running,
+                Vec::new(),
+                vec![crate::inventory::MountStatus::from_record(&record(
+                    auth_health,
+                ))],
+            ),
+        };
+
+        let taken = report(omnifs_api::CredentialHealth::StaticUnvalidated);
+        assert_eq!(taken.exit_code(), ExitCode::Success);
+        let status = serde_json::to_value(&taken.inventory.mounts[0]).unwrap();
+        assert_eq!(status["auth"]["state"], "ready");
+
+        let rejected = report(omnifs_api::CredentialHealth::NeedsConsent);
+        assert_eq!(rejected.exit_code(), ExitCode::Degraded);
+        let status = serde_json::to_value(&rejected.inventory.mounts[0]).unwrap();
+        assert_eq!(status["auth"]["state"], "error");
+        assert_eq!(
+            status["auth"]["message"],
+            "credential requires re-authentication"
+        );
+        assert_eq!(status["auth"]["command"], "omnifs mount reauth slack");
+        assert_eq!(
+            rejected.inventory.next_action(),
+            Some(crate::inventory::NextAction::Reauthenticate {
+                mount: "slack".to_owned()
+            })
+        );
+    }
+
     #[test]
     fn running_context_metadata_reports_pid_mounts_and_filesystems_as_one_sentence() {
         let inventory = Inventory::test(

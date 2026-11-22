@@ -233,6 +233,63 @@ async fn test_execute_fetch_returns_denied_when_auth_is_required_but_missing() {
     }
 }
 
+/// A static token that the upstream answers with 401 at a callout requires
+/// re-authentication in the health of its mount binding from that answer
+/// on, with the answer itself for the provider, and is no rejected one
+/// again once the upstream takes it.
+#[tokio::test]
+async fn a_static_token_that_the_upstream_rejects_at_a_callout_requires_reauthentication() {
+    let api = FakeHttpsApiServer::start("Bearer taken", "ok").await;
+    let manifest = AuthManifest {
+        schemes: vec![AuthScheme::StaticToken(StaticTokenScheme {
+            inject_domains: vec![FakeHttpsApiServer::domain()],
+            ..match github_pat_manifest().schemes.remove(0) {
+                AuthScheme::StaticToken(scheme) => scheme,
+                _ => unreachable!("the manifest of a static token"),
+            }
+        })],
+    };
+    let status_with = |token: &'static str| {
+        let manifest = &manifest;
+        let api = &api;
+        async move {
+            let auth = static_binding(
+                manifest,
+                Some(CredentialEntry::static_token(SecretString::from(token))),
+            );
+            assert_eq!(
+                auth.health(),
+                omnifs_auth::CredentialHealth::StaticUnvalidated
+            );
+            let stack = HttpStack::with_https_client(
+                Some(Arc::clone(&auth)),
+                RuntimeAuthority::for_test(&[FakeHttpsApiServer::domain().as_str()], &[], &[]),
+                test_https_client(),
+            );
+            let request = wit_types::HttpRequest {
+                method: "GET".to_string(),
+                url: api.url(),
+                headers: Vec::new(),
+                body: None,
+            };
+            match stack.fetch(&request, Duration::from_secs(5)).await {
+                wit_types::CalloutResult::HttpResponse(response) => {
+                    (response.status, auth.health())
+                },
+                other => panic!("expected the answer of the upstream, got {other:?}"),
+            }
+        }
+    };
+    assert_eq!(
+        status_with("revoked").await,
+        (401, omnifs_auth::CredentialHealth::NeedsConsent)
+    );
+    assert_eq!(
+        status_with("taken").await,
+        (200, omnifs_auth::CredentialHealth::StaticUnvalidated)
+    );
+}
+
 #[tokio::test]
 async fn oauth_401_refreshes_and_retries_once() {
     let tokens = FakeTokenServer::start(false).await;

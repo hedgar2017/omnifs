@@ -143,6 +143,8 @@ impl RejectionEvidence {
         }
     }
 
+    /// Whether the upstream rejects the credential of the request: a 401,
+    /// or a 403 that names an invalid bearer token.
     fn asks_for_refresh(&self) -> bool {
         self.status == 401
             || (self.status == 403
@@ -150,6 +152,13 @@ impl RejectionEvidence {
                     .www_authenticate
                     .as_deref()
                     .is_some_and(Self::bearer_invalid_token))
+    }
+
+    /// Whether the upstream took the credential of the request: an answer
+    /// that neither rejects it nor is a failure of the upstream itself,
+    /// which says nothing of the credential.
+    fn takes_credential(&self) -> bool {
+        !self.asks_for_refresh() && self.status < 500
     }
 
     fn bearer_invalid_token(challenges: &str) -> bool {
@@ -207,6 +216,9 @@ pub struct AuthBinding {
     value_prefix: String,
     request: Option<OAuthRequest>,
     current: ArcSwapOption<CredentialEntry>,
+    /// The credential that the upstream rejected, up to the next answer in
+    /// which the upstream takes a credential of this binding.
+    rejected: ArcSwapOption<CredentialEntry>,
     refresh_failures: AtomicU32,
     needs_consent: AtomicBool,
 }
@@ -235,6 +247,7 @@ impl AuthBinding {
             value_prefix,
             request,
             current: ArcSwapOption::new(current.map(Arc::new)),
+            rejected: ArcSwapOption::empty(),
             refresh_failures: AtomicU32::new(0),
             needs_consent: AtomicBool::new(false),
         }
@@ -274,13 +287,26 @@ impl AuthBinding {
         if self.needs_consent.load(Ordering::Relaxed) {
             return CredentialHealth::NeedsConsent;
         }
+        // The upstream rejected the credential that the binding still has:
+        // no later token took its place and no later answer took it.
+        let rejected = self
+            .rejected
+            .load_full()
+            .is_some_and(|rejected| same_token(&rejected, &entry));
         if self.kind == AuthKind::StaticToken {
-            return CredentialHealth::StaticUnvalidated;
+            return if rejected {
+                CredentialHealth::NeedsConsent
+            } else {
+                CredentialHealth::StaticUnvalidated
+            };
         }
         let now = OffsetDateTime::now_utc();
         let failures = self.refresh_failures.load(Ordering::Relaxed);
-        if failures > 0 && !CredentialService::is_fresh(&entry, now) {
+        if failures > 0 && (rejected || !CredentialService::is_fresh(&entry, now)) {
             return CredentialHealth::RefreshFailed { attempts: failures };
+        }
+        if rejected {
+            return CredentialHealth::NeedsConsent;
         }
         // A flow without a sign-in asserts for the next request by itself: its
         // credential is ready whatever the time of its last token.
@@ -337,6 +363,11 @@ impl AuthBinding {
         Ok(Some(self.header_for(&entry)))
     }
 
+    /// Takes the answer of the upstream to a request with the credential of
+    /// this binding. An answer that rejects the credential is of the health
+    /// of the binding from then on, up to an answer in which the upstream
+    /// takes a credential of it, and asks an OAuth credential for its
+    /// refresh.
     pub async fn report_rejected_for_response(
         &self,
         url: &str,
@@ -347,7 +378,17 @@ impl AuthBinding {
             return RefreshOutcome::NotApplicable;
         }
         let evidence = RejectionEvidence::new(status, www_authenticate);
-        if !evidence.asks_for_refresh() || self.kind != AuthKind::OAuth {
+        if !evidence.asks_for_refresh() {
+            if evidence.takes_credential() {
+                self.rejected.store(None);
+            }
+            return RefreshOutcome::NotApplicable;
+        }
+        // The health of the binding names the rejection from this answer on:
+        // a static token has no next one, and an OAuth credential has the
+        // one of its refresh.
+        self.rejected.store(self.current.load_full());
+        if self.kind != AuthKind::OAuth {
             return RefreshOutcome::NotApplicable;
         }
         if self.needs_consent.load(Ordering::Relaxed) {
@@ -620,7 +661,7 @@ impl CredentialService {
         force: bool,
     ) -> bool {
         Self::is_fresh(stored, now)
-            && (!force || observed.is_none_or(|entry| !same_oauth_token(stored, entry)))
+            && (!force || observed.is_none_or(|entry| !same_token(stored, entry)))
     }
 }
 
@@ -761,7 +802,8 @@ fn validate_kind(
     Ok(())
 }
 
-fn same_oauth_token(left: &CredentialEntry, right: &CredentialEntry) -> bool {
+/// Whether `left` and `right` have the same tokens.
+fn same_token(left: &CredentialEntry, right: &CredentialEntry) -> bool {
     if left.access_token().expose_secret() != right.access_token().expose_secret() {
         return false;
     }

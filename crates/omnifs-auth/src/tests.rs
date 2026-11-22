@@ -967,6 +967,138 @@ fn bind_rejects_snapshot_kind_mismatch() {
     ));
 }
 
+/// A static token that the upstream rejects requires re-authentication
+/// from that answer on, up to an answer in which the upstream takes it: a
+/// failure of the upstream itself says nothing of the token.
+#[tokio::test]
+async fn a_static_token_that_the_upstream_rejects_requires_reauthentication() {
+    let id = CredentialId::new("test-provider", "pat", "default").unwrap();
+    let service = Arc::new(durable_service(
+        &id,
+        CredentialEntry::static_token(SecretString::from("token")),
+        Arc::new(SimpleRefreshSink),
+    ));
+    let binding = service
+        .bind_static(
+            id,
+            vec!["api.example.test".to_owned()],
+            "Authorization".to_owned(),
+            "Bearer ".to_owned(),
+        )
+        .unwrap();
+    let answer = |url: &'static str, status: u16, challenge: Option<&'static str>| {
+        let binding = &binding;
+        async move {
+            assert_eq!(
+                binding
+                    .report_rejected_for_response(url, status, challenge.map(str::to_owned))
+                    .await,
+                RefreshOutcome::NotApplicable
+            );
+            binding.health()
+        }
+    };
+    let resource = "https://api.example.test/resource";
+    assert_eq!(binding.health(), crate::CredentialHealth::StaticUnvalidated);
+    // The answer of another host is not to the token.
+    assert_eq!(
+        answer("https://other.example.test/resource", 401, None).await,
+        crate::CredentialHealth::StaticUnvalidated
+    );
+
+    for (status, challenge) in [(401, None), (403, Some(r#"Bearer error="invalid_token""#))] {
+        assert_eq!(
+            answer(resource, status, challenge).await,
+            crate::CredentialHealth::NeedsConsent,
+            "{status}"
+        );
+        assert_eq!(
+            answer(resource, 503, None).await,
+            crate::CredentialHealth::NeedsConsent
+        );
+        // The token still goes with each request.
+        assert!(binding.authorization_for(resource).await.unwrap().is_some());
+        for taken in [200, 404, 403] {
+            assert_eq!(
+                answer(resource, taken, None).await,
+                crate::CredentialHealth::StaticUnvalidated,
+                "{taken} after {status}"
+            );
+            assert_eq!(
+                answer(resource, 401, None).await,
+                crate::CredentialHealth::NeedsConsent
+            );
+        }
+        answer(resource, 200, None).await;
+    }
+}
+
+/// A token of a flow without a sign-in that the upstream rejects before its
+/// expiry, and whose next assertion the token endpoint refuses, is a failed
+/// refresh, and ready again with the token of a later assertion.
+#[tokio::test]
+async fn a_rejected_token_whose_assertion_fails_is_a_failed_refresh_before_its_expiry() {
+    let fake = FakeAuthServer::start(FakeBehavior::default()).await;
+    let binding = |client: &str| {
+        let id = CredentialId::new("test-provider", "oauth", "default").unwrap();
+        let service = Arc::new(durable_service(
+            &id,
+            CredentialEntry::oauth(
+                SecretString::from("old-access".to_owned()),
+                None,
+                Some(OffsetDateTime::now_utc() + time::Duration::HOUR),
+                "Bearer",
+                vec!["read".to_owned(), "write".to_owned()],
+            ),
+            Arc::new(SimpleRefreshSink),
+        ));
+        let mut scheme = fake.jwt_bearer_scheme();
+        scheme.default_client_id = Some(client.to_owned());
+        let request = OAuthRequest::from_runtime(
+            scheme,
+            crate::OAuthRuntimeOverrides {
+                client_secret: Some(SecretString::from(ASSERTION_KEY.to_owned())),
+                ..crate::OAuthRuntimeOverrides::default()
+            },
+        )
+        .unwrap();
+        service
+            .bind_oauth(
+                id,
+                request,
+                vec!["api.example.test".to_owned()],
+                "Authorization".to_owned(),
+                "Bearer ".to_owned(),
+            )
+            .unwrap()
+    };
+    let resource = "https://api.example.test/resource";
+
+    // The token endpoint refuses the assertion of another client.
+    let refused = binding("another-client");
+    assert_eq!(refused.health(), crate::CredentialHealth::Ready);
+    let outcome = refused
+        .report_rejected_for_response(resource, 401, None)
+        .await;
+    assert!(
+        matches!(outcome, RefreshOutcome::RefreshFailed(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        refused.health(),
+        crate::CredentialHealth::RefreshFailed { attempts: 1 }
+    );
+
+    let renewed = binding("client-id");
+    assert_eq!(
+        renewed
+            .report_rejected_for_response(resource, 401, None)
+            .await,
+        RefreshOutcome::Refreshed
+    );
+    assert_eq!(renewed.health(), crate::CredentialHealth::Ready);
+}
+
 #[tokio::test]
 async fn invalid_grant_refresh_needs_consent_and_keeps_snapshot() {
     let fake = FakeAuthServer::start(FakeBehavior {

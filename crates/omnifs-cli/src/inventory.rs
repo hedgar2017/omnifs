@@ -607,8 +607,9 @@ impl AuthState {
                 message: "credential refresh failed".to_owned(),
                 command: command(),
             },
+            // A credential that its upstream rejects, or that has no refresh.
             Some(CredentialHealth::NeedsConsent) => Self::Error {
-                message: "credential needs consent".to_owned(),
+                message: "credential requires re-authentication".to_owned(),
                 command: command(),
             },
             Some(
