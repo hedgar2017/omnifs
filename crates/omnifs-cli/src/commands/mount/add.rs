@@ -123,6 +123,15 @@ impl AddArgs {
         })
     }
 
+    /// Whether the invocation gives a credential of its own, a token or the
+    /// client credentials, which is submitted whatever credential is stored.
+    pub(crate) fn gives_credential(&self) -> bool {
+        self.token.is_some()
+            || self.token_env.is_some()
+            || self.client_id.is_some()
+            || self.client_secret_file.is_some()
+    }
+
     /// This invocation's chosen auth, before any ambient-credential import
     /// promotes it: `--no-auth` wins outright, an explicit token/token-env
     /// pair selects the static-token scheme, an explicit `--scheme` resolves
@@ -260,6 +269,7 @@ pub(crate) async fn run_static_token_init(
 
 #[cfg(test)]
 mod tests {
+    use super::AddArgs;
     use crate::commands::mount::AuthImportDecision;
     use crate::commands::mount::spec_creation::{create_config, validate_config};
     use omnifs_auth::{AuthManifest, AuthScheme};
@@ -267,6 +277,38 @@ mod tests {
         AccessNeed, ConfigField, ConfigMetadata, ConfigType, HostResourceBinding,
         LimitDeclarations, PreopenMode, ProviderManifest, ResourceLimit,
     };
+
+    fn add_args(arguments: &[&str]) -> AddArgs {
+        #[derive(clap::Parser)]
+        struct Command {
+            #[command(flatten)]
+            add: AddArgs,
+        }
+        <Command as clap::Parser>::try_parse_from(
+            std::iter::once("add").chain(arguments.iter().copied()),
+        )
+        .unwrap()
+        .add
+    }
+
+    /// A stored credential, as one that `mount rm` leaves, stands only for
+    /// an invocation without a credential of its own.
+    #[test]
+    fn a_token_or_client_credentials_of_the_invocation_are_a_given_credential() {
+        assert!(!add_args(&["github"]).gives_credential());
+        assert!(!add_args(&["github", "--account", "work"]).gives_credential());
+        for given in [
+            &["--token", "-"][..],
+            &["--token-env", "TOKEN"],
+            &["--client-id", "client"],
+            &["--client-secret-file", "key.pem"],
+        ] {
+            assert!(
+                add_args(&[&["github"], given].concat()).gives_credential(),
+                "{given:?}"
+            );
+        }
+    }
 
     #[test]
     fn config_override_skips_default_generation_for_required_fields() {

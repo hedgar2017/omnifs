@@ -307,15 +307,23 @@ pub(crate) async fn assemble_mount_build(
     // An ambient credential (imported under --yes or on the interactive
     // prompt) promotes an OAuth default to a static token, which lets a
     // `--no-input` run of an OAuth-default provider complete headlessly. The
-    // OAuth bail only fires when nothing was imported.
-    let import_outcome = AuthImportDecision::new(
-        default_auth,
-        auth_manifest.as_ref(),
-        &provider_name,
-        interactive,
-        prompt.yes(),
-    )
-    .resolve(output, mount_add_key_width())?;
+    // OAuth bail only fires when nothing was imported. An invocation with a
+    // credential of its own imports none.
+    let import_outcome = if args.gives_credential() {
+        ImportOutcome {
+            auth: default_auth,
+            token: None,
+        }
+    } else {
+        AuthImportDecision::new(
+            default_auth,
+            auth_manifest.as_ref(),
+            &provider_name,
+            interactive,
+            prompt.yes(),
+        )
+        .resolve(output, mount_add_key_width())?
+    };
     let ImportOutcome { auth, token } = import_outcome;
 
     // An OAuth flow without a user, as the JWT bearer grant of a service
@@ -360,9 +368,9 @@ pub(crate) async fn assemble_mount_build(
     let mut config = config_bytes(config_raw)?;
     args.apply_mount_overrides(&manifest, &mut config)?;
 
-    // Client credentials of the invocation, as a token of it, are submitted
+    // A credential of the invocation, as an imported token, is submitted
     // whatever credential is stored.
-    let given = token.is_some() || args.client_id.is_some() || args.client_secret_file.is_some();
+    let given = token.is_some() || args.gives_credential();
     let auth_ready = match auth.as_ref() {
         Some(auth) if !given => {
             let account = auth.account_or_default();
