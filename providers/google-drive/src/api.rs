@@ -3,16 +3,15 @@
 //!
 //! Google Drive answers a request over a quota with the status `403` and the
 //! reason `rateLimitExceeded` or `userRateLimitExceeded` as well as with
-//! `429`. [`DriveApi`] overrides [`EndpointHooks::classify`] for the `403`;
-//! every other status falls through to the SDK's default handling.
+//! `429`. [`DriveApi`] overrides [`EndpointHooks::classify`] for the `403`.
 
 use http::Response;
-use omnifs_sdk::endpoint::{EndpointHooks, HttpResponse};
+use omnifs_sdk::endpoint::EndpointHooks;
 use omnifs_sdk::error::ProviderError;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::Result;
+use crate::{Id, Result};
 
 /// The API of Google Drive at its version 3.
 #[derive(omnifs_sdk::Endpoint)]
@@ -57,23 +56,17 @@ fn over_quota(body: &[u8]) -> bool {
     })
 }
 
-/// The fields of a file or a folder that the provider asks Google Drive for,
-/// and that `file.json` and `folder.json` have.
+/// The fields of an item that the provider asks Google Drive for, and that
+/// `file.json`, `folder.json`, and `item.json` have.
 pub(crate) const FIELDS: &str = "id,name,mimeType,description,parents,driveId,trashed,createdTime,modifiedTime,size,md5Checksum,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)";
 
-/// The error of an answer of Google Drive with a failing status.
-pub(crate) fn status_error(response: &HttpResponse) -> ProviderError {
-    ProviderError::from_http_status(response.status())
-}
-
-/// Decode the JSON of an answer of Google Drive.
 pub(crate) fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(|error| {
         ProviderError::invalid_input(format!("an answer of Google Drive: {error}"))
     })
 }
 
-/// A page of the files of Google Drive: its objects as they came, the token
+/// A page of the items of Google Drive: its objects as they came, the token
 /// of its next page while it has one, and whether Google Drive searched not
 /// every drive for it.
 #[derive(Deserialize)]
@@ -94,21 +87,21 @@ pub(crate) struct ChangeList {
     pub(crate) new_start_page_token: Option<String>,
 }
 
-/// A change of Google Drive: what it is of, and for a file or a folder its
-/// ID, whether the account no longer has it, and its object as it came
-/// while the account has it.
+/// A change of Google Drive: what it is of, and for an item its ID, whether
+/// the account no longer has it, and its object as it came while the account
+/// has it.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Change {
     #[serde(rename = "changeType")]
     pub(crate) of: ChangeType,
-    pub(crate) file_id: Option<String>,
+    pub(crate) file_id: Option<Id>,
     pub(crate) removed: bool,
     pub(crate) file: Option<Box<RawValue>>,
 }
 
-/// What a change is of: a file or a folder, or a shared drive, of which the
-/// mount has nothing.
+/// What a change is of: an item, or a shared drive, of which the mount has
+/// nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ChangeType {
@@ -123,11 +116,16 @@ pub(crate) struct StartPageToken {
     pub(crate) start_page_token: String,
 }
 
-/// What the provider reads of an item of the Drive.
+/// The ID of an object of an item.
+#[derive(Deserialize)]
+pub(crate) struct Identified {
+    pub(crate) id: Id,
+}
+
+/// What the provider reads of the object of an item.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Item {
-    pub(crate) id: String,
     pub(crate) name: String,
     mime_type: String,
     pub(crate) trashed: bool,
@@ -138,48 +136,68 @@ pub(crate) struct Item {
 /// What an item is for the mount.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
+    File,
     Folder,
-    File(Content),
-    /// An item of Google without bytes of its own, as a form or a shortcut.
+    /// An item without bytes of its own.
     Other,
 }
 
+impl Kind {
+    pub(crate) const ALL: [Self; 3] = [Self::File, Self::Folder, Self::Other];
+}
+
 /// What the file `content` of a file has.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Content {
-    /// The bytes of an uploaded file.
-    Bytes,
-    /// The export of a file of Google with this MIME type.
-    Export(&'static str),
+pub(crate) enum Content<'a> {
+    /// The bytes with this MD5 of an uploaded file.
+    Bytes(&'a str),
+    /// The export with `mime_type` of a file of Google modified at
+    /// `modified`.
+    Export {
+        mime_type: &'static str,
+        modified: &'a str,
+    },
+}
+
+impl Content<'_> {
+    /// What changes with the content.
+    pub(crate) fn revision(&self) -> &str {
+        match self {
+            Self::Bytes(md5) => md5,
+            Self::Export { modified, .. } => modified,
+        }
+    }
 }
 
 const GOOGLE: &str = "application/vnd.google-apps.";
 
 impl Item {
-    /// What the item is for the mount, by its MIME type.
-    pub(crate) fn kind(&self) -> Kind {
-        match self.mime_type.strip_prefix(GOOGLE) {
-            Some("folder") => Kind::Folder,
-            Some("document") => Kind::File(Content::Export("text/markdown")),
-            Some("spreadsheet") => Kind::File(Content::Export("text/csv")),
-            Some("presentation") => Kind::File(Content::Export("text/plain")),
-            Some("drawing") => Kind::File(Content::Export("image/svg+xml")),
-            Some("script") => {
-                Kind::File(Content::Export("application/vnd.google-apps.script+json"))
-            },
-            Some(_) => Kind::Other,
-            None => Kind::File(Content::Bytes),
-        }
+    /// The content of a file, by its MIME type and its MD5; none for a
+    /// folder and for another item.
+    pub(crate) fn content(&self) -> Option<Content<'_>> {
+        let Some(google) = self.mime_type.strip_prefix(GOOGLE) else {
+            return self.md5_checksum.as_deref().map(Content::Bytes);
+        };
+        let mime_type = match google {
+            "document" => "text/markdown",
+            "spreadsheet" => "text/csv",
+            "presentation" => "text/plain",
+            "drawing" => "image/svg+xml",
+            "script" => "application/vnd.google-apps.script+json",
+            _ => return None,
+        };
+        Some(Content::Export {
+            mime_type,
+            modified: &self.modified_time,
+        })
     }
 
-    /// What changes with the content of a file: the checksum of an uploaded
-    /// file, and the `modifiedTime` of a file of Google.
-    pub(crate) fn revision(&self, content: Content) -> Result<&str> {
-        match content {
-            Content::Bytes => self.md5_checksum.as_deref().ok_or_else(|| {
-                ProviderError::invalid_input("an uploaded file of Google Drive has no md5Checksum")
-            }),
-            Content::Export(_) => Ok(&self.modified_time),
+    pub(crate) fn kind(&self) -> Kind {
+        if self.content().is_some() {
+            Kind::File
+        } else if self.mime_type.strip_prefix(GOOGLE) == Some("folder") {
+            Kind::Folder
+        } else {
+            Kind::Other
         }
     }
 }

@@ -6,33 +6,37 @@
 //! `content`, `folders/{id}/` for each folder with `name` and `folder.json`,
 //! and `others/{id}/` for each other item with `name` and `item.json`, by
 //! the ID of Google Drive, as in a link of Google Drive. A file is an
-//! uploaded file, whose `content` is its bytes, of any size, or a file of
-//! Google with an export: a document of Google Docs, whose `content` is its
-//! Markdown, a spreadsheet of Google Sheets, whose `content` is the CSV of
-//! its first sheet, a presentation of Google Slides, whose `content` is its
-//! plain text, a drawing of Google Drawings, whose `content` is its SVG, or
-//! a project of Google Apps Script, whose `content` is its JSON. Another
-//! item is one of Google without bytes of its own, as a form or a shortcut.
-//! Their facts come from feeds alone: the feed of the Drive lists the items
-//! and takes their changes from the changes of Google Drive, and the own
-//! feed of a file, a folder, or another item takes one by its ID, the
-//! content of a file too.
+//! uploaded file with an MD5, whose `content` is its bytes, of any size, or
+//! a file of Google with an export: a document of Google Docs, whose
+//! `content` is its Markdown, a spreadsheet of Google Sheets, whose `content`
+//! is the CSV of its first sheet, a presentation of Google Slides, whose
+//! `content` is its plain text, a drawing of Google Drawings, whose `content`
+//! is its SVG, or a project of Google Apps Script, whose `content` is its
+//! JSON. Another item is one without bytes of its own: one of Google, as a
+//! form or a shortcut, or an uploaded one without an MD5.
+//!
+//! Their facts come from feeds alone. The feed of the Drive lists the items
+//! of the account in `files/`, `folders/`, and `others/` and takes their
+//! changes from the changes of Google Drive. The own feed of a file, a
+//! folder, or another item takes one by its ID, and again at a read of its
+//! facts after their time, since Google Drive reports no change of an item
+//! that the account has by its link alone; the own feed of a file takes its
+//! content too, at what Google Drive has of the file by its ID then.
 
 use std::future::Future;
 
 use omnifs_sdk::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 pub(crate) use omnifs_sdk::prelude::Result;
 
 mod api;
 mod feed;
 
-/// The ID of a file or a folder of Google Drive: letters, digits, `-`, and
-/// `_`.
+/// The ID of an item of Google Drive: letters, digits, `-`, and `_`.
 #[omnifs_sdk::path_segment(validate = is_id)]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
 pub struct Id(String);
 
 impl TryFrom<String> for Id {
@@ -44,12 +48,6 @@ impl TryFrom<String> for Id {
     }
 }
 
-impl From<Id> for String {
-    fn from(id: Id) -> Self {
-        id.0
-    }
-}
-
 fn is_id(segment: &str) -> bool {
     !segment.is_empty()
         && segment
@@ -57,29 +55,11 @@ fn is_id(segment: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-impl Id {
-    /// The ID of an object of an answer of Google Drive.
-    pub(crate) fn of(id: &str) -> Result<Self> {
-        id.parse()
-            .map_err(|()| ProviderError::invalid_input(format!("the ID {id} of Google Drive")))
-    }
-}
-
 #[omnifs_sdk::path_captures]
 pub(crate) struct DriveKey {}
 
 #[omnifs_sdk::path_captures]
-pub(crate) struct FileKey {
-    pub(crate) id: Id,
-}
-
-#[omnifs_sdk::path_captures]
-pub(crate) struct FolderKey {
-    pub(crate) id: Id,
-}
-
-#[omnifs_sdk::path_captures]
-pub(crate) struct OtherKey {
+pub(crate) struct ItemKey {
     pub(crate) id: Id,
 }
 
@@ -89,17 +69,17 @@ pub(crate) struct OtherKey {
 pub(crate) struct Drive {}
 
 /// A file of the Drive.
-#[omnifs_sdk::object(kind = "google-drive.file", key = FileKey, load = fed_only)]
+#[omnifs_sdk::object(kind = "google-drive.file", key = ItemKey, load = fed_only)]
 #[derive(Deserialize)]
 pub(crate) struct File {}
 
 /// A folder of the Drive.
-#[omnifs_sdk::object(kind = "google-drive.folder", key = FolderKey, load = fed_only)]
+#[omnifs_sdk::object(kind = "google-drive.folder", key = ItemKey, load = fed_only)]
 #[derive(Deserialize)]
 pub(crate) struct Folder {}
 
 /// An item of the Drive that is no file and no folder.
-#[omnifs_sdk::object(kind = "google-drive.other", key = OtherKey, load = fed_only)]
+#[omnifs_sdk::object(kind = "google-drive.other", key = ItemKey, load = fed_only)]
 #[derive(Deserialize)]
 pub(crate) struct Other {}
 
@@ -122,7 +102,7 @@ fn fed_only<O: Object>(
     display_name = "Google Drive",
     description = "files, folders, and other items from your Drive",
     mount = "google-drive",
-    projection = 2,
+    projection = 3,
     capabilities(domain(
         "www.googleapis.com",
         "Fetch the items, the content of the files, and the changes of a Google Drive."
