@@ -33,8 +33,10 @@
 //! listings: after the end of its first answer, the host asks it past its
 //! deadline only for a listing of its anchor and for a lookup of an entry of
 //! that listing, on a starting path, without its positive lookup, and serves
-//! each other operation from the projection; the kept parts of a later
-//! answer continue as for each feed.
+//! each other operation from the projection; a lookup of that anchor past
+//! that deadline changes the attributes of its directory, so that a
+//! filesystem lists it again; the kept parts of a later answer continue as
+//! for each feed.
 //!
 //! The host calls the feed `method` once per part of an answer with a
 //! [`FeedCx`]: the anchor path and the key of the object, the token the feed

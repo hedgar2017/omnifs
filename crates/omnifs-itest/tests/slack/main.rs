@@ -164,7 +164,8 @@ async fn the_users_are_the_full_listings_of_users_list() {
 
 /// The first full listing of the channels at the first read of `channels/`,
 /// by `next_cursor`; past the deadline no request for a read of a channel
-/// that the source filesystem has, a full listing for `channels/` and one
+/// that the source filesystem has, a change of the attributes of `channels/`
+/// at its lookup alone, a full listing for `channels/` and one
 /// for a channel that it lacks, which removes a channel that the listing
 /// lacks with its messages, and no request for a channel that it lacks
 /// within the deadline.
@@ -209,12 +210,31 @@ async fn the_channels_are_the_full_listings_of_users_conversations() {
     assert_eq!(object, channel("C01", "general"));
     first_full_listing(&harness, "C02", &[message(1, Some("U01"), "Hello")]).await;
 
+    let folder = lookup(&harness, "channels").await.unwrap();
+    assert_eq!(
+        served(&harness, lookup(&harness, "channels"))
+            .await
+            .unwrap()
+            .attrs()
+            .unwrap()
+            .change,
+        folder.attrs().unwrap().change
+    );
     tokio::time::sleep(PAST_DEADLINE).await;
     assert_eq!(
         served(&harness, read(&harness, "channels/C01/name"))
             .await
             .unwrap(),
         "general"
+    );
+    assert_ne!(
+        served(&harness, lookup(&harness, "channels"))
+            .await
+            .unwrap()
+            .attrs()
+            .unwrap()
+            .change,
+        folder.attrs().unwrap().change
     );
     let (listing, requests) = answering(
         &harness,
@@ -647,7 +667,7 @@ async fn the_replies_take_the_pages_of_conversations_replies() {
         &harness,
         names_at(&harness, &replies(1)),
         vec![
-            ok(&page("messages", &[edited.clone()], None)),
+            ok(&page("messages", std::slice::from_ref(&edited), None)),
             ok(&page(
                 "messages",
                 &[

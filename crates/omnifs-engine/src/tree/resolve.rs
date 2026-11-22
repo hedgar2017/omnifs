@@ -235,12 +235,17 @@ impl EngineNamespace {
         crate::inspector::cache_event(CacheKind::BrowseMiss);
         let runtime = entry.runtime().expect("online entry has a runtime");
         match runtime.lookup_child(parent, name).await? {
-            LookupOutcome::Entry(entry) if fed => Ok(Node::fed(
-                mount,
-                entry.path().clone(),
-                entry.path().clone(),
-                entry.meta().clone(),
-            )),
+            LookupOutcome::Entry(entry) if fed => {
+                if !above_fed && entry.meta().is_directory() {
+                    super::feed::due_listing(&runtime, &rel).await?;
+                }
+                Ok(Node::fed(
+                    mount,
+                    entry.path().clone(),
+                    entry.path().clone(),
+                    entry.meta().clone(),
+                ))
+            },
             LookupOutcome::Entry(entry) => Ok(Node::new(
                 mount,
                 entry.path().clone(),

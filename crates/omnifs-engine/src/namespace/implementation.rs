@@ -1107,6 +1107,8 @@ impl EngineNamespace {
         let span = Self::begin_span(op, &display_mount, &display_path);
         let result = async {
             let node = self.resolve_node(&full_path).await?;
+            // The attrs carry each change that the resolve recorded.
+            self.process_invalidations(&mount);
             if let Some((tree_ref, relative, _)) = node.host() {
                 let metadata = self.host_stat(tree_ref, relative).await?;
                 return Ok(metadata.attrs(Self::host_change(&metadata)));
@@ -1497,6 +1499,8 @@ impl Namespace for EngineNamespace {
                     },
                     Err(error) => return Err(NsError::from(error)),
                 };
+                // The attrs carry each change that the resolve recorded.
+                self.process_invalidations(&mount);
                 let id = self.intern(&node);
                 let attrs = if let Some((tree_ref, relative, _)) = node.host() {
                     let metadata = self.host_stat(tree_ref, relative).await?;
