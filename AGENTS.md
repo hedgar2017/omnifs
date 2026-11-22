@@ -74,7 +74,7 @@ Allowed, but never as a side effect. Surface the tradeoff and get sign-off in th
 - `crates/omnifs-core`: shared path, mount and provider content identities, filesystem identity, and file-contract primitives.
 - `crates/omnifs-sdk`: provider authoring API, object model, route registration, and dispatch.
 - `crates/omnifs-wit/wit/provider.wit`: provider component contract. Guest bindings live at `omnifs_wit::provider`; host (Wasmtime) bindings at `omnifs_wit::host` behind `host-bindings`.
-- `crates/omnifs-bootstrap`: profile-root resolution, the fixed control socket, daemon process identity, the record of who started the daemon of a profile (`owner.json`), and the daemon spawn lock.
+- `crates/omnifs-bootstrap`: profile-root resolution, the fixed control socket, daemon process identity, and the daemon spawn lock.
 - `crates/omnifs-state`: daemon-owned SQLx/SQLite state, provider artifacts, mounts, credentials, projection cache, and raw daemon logs.
 - `crates/omnifs-daemon`: daemon lifecycle and recovery, local gRPC control, namespace supervision, bounded raw-log streaming, and serialized durable mutations.
 - `crates/omnifs-vfs`: shared VFS facade (`Namespace` and plain answers); enable `wire` for framing, handshake, attach/reconnect, readiness, and `VfsServer`.
