@@ -40,7 +40,6 @@ pub struct OAuthRequestConfig {
     pub redirect_uri: Option<String>,
     pub client_id: Option<String>,
     pub client_secret_file: Option<String>,
-    pub client_secret_env: Option<String>,
     pub subject: Option<String>,
 }
 
@@ -375,35 +374,19 @@ pub struct JwtBearerLoginRequest {
     pub(crate) oauth: OAuthRequest,
 }
 
+/// The client secret of the file that `config` names, none without one.
 fn read_oauth_client_secret(
     config: &OAuthRequestConfig,
 ) -> Result<Option<SecretString>, AuthError> {
-    if let Some(path) = config.client_secret_file.as_deref() {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => {
-                return secret_from_config_value(
-                    contents.trim(),
-                    &format!("auth.client_secret_file {path}"),
-                );
-            },
-            Err(error) if config.client_secret_env.is_none() => {
-                return Err(AuthError::RequestConfig(format!(
-                    "failed to read auth.client_secret_file {path}: {error}"
-                )));
-            },
-            Err(_) => {},
-        }
-    }
-
-    let Some(env_var) = config.client_secret_env.as_deref() else {
+    let Some(path) = config.client_secret_file.as_deref() else {
         return Ok(None);
     };
-    let value = std::env::var(env_var).map_err(|error| {
+    let contents = std::fs::read_to_string(path).map_err(|error| {
         AuthError::RequestConfig(format!(
-            "failed to read auth.client_secret_env {env_var}: {error}"
+            "failed to read auth.client_secret_file {path}: {error}"
         ))
     })?;
-    secret_from_config_value(value.trim(), &format!("auth.client_secret_env {env_var}"))
+    secret_from_config_value(contents.trim(), &format!("auth.client_secret_file {path}"))
 }
 
 fn secret_from_config_value(value: &str, source: &str) -> Result<Option<SecretString>, AuthError> {
@@ -504,6 +487,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.subject(), Some("ada@example.test"));
+    }
+
+    /// The client secret of a request is the content of its file, and a
+    /// file that cannot be read or is empty is an error of the request.
+    #[test]
+    fn the_client_secret_of_a_request_is_the_content_of_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |file: &str| OAuthRequestConfig {
+            client_secret_file: Some(dir.path().join(file).to_str().unwrap().to_owned()),
+            ..OAuthRequestConfig::default()
+        };
+        std::fs::write(dir.path().join("secret"), "client-secret\n").unwrap();
+        let request = OAuthRequest::from_config(Some(&config("secret")), scheme()).unwrap();
+        assert_eq!(
+            request.client_secret().unwrap().expose_secret(),
+            "client-secret"
+        );
+
+        let error = OAuthRequest::from_config(Some(&config("missing")), scheme()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("failed to read auth.client_secret_file "),
+            "{error}"
+        );
+        std::fs::write(dir.path().join("empty"), "\n").unwrap();
+        let error = OAuthRequest::from_config(Some(&config("empty")), scheme()).unwrap_err();
+        assert!(error.to_string().ends_with("empty is empty"), "{error}");
     }
 
     #[test]

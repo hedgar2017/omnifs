@@ -37,8 +37,6 @@ pub(crate) struct OAuth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) client_secret_env: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) client_secret_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) redirect_uri: Option<String>,
@@ -89,7 +87,6 @@ impl OAuth {
             redirect_uri: self.redirect_uri.clone(),
             client_id: self.client_id.clone(),
             client_secret_file: self.client_secret_file.clone(),
-            client_secret_env: self.client_secret_env.clone(),
             subject: self.subject.clone(),
         }
     }

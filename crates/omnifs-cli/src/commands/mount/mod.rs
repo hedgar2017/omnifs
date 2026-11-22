@@ -468,7 +468,9 @@ impl ReauthArgs {
                 "`omnifs mount reauth {mount_name}` cannot complete OAuth without a terminal"
             ))
             .with_hint("run it interactively")
-            .with_hint("or use a static-token scheme with --token - or --token-env VAR")
+            .with_hint(format!(
+                "or give the mount a static-token scheme with `omnifs mount update {mount_name} --scheme <scheme> --token-env VAR`"
+            ))
             .with_exit_code(ExitCode::AuthRequired);
         }
 
