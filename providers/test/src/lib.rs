@@ -686,6 +686,38 @@ struct PrintKey {
     print: u64,
 }
 
+/// A memo, a dynamic object that its load gives, with two representations of
+/// its canonical bytes: past its deadline a read of either loads it again.
+#[omnifs_sdk::object(kind = "test.memo", key = MemoKey)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Memo {
+    memo: u64,
+}
+
+impl Memo {
+    fn load(
+        _cx: &Cx<State>,
+        key: &MemoKey,
+        _since: Option<Validator>,
+    ) -> impl core::future::Future<Output = Result<Load<Self>>> {
+        let bytes = format!(r#"{{"memo":{}}}"#, key.memo).into_bytes();
+        core::future::ready(
+            Self::decode(&bytes).map(|memo| Load::fresh(memo, Canonical::new(bytes, None))),
+        )
+    }
+}
+
+impl Representable<Markdown> for Memo {
+    fn represent(&self) -> Vec<u8> {
+        format!("# Memo {}\n", self.memo).into_bytes()
+    }
+}
+
+#[omnifs_sdk::path_captures]
+struct MemoKey {
+    memo: u64,
+}
+
 /// A card of a shelf, whose facts come from the feed of its shelf alone: an
 /// object without canonical bytes and without a load.
 #[omnifs_sdk::object(kind = "test.card", key = CardKey, no_load)]
@@ -953,6 +985,12 @@ impl TestProvider {
             o.fed();
             o.file("print.json").canonical::<Json>()?;
             o.file("print.md").representation::<Markdown>()?;
+            Ok(())
+        })?;
+        r.object::<Memo>("/memos/{memo}", |o| {
+            o.dynamic();
+            o.file("memo.json").canonical::<Json>()?;
+            o.file("memo.md").representation::<Markdown>()?;
             Ok(())
         })?;
         r.object::<Card>("/shelves/{shelf}/cards/{card}", |o| {

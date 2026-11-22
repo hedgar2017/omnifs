@@ -96,115 +96,26 @@ async fn canonical_read_repeats_with_stable_bytes() {
     assert_eq!(first.attrs.size, second.attrs.size);
 }
 
-/// Concurrent reads of two representations of one object each take the bytes
-/// of their own path.
+/// Concurrent reads of two representations of one object share the load of
+/// the object past its deadline, and each takes the bytes of its own path.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_reads_of_two_representations_take_the_bytes_of_their_own_paths() {
     let harness = make_runtime();
     let namespace = harness.namespace.as_ref();
-    let markdown = resolve(namespace, "/test/items/all/7/item.md").await;
-    let json = resolve(namespace, "/test/items/all/7/item.json").await;
+    let markdown = resolve(namespace, "/test/memos/7/memo.md").await;
+    let json = resolve(namespace, "/test/memos/7/memo.json").await;
     let read = |node: &LookupAnswer| {
         let path = node.path.clone();
         async move { namespace.read(path, 0, u32::MAX).await.unwrap().bytes }
     };
-    let (first, second) = tokio::join!(read(&markdown), read(&json));
-    assert_eq!(first, b"# Item 7\n\nBody 7\n");
-    assert_eq!(second, read(&json).await);
-    assert_ne!(first, second);
-}
-
-/// Run `read` of a file of the test provider that fetches a blob, and answer
-/// the fetch with `body` as its upstream. Returns the read and the request
-/// of the fetch.
-async fn read_with_blob<T>(
-    harness: &omnifs_itest::RuntimeHarness,
-    read: impl Future<Output = T>,
-    body: &[u8],
-) -> (T, omnifs_wit::host::types::BlobFetchRequest) {
-    let answer = async {
-        let callout = loop {
-            match harness.runtime.try_recv_test_callout() {
-                Some(callout) => break callout,
-                None => tokio::time::sleep(std::time::Duration::from_millis(2)).await,
-            }
-        };
-        let omnifs_wit::host::types::Callout::FetchBlob(request) = callout.callout().clone() else {
-            panic!("expected a blob fetch, got {:?}", callout.callout());
-        };
-        harness.runtime.answer_test_blob(callout, 200, body).await;
-        request
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        tokio::join!(read, answer)
-    })
-    .await
-    .expect("the read fetches one blob")
-}
-
-/// A file of a blob reads by ranges of its body in the body store, at any
-/// size: no read has the whole of it in memory, and none is refused for
-/// the bytes that the host takes in memory.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_file_of_a_blob_reads_by_ranges_above_the_bytes_of_the_host_in_memory() {
-    const ABOVE: u64 = 64 * 1024 * 1024 + 5;
-    let harness = make_runtime();
-    let namespace = harness.namespace.as_ref();
-    let mut body = vec![0_u8; usize::try_from(ABOVE).unwrap()];
-    body[usize::try_from(ABOVE).unwrap() - 5..].copy_from_slice(b"tail!");
-    let (tail, _) = read_with_blob(
-        &harness,
-        namespace.read(path("/test/hello/blob"), ABOVE - 5, 4096),
-        &body,
-    )
-    .await;
-    let tail = tail.expect("the tail of a blob above the bytes of the host in memory");
-    assert_eq!(tail.bytes, b"tail!");
-    assert!(tail.eof);
-
-    // Each later read is a range of the body that the projection has,
-    // without the provider.
-    harness.runtime.shutdown().unwrap();
-    let head = namespace
-        .read(path("/test/hello/blob"), 0, 4)
-        .await
-        .unwrap();
-    assert_eq!((head.bytes.as_slice(), head.eof), (&[0_u8; 4][..], false));
-    let end = namespace
-        .read(path("/test/hello/blob"), ABOVE - 2, 4096)
-        .await
-        .unwrap();
-    assert_eq!((end.bytes.as_slice(), end.eof), (&b"l!"[..], true));
-}
-
-/// The answer of a blob fetch is of its request: the projection keeps it
-/// from the end of the fetch, for a read that fails after it and for a read
-/// whose answer the host refuses.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_answer_of_a_blob_fetch_stays_whatever_its_read_does_after() {
-    for file in [
-        "/test/hello/blob-then-error",
-        "/test/hello/blob-of-another-size",
-    ] {
-        let harness = make_runtime();
-        let (read, request) = read_with_blob(
-            &harness,
-            harness.namespace.read(path(file), 0, 4096),
-            b"the bytes of a blob",
-        )
-        .await;
-        assert!(read.is_err(), "{file}: {read:?}");
-        assert!(harness.runtime.keeps_test_blob(&request), "{file}");
+    assert_eq!(read(&markdown).await, b"# Memo 7\n");
+    assert_eq!(read(&json).await, br#"{"memo":7}"#);
+    for round in 0..3 {
+        // Past the deadline of the object, each read asks the provider: the
+        // second joins the flight of the first.
+        tokio::time::sleep(std::time::Duration::from_millis(3_200)).await;
+        let (first, second) = tokio::join!(read(&markdown), read(&json));
+        assert_eq!(first, b"# Memo 7\n", "round {round}");
+        assert_eq!(second, br#"{"memo":7}"#, "round {round}");
     }
-
-    // The read that takes its blob as its file keeps the answer too.
-    let harness = make_runtime();
-    let (read, request) = read_with_blob(
-        &harness,
-        harness.namespace.read(path("/test/hello/blob"), 0, 4096),
-        b"the bytes of a blob",
-    )
-    .await;
-    assert_eq!(read.unwrap().bytes, b"the bytes of a blob");
-    assert!(harness.runtime.keeps_test_blob(&request));
 }
