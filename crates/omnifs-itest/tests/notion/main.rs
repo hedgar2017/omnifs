@@ -25,8 +25,15 @@ const EARLIEST: &str = "2026-11-21T08:00:00.000Z";
 /// A later `last_edited_time` than `EDITED`.
 const EDITED_LATER: &str = "2026-11-21T10:05:00.000Z";
 
-/// A `Date` two seconds before the end of the minute of `EDITED`.
-const WITHIN: &str = "Sat, 21 Nov 2026 10:00:58 GMT";
+/// A `Date` five seconds before the end of the minute of `EDITED`.
+const WITHIN: &str = "Sat, 21 Nov 2026 10:00:55 GMT";
+
+/// Past the end of the minute of `EDITED` after an answer of the `Date`
+/// `WITHIN`, and past the deadline of a feed.
+const PAST_WITHIN: Duration = Duration::from_millis(5_200);
+
+/// The `Date` of the end of the minute of `EDITED`.
+const AT_END: &str = "Sat, 21 Nov 2026 10:01:00 GMT";
 
 fn names_of(ids: &[u32]) -> Vec<String> {
     let mut names = ids.iter().map(|n| id(*n)).collect::<Vec<_>>();
@@ -659,13 +666,14 @@ async fn a_data_source_by_its_id() {
 /// The content at the first read of `body.md`, by a lookup and by its path
 /// alone: the markdown of the page and of its unknown blocks in turn, each
 /// once, a block with `404` without its markdown, and the removal of the page for its
-/// `404`; a content taken within the minute of its `last_edited_time` by its
-/// `Date` taken once more at the first read after the end of that minute.
+/// `404`; a content that Notion may have read within the minute of its
+/// `last_edited_time`, by its `Date` less the time of its request, taken once
+/// more at the first read after the end of that minute.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() {
     let harness = notion_harness();
-    for n in [1, 2, 3, 4] {
+    for n in [1, 2, 3, 4, 5, 6] {
         assert!(found_by_id(&harness, "pages", n, &page(n, &format!("Page {n}"), EDITED)).await);
     }
 
@@ -719,6 +727,42 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
             .is_missing()
     );
 
+    // An answer without a `Date` is the error of the read.
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(5))),
+        vec![answer(200, &[], &markdown("Page 5 body", &[]))],
+    )
+    .await;
+    assert!(matches!(body, Err(NsError::Invalid)), "{body:?}");
+    expect(&requests[0], "GET", &markdown_of(&id(5)), None);
+
+    // A content of a `Date` at the end of the minute of its
+    // `last_edited_time`, which Notion may have read within that minute, is
+    // taken once more at the next read, here the read after its lookup.
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(6))),
+        vec![
+            answer(200, &[("Date", AT_END)], &markdown("Page 6 body", &[])),
+            ok(&markdown("Page 6 body, edited", &[])),
+        ],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Page 6 body, edited");
+    for request in &requests {
+        expect(request, "GET", &markdown_of(&id(6)), None);
+    }
+    assert_eq!(
+        served(
+            &harness,
+            read(&harness, &format!("pages/{}/body.md", id(6)))
+        )
+        .await
+        .unwrap(),
+        "Page 6 body, edited"
+    );
+
     let (body, requests) = answering(
         &harness,
         read(&harness, &format!("pages/{}/body.md", id(4))),
@@ -740,7 +784,7 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
         .unwrap(),
         "Page 4 body"
     );
-    tokio::time::sleep(PAST_DEADLINE).await;
+    tokio::time::sleep(PAST_WITHIN).await;
     let (body, requests) = answering(
         &harness,
         read(&harness, &format!("pages/{}/body.md", id(4))),
@@ -786,6 +830,8 @@ async fn the_content_takes_the_markdown_of_the_page_and_of_its_unknown_blocks() 
             page(1, "Page 1", EDITED),
             page(2, "Page 2", EDITED),
             page(4, "Page 4", EDITED),
+            page(5, "Page 5", EDITED),
+            page(6, "Page 6", EDITED),
         ],
     )
     .await;
@@ -941,7 +987,7 @@ async fn the_comments_take_their_answers_by_next_cursor() {
     .await;
     assert_eq!(comments.unwrap(), names_of(&[41]));
     expect(&requests[0], "GET", &comments_of(4, None), None);
-    tokio::time::sleep(PAST_DEADLINE).await;
+    tokio::time::sleep(PAST_WITHIN).await;
     let (comments, requests) = answering(
         &harness,
         names(&harness, &format!("pages/{}/comments", id(4))),

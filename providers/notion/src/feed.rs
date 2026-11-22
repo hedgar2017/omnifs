@@ -12,9 +12,10 @@
 //! its ID, a part for each request.
 //!
 //! Notion gives `last_edited_time` by the minute, so the content and the
-//! comments that a page answers within the minute of its `last_edited_time`,
-//! by the `Date` of their first answer, count as lacking after the end of that
-//! minute, and the next read takes them once more.
+//! comments that Notion may have read within the minute of the
+//! `last_edited_time` of their page, by the `Date` of their first answer less
+//! the time of its request, count as lacking after the end of that minute,
+//! and the next read takes them once more.
 
 use std::collections::BTreeSet;
 use std::time::SystemTime;
@@ -279,14 +280,17 @@ fn cursor_refused(cursor: Option<&str>, response: &HttpResponse) -> bool {
     cursor.is_some() && matches!(response.status(), 400..=499) && response.status() != 429
 }
 
-/// The time of the computer at the end of the minute of `last_edited_time`
-/// by the `Date` of `response`, for a `Date` within that minute, as Notion
-/// gives `last_edited_time` by the minute.
+/// The time of the computer at the end of the minute of `last_edited_time`,
+/// by the `Date` of `response`, for an answer that Notion may have read
+/// within that minute, as Notion gives `last_edited_time` by the minute.
+/// Notion read the answer to a request sent at `sent` no earlier than its
+/// `Date` less the time of the request.
 fn minute_end(
     last_edited_time: OffsetDateTime,
-    _sent: OffsetDateTime,
+    sent: OffsetDateTime,
     response: &HttpResponse,
 ) -> Result<Option<OffsetDateTime>> {
+    let now = OffsetDateTime::now_utc();
     let date = response
         .header("date")
         .ok_or_else(|| ProviderError::invalid_input("an answer of Notion has no Date"))?;
@@ -298,10 +302,10 @@ fn minute_end(
         .and_then(|time| time.replace_nanosecond(0))
         .map_err(|error| ProviderError::internal(error.to_string()))?;
     let end = minute + Duration::MINUTE;
-    if date >= end {
+    if date - (now - sent) >= end {
         return Ok(None);
     }
-    Ok(Some(OffsetDateTime::now_utc() + (end - date)))
+    Ok(Some(now + (end - date)))
 }
 
 // ===========================================================================
