@@ -43,27 +43,34 @@
         reviews/{id}/
         checks/{id}/
   actions/runs/{id}/
+    run.json
     status
     conclusion
-    log
+    logs.zip
   repo/  ← bind-mounted clone, lazily cloned via SSH
 /github/notifications/thread-{id}/
 ```
 
-The feed of a repository keeps its issues, pull requests, and comments. The first read of `issues/all/`, `issues/open/`, `pulls/all/`, or `pulls/open/` takes the first full listing a page at a time: every issue and pull request by `updated_at`, then every comment by `updated_at`, then the GitHub GraphQL counts of the comments of each item; a stopped listing continues from its next page at the next read of those folders. A page after one that moved the time of its list asks for the rows since that time, so that a row that changes between two pages moves no other row past a page.
+The feed of a repository keeps its issues, pull requests, and comments. The issues and the pull requests come from GitHub GraphQL, each kind in the order of `updatedAt` after the cursor of the last node taken, so that each changed item comes once, with no time and no boundary row; `item.json` is that node and `item.md` its rendering, served without a request of their own. The comments come from the REST list of the comments of the repository.
+
+The first read of `issues/all/`, `issues/open/`, `pulls/all/`, or `pulls/open/` takes the first full listing a page at a time: every issue, every pull request, every comment, the GitHub GraphQL counts of the comments of each item, with the IDs of an item whose comments are other than its count, and the REST count of the comments; a stopped listing continues from its next page at the next read of those folders.
 
 After it, a read 3 seconds or more after the last answer is a check, a part of the answer for each request, which the host publishes together with the last part:
 
-- the issues and pull requests since the last `updated_at` of one, with `If-None-Match`;
-- the comments since the last `updated_at` of one, with `If-None-Match`, so that an edit of a comment comes without a change of its item;
-- one GitHub GraphQL `POST` with the counts of the issues and of the pull requests, the IDs of the comments of each changed item, and one page of the counts of the comments of the items, the page after that of the check before it. An item with another count than its `comments/` takes the IDs of its comments, so that a comment that left an item without a change of that item leaves within as many checks as the repository has hundreds of items;
-- for another count of the issues or of the pull requests, the numbers of that kind, which remove the items that left.
+- one GitHub GraphQL `POST` with the issues and the pull requests after their cursors and the count of each kind;
+- the REST count of the comments of the repository;
+- the comments updated since a second before the last one, the first page with `If-None-Match`, so that the check takes each edit whether GitHub's `since` includes its second or not; a comment that comes twice in one pass moved past a page while the pass paged, and the pass asks again;
+- the IDs of each changed item whose comments are other than its count, which remove a deleted comment and bring by its ID a comment that the list lacks;
+- for a count of a kind other than the projection's with the changes of the check, the numbers of that kind, once, which remove the items that left and bring those that the projection lacks;
+- for a REST count of the comments other than the count the projection holds with the changes of the check, the counts of the comments of the items until each item whose comments changed unseen, as by a deletion, took its IDs.
 
-Before the first full listing ends, an item answers from its own `GET /repos/{owner}/{repo}/issues/{number}`, and its comments download at the first read of its `comments/` or of a comment in it, for a count other than `0`. The facts of an issue or a pull request live under `all/`, which `open/` shares while it is open. GitHub GraphQL answers only an authenticated mount.
+A quiet check is one `POST`, the REST count, and a `304`.
+
+Before the first full listing ends, an item answers from GitHub GraphQL by its number, and its comments download at the first read of its `comments/` or of a comment in it, for a count other than `0`. An item that GitHub answers for its number from another repository or with another number, as an issue that moved, and an item whose comments answer `301`, left the repository. A repository that GitHub GraphQL names otherwise, or whose REST requests answer `301`, is not at its path. The facts of an issue or a pull request live under `all/`, which `open/` shares while it is open. GitHub GraphQL answers only an authenticated mount.
 
 The owner and the repository are named as the path spells them: another spelling of the same name is another folder with its own downloads.
 
-`diff.patch` is the diff between the base and the head of the pull request, which each read asks `GET /repos/{owner}/{repo}/pulls/{number}` for; the host downloads the diff of a pair of commits once. `actions/runs/{id}/log` fails while GitHub answers the archive of the logs with a redirect, which the host does not follow.
+The entries of `files/`, `reviews/`, `reviews/{id}/comments/`, `checks/`, and `actions/runs/` render from the row that their listing brought. `diff.patch` is the diff between the base and the head of the pull request, which each read asks `GET /repos/{owner}/{repo}/pulls/{number}` for; the host downloads the diff of a pair of commits once. `actions/runs/{id}/logs.zip` is the archive of the logs, which the host fetches by the redirect of GitHub to its storage and holds; the mount does not approve that storage, so its read fails with the error of the refused hop.
 
 ## Capabilities
 

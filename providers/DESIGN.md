@@ -797,34 +797,38 @@ repository object declares fed directories for issues and pulls, a relative
 collection directory for workflow runs, and the `repo` tree handoff.
 
 The feed of the repository keeps its issues, pull requests, and comments: the
-`title`, `body`, `state`, and `user` of each item under `{kind}/all/`, which its
-entry in `{kind}/open/` shares while it is open, and the `author` and `body.md`
-of each comment. Its first full listing takes the rows of
-`GET /repos/{owner}/{repo}/issues` by `updated_at`, then the comments of the
-repository by `updated_at`, then each page of the GitHub GraphQL counts of the
+`title`, `body`, `state`, `user`, and the canonical bytes of each item under
+`{kind}/all/`, which its entry in `{kind}/open/` shares while it is open, and
+the `author` and `body.md` of each comment. The items come from GitHub GraphQL,
+each kind in the order of `updatedAt` after the cursor of the last node that
+an answer took, which a check asks after: each changed item comes once, with
+no time and no boundary row, and its node is the canonical bytes of its
+object, from which `item.json` and `item.md` render without a load. The first
+full listing takes the issues, the pull requests, every comment of the REST
+list of the comments of the repository by its link `next`, the counts of the
 comments of each item, where an item with another count takes the ids of its
-comments, and each comment of those that the projection lacks by its id. A page
-of the rows or of the comments after one that moved the time of its list asks
-for the rows since that time, and by its link `next` only after a page whose
-rows end at the time they were asked since: a row that changes between two
-pages moves no other row past a page. After the first full listing, each answer
-past the deadline is a check: each page of the rows since the time of the last
-row, the first with the `ETag` of that time; each page of the comments since
-the time of the last comment, the first with the `ETag` of that time, so that an
-edit of a comment comes without a change of its item; and the counts, at most
-100 items a `POST`, the first with the page of the counts of the comments of
-the items after that of the check before it. A changed item, and an item of
-that page with another count than its `comments/`, takes the ids of its
-comments, which remove a comment that left it and bring by its id a comment
-that the comments of the check lack; an item that GitHub GraphQL cannot
-resolve leaves. Another count of a kind takes the numbers of its items once:
-an item of the projection that they lack leaves, and an item that the
-projection lacks comes from `GET /repos/{owner}/{repo}/issues/{number}`, unless
-that answers without it. Each request is a part, and the host keeps the parts
-until the last one. Before the first full listing ends, the feed of an item
-answers for it from `GET /repos/{owner}/{repo}/issues/{number}` and takes its
-comments at the first read of its `comments/`, each page after the first by the
-link `next` of the one before it.
+comments and each comment of those that the projection lacks by its id, and
+the REST count of the comments. After it, each answer past the deadline is a
+check: one `POST` of the nodes of each kind after its cursor with the count of
+each kind; the REST count of the comments with its newest comment; each page
+of the comments since a second before the last one, the first with the `ETag`
+of that time, so that the check takes each comment whether `since` includes
+its second or not, and again from that time when a comment comes twice in one
+pass, which a move past a page while the pass paged shifted; the ids of each
+changed item whose comments are other than its count; for a count of a kind
+other than the projection's with the changes of the check, the numbers of that
+kind once, as bits, which remove each item that they lack and bring each item
+that the projection lacks by its number; and, for a REST count other than the
+count that the projection holds with the comments that the check added and
+removed, the counts of the comments of the items until each item whose
+comments changed unseen took its ids. An item that GitHub answers for its
+number from another repository or with another number left this one, and a
+repository that GitHub GraphQL names otherwise is not at its path; a REST
+request follows no redirect, so that a `301` says the same. Each request is a
+part, and the host keeps the parts until the last one. Before the first full
+listing ends, the feed of an item answers for it from GitHub GraphQL by its
+number and takes its comments at the first read of its `comments/`, each page
+after the first by the link `next` of the one before it.
 
 The owner and the repository of a key are the segments of its path as they are
 spelled, so that the facts of a feed live under the path of its object.
@@ -866,11 +870,10 @@ async fn diff(cx: Cx<GitHub>, key: PullRequestKey) -> Result<BlobFile<Diff>> {
 }
 ```
 
-GitHub action logs are different in the current provider: the endpoint returns a
-zip and the provider flattens it into text in guest memory. That can remain a
-direct transformed file. If the log surface becomes a raw downloadable archive
-or an extracted tree, model it as a blob or tree face instead of a direct file.
-An answer without the archive is an error of the read, never a file.
+GitHub action logs are the archive that the endpoint answers, a blob face
+`logs.zip` whose fetch follows the redirect of GitHub to the storage of the
+archive, so that the host holds it at any size and asks for it again by its
+validators.
 
 ### arXiv
 
