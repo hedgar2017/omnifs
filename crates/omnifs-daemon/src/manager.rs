@@ -890,6 +890,7 @@ mod tests {
                 "description": "A test provider",
                 "provider": "demo.wasm",
                 "defaultMount": "demo",
+                "witPackage": omnifs_engine::test_support::PROVIDER_WIT_PACKAGE,
                 "projection": 1,
                 "refreshIntervalSecs": 0,
                 "capabilities": [{

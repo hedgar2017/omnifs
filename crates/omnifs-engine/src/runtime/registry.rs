@@ -467,6 +467,20 @@ fn validate_provider_input(
             config.name, config.provider.id
         )));
     }
+    // The artifact of another protocol is refused here, before its
+    // instantiation, which would refuse it by its imports alone.
+    if manifest.wit_package.as_deref() != Some(omnifs_wit::PROVIDER_WIT_PACKAGE) {
+        return Err(RegistryError::RuntimeError(format!(
+            "provider {} for mount {} speaks {}, and this host speaks `{}`: build the provider against this host",
+            manifest.id,
+            config.name,
+            manifest.wit_package.as_deref().map_or_else(
+                || "no declared protocol".to_owned(),
+                |package| format!("`{package}`")
+            ),
+            omnifs_wit::PROVIDER_WIT_PACKAGE,
+        )));
+    }
     if manifest.id != config.provider.meta.name.as_str()
         || manifest.version.as_deref()
             != config
@@ -640,6 +654,79 @@ mod tests {
 
     /// A read under a mount whose provider has no manifest, and so no
     /// projection, answers with its unavailability.
+    /// The host refuses the artifact of another protocol than its own by
+    /// the WIT package of its manifest, before it instantiates it, and the
+    /// generation builds the mount beside it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mount_whose_provider_speaks_another_protocol_is_unavailable_before_its_instantiation()
+     {
+        let root = tempfile::tempdir().expect("temp root");
+        let bytes = std::fs::read(test_provider_wasm_path()).expect("read test provider");
+        let (_, manifest) = Artifact::from_bytes_with_manifest("test-provider.wasm", bytes.clone())
+            .expect("validate test provider");
+        assert_eq!(
+            manifest.wit_package.as_deref(),
+            Some(omnifs_wit::PROVIDER_WIT_PACKAGE),
+            "the provider macro writes the WIT package of the host"
+        );
+        let active = || MountBuildState::Active {
+            auth: None,
+            credential_generation: None,
+        };
+        let other = |wit_package: Option<&str>| ProviderManifest {
+            wit_package: wit_package.map(ToOwned::to_owned),
+            ..manifest.clone()
+        };
+        let table = MountTable::prepare_durable(
+            &test_host(root.path()),
+            vec![
+                input(
+                    &bytes,
+                    other(Some("package omnifs:provider@0.11.0;")),
+                    "older",
+                    serde_json::json!({}),
+                    active(),
+                ),
+                input(
+                    &bytes,
+                    other(None),
+                    "undeclared",
+                    serde_json::json!({}),
+                    active(),
+                ),
+                input(
+                    &bytes,
+                    manifest.clone(),
+                    "test",
+                    serde_json::json!({}),
+                    active(),
+                ),
+            ],
+        )
+        .expect("prepare the generation");
+        let mut entries = table
+            .selected_entries()
+            .map(|(name, _, availability, runtime)| {
+                (name.to_string(), availability, runtime.is_some())
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        assert!(
+            matches!(
+                &entries[..],
+                [
+                    (older, MountAvailability::ProviderUnavailable { reason: old }, false),
+                    (test, MountAvailability::Active, true),
+                    (undeclared, MountAvailability::ProviderUnavailable { reason: none }, false),
+                ] if older == "older" && test == "test" && undeclared == "undeclared"
+                    && old.contains("speaks `package omnifs:provider@0.11.0;`")
+                    && old.contains(omnifs_wit::PROVIDER_WIT_PACKAGE)
+                    && none.contains("speaks no declared protocol")
+            ),
+            "{entries:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_mount_without_a_manifest_of_its_provider_answers_as_unavailable() {
         let root = tempfile::tempdir().expect("temp root");

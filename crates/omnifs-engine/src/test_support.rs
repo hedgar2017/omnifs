@@ -29,6 +29,9 @@ pub fn wasm_cache_dir() -> PathBuf {
 mod target_dir;
 pub use target_dir::cargo_target_dir;
 
+/// The WIT package of this host, which it requires of a provider artifact.
+pub use omnifs_wit::PROVIDER_WIT_PACKAGE;
+
 /// Open a runtime [`HostOnline`] for tests, using the shared Wasmtime cache.
 pub fn open_test_host(
     cache_dir: impl AsRef<std::path::Path>,
