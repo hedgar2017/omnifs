@@ -487,7 +487,7 @@ impl WorkspaceFeed<'_> {
 
     /// A request of a page or a data source of the projection that a full
     /// listing lacks, by its ID: its facts, or its removal for `404` or in
-    /// the trash.
+    /// the trash, with the token of a removed one for its feed.
     async fn missing(
         &mut self,
         first: bool,
@@ -495,10 +495,12 @@ impl WorkspaceFeed<'_> {
         mut databases: BTreeSet<Id>,
         seen: Option<Latest>,
     ) -> Result<Feed> {
-        let (path, request) = if let Some(id) = pages.pop_first() {
-            (page_path(&id), format!("/v1/pages/{id}"))
+        let (request, removed) = if let Some(id) = pages.pop_first() {
+            let removed = Inner::Page(id.clone(), encode(&None::<PageToken>)?);
+            (format!("/v1/pages/{id}"), removed)
         } else if let Some(id) = databases.pop_first() {
-            (data_source_path(&id), format!("/v1/data_sources/{id}"))
+            let removed = Inner::DataSource(id.clone(), encode(&None::<DataSourceToken>)?);
+            (format!("/v1/data_sources/{id}"), removed)
         } else {
             return Err(ProviderError::invalid_input(
                 "a full listing takes no missing page or data source",
@@ -510,7 +512,13 @@ impl WorkspaceFeed<'_> {
                 let object: Box<RawValue> = decode(response.body())?;
                 self.take(&object, listing_write(first))?;
             },
-            404 => self.cx.remove(&path)?,
+            404 => {
+                self.cx.remove(match &removed {
+                    Inner::Page(id, _) => page_path(id),
+                    Inner::DataSource(id, _) => data_source_path(id),
+                })?;
+                self.inner.push(removed);
+            },
             _ => return Err(status_error(&response)),
         }
         if pages.is_empty() && databases.is_empty() {

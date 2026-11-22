@@ -252,6 +252,17 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
         ],
     )
     .await;
+    // A content stopped after its first part, of a page that the next full
+    // listing removes.
+    let (stopped, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(2))),
+        vec![ok(&markdown("Two body", &[21])), network()],
+    )
+    .await;
+    assert!(matches!(stopped, Err(NsError::Network)), "{stopped:?}");
+    expect(&requests[0], "GET", &markdown_of(&id(2)), None);
+    expect(&requests[1], "GET", &markdown_of(&notion_id(21)), None);
 
     tokio::time::sleep(PAST_DEADLINE).await;
     let (stopped, requests) = answering(
@@ -304,13 +315,26 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
             .unwrap(),
         "One again"
     );
+    // The removal leaves nothing of the stopped content of the page.
+    assert!(
+        served(&harness, lookup(&harness, &format!("pages/{}", id(2))))
+            .await
+            .unwrap()
+            .is_missing()
+    );
 
     tokio::time::sleep(PAST_DEADLINE).await;
     let (listing, requests) = answering(
         &harness,
         names(&harness, "databases"),
         vec![
-            ok(&list(&[page(1, "One again", EDITED_LATER)], None)),
+            ok(&list(
+                &[
+                    page(2, "Two again", EDITED_LATER),
+                    page(1, "One again", EDITED_LATER),
+                ],
+                None,
+            )),
             failure(404, "object_not_found"),
         ],
     )
@@ -323,6 +347,16 @@ async fn a_full_listing_again_past_its_deadline_is_taken_after_its_last_part() {
         &format!("/v1/data_sources/{}", id(3)),
         None,
     );
+    // The page that a full listing removed and a later one brings again
+    // takes its content from its first request.
+    let (body, requests) = answering(
+        &harness,
+        read(&harness, &format!("pages/{}/body.md", id(2))),
+        vec![ok(&markdown("Two again body", &[]))],
+    )
+    .await;
+    assert_eq!(body.unwrap(), "Two again body");
+    expect(&requests[0], "GET", &markdown_of(&id(2)), None);
 }
 
 /// The changes at a read of a file of a page past the deadline of the last
