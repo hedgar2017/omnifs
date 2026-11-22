@@ -17,7 +17,7 @@ _install-wasi-sdk action scope:
     case "{{ action }}:{{ scope }}" in
       build:host) exit 0 ;;
       check:host)
-        wasm_dir="target/wasm32-wasip2/release"
+        wasm_dir="${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release"
         if [[ -n "$(find "$wasm_dir" -maxdepth 1 -name 'omnifs_provider_*.wasm' -print -quit 2>/dev/null)" ]]; then
           exit 0
         fi
@@ -93,7 +93,7 @@ check scope='': (_install-wasi-sdk "check" scope)
     }
 
     check_host() {
-      wasm_dir="target/wasm32-wasip2/release"
+      wasm_dir="${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release"
       if [[ -z "$(find "$wasm_dir" -maxdepth 1 -name 'omnifs_provider_*.wasm' -print -quit 2>/dev/null)" ]]; then
         bash scripts/ci/build-providers.sh
       fi
@@ -143,9 +143,10 @@ validate scope='providers':
       exit 1
     fi
     shopt -s nullglob
-    wasms=(target/wasm32-wasip2/release/*.wasm)
+    wasm_dir="${CARGO_TARGET_DIR:-target}/wasm32-wasip2/release"
+    wasms=("$wasm_dir"/*.wasm)
     if (( ${#wasms[@]} == 0 )); then
-      printf 'no WASM components found in target/wasm32-wasip2/release\n' >&2
+      printf 'no WASM components found in %s\n' "$wasm_dir" >&2
       exit 1
     fi
     for wasm in "${wasms[@]}"; do

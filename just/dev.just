@@ -40,8 +40,12 @@ refresh:
 # Regenerate the provider JSON schema.
 [group('dev')]
 schema:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo build -q --release -p omnifs-provider --example write_provider
-    target/release/examples/write_provider > crates/omnifs-provider/schema/omnifs.provider.schema.json
+    schema=crates/omnifs-provider/schema/omnifs.provider.schema.json
+    "${CARGO_TARGET_DIR:-target}/release/examples/write_provider" > "$schema.new"
+    mv "$schema.new" "$schema"
 
 # Build provider artifacts and launch the supported contributor runtime.
 [group('dev')]
