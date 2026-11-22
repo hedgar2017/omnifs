@@ -11,4 +11,5 @@ pub mod receipt;
 pub mod setup;
 pub mod skill;
 pub mod status;
+pub mod sync;
 pub mod version;

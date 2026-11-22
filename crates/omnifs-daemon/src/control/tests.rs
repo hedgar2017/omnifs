@@ -179,6 +179,37 @@ async fn a_daemon_names_its_control_protocol_and_its_teardown() {
     runtime.shutdown().await;
 }
 
+/// The begin and the end of a sync of a mount that the daemon does not
+/// serve are errors of a mount that is not found.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(unsafe_code)]
+async fn a_sync_of_a_mount_that_the_daemon_does_not_serve_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = crate::ENV_LOCK.lock().await;
+    let home = std::fs::canonicalize(dir.path()).unwrap();
+    unsafe {
+        std::env::set_var("OMNIFS_HOME", &home);
+    }
+    let runtime = test_daemon(&dir).await;
+    let mut c = client(&home.join("control.sock")).await;
+    let status = c
+        .begin_sync(wire::BeginSyncRequest {
+            mount: "missing".to_owned(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&status), ControlErrorCode::NotFound);
+    let status = c
+        .end_sync(wire::EndSyncRequest {
+            mount: "missing".to_owned(),
+            sync: 1,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&status), ControlErrorCode::NotFound);
+    runtime.shutdown().await;
+}
+
 /// The daemon answers a message over the limit of a control message with
 /// its own error, which names the size and the limit.
 #[test]

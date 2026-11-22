@@ -81,6 +81,9 @@ pub enum Commands {
     /// List or remove stored credentials
     Credential(commands::credential::CredentialArgs),
 
+    /// Begin or end the sync of a mount, in which each feed of it is due once
+    Sync(commands::sync::SyncArgs),
+
     /// Start the daemon, list providers, and offer quick-start mounts and filesystems
     Setup(commands::setup::SetupArgs),
 
@@ -170,6 +173,13 @@ impl Commands {
                     commands::credential::CredentialCommand::Rm(_) => "credential.rm",
                 },
             ),
+            Self::Sync(args) => (
+                Some("sync"),
+                match &args.command {
+                    commands::sync::SyncCommand::Begin(_) => "sync.begin",
+                    commands::sync::SyncCommand::End(_) => "sync.end",
+                },
+            ),
             Self::Setup(_) => (Some("setup"), "setup"),
             Self::Skill(_) => (Some("skill"), "skill"),
             Self::Doctor => (Some("doctor"), "doctor"),
@@ -215,6 +225,7 @@ impl Commands {
             Self::Inspect(args) => args.run(output).await.map(|()| ExitCode::Success),
             Self::Mount(args) => args.run(output).await,
             Self::Credential(args) => args.run(output).await,
+            Self::Sync(args) => args.run(output).await,
             Self::Setup(args) => Box::pin(args.run(output)).await,
             Self::Skill(args) => args.run(&output).map(|()| ExitCode::Success),
             Self::Completions(args) => args.run(&output).map(|()| ExitCode::Success),

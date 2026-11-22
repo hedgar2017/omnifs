@@ -508,6 +508,32 @@ impl wire::control_server::Control for GrpcControlService {
         })
     }
 
+    async fn begin_sync(
+        &self,
+        request: Request<wire::BeginSyncRequest>,
+    ) -> Result<Response<wire::BeginSyncResponse>, Status> {
+        let daemon = self.daemon()?;
+        let mount = request.into_inner().mount;
+        let sync = daemon
+            .serving
+            .begin_sync(&mount)
+            .map_err(|error| sync_status(&error))?;
+        reply(wire::BeginSyncResponse { sync })
+    }
+
+    async fn end_sync(
+        &self,
+        request: Request<wire::EndSyncRequest>,
+    ) -> Result<Response<wire::Empty>, Status> {
+        let daemon = self.daemon()?;
+        let request = request.into_inner();
+        daemon
+            .serving
+            .end_sync(&request.mount, request.sync)
+            .map_err(|error| sync_status(&error))?;
+        reply(wire::Empty {})
+    }
+
     async fn get_mount(
         &self,
         request: Request<wire::GetMountRequest>,
@@ -772,4 +798,14 @@ impl wire::control_server::Control for GrpcControlService {
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
     }
+}
+
+/// The status of the error of a begin or an end of a sync.
+fn sync_status(error: &omnifs_engine::SyncError) -> Status {
+    let code = match error {
+        omnifs_engine::SyncError::UnknownMount(_) => ControlErrorCode::NotFound,
+        omnifs_engine::SyncError::Unavailable(_) => ControlErrorCode::NotReady,
+        omnifs_engine::SyncError::Engine { .. } => ControlErrorCode::InvalidRequest,
+    };
+    grpc_status(ControlError::new(code, error.to_string()))
 }

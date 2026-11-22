@@ -405,6 +405,24 @@ impl RpcClient {
             .map_err(Into::into)
     }
 
+    /// Begin a sync of `mount`, and the number of the sync.
+    pub(crate) async fn begin_sync(&self, mount: &str) -> anyhow::Result<u64> {
+        let request = wire::BeginSyncRequest {
+            mount: mount.to_owned(),
+        };
+        Ok(bounded_unary!(self, begin_sync, request).into_inner().sync)
+    }
+
+    /// End the sync `sync` of `mount`.
+    pub(crate) async fn end_sync(&self, mount: &str, sync: u64) -> anyhow::Result<()> {
+        let request = wire::EndSyncRequest {
+            mount: mount.to_owned(),
+            sync,
+        };
+        bounded_unary!(self, end_sync, request);
+        Ok(())
+    }
+
     pub(crate) async fn list_credentials(&self) -> anyhow::Result<Vec<CredentialStatus>> {
         let response = bounded_unary!(self, list_credentials, wire::Empty {}).into_inner();
         response

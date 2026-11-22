@@ -162,5 +162,7 @@ impl wire::control_server::Control for Service {
         subscribe_inspector(wire::InspectorRequest) -> Self::SubscribeInspectorStream;
         stream_logs(wire::StreamLogsRequest) -> Self::StreamLogsStream;
         watch_phase(wire::Empty) -> Self::WatchPhaseStream;
+        begin_sync(wire::BeginSyncRequest) -> wire::BeginSyncResponse;
+        end_sync(wire::EndSyncRequest) -> wire::Empty;
     }
 }
