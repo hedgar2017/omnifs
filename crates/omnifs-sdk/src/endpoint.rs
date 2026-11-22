@@ -43,8 +43,8 @@
 //! and `Accept`.
 //!
 //! Every send participates in the per-authority rate-limit breaker: a 429
-//! arms a cooldown for the authority of the URL that answered (honoring
-//! `Retry-After`, else the endpoint's [`RateLimitPolicy`]), and later sends
+//! with a `Retry-After` arms a window for the authority of the URL that
+//! answered, to the instant that it states, and later sends
 //! to that authority
 //! fast-fail in-guest until the window passes. An upstream that signals
 //! errors off the status line (a 403 rate limit, an error in a 200 body)
@@ -77,15 +77,14 @@ use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 
 /// Per-endpoint rate-limit policy, generated from
 /// `#[endpoint(rate_limit = ..)]` (`"off"` or a whole number of seconds).
-/// `Default` uses the breaker's default cooldown when a 429 carries no
-/// `Retry-After`; `Cooldown` overrides that default; `Off` opts the endpoint
+/// `Default` arms the breaker for the `Retry-After` of a 429 alone; `Off`
+/// opts the endpoint
 /// out of arming the breaker entirely. The pre-send check still runs under
 /// `Off`, so a window armed by another endpoint on the same authority still
 /// fast-fails this one.
 #[derive(Clone, Copy, Debug)]
 pub enum RateLimitPolicy {
     Default,
-    Cooldown(core::time::Duration),
     Off,
 }
 
@@ -114,7 +113,7 @@ pub trait Endpoint {
 
     /// How a 429 from this endpoint arms the per-authority breaker.
     /// Generated from `#[endpoint(rate_limit = ..)]`; defaults to honoring
-    /// `Retry-After` with the breaker's built-in fallback cooldown.
+    /// the `Retry-After` of a 429 alone.
     fn rate_limit(&self) -> RateLimitPolicy {
         RateLimitPolicy::Default
     }
@@ -460,7 +459,7 @@ impl<E: EndpointHooks> ResponsePolicy<E> {
 
         match resp.status() {
             StatusCode::TOO_MANY_REQUESTS => {
-                self.record_rate_limit(authority.as_deref(), self.retry_after(resp));
+                self.record_rate_limit(authority.as_deref(), Self::retry_after(resp));
             },
             status if status.as_u16() < 400 => self.record_success(authority.as_deref()),
             _ => {},
@@ -468,15 +467,11 @@ impl<E: EndpointHooks> ResponsePolicy<E> {
         Ok(())
     }
 
-    fn retry_after(&self, resp: &Response<Vec<u8>>) -> Option<core::time::Duration> {
+    /// The `Retry-After` of `resp`, the wait that its upstream states.
+    fn retry_after(resp: &Response<Vec<u8>>) -> Option<core::time::Duration> {
         let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok());
-        let parsed = header("retry-after")
-            .and_then(|value| crate::rate_limit::retry_after(value, header("date")));
-        let cooldown = match self.rate_limit {
-            RateLimitPolicy::Cooldown(d) => Some(d),
-            _ => None,
-        };
-        parsed.or(cooldown)
+        header("retry-after")
+            .and_then(|value| crate::rate_limit::retry_after(value, header("date")))
     }
 
     fn record_rate_limit(
@@ -725,19 +720,6 @@ mod tests {
     }
     impl EndpointHooks for TestEpOff {}
 
-    struct TestEpCooldown;
-
-    impl Endpoint for TestEpCooldown {
-        fn base(&self) -> &'static str {
-            "https://cooldown-policy.test"
-        }
-
-        fn rate_limit(&self) -> RateLimitPolicy {
-            RateLimitPolicy::Cooldown(Duration::from_secs(45))
-        }
-    }
-    impl EndpointHooks for TestEpCooldown {}
-
     /// The answer of `answered` to a request to `asked`.
     fn response(
         asked: &str,
@@ -861,30 +843,6 @@ mod tests {
             crate::rate_limit::with_breaker(|b| b.check("https://off-policy.test")),
             None
         );
-
-        crate::rate_limit::with_breaker(crate::rate_limit::RateLimitBreaker::clear);
-    }
-
-    #[test]
-    fn endpoint_cooldown_policy_overrides_default() {
-        crate::rate_limit::with_breaker(crate::rate_limit::RateLimitBreaker::clear);
-
-        let cx = Cx::new(1, Rc::new(RefCell::new(())));
-        let (_request, policy) = cx
-            .endpoint(TestEpCooldown)
-            .get("/x")
-            .into_http_request()
-            .unwrap();
-        let resp = response("https://cooldown-policy.test/x", None, 429, &[]);
-        policy.apply(&resp).unwrap();
-        let error = resp.error_for_status_ref().unwrap_err();
-
-        assert_eq!(error.kind(), ProviderErrorKind::RateLimited);
-        let remaining =
-            crate::rate_limit::with_breaker(|b| b.check("https://cooldown-policy.test"))
-                .expect("breaker should be open");
-        assert!(remaining <= Duration::from_secs(45));
-        assert!(remaining > Duration::from_secs(30));
 
         crate::rate_limit::with_breaker(crate::rate_limit::RateLimitBreaker::clear);
     }

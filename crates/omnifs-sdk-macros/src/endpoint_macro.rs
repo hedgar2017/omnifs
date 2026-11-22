@@ -18,18 +18,12 @@ struct EndpointArgs {
 
 enum RateLimitArg {
     Off,
-    Cooldown(u64),
 }
 
 impl RateLimitArg {
     fn tokens(&self) -> TokenStream2 {
         match self {
             Self::Off => quote! { omnifs_sdk::endpoint::RateLimitPolicy::Off },
-            Self::Cooldown(seconds) => quote! {
-                omnifs_sdk::endpoint::RateLimitPolicy::Cooldown(
-                    core::time::Duration::from_secs(#seconds)
-                )
-            },
         }
     }
 }
@@ -130,16 +124,13 @@ impl EndpointArgs {
                         "`rate_limit` may only be specified once",
                     ));
                 }
-                self.rate_limit = Some(if value_str == "off" {
-                    RateLimitArg::Off
-                } else {
-                    RateLimitArg::Cooldown(value_str.parse::<u64>().map_err(|_| {
-                        syn::Error::new(
-                            mnv.value.span(),
-                            "rate_limit must be \"off\" or a whole number of seconds",
-                        )
-                    })?)
-                });
+                if value_str != "off" {
+                    return Err(syn::Error::new(
+                        mnv.value.span(),
+                        "rate_limit must be \"off\": a window is the Retry-After of its upstream alone",
+                    ));
+                }
+                self.rate_limit = Some(RateLimitArg::Off);
             },
             _ => {
                 return Err(syn::Error::new(

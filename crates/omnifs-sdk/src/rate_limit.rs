@@ -1,10 +1,10 @@
 //! Per-authority rate-limit circuit breaker.
 //!
 //! One breaker per provider instance, shared by every HTTP send path in this
-//! crate (raw `cx.http()`, typed endpoints, and blob fetches). A 429 arms a
-//! cooldown window for the request URL's authority, sized by `Retry-After`
-//! when present, else by the endpoint's
-//! [`crate::endpoint::RateLimitPolicy`], else by a small default; while the
+//! crate (raw `cx.http()`, typed endpoints, and blob fetches). A 429 with a
+//! `Retry-After` arms a window for the request URL's authority until the
+//! instant that the upstream states, and a 429 without one arms none: the
+//! host asks no time of its own. While the
 //! window is open, sends to that authority fail in-guest with a
 //! rate-limited error carrying the remaining cooldown, without issuing a
 //! callout. An answer is of the authority of the URL that answered it, which
@@ -27,17 +27,9 @@ use std::time::Instant;
 
 use hashbrown::HashMap;
 
-// 429 cooldown when the upstream sent no Retry-After. Placeholder until a
-// per-endpoint #[endpoint(rate_limit = ...)] policy makes this configurable.
-const DEFAULT_COOLDOWN: Duration = Duration::from_secs(5);
-
-// Upper bound on a single breaker window. Guards against an upstream
-// `Retry-After` large enough to overflow `Instant::now() + cooldown` (which
-// would panic the guest) or wedge the breaker open indefinitely. One hour is
-// well past any real backoff for a filesystem.
-const MAX_COOLDOWN: Duration = Duration::from_hours(1);
-
-type BreakerMap = HashMap<String, Instant, BuildHasherDefault<DefaultHasher>>;
+/// The instant that a window closes, none for an instant past the clock of
+/// the guest, which closes it only at a clear.
+type BreakerMap = HashMap<String, Option<Instant>, BuildHasherDefault<DefaultHasher>>;
 
 /// Map of authority to the instant its 429 window closes. Single-threaded
 /// (`RefCell`) because provider guests run one operation at a time; access
@@ -60,6 +52,9 @@ impl RateLimitBreaker {
         let now = Instant::now();
         let open = self.open.borrow();
         let open_until = open.get(authority).copied()?;
+        let Some(open_until) = open_until else {
+            return Some(Duration::MAX);
+        };
         if open_until > now {
             return Some(open_until.duration_since(now));
         }
@@ -68,15 +63,16 @@ impl RateLimitBreaker {
         None
     }
 
-    /// Arm after a 429. `retry_after` is the parsed Retry-After (or the
-    /// endpoint's policy cooldown) if present; without it the default
-    /// cooldown applies. The window is clamped so an absurd upstream value
-    /// can neither overflow `Instant` arithmetic nor wedge the breaker open.
+    /// Arm after a 429 with the `retry_after` that its upstream states, to
+    /// the instant that it names; a 429 without one arms nothing.
     pub fn record_429(&self, authority: &str, retry_after: Option<Duration>) {
-        let cooldown = retry_after.unwrap_or(DEFAULT_COOLDOWN).min(MAX_COOLDOWN);
-        self.open
-            .borrow_mut()
-            .insert(authority.to_string(), Instant::now() + cooldown);
+        let Some(retry_after) = retry_after else {
+            return;
+        };
+        self.open.borrow_mut().insert(
+            authority.to_string(),
+            Instant::now().checked_add(retry_after),
+        );
     }
 
     /// Close after a successful (status < 400) response.
@@ -222,27 +218,26 @@ mod tests {
     }
 
     #[test]
-    fn missing_retry_after_uses_default_cooldown() {
+    fn missing_retry_after_arms_no_window() {
         with_breaker(RateLimitBreaker::clear);
         let auth = "https://missing-retry-after.test";
 
         with_breaker(|b| b.record_429(auth, None));
-        let remaining = with_breaker(|b| b.check(auth)).expect("breaker should be open");
-
-        assert!(remaining <= DEFAULT_COOLDOWN);
+        assert_eq!(with_breaker(|b| b.check(auth)), None);
     }
 
     #[test]
-    fn huge_retry_after_is_clamped_not_panicking() {
+    fn huge_retry_after_holds_the_window_without_panicking() {
         with_breaker(RateLimitBreaker::clear);
         let auth = "https://huge-retry.test";
 
-        // `u64::MAX` seconds would overflow `Instant::now() + Duration` without
-        // the `MAX_COOLDOWN` clamp; this asserts the clamp and the no-panic.
+        // `u64::MAX` seconds is past the clock: the window stands until a
+        // clear, without an overflow of `Instant`.
         with_breaker(|b| b.record_429(auth, Some(Duration::from_secs(u64::MAX))));
         let remaining = with_breaker(|b| b.check(auth)).expect("breaker should be open");
 
-        assert!(remaining <= MAX_COOLDOWN);
+        assert_eq!(remaining, Duration::MAX);
+        with_breaker(RateLimitBreaker::clear);
     }
 
     #[test]

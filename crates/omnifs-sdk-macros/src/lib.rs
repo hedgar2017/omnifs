@@ -165,8 +165,8 @@ pub fn path_segment(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `User-Agent`). Auth headers are NOT declared here: credentials are
 ///   host-managed and declared via `auth = ..` on `#[omnifs_sdk::provider]`;
 ///   the host materializes them into requests.
-/// - `rate_limit = "off"` or `rate_limit = "<seconds>"`: the per-authority
-///   429 breaker policy (default cooldown applies when omitted).
+/// - `rate_limit = "off"`: the endpoint arms no per-authority 429 breaker;
+///   without it, a 429 arms the breaker for its `Retry-After` alone.
 ///
 /// Use via `cx.endpoint::<MyApi>().get("/path")..`.
 #[proc_macro_derive(Endpoint, attributes(endpoint))]
