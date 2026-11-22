@@ -102,7 +102,7 @@ pub enum Commands {
     /// command, not invoked directly. The daemon still runs as its own process
     /// over the local control socket; this is the same binary, not a separate entrypoint.
     #[command(hide = true)]
-    Daemon(DaemonArgs),
+    Daemon,
 
     /// Run a host filesystem. Internal: launched by filesystem lifecycle commands.
     #[command(hide = true)]
@@ -116,33 +116,9 @@ pub enum Commands {
     Fs(commands::fs::FsArgs),
 }
 
-/// The arguments of the hidden `omnifs daemon`.
-#[derive(clap::Args, Debug, Clone)]
-pub struct DaemonArgs {
-    /// The daemon is the process of a command of omnifs that found none, in
-    /// place of the one of another parent, as a service manager.
-    #[arg(long, hide = true)]
-    started_by_command: bool,
-}
-
-impl DaemonArgs {
-    /// The flag of a daemon that a command of omnifs starts.
-    pub(crate) const STARTED_BY_COMMAND: &'static str = "--started-by-command";
-
-    /// Who started the daemon: a command of omnifs with its flag, and
-    /// another parent without it.
-    fn owner(&self) -> omnifs_bootstrap::DaemonOwner {
-        if self.started_by_command {
-            omnifs_bootstrap::DaemonOwner::Command
-        } else {
-            omnifs_bootstrap::DaemonOwner::Service
-        }
-    }
-}
-
 impl Cli {
     pub(crate) fn runs_daemon(&self) -> bool {
-        if matches!(&self.command, Some(Commands::Daemon(_))) {
+        if matches!(&self.command, Some(Commands::Daemon)) {
             return true;
         }
         false
@@ -199,7 +175,7 @@ impl Commands {
             Self::Doctor => (Some("doctor"), "doctor"),
             Self::Completions(_) => (Some("completions"), "completions"),
             Self::Version => (Some("version"), "version"),
-            Self::Daemon(_) => (None, "daemon"),
+            Self::Daemon => (None, "daemon"),
             Self::RunFs(_) => (None, "run-fs"),
             Self::Fs(args) => (
                 Some("fs"),
@@ -243,9 +219,7 @@ impl Commands {
             Self::Skill(args) => args.run(&output).map(|()| ExitCode::Success),
             Self::Completions(args) => args.run(&output).map(|()| ExitCode::Success),
             Self::Version => commands::version::run(output).await,
-            Self::Daemon(args) => omnifs_daemon::run(args.owner())
-                .await
-                .map(|()| ExitCode::Success),
+            Self::Daemon => omnifs_daemon::run().await.map(|()| ExitCode::Success),
             Self::RunFs(_) => {
                 anyhow::bail!("run-fs must be dispatched before the CLI runtime starts")
             },

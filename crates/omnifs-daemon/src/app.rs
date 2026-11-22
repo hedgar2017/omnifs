@@ -38,9 +38,7 @@ fn next_recovery_id() -> RecoveryId {
 }
 
 /// Bind control first, then keep it available through startup and recovery.
-/// The daemon records `owner`, who started it, in its profile once it holds
-/// the control socket of that profile.
-pub async fn run(owner: omnifs_bootstrap::DaemonOwner) -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
     let context = Arc::new(DaemonContext::resolve()?);
     logging::verify_resolved_profile(&context)?;
     let embedded = Arc::new(EmbeddedProviders::load()?);
@@ -49,9 +47,7 @@ pub async fn run(owner: omnifs_bootstrap::DaemonOwner) -> anyhow::Result<()> {
     if let Err(error) = context
         .endpoint()
         .write_process_identity(context.process_identity())
-        .and_then(|()| context.endpoint().write_daemon_owner(owner))
     {
-        unpublish_process_identity(&context);
         remove_control_socket(&context);
         return Err(error.into());
     }
@@ -514,7 +510,7 @@ mod tests {
         std::fs::create_dir_all(&control_store).unwrap();
         std::fs::write(control_store.join("state.sqlite3"), b"not sqlite").unwrap();
 
-        let daemon = tokio::spawn(super::run(omnifs_bootstrap::DaemonOwner::Service));
+        let daemon = tokio::spawn(async { super::run().await });
         let socket = home.join("control.sock");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let (instance_id, recovery_id) = loop {
