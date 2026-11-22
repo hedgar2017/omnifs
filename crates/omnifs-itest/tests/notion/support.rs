@@ -1,13 +1,13 @@
 //! Notion provider route-test helpers.
 
-use std::future::Future;
 use std::time::Duration;
 
 use omnifs_core::path::Path;
-use omnifs_engine::{DirCursor, LookupAnswer, Namespace, NsError};
+use omnifs_engine::{Namespace, NsError};
+use omnifs_itest::support::{Answer, Request};
 use omnifs_itest::{RuntimeHarness, make_initialized_runtime};
 use omnifs_wit::host::types::{
-    Callout, CalloutError, CalloutResult, ErrorKind, Header, HttpRequest, HttpResponse,
+    CalloutError, CalloutResult, ErrorKind, Header, HttpRequest, HttpResponse,
 };
 use serde_json::{Value, json};
 
@@ -38,45 +38,6 @@ pub fn notion_harness() -> RuntimeHarness {
     )
 }
 
-/// Run a namespace operation, answer the callouts it makes in order with
-/// `answers`, and return its output with the requests of those callouts. An
-/// operation that makes another number of callouts times out.
-pub async fn answering<T>(
-    harness: &RuntimeHarness,
-    operation: impl Future<Output = T>,
-    answers: Vec<CalloutResult>,
-) -> (T, Vec<HttpRequest>) {
-    let runtime = &harness.runtime;
-    let answer = async {
-        let mut requests = Vec::new();
-        for result in answers {
-            let callout = loop {
-                match runtime.try_recv_test_callout() {
-                    Some(callout) => break callout,
-                    None => tokio::time::sleep(Duration::from_millis(2)).await,
-                }
-            };
-            let Callout::Fetch(request) = callout.callout() else {
-                panic!("expected a fetch, got {:?}", callout.callout());
-            };
-            requests.push(request.clone());
-            callout.answer(result);
-        }
-        requests
-    };
-    let (output, requests) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(operation, answer)
-    })
-    .await
-    .expect("the operation makes exactly the answered requests");
-    (output, requests)
-}
-
-/// Run `operation`, which makes no request.
-pub async fn served<T>(harness: &RuntimeHarness, operation: impl Future<Output = T>) -> T {
-    answering(harness, operation, Vec::new()).await.0
-}
-
 /// The value of header `name` of `request`.
 pub fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
     request
@@ -88,7 +49,11 @@ pub fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a st
 
 /// Check that `request` is `method` of `path` of the API of Notion with
 /// `body`, at the version of the provider.
-pub fn expect(request: &HttpRequest, method: &str, path: &str, body: Option<&Value>) {
+pub fn expect(request: &Request, method: &str, path: &str, body: Option<&Value>) {
+    let Request::Fetch(request) = request else {
+        panic!("a request of Notion is a fetch: {request:?}");
+    };
+    assert!(!request.follow_redirects, "{}", request.url);
     assert_eq!(request.method, method, "{}", request.url);
     assert_eq!(
         request.url,
@@ -109,7 +74,7 @@ pub fn expect(request: &HttpRequest, method: &str, path: &str, body: Option<&Val
 }
 
 /// Check that `request` is the search with `page_size` from `cursor`.
-pub fn expect_search(request: &HttpRequest, page_size: usize, cursor: Option<&str>) {
+pub fn expect_search(request: &Request, page_size: usize, cursor: Option<&str>) {
     let mut body = json!({
         "sort": { "direction": "descending", "timestamp": "last_edited_time" },
         "page_size": page_size,
@@ -121,8 +86,8 @@ pub fn expect_search(request: &HttpRequest, page_size: usize, cursor: Option<&st
 }
 
 /// An answer of Notion with `status`, `headers`, and `body`.
-pub fn answer(status: u16, headers: &[(&str, &str)], body: &Value) -> CalloutResult {
-    CalloutResult::HttpResponse(HttpResponse {
+pub fn answer(status: u16, headers: &[(&str, &str)], body: &Value) -> Answer {
+    Answer::Fetch(CalloutResult::HttpResponse(HttpResponse {
         status,
         headers: headers
             .iter()
@@ -133,16 +98,16 @@ pub fn answer(status: u16, headers: &[(&str, &str)], body: &Value) -> CalloutRes
             .collect(),
         body: body.to_string().into_bytes(),
         redirected: None,
-    })
+    }))
 }
 
 /// An answer `200` with `body`, of a `Date` past the minute of `EDITED`.
-pub fn ok(body: &Value) -> CalloutResult {
+pub fn ok(body: &Value) -> Answer {
     answer(200, &[("Date", LATER)], body)
 }
 
 /// An error answer of Notion with `status` and `code`.
-pub fn failure(status: u16, code: &str) -> CalloutResult {
+pub fn failure(status: u16, code: &str) -> Answer {
     answer(
         status,
         &[("Date", LATER)],
@@ -156,7 +121,7 @@ pub fn failure(status: u16, code: &str) -> CalloutResult {
 }
 
 /// An answer `429` of a rate limit, with a `Retry-After` of one second.
-pub fn rate_limited() -> CalloutResult {
+pub fn rate_limited() -> Answer {
     answer(
         429,
         &[("Retry-After", "1")],
@@ -165,12 +130,12 @@ pub fn rate_limited() -> CalloutResult {
 }
 
 /// A failure of the network.
-pub fn network() -> CalloutResult {
-    CalloutResult::CalloutError(CalloutError {
+pub fn network() -> Answer {
+    Answer::Fetch(CalloutResult::CalloutError(CalloutError {
         kind: ErrorKind::Network,
         message: "the network of a fixture failed".to_string(),
         retryable: true,
-    })
+    }))
 }
 
 /// The ID of a fixture `n`, as a path names it.
@@ -289,48 +254,10 @@ pub fn markdown(text: &str, unknown: &[u32]) -> Value {
     })
 }
 
-/// Look up `path` under the mount a segment at a time, to its first missing
-/// segment.
-pub async fn lookup(harness: &RuntimeHarness, path: &str) -> Result<LookupAnswer, NsError> {
-    let mut answer = harness.namespace.lookup(Path::root(), "notion").await?;
-    for segment in path.split('/') {
-        if answer.is_missing() {
-            break;
-        }
-        answer = harness.namespace.lookup(answer.path, segment).await?;
-    }
-    Ok(answer)
-}
-
-/// The names of the directory at `path`, sorted.
-pub async fn names(harness: &RuntimeHarness, path: &str) -> Result<Vec<String>, NsError> {
-    let dir = lookup(harness, path).await?;
-    let page = harness
-        .namespace
-        .readdir(dir.path, DirCursor::start(), 0)
-        .await?;
-    let mut names = page
-        .entries
-        .into_iter()
-        .map(|entry| entry.name)
-        .collect::<Vec<_>>();
-    names.sort();
-    Ok(names)
-}
-
-pub async fn read(harness: &RuntimeHarness, path: &str) -> Result<String, NsError> {
-    let file = lookup(harness, path).await?;
-    contents(harness, file.path).await
-}
-
-/// The file at `path` under the mount by its path alone, without a lookup,
-/// as by a filehandle held across a change of the projection.
+/// The whole of the file at `path` by its path alone, without a lookup, as
+/// by a filehandle held across a change of the projection.
 pub async fn read_at(harness: &RuntimeHarness, path: &str) -> Result<String, NsError> {
-    let file = Path::parse(&format!("/notion/{path}")).unwrap();
-    contents(harness, file).await
-}
-
-async fn contents(harness: &RuntimeHarness, file: Path) -> Result<String, NsError> {
+    let file = Path::parse(path).unwrap();
     let read = harness.namespace.read(file, 0, u32::MAX).await?;
     Ok(String::from_utf8(read.bytes).unwrap())
 }
