@@ -346,12 +346,30 @@ impl HttpStack {
             },
             None => RefreshOutcome::NotApplicable,
         };
-        match rejection {
-            RefreshOutcome::Refreshed => send().await,
-            RefreshOutcome::NoCredential | RefreshOutcome::NotApplicable => Ok(response),
+        let (Some(auth), RefreshOutcome::Refreshed) = (&self.auth, &rejection) else {
+            return match rejection {
+                RefreshOutcome::RefreshFailed(error) => {
+                    Err(callout_denied(format!("auth refresh failed: {error}")))
+                },
+                _ => Ok(response),
+            };
+        };
+        // The answer to the refreshed credential is of the binding too: an
+        // upstream that rejects it again is known at once, not at the next
+        // request. It is the answer of the request, without another send.
+        let response = send().await?;
+        match auth
+            .report_rejected_for_response(
+                url,
+                response.status().as_u16(),
+                www_authenticate(response.headers()),
+            )
+            .await
+        {
             RefreshOutcome::RefreshFailed(error) => {
                 Err(callout_denied(format!("auth refresh failed: {error}")))
             },
+            _ => Ok(response),
         }
     }
 

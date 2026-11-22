@@ -271,6 +271,7 @@ async fn a_static_token_that_the_upstream_rejects_at_a_callout_requires_reauthen
                 url: api.url(),
                 headers: Vec::new(),
                 body: None,
+                follow_redirects: false,
             };
             match stack.fetch(&request, Duration::from_secs(5)).await {
                 wit_types::CalloutResult::HttpResponse(response) => {
@@ -1219,6 +1220,40 @@ async fn a_hop_that_rejects_its_credential_refreshes_it_and_asks_again() {
             .map(|r| path_of(r))
             .collect::<Vec<_>>(),
         ["/start", "/resource", "/resource"]
+    );
+}
+
+/// The answer to a refreshed credential that the upstream rejects again is
+/// reported to the credential at once, and is the answer of the request.
+#[tokio::test]
+async fn an_upstream_that_rejects_the_refreshed_credential_is_reported_with_its_answer() {
+    let tokens = FakeTokenServer::start(false).await;
+    let upstream = Upstream::start(|_| {
+        reply(
+            "401 Unauthorized",
+            &[("www-authenticate", "Bearer error=\"invalid_token\"")],
+            "",
+        )
+    })
+    .await;
+    let (auth, _sink, _key) = oauth_binding(tokens.endpoint(), "localhost".to_string());
+    let stack = HttpStack::with_https_client(
+        Some(auth),
+        RuntimeAuthority::for_test(&["localhost"], &[], &[]),
+        local_client(),
+    );
+    let mut request = get(upstream.url("localhost", "/resource"), false);
+    request.headers.clear();
+    let result = stack.fetch(&request, Duration::from_secs(5)).await;
+    assert!(
+        matches!(&result, wit_types::CalloutResult::HttpResponse(response) if response.status == 401),
+        "{result:?}"
+    );
+    assert_eq!(upstream.requests().len(), 2);
+    assert_eq!(
+        tokens.refreshes(),
+        2,
+        "each rejection reached the credential"
     );
 }
 
