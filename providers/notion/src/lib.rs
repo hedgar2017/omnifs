@@ -120,7 +120,7 @@ fn fed_only<O: Object>(
     display_name = "Notion",
     description = "pages, data sources, and comments from your workspace",
     mount = "notion",
-    projection = 1,
+    projection = 2,
     capabilities(domain(
         "api.notion.com",
         "Fetch the pages, data sources, page content, and comments of a Notion workspace."

@@ -15,7 +15,7 @@
 //! by the `Date` of their first answer, count as lacking after the end of that
 //! minute, and the next read takes them once more.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use omnifs_sdk::prelude::*;
@@ -100,38 +100,69 @@ enum Stage {
     },
 }
 
-/// The token of the feed of a page: the `last_edited_time` of the page and
-/// the next request of an unfinished answer. The token of a removed page is
-/// `null`.
+/// The token of the feed of a page: the `last_edited_time` of the page, its
+/// unfinished content and its unfinished comments, each of which the read
+/// that asks for it continues, and the time of the computer after which its
+/// finished comments count as lacking. The token of a removed page is `null`.
 #[derive(Serialize, Deserialize)]
 struct PageToken {
     #[serde(with = "time::serde::rfc3339")]
     last_edited_time: OffsetDateTime,
-    next: Option<PageRequest>,
+    content: Option<Content>,
+    comments: Option<Comments>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    comments_until: Option<OffsetDateTime>,
 }
 
-/// The next request of an unfinished answer of a page, with the time of the
+impl PageToken {
+    /// The token of a page with `last_edited_time` whose content and
+    /// comments no read asked for.
+    fn new(last_edited_time: OffsetDateTime) -> Self {
+        Self {
+            last_edited_time,
+            content: None,
+            comments: None,
+            comments_until: None,
+        }
+    }
+}
+
+/// The unfinished content of a page: the IDs of its requests in their order,
+/// the page and then each unknown block of each answer once, the count of
+/// them that it asked, the markdown of their answers, and the time of the
 /// computer at the end of the minute of the `last_edited_time` of the page
 /// for an answer within it.
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PageRequest {
-    /// The content: its markdown so far, none before its first answer, and
-    /// its queue of unknown block IDs.
-    Content {
-        markdown: Option<String>,
-        queue: VecDeque<String>,
-        #[serde(with = "time::serde::rfc3339::option")]
-        until: Option<OffsetDateTime>,
-    },
-    /// The comments at their next cursor, none for their first request, with
-    /// their objects so far.
-    Comments {
-        cursor: Option<String>,
-        comments: Vec<Box<RawValue>>,
-        #[serde(with = "time::serde::rfc3339::option")]
-        until: Option<OffsetDateTime>,
-    },
+struct Content {
+    ids: Vec<Id>,
+    asked: usize,
+    markdown: String,
+    #[serde(with = "time::serde::rfc3339::option")]
+    until: Option<OffsetDateTime>,
+}
+
+impl Content {
+    /// The content of the page `id` before its first request.
+    fn of(id: &Id) -> Self {
+        Self {
+            ids: vec![id.clone()],
+            asked: 0,
+            markdown: String::new(),
+            until: None,
+        }
+    }
+}
+
+/// The unfinished comments of a page: their next cursor, none for their
+/// first request, their objects so far, and the time of the computer at the
+/// end of the minute of the `last_edited_time` of the page for an answer
+/// within it.
+#[derive(Default, Serialize, Deserialize)]
+struct Comments {
+    cursor: Option<String>,
+    comments: Vec<Box<RawValue>>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    until: Option<OffsetDateTime>,
 }
 
 /// The token of the feed of a data source: its `last_edited_time`. The token
@@ -235,6 +266,7 @@ fn cursor_refused(cursor: Option<&String>, response: &HttpResponse) -> bool {
 /// gives `last_edited_time` by the minute.
 fn minute_end(
     last_edited_time: OffsetDateTime,
+    _sent: OffsetDateTime,
     response: &HttpResponse,
 ) -> Result<Option<OffsetDateTime>> {
     let date = response
@@ -395,10 +427,7 @@ impl WorkspaceFeed<'_> {
                     if projected.is_some() {
                         remove_content(self.cx, &id)?;
                     }
-                    let token = PageToken {
-                        last_edited_time: found.last_edited_time,
-                        next: None,
-                    };
+                    let token = PageToken::new(found.last_edited_time);
                     self.inner
                         .push(Inner::Page(id.clone(), encode(&Some(token))?));
                 }
@@ -627,24 +656,37 @@ struct PageFeed<'a> {
     id: &'a Id,
 }
 
-/// What a request of a page leaves: its next request, its end with the time
-/// after which its facts count as lacking, the page gone from the workspace,
-/// or the refusal of its cursor.
-enum PageStep {
-    Next(PageRequest),
-    Done(Option<OffsetDateTime>),
-    Gone,
-    Refused(ProviderError),
+/// What a starting path of a page asks for beside the page: its content, its
+/// comments, or one comment.
+#[derive(Clone, Copy)]
+enum Asked {
+    Content,
+    Comments,
+    Comment,
+}
+
+impl Asked {
+    /// What the starting path `start` asks for: the content for `body.md`,
+    /// the comments for `comments`, and a comment for a path in `comments`.
+    fn of(start: &str) -> Option<Self> {
+        match start {
+            "body.md" => Some(Self::Content),
+            "comments" => Some(Self::Comments),
+            start if start.starts_with("comments/") => Some(Self::Comment),
+            _ => None,
+        }
+    }
 }
 
 impl Page {
-    /// The feed of a page: the next request of its token; else its content
-    /// for the start `body.md`, and its comments for a start in `comments`,
-    /// each after the page by its ID in the same answer for a page without a
-    /// token; else the page by its ID, and after it, in the same answer, the
-    /// content or the comments of a due start of `body.md` or in `comments`
-    /// for a page with another `last_edited_time`. Each answer makes a part
-    /// of each request.
+    /// The feed of a page. A page without a token takes the page by its ID,
+    /// and after it, in the same answer, what its start asks for. A read
+    /// without its fact takes what its start asks for, from the next request
+    /// of it in the token. A read past the deadline takes the page by its
+    /// ID, and after it, in the same answer, what its path asks for of a page
+    /// with another `last_edited_time`. An answer that continues without its
+    /// start takes the next request of the token, of the content before the
+    /// comments. Each answer makes a part of each request.
     pub(crate) async fn feed(cx: FeedCx<PageKey>) -> Result<Feed> {
         let feed = PageFeed {
             cx: &cx,
@@ -655,37 +697,27 @@ impl Page {
             .map(decode_token::<Option<PageToken>>)
             .transpose()?
             .flatten();
-        match (token, request_of(cx.start())) {
-            (
-                Some(PageToken {
-                    last_edited_time,
-                    next: Some(next),
-                }),
-                _,
-            ) => feed.step(last_edited_time, next).await,
-            (Some(token), Some(request)) => feed.step(token.last_edited_time, request).await,
-            (token, request) => feed.page(token, request, request_of(cx.due())).await,
+        let asked = cx.start().or(cx.due()).and_then(Asked::of);
+        let Some(token) = token else {
+            return feed.page(None, asked).await;
+        };
+        let request = match (cx.start(), cx.due()) {
+            (Some(_), _) => asked,
+            (None, Some(_)) => asked.filter(|asked| match asked {
+                Asked::Content => token.content.is_some(),
+                Asked::Comments | Asked::Comment => token.comments.is_some(),
+            }),
+            (None, None) if token.content.is_some() => Some(Asked::Content),
+            (None, None) => token.comments.as_ref().map(|_| Asked::Comments),
+        };
+        match request {
+            Some(Asked::Content) => feed.content(token).await,
+            Some(Asked::Comment) if token.comments.is_none() && feed.has_comments(&token)? => {
+                page_part(&token, false, None)
+            },
+            Some(Asked::Comments | Asked::Comment) => feed.comments(token).await,
+            None => feed.page(Some(token), asked).await,
         }
-    }
-}
-
-/// The first request of the content of a page for the starting path `start`
-/// `body.md`, and of its comments for a starting path in `comments`.
-fn request_of(start: Option<&str>) -> Option<PageRequest> {
-    match start {
-        Some("body.md") => Some(PageRequest::Content {
-            markdown: None,
-            queue: VecDeque::new(),
-            until: None,
-        }),
-        Some(start) if start == "comments" || start.starts_with("comments/") => {
-            Some(PageRequest::Comments {
-                cursor: None,
-                comments: Vec::new(),
-                until: None,
-            })
-        },
-        _ => None,
     }
 }
 
@@ -697,14 +729,9 @@ impl PageFeed<'_> {
     /// The page by its ID: its facts, its folder joining `pages/`, with the
     /// removal of its content and its comments for another `last_edited_time`
     /// than that of `token`, or its removal for `404` or in the trash; then,
-    /// in the same answer, `request`, and `due` for another
-    /// `last_edited_time`.
-    async fn page(
-        &self,
-        token: Option<PageToken>,
-        request: Option<PageRequest>,
-        due: Option<PageRequest>,
-    ) -> Result<Feed> {
+    /// in the same answer, what `asked` names, for a page without a token or
+    /// with another `last_edited_time`.
+    async fn page(&self, token: Option<PageToken>, asked: Option<Asked>) -> Result<Feed> {
         let response = self
             .cx
             .endpoint(NotionApi)
@@ -720,127 +747,99 @@ impl PageFeed<'_> {
         if found.in_trash {
             return self.removal();
         }
-        let changed = token
-            .as_ref()
-            .is_some_and(|token| token.last_edited_time != found.last_edited_time);
-        if changed {
-            remove_content(self.cx, self.id)?;
-        }
         write_page(self.cx, self.id, &object, ListingWrite::Join)?;
-        let next = if changed { due } else { request };
-        page_part(found.last_edited_time, next, None)
-    }
-
-    /// One request of an unfinished answer of the page, a part with the next
-    /// request in its token, or its last part.
-    async fn step(&self, last_edited_time: OffsetDateTime, request: PageRequest) -> Result<Feed> {
-        let step = match request {
-            PageRequest::Content {
-                markdown,
-                queue,
-                until,
-            } => {
-                self.content(last_edited_time, markdown, queue, until)
-                    .await?
+        let mut token = match token {
+            Some(token) if token.last_edited_time == found.last_edited_time => {
+                return page_part(&token, false, None);
             },
-            PageRequest::Comments {
-                cursor,
-                comments,
-                until,
-            } => {
-                self.comments(last_edited_time, cursor, comments, until)
-                    .await?
+            Some(_) => {
+                remove_content(self.cx, self.id)?;
+                PageToken::new(found.last_edited_time)
             },
+            None => PageToken::new(found.last_edited_time),
         };
-        match step {
-            PageStep::Next(request) => page_part(last_edited_time, Some(request), None),
-            PageStep::Done(until) => page_part(last_edited_time, None, until),
-            PageStep::Gone => self.removal(),
-            PageStep::Refused(error) => {
-                let token = PageToken {
-                    last_edited_time,
-                    next: None,
-                };
-                Ok(Feed::restart(encode(&Some(token))?, error))
-            },
+        match asked {
+            Some(Asked::Content) => token.content = Some(Content::of(self.id)),
+            Some(Asked::Comments | Asked::Comment) => token.comments = Some(Comments::default()),
+            None => {},
         }
+        page_part(&token, asked.is_some(), None)
     }
 
     /// A request of the content: the markdown of the page, then that of each
-    /// unknown block of each answer in turn, a block with `404` without its
-    /// markdown, and at its last part `body.md`, the markdown of the page,
-    /// then that of each block in their order, each after an empty line.
-    async fn content(
-        &self,
-        last_edited_time: OffsetDateTime,
-        markdown: Option<String>,
-        mut queue: VecDeque<String>,
-        until: Option<OffsetDateTime>,
-    ) -> Result<PageStep> {
-        let (markdown, until) = match markdown {
-            None => {
-                let response = self.markdown(self.id.as_str()).await?;
-                match response.status() {
-                    200 => {},
-                    404 => return Ok(PageStep::Gone),
-                    _ => return Err(status_error(&response)),
-                }
-                let answer: Markdown = decode(response.body())?;
-                queue.extend(answer.unknown_block_ids);
-                (answer.markdown, minute_end(last_edited_time, &response)?)
-            },
-            Some(mut markdown) => {
-                let block = queue.pop_front().ok_or_else(|| {
-                    ProviderError::invalid_input("the content of a page takes no unknown block")
-                })?;
-                let response = self.markdown(&block).await?;
-                match response.status() {
-                    200 => {
-                        let answer: Markdown = decode(response.body())?;
-                        queue.extend(answer.unknown_block_ids);
-                        markdown.push_str("\n\n");
-                        markdown.push_str(&answer.markdown);
-                    },
-                    404 => {},
-                    _ => return Err(status_error(&response)),
-                }
-                (markdown, until)
-            },
-        };
-        if !queue.is_empty() {
-            return Ok(PageStep::Next(PageRequest::Content {
-                markdown: Some(markdown),
-                queue,
-                until,
-            }));
+    /// unknown block of each answer once, in turn, a block with `404` without
+    /// its markdown, and at its last part `body.md`, the markdown of the
+    /// page, then that of each block in their order, each after an empty
+    /// line. A page with `404` is removed.
+    async fn content(&self, mut token: PageToken) -> Result<Feed> {
+        let mut content = token.content.take().unwrap_or_else(|| Content::of(self.id));
+        if let Some(id) = content.ids.get(content.asked) {
+            let sent = OffsetDateTime::now_utc();
+            let response = self
+                .cx
+                .endpoint(NotionApi)
+                .get(format!("/v1/pages/{id}/markdown"))
+                .query("markdown_version", "v2")
+                .send()
+                .await?;
+            let page = content.asked == 0;
+            match response.status() {
+                200 => {
+                    let answer: Markdown = decode(response.body())?;
+                    if page {
+                        content.until = minute_end(token.last_edited_time, sent, &response)?;
+                    } else {
+                        content.markdown.push_str("\n\n");
+                    }
+                    content.markdown.push_str(&answer.markdown);
+                    for id in &answer.unknown_block_ids {
+                        let id = Id::of(id)?;
+                        if !content.ids.contains(&id) {
+                            content.ids.push(id);
+                        }
+                    }
+                },
+                404 if page => return self.removal(),
+                404 => {},
+                _ => return Err(status_error(&response)),
+            }
+            content.asked += 1;
         }
-        self.cx
-            .file(format!("{}/body.md", self.path()), markdown.into_bytes())?;
-        Ok(PageStep::Done(until))
+        if content.asked < content.ids.len() {
+            token.content = Some(content);
+            return page_part(&token, true, None);
+        }
+        self.cx.file(
+            format!("{}/body.md", self.path()),
+            content.markdown.into_bytes(),
+        )?;
+        page_part(&token, false, content.until)
     }
 
-    /// `GET /v1/pages/{id}/markdown?markdown_version=v2` of the page or of a
-    /// block, by its ID.
-    async fn markdown(&self, id: &str) -> Result<HttpResponse> {
-        self.cx
-            .endpoint(NotionApi)
-            .get(format!("/v1/pages/{id}/markdown"))
-            .query("markdown_version", "v2")
-            .send()
-            .await
+    /// Whether the comments of the page stand: `comments/` complete in the
+    /// projection, before the time after which they count as lacking.
+    fn has_comments(&self, token: &PageToken) -> Result<bool> {
+        Ok(token
+            .comments_until
+            .is_none_or(|until| OffsetDateTime::now_utc() < until)
+            && self
+                .cx
+                .listing(format!("{}/comments", self.path()), ListingForm::Count)?
+                .is_some_and(|comments| comments.complete))
     }
 
     /// A request of the comments, by the cursor of the previous one, and at
     /// their last part each comment, `comments/` complete, and the removal of
     /// each comment of the projection that their answers lack. The comments
-    /// that Notion restricts for the connection are no comments.
-    async fn comments(
-        &self,
-        last_edited_time: OffsetDateTime,
-        cursor: Option<String>,
-        mut comments: Vec<Box<RawValue>>,
-        until: Option<OffsetDateTime>,
-    ) -> Result<PageStep> {
+    /// that Notion restricts for the connection are no comments. A cursor
+    /// that Notion refuses restarts the answer, with the token without the
+    /// comments, and a page with `404` to its first request is removed.
+    async fn comments(&self, mut token: PageToken) -> Result<Feed> {
+        let Comments {
+            cursor,
+            mut comments,
+            mut until,
+        } = token.comments.take().unwrap_or_default();
         let mut request = self
             .cx
             .endpoint(NotionApi)
@@ -850,30 +849,34 @@ impl PageFeed<'_> {
         if let Some(cursor) = &cursor {
             request = request.query("start_cursor", cursor);
         }
+        let sent = OffsetDateTime::now_utc();
         let response = request.send().await?;
         let none = match response.status() {
             200 => false,
-            404 => return Ok(PageStep::Gone),
             _ if cursor_refused(cursor.as_ref(), &response) => {
-                return Ok(PageStep::Refused(status_error(&response)));
+                return Ok(Feed::restart(
+                    encode(&Some(token))?,
+                    status_error(&response),
+                ));
             },
+            404 => return self.removal(),
             _ if restricted(&response) => true,
             _ => return Err(status_error(&response)),
         };
-        let until = match cursor {
-            None => minute_end(last_edited_time, &response)?,
-            Some(_) => until,
-        };
+        if cursor.is_none() {
+            until = minute_end(token.last_edited_time, sent, &response)?;
+        }
         if !none {
             let list: List = decode(response.body())?;
             let next = list.next()?;
             comments.extend(list.results);
             if let Some(cursor) = next {
-                return Ok(PageStep::Next(PageRequest::Comments {
+                token.comments = Some(Comments {
                     cursor: Some(cursor),
                     comments,
                     until,
-                }));
+                });
+                return page_part(&token, true, None);
             }
         }
         let folder = format!("{}/comments", self.path());
@@ -895,7 +898,8 @@ impl PageFeed<'_> {
         for id in listed(self.cx, &folder)?.difference(&taken) {
             self.cx.remove(format!("{folder}/{id}"))?;
         }
-        Ok(PageStep::Done(until))
+        token.comments_until = until;
+        page_part(&token, false, until)
     }
 
     /// The removal of the page, with the token of a removed page.
@@ -937,19 +941,9 @@ impl DataSource {
     }
 }
 
-/// A part of the feed of a page with `last_edited_time` and the next request,
-/// followed by more parts while there is one, its facts counting as lacking
-/// after `until`.
-fn page_part(
-    last_edited_time: OffsetDateTime,
-    next: Option<PageRequest>,
-    until: Option<OffsetDateTime>,
-) -> Result<Feed> {
-    let more = next.is_some();
-    let token = PageToken {
-        last_edited_time,
-        next,
-    };
+/// A part of the feed of a page with `token`, followed by `more` parts, its
+/// facts counting as lacking after `until`.
+fn page_part(token: &PageToken, more: bool, until: Option<OffsetDateTime>) -> Result<Feed> {
     let part = Feed::part(encode(&Some(token))?).more(more);
     Ok(match until {
         Some(until) => part.until(SystemTime::from(until)),
