@@ -94,6 +94,35 @@ async fn read_all_control_exhausts_then_control_still_resolves() {
     }
 }
 
+/// `@all` loads every page of a listing, as many as its provider has: no
+/// count of pages of the host ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn all_loads_every_page_of_a_listing() {
+    let harness = make_runtime();
+    let namespace = harness.namespace.as_ref();
+    let many = resolve(namespace, "/test/hello/many").await;
+    namespace
+        .readdir(many.path.clone(), DirCursor::start(), 0)
+        .await
+        .unwrap();
+    let all = resolve(namespace, "/test/hello/many/@all").await;
+    let result = namespace.read(all.path, 0, u32::MAX).await.unwrap();
+    let result = String::from_utf8(result.bytes).unwrap();
+    assert!(result.contains("complete"), "{result}");
+    let listing = namespace
+        .readdir(many.path, DirCursor::start(), 0)
+        .await
+        .unwrap();
+    assert!(listing.next.is_none());
+    for page in 0..25 {
+        let name = format!("m-{page}");
+        assert!(
+            listing.entries.iter().any(|entry| entry.name == name),
+            "{name}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn root_ignore_synthesized() {
     let harness = make_runtime();

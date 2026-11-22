@@ -156,6 +156,7 @@ async fn test_read_file_sibling_projections_do_not_erase_parent_dirents() {
             "large-ranged",
             "lazy",
             "live-log",
+            "many",
             "message",
             "projected",
             "ranged",

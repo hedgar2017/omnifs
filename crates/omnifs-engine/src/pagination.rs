@@ -6,9 +6,6 @@ use crate::ops::namespace::{ListOutcome, PageRequest};
 use crate::view::DirentsPayload;
 use omnifs_core::path::Path;
 
-/// Safety cap on `@all` pagination.
-pub const MAX_PAGINATION_PAGES: u32 = 20;
-
 /// Outcome of advancing a paged directory by one page.
 pub enum NextPageOutcome {
     Loaded { added: usize, more: bool },
@@ -61,17 +58,12 @@ impl Runtime {
         }
     }
 
-    /// Load pages until the provider exhausts the cursor or the safety cap is
-    /// reached.
+    /// Load pages until the provider exhausts the cursor: no count of pages
+    /// of the host ends it.
     pub async fn paginate_all(&self, path: &Path) -> String {
         let mut pages = 0;
         let mut added_total = 0;
         loop {
-            if pages >= MAX_PAGINATION_PAGES {
-                return format!(
-                    "loaded {pages} pages (+{added_total}); capped at {MAX_PAGINATION_PAGES} pages\n"
-                );
-            }
             match self.paginate_next(path).await {
                 NextPageOutcome::Loaded { added, more } => {
                     pages += 1;
