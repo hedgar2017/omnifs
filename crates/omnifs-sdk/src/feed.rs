@@ -52,8 +52,6 @@
 //! A token is a value of a type of the feed, which this module alone encodes
 //! as the string the host keeps: [`Feed::part`], [`FeedPart::inner`], and
 //! [`Feed::restart`] take it, and [`FeedCx::token`] reads it as that type.
-//! `raw_token`, `raw_part`, `raw_inner`, and `raw_restart` are the same
-//! calls with the string itself.
 //!
 //! A feed reads the projection in the subtree of its object: a listing as
 //! its names, each parsed as a key ([`FeedCx::names`]), or as its count
@@ -159,11 +157,6 @@ impl<K, S> FeedCx<K, S> {
                 })
             })
             .transpose()
-    }
-
-    /// The token as the string the host keeps.
-    pub fn raw_token(&self) -> Option<&str> {
-        self.token.as_deref()
     }
 
     /// The declared starting path, relative to the object, of the operation
@@ -431,19 +424,14 @@ impl Feed {
     /// reads with [`FeedCx::token`]. The answer ends with it unless
     /// [`FeedPart::more`] says more parts follow.
     pub fn part(token: &impl Serialize) -> Result<FeedPart> {
-        encode(token).map(Self::raw_part)
-    }
-
-    /// [`Self::part`] with the token as the string the host keeps.
-    pub fn raw_part(token: impl Into<String>) -> FeedPart {
-        FeedPart {
-            token: token.into(),
+        Ok(FeedPart {
+            token: encode(token)?,
             more: false,
             inner: Vec::new(),
             until: None,
             unlisted: false,
             anew: false,
-        }
+        })
     }
 
     /// A restart of the answer; valid for a call with a token. The host
@@ -452,15 +440,10 @@ impl Feed {
     /// and gives `error` to each operation that waits for the answer. The
     /// writes of the call are not facts.
     pub fn restart(token: &impl Serialize, error: ProviderError) -> Result<Self> {
-        encode(token).map(|token| Self::raw_restart(token, error))
-    }
-
-    /// [`Self::restart`] with the token as the string the host keeps.
-    pub fn raw_restart(token: impl Into<String>, error: ProviderError) -> Self {
-        Self::Restart {
-            token: token.into(),
+        Ok(Self::Restart {
+            token: encode(token)?,
             error,
-        }
+        })
     }
 }
 
@@ -522,19 +505,13 @@ impl FeedPart {
     /// The token of the inner feed of the object of type `O` with `key`, as
     /// an item of a page of rows: the host keeps it as that feed's state,
     /// which the feed of that object reads with [`FeedCx::token`].
-    pub fn inner<O: Object>(self, key: &O::Key, token: &impl Serialize) -> Result<Self> {
-        encode(token).map(|token| self.raw_inner::<O>(key, token))
-    }
-
-    /// [`Self::inner`] with the token as the string the host keeps.
-    #[must_use]
-    pub fn raw_inner<O: Object>(mut self, key: &O::Key, token: impl Into<String>) -> Self {
+    pub fn inner<O: Object>(mut self, key: &O::Key, token: &impl Serialize) -> Result<Self> {
         self.inner.push(InnerState {
             kind: O::kind(),
             identity: key.identity_captures(),
-            token: token.into(),
+            token: encode(token)?,
         });
-        self
+        Ok(self)
     }
 
     /// The time after which the facts of this part, a file or a complete
