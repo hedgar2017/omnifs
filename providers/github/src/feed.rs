@@ -10,7 +10,8 @@
 //! The first full listing takes the issues, then the pull requests, then
 //! every comment, then the GitHub GraphQL counts of the comments of each item,
 //! with the IDs of an item with another count, then the REST count of the
-//! comments of the repository. After it, each answer is a check:
+//! comments of the repository. After it, each answer, which the host asks
+//! for once in each sync, is a check:
 //!
 //! - one `POST` with the nodes of each kind after its cursor and the counts of
 //!   the issues and of the pull requests;
@@ -295,6 +296,7 @@ struct ItemRef {
 /// A row of a REST list of comments of the repository.
 struct CommentRow {
     comment: Comment,
+    bytes: Box<RawValue>,
     item: ItemRef,
     updated_at: OffsetDateTime,
 }
@@ -308,12 +310,13 @@ struct CommentFields {
 }
 
 impl CommentRow {
-    fn of(bytes: &RawValue) -> Result<Self> {
+    fn of(bytes: Box<RawValue>) -> Result<Self> {
         let comment: Comment = decode_json(bytes.get())?;
         let fields: CommentFields = decode_json(bytes.get())?;
         let item = comment_item(&fields.html_url)?;
         Ok(Self {
             comment,
+            bytes,
             item,
             updated_at: fields.updated_at,
         })
@@ -458,8 +461,11 @@ fn page_of(path: &str) -> Result<u64> {
         .ok_or_else(|| ProviderError::invalid_input(format!("{path} names no page")))
 }
 
-/// The query pair `since` of a second before `time`, so that the rows of the
-/// second of `time` come whether `since` includes its second or not.
+/// The query pair `since` of a second before `time`. GitHub gives each time
+/// to the second, and `since` takes a time to the second: the second before
+/// that of `time` is the one unit of GitHub's own precision that makes the
+/// rows of the second of `time` come whether `since` includes its second or
+/// not.
 fn since_pair(time: Option<OffsetDateTime>) -> Result<String> {
     match time {
         Some(time) => {
@@ -965,9 +971,16 @@ impl<'a, K> Writer<'a, K> {
         Ok(())
     }
 
-    /// The facts of a comment: `author` and `body.md` under `comments/{id}/`
-    /// of its item, its `comments/` joined as `write` says.
-    fn comment(&mut self, item: ItemRef, write: ListingWrite, comment: &Comment) -> Result<()> {
+    /// The facts of a comment: `author`, `body.md`, and its canonical bytes,
+    /// the row of its list, under `comments/{id}/` of its item, its
+    /// `comments/` joined as `write` says.
+    fn comment(
+        &mut self,
+        item: ItemRef,
+        write: ListingWrite,
+        comment: &Comment,
+        bytes: &RawValue,
+    ) -> Result<()> {
         let comments = comments_path(self.repo, item);
         self.cx.dir(&comments, write)?;
         let at = format!("{comments}/{}", comment.id);
@@ -975,7 +988,9 @@ impl<'a, K> Writer<'a, K> {
         self.cx
             .file(format!("{at}/author"), comment.login().as_bytes())?;
         self.cx
-            .file(format!("{at}/body.md"), comment.body_text().as_bytes())?;
+            .file(format!("{at}/body.md"), comment.body.as_bytes())?;
+        self.cx
+            .canonical::<Comment>(&at, Canonical::new(bytes.get().as_bytes(), None));
         if self.ledger.is_some() {
             let published = self.published(item)?.contains(&comment.id);
             let ledger = self.ledger.as_deref_mut().expect("the ledger is some");
@@ -1053,7 +1068,8 @@ impl<'a, K> Writer<'a, K> {
             200 => {
                 let text = std::str::from_utf8(response.body())
                     .map_err(|error| ProviderError::invalid_input(format!("utf-8: {error}")))?;
-                self.comment(item, write, &decode_json(text)?)
+                let bytes: Box<RawValue> = decode_json(text)?;
+                self.comment(item, write, &decode_json(bytes.get())?, &bytes)
             },
             301 | 404 | 410 => {
                 self.remove_comment(item, id)?;
@@ -1364,10 +1380,10 @@ impl RepoFeed<'_> {
         };
         let mut w = Writer::new(self.cx, &self.repo, None);
         for bytes in rows {
-            let row = CommentRow::of(&bytes)?;
+            let row = CommentRow::of(bytes)?;
             self.comments.time = Some(row.updated_at);
             if w.has_item(row.item)? {
-                w.comment(row.item, ListingWrite::Join, &row.comment)?;
+                w.comment(row.item, ListingWrite::Join, &row.comment, &row.bytes)?;
             }
         }
         let stage = match next {
@@ -1616,12 +1632,12 @@ impl RepoFeed<'_> {
         } = check;
         let mut w = Writer::new(self.cx, &self.repo, Some(ledger));
         for bytes in rows {
-            let row = CommentRow::of(&bytes)?;
+            let row = CommentRow::of(bytes)?;
             moved |= !seen.insert(row.comment.id);
             latest = latest.max(Some(row.updated_at));
             match changed.get_mut(&row.item.number) {
                 Some(changed) if !changed.gone => {
-                    w.comment(row.item, ListingWrite::Partial, &row.comment)?;
+                    w.comment(row.item, ListingWrite::Partial, &row.comment, &row.bytes)?;
                     changed.ids.brought.insert(row.comment.id);
                 },
                 Some(_) => {},
@@ -1629,7 +1645,7 @@ impl RepoFeed<'_> {
                 // item, which the numbers of its kind bring.
                 None => {
                     if w.has_item(row.item)? {
-                        w.comment(row.item, ListingWrite::Join, &row.comment)?;
+                        w.comment(row.item, ListingWrite::Join, &row.comment, &row.bytes)?;
                     }
                 },
             }
@@ -2171,7 +2187,7 @@ async fn item_comments<K>(
     item: ItemRef,
     since: Option<OffsetDateTime>,
     link: Option<String>,
-) -> Result<Option<(Vec<Comment>, Option<String>)>> {
+) -> Result<Option<(Vec<(Comment, Box<RawValue>)>, Option<String>)>> {
     let path = match link {
         Some(link) => link,
         None => format!(
@@ -2183,8 +2199,8 @@ async fn item_comments<K>(
     match rest_page(cx, &path, None).await? {
         RestPage::Rows { rows, next, .. } => {
             let rows = rows
-                .iter()
-                .map(|row| decode_json(row.get()))
+                .into_iter()
+                .map(|row| Ok((decode_json(row.get())?, row)))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Some((rows, next)))
         },
@@ -2216,8 +2232,8 @@ async fn take_item_request<K>(
             let Some((rows, next)) = item_comments(cx, repo, item, Some(since), link).await? else {
                 return Ok(ItemStep::Left);
             };
-            for comment in &rows {
-                w.comment(item, ListingWrite::Partial, comment)?;
+            for (comment, bytes) in &rows {
+                w.comment(item, ListingWrite::Partial, comment, bytes)?;
                 brought.insert(comment.id);
             }
             Ok(ItemStep::Next(match next {
@@ -2233,8 +2249,8 @@ async fn take_item_request<K>(
             let Some((rows, next)) = item_comments(cx, repo, item, None, link).await? else {
                 return Ok(ItemStep::Left);
             };
-            for comment in &rows {
-                w.comment(item, ListingWrite::Partial, comment)?;
+            for (comment, bytes) in &rows {
+                w.comment(item, ListingWrite::Partial, comment, bytes)?;
                 brought.insert(comment.id);
             }
             if let Some(link) = next {

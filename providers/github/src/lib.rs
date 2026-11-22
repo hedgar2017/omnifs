@@ -13,8 +13,7 @@ mod item;
 mod objects;
 
 use objects::{
-    ChangedFile, CheckRun, Comment, Issue, Notification, Owner, PullRequest, Repo, Review,
-    ReviewComment, WorkflowRun,
+    ChangedFile, Comment, Issue, Notification, Owner, PullRequest, Repo, Review, ReviewComment,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,21 +48,17 @@ pub enum StateFilter {
     display_name = "GitHub",
     description = "repos, issues, and pull requests",
     mount = "github",
-    projection = 3,
+    projection = 4,
     capabilities(
         domain(
             "api.github.com",
-            "Fetch GitHub API resources such as repository metadata, issues, pull requests, actions, and events."
+            "Fetch GitHub API resources such as repository metadata, issues, pull requests, and notifications."
         ),
         git_repo(
             "git@github.com:*",
             "Clone repository contents over SSH when browsing repo paths."
         ),
     ),
-    limits(memory_mb(
-        256,
-        "Leave room for larger GitHub API payloads and repository tree projections."
-    ),),
     auth = r#"{"default":"device","schemes":[{"staticToken":{"key":"pat","valuePrefix":"Bearer ","description":"GitHub personal access token","injectDomains":["api.github.com"],"creationUrl":"https://github.com/settings/tokens/new?scopes=read:user&description=omnifs","validation":{"method":"GET","url":"https://api.github.com/user","expectStatus":200,"extract":{"identity":"/login"}},"ambientSources":[{"kind":{"envVar":{"name":"GITHUB_TOKEN"}}},{"kind":{"command":{"argv":["gh","auth","token"]}},"note":"gh CLI login"}]}},{"oauth":{"key":"device","displayName":"GitHub OAuth device flow","authorizationEndpoint":"https://github.com/login/oauth/authorize","tokenEndpoint":"https://github.com/login/oauth/access_token","defaultClientId":"Ov23licogxMDzS47s9sF","flow":{"deviceCode":{"deviceAuthorizationEndpoint":"https://github.com/login/device/code","devicePollCompat":"errorInOkBody"}},"injectDomains":["api.github.com"],"injectValuePrefix":"Bearer "}}],"guidance":{"pat":{"summary":"A classic personal access token; the create link pre-selects the read:user scope.","setupSteps":["Add the repo scope as well if you want to browse private repositories and their issues or pull requests."],"docsUrl":"https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens"},"device":{"summary":"Approve a one-time code at github.com/login/device using omnifs's GitHub app; nothing to copy back."}}}"#
 )]
 impl GithubProvider {
@@ -86,7 +81,6 @@ impl GithubProvider {
             o.dir("pulls")
                 .choices(StateFilter::choices().expect("StateFilter has finite choices"))?;
             o.dir("pulls/{filter}").fed()?;
-            o.dir("actions/runs").collection(Repo::workflow_runs)?;
             o.feed(Repo::feed)
                 .starts(["issues/{filter}", "pulls/{filter}"])?;
             Ok(())
@@ -120,7 +114,6 @@ impl GithubProvider {
             o.dir("comments").fed()?;
             o.dir("files").collection(PullRequest::files)?;
             o.dir("reviews").collection(PullRequest::reviews)?;
-            o.dir("checks").collection(PullRequest::checks)?;
             o.feed(PullRequest::feed)
                 .starts(["", "title", "body", "state", "user", "comments"])?;
             Ok(())
@@ -166,29 +159,6 @@ impl GithubProvider {
             },
         )?;
 
-        r.object::<CheckRun>(
-            "/{owner}/{repo}/pulls/{filter}/{number}/checks/{check_run_id}",
-            |o| {
-                o.dynamic();
-                o.file("check.json").canonical::<Json>()?;
-                o.file("check.md").representation::<Markdown>()?;
-                o.file("name").computed(CheckRun::name)?;
-                o.file("status").computed(CheckRun::status)?;
-                o.file("conclusion").computed(CheckRun::conclusion)?;
-                o.file("summary.md").lazy().computed(CheckRun::summary_md)?;
-                Ok(())
-            },
-        )?;
-
-        r.object::<WorkflowRun>("/{owner}/{repo}/actions/runs/{run_id}", |o| {
-            o.dynamic();
-            o.file("run.json").canonical::<Json>()?;
-            o.file("status").computed(WorkflowRun::status)?;
-            o.file("conclusion").computed(WorkflowRun::conclusion)?;
-            o.file("logs.zip").blob(WorkflowRun::logs)?;
-            Ok(())
-        })?;
-
         r.object::<Comment>(
             "/{owner}/{repo}/{item_kind}/{filter}/{number}/comments/{comment_id}",
             |o| {
@@ -229,11 +199,6 @@ pub struct RepoName(String);
 pub(crate) struct FilePath(String);
 
 impl FilePath {
-    pub(crate) fn from_github_path(path: &str) -> Option<Self> {
-        let encoded = Self::encode(path);
-        encoded.parse().ok()
-    }
-
     pub(crate) fn decoded(&self) -> Result<String> {
         let bytes = Self::decode_bytes(&self.0)?;
         String::from_utf8(bytes)
@@ -264,7 +229,9 @@ impl FilePath {
         true
     }
 
-    fn encode(path: &str) -> String {
+    /// The segment of a path of a file of GitHub: each byte other than an
+    /// unreserved one as `%XX`.
+    pub(crate) fn encode(path: &str) -> String {
         let mut encoded = String::with_capacity(path.len());
         for byte in path.bytes() {
             if Self::is_unreserved_path_byte(byte) {
@@ -372,16 +339,4 @@ pub fn is_safe_owner(s: &str) -> bool {
 
 pub(crate) const FILE_PAGE_SIZE: u64 = 100;
 pub(crate) const REVIEW_PAGE_SIZE: u64 = 100;
-pub(crate) const CHECK_RUN_PAGE_SIZE: u64 = 100;
 pub(crate) const NOTIFICATION_PAGE_SIZE: u64 = 50;
-pub(crate) const WORKFLOW_RUN_PAGE_SIZE: u64 = 30;
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct CheckRunsResponse {
-    pub(crate) check_runs: Vec<Box<serde_json::value::RawValue>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct WorkflowRunsResponse {
-    pub(crate) workflow_runs: Vec<Box<serde_json::value::RawValue>>,
-}

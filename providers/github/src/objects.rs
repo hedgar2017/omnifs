@@ -198,83 +198,6 @@ impl Representable<Markdown> for ReviewComment {
     }
 }
 
-#[omnifs_sdk::object(kind = "github.check", key = crate::item::CheckRunKey)]
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct CheckRun {
-    pub(crate) id: u64,
-    pub(crate) name: String,
-    pub(crate) status: String,
-    pub(crate) conclusion: Option<String>,
-    pub(crate) html_url: Option<String>,
-    pub(crate) output: CheckOutput,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct CheckOutput {
-    pub(crate) title: Option<String>,
-    pub(crate) summary: Option<String>,
-    pub(crate) text: Option<String>,
-}
-
-impl CheckRun {
-    pub(crate) fn name(&self, _key: &crate::item::CheckRunKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.name.clone(), TextFormat::Raw).build())
-    }
-
-    pub(crate) fn status(&self, _key: &crate::item::CheckRunKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.status.clone(), TextFormat::Raw).build())
-    }
-
-    pub(crate) fn conclusion(&self, _key: &crate::item::CheckRunKey) -> Result<FileProjection> {
-        Ok(
-            FileProjection::text(self.conclusion.clone().unwrap_or_default(), TextFormat::Raw)
-                .build(),
-        )
-    }
-
-    pub(crate) fn summary_md(&self, _key: &crate::item::CheckRunKey) -> Result<FileProjection> {
-        Ok(FileProjection::body(self.summary_markdown())
-            .content_type(ContentType::Markdown)
-            .build())
-    }
-
-    fn summary_markdown(&self) -> String {
-        let output = &self.output;
-        let mut summary = String::new();
-        if let Some(title) = &output.title {
-            summary.push_str("## ");
-            summary.push_str(title);
-            summary.push_str("\n\n");
-        }
-        if let Some(body) = &output.summary {
-            summary.push_str(body);
-            summary.push('\n');
-        }
-        if let Some(text) = &output.text {
-            if !summary.ends_with("\n\n") {
-                summary.push('\n');
-            }
-            summary.push_str(text);
-            summary.push('\n');
-        }
-        summary
-    }
-}
-
-impl Representable<Markdown> for CheckRun {
-    fn represent(&self) -> Vec<u8> {
-        let conclusion = self.conclusion.as_deref().unwrap_or("");
-        let url = self.html_url.as_deref().unwrap_or("");
-        format!(
-            "# {}\n\n- Status: {}\n- Conclusion: {conclusion}\n- URL: {url}\n\n{}",
-            self.name,
-            self.status,
-            self.summary_markdown()
-        )
-        .into_bytes()
-    }
-}
-
 /// A GitHub owner (user or organization) profile. The upstream profile JSON is
 /// the canonical payload; `profile.md` renders it.
 #[omnifs_sdk::object(kind = "github.owner", key = crate::item::OwnerKey)]
@@ -305,8 +228,9 @@ pub(crate) struct Repo {}
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Comment {
     pub(crate) id: u64,
+    /// The author, `null` for an account that GitHub deleted.
     pub(crate) user: Option<User>,
-    pub(crate) body: Option<String>,
+    pub(crate) body: String,
 }
 
 impl Comment {
@@ -314,16 +238,11 @@ impl Comment {
     pub(crate) fn login(&self) -> &str {
         self.user.as_ref().map_or("", |user| user.login.as_str())
     }
-
-    /// The body, empty for a comment without one.
-    pub(crate) fn body_text(&self) -> &str {
-        self.body.as_deref().unwrap_or("")
-    }
 }
 
 impl Representable<Markdown> for Comment {
     fn represent(&self) -> Vec<u8> {
-        format!("{}:\n{}\n", self.login(), self.body_text()).into_bytes()
+        format!("{}:\n{}\n", self.login(), self.body).into_bytes()
     }
 }
 
@@ -376,24 +295,5 @@ impl Notification {
 impl Representable<Markdown> for Notification {
     fn represent(&self) -> Vec<u8> {
         self.item_markdown()
-    }
-}
-
-#[omnifs_sdk::object(kind = "github.run", key = crate::item::RunKey)]
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct WorkflowRun {
-    pub(crate) id: u64,
-    pub(crate) status: String,
-    pub(crate) conclusion: Option<String>,
-}
-
-impl WorkflowRun {
-    pub(crate) fn status(&self, _key: &crate::item::RunKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.status.clone(), TextFormat::Raw).build())
-    }
-
-    pub(crate) fn conclusion(&self, _key: &crate::item::RunKey) -> Result<FileProjection> {
-        let c = self.conclusion.clone().unwrap_or_default();
-        Ok(FileProjection::text(c, TextFormat::Raw).build())
     }
 }

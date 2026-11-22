@@ -9,13 +9,11 @@ use omnifs_sdk::prelude::*;
 
 use crate::api::GitHubApi;
 use crate::objects::{
-    ChangedFile, CheckRun, Comment, Issue, Notification, Owner, PullRequest, Repo, Review,
-    ReviewComment, WorkflowRun,
+    ChangedFile, Comment, Issue, Notification, Owner, PullRequest, Repo, Review, ReviewComment,
 };
 use crate::{
-    CHECK_RUN_PAGE_SIZE, CheckRunsResponse, FILE_PAGE_SIZE, FilePath, NOTIFICATION_PAGE_SIZE,
-    OwnerKind, OwnerName, REVIEW_PAGE_SIZE, RepoId, RepoName, StateFilter, ThreadId,
-    WORKFLOW_RUN_PAGE_SIZE, WorkflowRunsResponse,
+    FILE_PAGE_SIZE, FilePath, NOTIFICATION_PAGE_SIZE, OwnerKind, OwnerName, REVIEW_PAGE_SIZE,
+    RepoId, RepoName, StateFilter, ThreadId,
 };
 
 /// Identity discriminator for the comment anchor's `{item_kind}` segment. A
@@ -103,36 +101,6 @@ pub(crate) struct ReviewCommentKey {
 }
 
 #[omnifs_sdk::path_captures]
-pub(crate) struct CheckRunKey {
-    pub(crate) owner: OwnerName,
-    pub(crate) repo: RepoName,
-    #[expect(
-        dead_code,
-        reason = "a key of the route binds its `{filter}` capture, which its identity excludes"
-    )]
-    pub(crate) filter: Facet<StateFilter>,
-    pub(crate) number: u64,
-    pub(crate) check_run_id: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct CheckCursor {
-    sha: String,
-    page: u64,
-}
-
-impl omnifs_sdk::collection::Cursor for CheckCursor {
-    fn encode(&self) -> String {
-        serde_json::to_string(self).expect("check cursor serialization is infallible")
-    }
-
-    fn decode(token: &str) -> Result<Self> {
-        serde_json::from_str(token)
-            .map_err(|_| ProviderError::invalid_input("invalid check cursor"))
-    }
-}
-
-#[omnifs_sdk::path_captures]
 pub(crate) struct CommentKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
@@ -144,13 +112,6 @@ pub(crate) struct CommentKey {
     pub(crate) filter: Facet<StateFilter>,
     pub(crate) number: u64,
     pub(crate) comment_id: u64,
-}
-
-#[omnifs_sdk::path_captures]
-pub(crate) struct RunKey {
-    pub(crate) owner: OwnerName,
-    pub(crate) repo: RepoName,
-    pub(crate) run_id: u64,
 }
 
 #[omnifs_sdk::path_captures]
@@ -283,21 +244,6 @@ impl ReviewComment {
     }
 }
 
-impl CheckRun {
-    pub(crate) async fn load(
-        cx: &Cx,
-        key: &CheckRunKey,
-        since: Option<Validator>,
-    ) -> Result<Load<Self>> {
-        let repo = RepoId::new(&key.owner, &key.repo);
-        cx.endpoint(GitHubApi)
-            .get(format!("/repos/{repo}/check-runs/{}", key.check_run_id))
-            .maybe_if_none_match(since.as_ref())
-            .load_with(decode_json::<Self>)
-            .await
-    }
-}
-
 impl Comment {
     pub(crate) async fn load(
         cx: &Cx,
@@ -312,21 +258,6 @@ impl Comment {
             .send()
             .await?;
         moved_or_load(&response)
-    }
-}
-
-impl WorkflowRun {
-    pub(crate) async fn load(
-        cx: &Cx,
-        key: &RunKey,
-        since: Option<Validator>,
-    ) -> Result<Load<Self>> {
-        let repo = RepoId::new(&key.owner, &key.repo);
-        cx.endpoint(GitHubApi)
-            .get(format!("/repos/{repo}/actions/runs/{}", key.run_id))
-            .maybe_if_none_match(since.as_ref())
-            .load_with(decode_json::<Self>)
-            .await
     }
 }
 
@@ -372,7 +303,7 @@ impl omnifs_sdk::collection::Cursor for RepoCursor {
 }
 
 /// The validator of a page of `Owner::repos`: the owner kind and the `ETag`
-/// of the page, so that the collection asks for a page past its deadline with
+/// of the page, so that the collection asks for a page again in a sync with
 /// one conditional request and no classification of the owner.
 #[derive(Debug, Deserialize, Serialize)]
 struct RepoValidator {
@@ -418,6 +349,7 @@ impl Owner {
                 answer => (OwnerKind::Org, answer?),
             },
         };
+        let more = next_page(&answer);
         let PageAnswer::Fresh {
             value: repos,
             validator,
@@ -426,71 +358,29 @@ impl Owner {
         else {
             return unchanged(&cx);
         };
-        let len = repos.len() as u64;
         let entries = repos
             .into_iter()
-            .filter_map(|row| {
-                row.name.parse::<RepoName>().ok().map(|repo| {
-                    CollectionEntry::key(RepoKey {
-                        owner: key.owner.clone(),
-                        repo,
-                    })
-                })
+            .map(|row| {
+                Ok(CollectionEntry::key(RepoKey {
+                    owner: key.owner.clone(),
+                    repo: parsed(&row.name)?,
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let collection = page_or_complete(
             entries,
-            len,
-            100,
+            more,
             RepoCursor {
                 kind,
                 page: page + 1,
             },
-        )?;
+        );
         Ok(with_page_validator(
             collection,
             encode_validator(&RepoValidator {
                 kind,
                 etag: page_etag(validator)?.0,
             }),
-        ))
-    }
-}
-
-impl Repo {
-    pub(crate) async fn workflow_runs(
-        key: RepoKey,
-        cx: ListCx<PageCursor>,
-    ) -> Result<Collection<WorkflowRun, PageCursor>> {
-        let page = cx.cursor().map_or(1, |cursor| cursor.0);
-        let repo_id = RepoId::new(&key.owner, &key.repo);
-        let answer = cx
-            .endpoint(GitHubApi)
-            .get(format!(
-                "/repos/{repo_id}/actions/runs?per_page={WORKFLOW_RUN_PAGE_SIZE}&page={page}"
-            ))
-            .maybe_if_none_match(cx.validator())
-            .page::<WorkflowRunsResponse>()
-            .await?;
-        let PageAnswer::Fresh {
-            value: runs,
-            validator,
-            ..
-        } = answer
-        else {
-            return unchanged(&cx);
-        };
-        let len = runs.workflow_runs.len() as u64;
-        let entries = fresh(runs.workflow_runs, |run: &WorkflowRun| {
-            Some(RunKey {
-                owner: key.owner.clone(),
-                repo: key.repo.clone(),
-                run_id: run.id,
-            })
-        })?;
-        Ok(with_page_validator(
-            page_or_complete(entries, len, WORKFLOW_RUN_PAGE_SIZE, PageCursor(page + 1))?,
-            page_etag(validator)?,
         ))
     }
 }
@@ -507,6 +397,7 @@ impl PullRequest {
             .maybe_if_none_match(cx.validator())
             .page::<Vec<Box<RawValue>>>()
             .await?;
+        let more = next_page(&answer);
         let PageAnswer::Fresh {
             value: files,
             validator,
@@ -515,18 +406,17 @@ impl PullRequest {
         else {
             return unchanged(&cx);
         };
-        let len = files.len() as u64;
         let entries = fresh(files, |file: &ChangedFile| {
-            Some(ChangedFileKey {
+            Ok(ChangedFileKey {
                 owner: key.owner.clone(),
                 repo: key.repo.clone(),
                 filter: key.filter,
                 number: key.number,
-                path: FilePath::from_github_path(&file.filename)?,
+                path: parsed(&FilePath::encode(&file.filename))?,
             })
         })?;
         Ok(with_page_validator(
-            page_or_complete(entries, len, FILE_PAGE_SIZE, PageCursor(page + 1))?,
+            page_or_complete(entries, more, PageCursor(page + 1)),
             page_etag(validator)?,
         ))
     }
@@ -546,6 +436,7 @@ impl PullRequest {
             .maybe_if_none_match(cx.validator())
             .page::<Vec<Box<RawValue>>>()
             .await?;
+        let more = next_page(&answer);
         let PageAnswer::Fresh {
             value: reviews,
             validator,
@@ -554,9 +445,8 @@ impl PullRequest {
         else {
             return unchanged(&cx);
         };
-        let len = reviews.len() as u64;
         let entries = fresh(reviews, |review: &Review| {
-            Some(ReviewKey {
+            Ok(ReviewKey {
                 owner: key.owner.clone(),
                 repo: key.repo.clone(),
                 filter: key.filter,
@@ -565,117 +455,8 @@ impl PullRequest {
             })
         })?;
         Ok(with_page_validator(
-            page_or_complete(entries, len, REVIEW_PAGE_SIZE, PageCursor(page + 1))?,
+            page_or_complete(entries, more, PageCursor(page + 1)),
             page_etag(validator)?,
-        ))
-    }
-
-    /// The first page asks for the pull request with the `ETag` of its
-    /// validator, and the check runs of the head that the pull request names
-    /// ask with their own `ETag` while the head is that of the validator, or
-    /// in full for another head. The page keeps the `ETag` of the pull request
-    /// that its answer brought, so an unchanged page of check runs after a
-    /// changed pull request takes it too.
-    pub(crate) async fn checks(
-        key: PullKey,
-        cx: ListCx<CheckCursor>,
-    ) -> Result<Collection<CheckRun, CheckCursor>> {
-        let repo = RepoId::new(&key.owner, &key.repo);
-        let since: Option<CheckValidator> = cx.validator().map(decode_validator).transpose()?;
-        let (sha, page, pull, runs_since) = if let Some(cursor) = cx.cursor() {
-            (
-                cursor.sha.clone(),
-                cursor.page,
-                None,
-                since.map(|since| since.runs),
-            )
-        } else {
-            let known = since.and_then(|since| since.pull.map(|pull| (pull, since.runs)));
-            let answer = cx
-                .endpoint(GitHubApi)
-                .get(format!("/repos/{repo}/pulls/{}", key.number))
-                .maybe_if_none_match(
-                    known
-                        .as_ref()
-                        .map(|(pull, _)| VersionToken(pull.etag.clone()))
-                        .as_ref(),
-                )
-                .page::<PullCommits>()
-                .await?;
-            match (answer, known) {
-                (
-                    PageAnswer::Fresh {
-                        value, validator, ..
-                    },
-                    known,
-                ) => (
-                    value.head.sha.clone(),
-                    1,
-                    Some(PullValidator {
-                        etag: page_etag(validator)?.0,
-                        sha: value.head.sha.clone(),
-                    }),
-                    known
-                        .filter(|(pull, _)| pull.sha == value.head.sha)
-                        .map(|(_, runs)| runs),
-                ),
-                (PageAnswer::Unchanged { .. }, Some((pull, runs))) => {
-                    (pull.sha.clone(), 1, Some(pull), Some(runs))
-                },
-                (PageAnswer::Unchanged { .. }, None) => {
-                    return Err(ProviderError::internal(
-                        "the pull request answered 304 to a request without its ETag",
-                    ));
-                },
-            }
-        };
-        let answer = cx
-            .endpoint(GitHubApi)
-            .get(format!(
-                "/repos/{repo}/commits/{sha}/check-runs?per_page={CHECK_RUN_PAGE_SIZE}&page={page}"
-            ))
-            .maybe_if_none_match(runs_since.clone().map(VersionToken).as_ref())
-            .page::<CheckRunsResponse>()
-            .await?;
-        let PageAnswer::Fresh {
-            value: runs,
-            validator: runs_etag,
-            ..
-        } = answer
-        else {
-            let runs = runs_since.ok_or_else(|| {
-                ProviderError::internal("the check runs answered 304 to a request without an ETag")
-            })?;
-            return Ok(Collection::unchanged(PageValidator {
-                token: encode_validator(&CheckValidator { pull, runs }),
-                interval: None,
-            }));
-        };
-        let validator = encode_validator(&CheckValidator {
-            pull,
-            runs: page_etag(runs_etag)?.0,
-        });
-        let len = runs.check_runs.len() as u64;
-        let entries = fresh(runs.check_runs, |check: &CheckRun| {
-            Some(CheckRunKey {
-                owner: key.owner.clone(),
-                repo: key.repo.clone(),
-                filter: key.filter,
-                number: key.number,
-                check_run_id: check.id,
-            })
-        })?;
-        Ok(with_page_validator(
-            page_or_complete(
-                entries,
-                len,
-                CHECK_RUN_PAGE_SIZE,
-                CheckCursor {
-                    sha,
-                    page: page + 1,
-                },
-            )?,
-            validator,
         ))
     }
 }
@@ -696,6 +477,7 @@ impl Review {
             .maybe_if_none_match(cx.validator())
             .page::<Vec<Box<RawValue>>>()
             .await?;
+        let more = next_page(&answer);
         let PageAnswer::Fresh {
             value: comments,
             validator,
@@ -704,9 +486,8 @@ impl Review {
         else {
             return unchanged(&cx);
         };
-        let len = comments.len() as u64;
         let entries = fresh(comments, |comment: &ReviewComment| {
-            Some(ReviewCommentKey {
+            Ok(ReviewCommentKey {
                 owner: key.owner.clone(),
                 repo: key.repo.clone(),
                 filter: key.filter,
@@ -716,7 +497,7 @@ impl Review {
             })
         })?;
         Ok(with_page_validator(
-            page_or_complete(entries, len, REVIEW_PAGE_SIZE, PageCursor(page + 1))?,
+            page_or_complete(entries, more, PageCursor(page + 1)),
             page_etag(validator)?,
         ))
     }
@@ -755,6 +536,7 @@ impl Notification {
                         })
                     })
                     .transpose()?;
+                let more = next_page(&answer);
                 let PageAnswer::Fresh {
                     value: notifications,
                     validator,
@@ -768,36 +550,30 @@ impl Notification {
                     })?;
                     return Ok(DirListing::unchanged(PageValidator { token, interval }));
                 };
-                let len = notifications.len() as u64;
                 let entries = notifications
                     .iter()
-                    .filter_map(|notification| {
-                        notification
-                            .id
-                            .parse::<ThreadId>()
-                            .ok()
+                    .map(|notification| {
+                        parsed::<ThreadId>(&notification.id)
                             .map(|_| Entry::dir(format!("thread-{}", notification.id)))
                     })
-                    .collect::<Vec<_>>();
-                let mut listing = if len < NOTIFICATION_PAGE_SIZE {
-                    DirListing::exhaustive(entries)
-                } else {
+                    .collect::<Result<Vec<_>>>()?;
+                let mut listing = if more {
                     DirListing::paged(entries, Cursor::Page(page + 1))
+                } else {
+                    DirListing::exhaustive(entries)
                 };
                 listing = listing.with_validator(PageValidator {
                     token: page_etag(validator)?,
                     interval,
                 });
                 for notification in notifications {
-                    if notification.id.parse::<ThreadId>().is_ok() {
-                        listing = listing.preload_file(
-                            format!("thread-{}/item.md", notification.id),
-                            FileProjection::inline(notification.item_markdown())
-                                .content_type(ContentType::Markdown)
-                                .dynamic()
-                                .build(),
-                        );
-                    }
+                    listing = listing.preload_file(
+                        format!("thread-{}/item.md", notification.id),
+                        FileProjection::inline(notification.item_markdown())
+                            .content_type(ContentType::Markdown)
+                            .dynamic()
+                            .build(),
+                    );
                 }
                 Ok(listing)
             },
@@ -874,56 +650,47 @@ impl Repo {
     }
 }
 
-impl WorkflowRun {
-    /// The archive of the logs of the run, which GitHub answers with a
-    /// redirect to its storage: the host follows it and holds the archive,
-    /// so that no size bounds it, and asks for it again by its validators.
-    pub(crate) async fn logs(cx: Cx, key: RunKey) -> Result<BlobFile<Zip>> {
-        let repo = RepoId::new(&key.owner, &key.repo);
-        let blob = cx
-            .endpoint(GitHubApi)
-            .get(format!("/repos/{repo}/actions/runs/{}/logs", key.run_id))
-            .into_blob()
-            .follow_redirects()
-            .fetch()
-            .await?;
-        Ok(BlobFile::new(blob.id)
-            .size(FileSize::Exact(blob.size))
-            .stability(Stability::Dynamic))
-    }
-}
-
-/// The format of a ZIP archive.
-pub(crate) struct Zip;
-
-impl Format for Zip {
-    const CT: ContentType = ContentType::Custom("application/zip");
-}
-
 // ===========================================================================
 // Helpers
 // ===========================================================================
 
 /// The entries of the rows of a page, each with its bytes as the canonical
 /// bytes of its object: a row of a list is the object that its own request
-/// answers. `key` names the entry of a row, none for a row without one.
+/// answers. `key` names the entry of a row.
 fn fresh<T: omnifs_sdk::object::Object + serde::de::DeserializeOwned>(
     rows: Vec<Box<RawValue>>,
-    key: impl Fn(&T) -> Option<T::Key>,
+    key: impl Fn(&T) -> Result<T::Key>,
 ) -> Result<Vec<CollectionEntry<T>>> {
-    let mut entries = Vec::new();
-    for row in rows {
-        let value: T = serde_json::from_str(row.get())
-            .map_err(|error| ProviderError::invalid_input(format!("json decode: {error}")))?;
-        if let Some(key) = key(&value) {
-            entries.push(CollectionEntry::fresh(
-                key,
+    rows.into_iter()
+        .map(|row| {
+            let value: T = serde_json::from_str(row.get())
+                .map_err(|error| ProviderError::invalid_input(format!("json decode: {error}")))?;
+            Ok(CollectionEntry::fresh(
+                key(&value)?,
                 value,
                 Canonical::new(row.get().as_bytes(), None),
-            ));
-        }
-    }
-    Ok(entries)
+            ))
+        })
+        .collect()
+}
+
+/// A segment of a path from a name that GitHub gives, which is the error of
+/// its answer when it is no segment.
+fn parsed<T: std::str::FromStr>(name: &str) -> Result<T> {
+    name.parse().map_err(|_| {
+        ProviderError::invalid_input(format!("GitHub names {name:?}, no path segment"))
+    })
+}
+
+/// Whether the header `Link` of a page answer has a page after it.
+fn next_page<T>(answer: &PageAnswer<T>) -> bool {
+    answer.header("link").is_some_and(|links| {
+        links.split(',').any(|link| {
+            link.split(';')
+                .skip(1)
+                .any(|param| param.trim() == r#"rel="next""#)
+        })
+    })
 }
 
 /// The load of an object from its answer: `301`, `404`, and `410` say that
@@ -949,16 +716,17 @@ fn moved_or_load<T: serde::de::DeserializeOwned>(response: &HttpResponse) -> Res
     }
 }
 
+/// The listing of a page: complete after the last page, else a page with
+/// the cursor `next` of the page after it.
 fn page_or_complete<T: omnifs_sdk::object::Object, C: omnifs_sdk::collection::Cursor>(
     entries: Vec<CollectionEntry<T>>,
-    len: u64,
-    page_size: u64,
+    more: bool,
     next: C,
-) -> Result<Collection<T, C>> {
-    if len < page_size {
-        Ok(Collection::complete(entries))
+) -> Collection<T, C> {
+    if more {
+        Collection::page(entries).next(next)
     } else {
-        Ok(Collection::page(entries).next(next))
+        Collection::complete(entries)
     }
 }
 
@@ -1002,67 +770,39 @@ fn decode_validator<T: serde::de::DeserializeOwned>(token: &VersionToken) -> Res
         .map_err(|_| ProviderError::invalid_input("invalid page validator"))
 }
 
-/// The validator of a page of `PullRequest::checks`: the `ETag` of its check
-/// runs and, on the first page, the `ETag` and the head SHA of the pull
-/// request, so that a page past its deadline asks for itself with
-/// conditional requests alone.
-#[derive(Debug, Deserialize, Serialize)]
-struct CheckValidator {
-    pull: Option<PullValidator>,
-    runs: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct PullValidator {
-    etag: String,
-    sha: String,
-}
-
 fn pull_files_path(owner: &OwnerName, repo: &RepoName, number: u64, page: u64) -> String {
     let repo = RepoId::new(owner, repo);
     format!("/repos/{repo}/pulls/{number}/files?per_page={FILE_PAGE_SIZE}&page={page}")
 }
 
-async fn pull_files_page(
-    cx: &Cx,
-    owner: &OwnerName,
-    repo: &RepoName,
-    number: u64,
-    page: u64,
-) -> Result<Vec<(ChangedFile, Box<RawValue>)>> {
-    let raw_files: Vec<Box<RawValue>> = cx
-        .endpoint(GitHubApi)
-        .get(pull_files_path(owner, repo, number, page))
-        .json()
-        .await?;
-    raw_files
-        .into_iter()
-        .map(|raw| {
-            let file = serde_json::from_str::<ChangedFile>(raw.get())
-                .map_err(|err| ProviderError::invalid_input(format!("json decode: {err}")))?;
-            Ok((file, raw))
-        })
-        .collect()
-}
-
+/// The changed file of a pull request named `filename`, from the pages of
+/// its files by their link `next`.
 async fn find_pull_file(
     cx: &Cx,
     key: &ChangedFileKey,
     filename: &str,
 ) -> Result<Option<(ChangedFile, Box<RawValue>)>> {
-    const MAX_FILE_PAGES: u64 = 30;
-
-    for page in 1..=MAX_FILE_PAGES {
-        let files = pull_files_page(cx, &key.owner, &key.repo, key.number, page).await?;
-        let len = files.len() as u64;
-        if let Some(file) = files
-            .into_iter()
-            .find(|(file, _raw)| file.filename == filename)
-        {
-            return Ok(Some(file));
+    for page in 1.. {
+        let answer = cx
+            .endpoint(GitHubApi)
+            .get(pull_files_path(&key.owner, &key.repo, key.number, page))
+            .page::<Vec<Box<RawValue>>>()
+            .await?;
+        let more = next_page(&answer);
+        let PageAnswer::Fresh { value: rows, .. } = answer else {
+            return Err(ProviderError::internal(
+                "the files answered 304 to a request without an ETag",
+            ));
+        };
+        for raw in rows {
+            let file = serde_json::from_str::<ChangedFile>(raw.get())
+                .map_err(|err| ProviderError::invalid_input(format!("json decode: {err}")))?;
+            if file.filename == filename {
+                return Ok(Some((file, raw)));
+            }
         }
-        if len < FILE_PAGE_SIZE {
-            return Ok(None);
+        if !more {
+            break;
         }
     }
     Ok(None)

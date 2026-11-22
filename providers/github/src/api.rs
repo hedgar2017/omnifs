@@ -36,24 +36,20 @@ impl EndpointHooks for GitHubApi {
         }
         Some(match retry_window(resp.headers()) {
             Ok(window) => {
-                ProviderError::rate_limited(rate_limit_message(resp)).with_retry_after(Some(window))
+                ProviderError::rate_limited(rate_limit_message(resp)).with_retry_after(window)
             },
             Err(error) => error,
         })
     }
 }
 
-/// The window GitHub asks for after a secondary rate limit without
-/// `Retry-After`: at least one minute.
-const SECONDARY_WINDOW: Duration = Duration::from_secs(60);
-
-/// The backoff window of a rate-limited answer from its `headers`, as GitHub
-/// asks: the seconds of `Retry-After`; else, for the primary limit, which
+/// The window of a rate-limited answer that its `headers` state: the seconds
+/// of `Retry-After`; else, for the primary limit, which
 /// `x-ratelimit-remaining: 0` says, the `x-ratelimit-reset` epoch minus now,
-/// zero for a reset that passed; else, for a secondary limit, one minute. A
-/// header of the window that is not text, or that does not parse as seconds,
-/// fails, as does a primary limit without its reset.
-fn retry_window(headers: &HeaderMap) -> Result<Duration, ProviderError> {
+/// zero for a reset that passed; else none, for a secondary limit that states
+/// no window. A header of the window that is not text, or that does not
+/// parse as seconds, fails, as does a primary limit without its reset.
+fn retry_window(headers: &HeaderMap) -> Result<Option<Duration>, ProviderError> {
     let seconds = |name: &str| -> Result<Option<u64>, ProviderError> {
         let Some(value) = headers.get(name) else {
             return Ok(None);
@@ -66,10 +62,10 @@ fn retry_window(headers: &HeaderMap) -> Result<Duration, ProviderError> {
         })
     };
     if let Some(secs) = seconds("retry-after")? {
-        return Ok(Duration::from_secs(secs));
+        return Ok(Some(Duration::from_secs(secs)));
     }
     if seconds("x-ratelimit-remaining")? != Some(0) {
-        return Ok(SECONDARY_WINDOW);
+        return Ok(None);
     }
     let reset = seconds("x-ratelimit-reset")?.ok_or_else(|| {
         ProviderError::invalid_input("a primary rate limit without x-ratelimit-reset")
@@ -79,7 +75,9 @@ fn retry_window(headers: &HeaderMap) -> Result<Duration, ProviderError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ProviderError::internal(format!("the clock: {error}")))?;
-    Ok(Duration::from_secs(reset.saturating_sub(now.as_secs())))
+    Ok(Some(Duration::from_secs(
+        reset.saturating_sub(now.as_secs()),
+    )))
 }
 
 fn is_rate_limited(resp: &Response<Vec<u8>>) -> bool {
