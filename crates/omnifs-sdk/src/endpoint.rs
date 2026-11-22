@@ -596,6 +596,14 @@ impl HttpResponse {
     pub fn redirected(&self) -> bool {
         self.inner.redirected()
     }
+
+    /// The error of the status of the response, as the structural terminals
+    /// map it with its headers, as a `Retry-After`; `Ok` for a success and
+    /// for `304`. The response stays, for a provider that reads the body of
+    /// an error of its upstream.
+    pub fn error_for_status_ref(&self) -> Result<()> {
+        crate::http::ResponseExt::error_for_status_ref(&self.inner)
+    }
 }
 
 /// A builder for a blob fetch against an [`Endpoint`], lowering onto
@@ -845,5 +853,24 @@ mod tests {
         );
 
         crate::rate_limit::with_breaker(crate::rate_limit::RateLimitBreaker::clear);
+    }
+
+    /// The error of the status of an [`HttpResponse`] is the one of its
+    /// answer, with the `Retry-After` of its headers, and none for a
+    /// success and for `304`.
+    #[test]
+    fn the_error_of_the_status_of_a_response_is_the_one_of_its_answer() {
+        let of = |status: u16, headers: &[(&str, &str)]| HttpResponse {
+            inner: response("https://status.test/x", None, status, headers),
+        };
+        assert!(of(200, &[]).error_for_status_ref().is_ok());
+        assert!(of(304, &[]).error_for_status_ref().is_ok());
+        let error = of(429, &[("Retry-After", "7")])
+            .error_for_status_ref()
+            .unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::RateLimited);
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+        let error = of(404, &[]).error_for_status_ref().unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::NotFound);
     }
 }
