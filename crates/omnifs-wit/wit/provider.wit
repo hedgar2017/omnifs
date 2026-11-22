@@ -378,9 +378,12 @@ interface types {
     }
 
     /// The token of an inner feed, keyed by the logical id of its object.
+    /// `unlisted` leaves an own inner feed unlisted, as one whose object no
+    /// inventory of the part has: the host keeps asking it for its paths.
     record feed-state {
         id: logical-id,
         token: feed-token,
+        unlisted: bool,
     }
 
     /// The names of a listing of the projection, whether the listing is

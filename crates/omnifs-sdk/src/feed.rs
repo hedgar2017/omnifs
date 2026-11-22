@@ -510,6 +510,26 @@ impl FeedPart {
             kind: O::kind(),
             identity: key.identity_captures(),
             token: encode(token)?,
+            unlisted: false,
+        });
+        Ok(self)
+    }
+
+    /// As [`FeedPart::inner`], for an own inner feed that stays unlisted:
+    /// the part brings its token, and the host keeps asking that feed for
+    /// its paths, once in each sync, as for a part of it with
+    /// [`FeedPart::unlisted`], since no inventory of this part has its
+    /// object.
+    pub fn inner_unlisted<O: Object>(
+        mut self,
+        key: &O::Key,
+        token: &impl Serialize,
+    ) -> Result<Self> {
+        self.inner.push(InnerState {
+            kind: O::kind(),
+            identity: key.identity_captures(),
+            token: encode(token)?,
+            unlisted: true,
         });
         Ok(self)
     }
@@ -545,6 +565,7 @@ pub(crate) struct InnerState {
     pub(crate) kind: ObjectKind,
     pub(crate) identity: Vec<(&'static str, String)>,
     pub(crate) token: String,
+    pub(crate) unlisted: bool,
 }
 
 /// The feed method of an object, erased over its future.

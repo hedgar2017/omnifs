@@ -816,6 +816,7 @@ fn feed_write(
                     (
                         ObjectId::from_wit(&state.id).as_bytes().to_vec(),
                         state.token.clone(),
+                        state.unlisted,
                     )
                 })
                 .collect();

@@ -358,7 +358,7 @@ pub(crate) struct FeedWrite {
     /// expired `until` an answer that ends without a write of it clears.
     pub lacked: Option<Path>,
     pub answer: FeedAnswerWrite,
-    pub inner: Vec<(Vec<u8>, String)>,
+    pub inner: Vec<(Vec<u8>, String, bool)>,
     pub anchors: Vec<(Path, Path)>,
     /// The number of the first sync in which the feeds of the answer are
     /// due: the sync after the last one begun.
@@ -2482,14 +2482,17 @@ fn write_feed_states(
     // An inner state is the token of its feed from then on, so the kept parts
     // of an answer from another token leave with it; the kept parts of an
     // answer from that token continue it.
-    for (id, token) in &feed.inner {
+    for (id, token, unlisted) in &feed.inner {
         let previous = read_feed_state(tx, facts, id)?;
-        let brought = moved(token, previous.as_ref());
+        let brought = FeedState {
+            unlisted: *unlisted,
+            ..moved(token, previous.as_ref())
+        };
         let state = match previous {
             Some(previous) if previous.token == brought.token => FeedState {
                 ended: true,
                 due_in: brought.due_in,
-                unlisted: false,
+                unlisted: *unlisted,
                 ..previous
             },
             Some(_) | None => {
@@ -3999,11 +4002,32 @@ mod tests {
     fn inner_state(token: &str) -> ProjectionTransition {
         let mut outer = fed_part("outer", HashMap::new());
         outer.object = b"outer".to_vec();
-        outer.inner = vec![(b"feed".to_vec(), token.into())];
+        outer.inner = vec![(b"feed".to_vec(), token.into(), false)];
         ProjectionTransition {
             feed: Some(outer),
             ..ProjectionTransition::default()
         }
+    }
+
+    /// An inner state lists its feed, and an unlisted inner state leaves it
+    /// unlisted, a new state and the state of its token alike.
+    #[test]
+    fn an_unlisted_inner_state_leaves_its_feed_unlisted() {
+        let (_dir, _caches, store) = open_store("unlisted");
+        let unlisted = |token: &str| {
+            let mut transition = inner_state(token);
+            transition.feed.as_mut().unwrap().inner[0].2 = true;
+            transition
+        };
+        let state = || store.feed_state(b"feed").unwrap().unwrap();
+        publish_from_state(&store, unlisted("token"));
+        assert!(state().unlisted && state().ended);
+        publish_from_state(&store, inner_state("token"));
+        assert!(!state().unlisted);
+        publish_from_state(&store, unlisted("token"));
+        assert!(state().unlisted, "the state of its token");
+        publish_from_state(&store, inner_state("other"));
+        assert!(!state().unlisted);
     }
 
     #[test]

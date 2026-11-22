@@ -227,6 +227,7 @@ fn wit_part(
         .map(|state| wit_types::FeedState {
             id: LogicalId::new(state.kind, state.identity).into(),
             token: state.token,
+            unlisted: state.unlisted,
         })
         .collect();
     (
