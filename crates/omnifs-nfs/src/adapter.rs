@@ -896,6 +896,7 @@ mod tests {
         last_read: Mutex<Option<(u64, u32)>>,
         /// Whether each read fails at a rate limit.
         rate_limited: AtomicBool,
+        events: tokio::sync::broadcast::Sender<NsEvent>,
     }
 
     fn stub_attrs(kind: EntryKind) -> Attrs {
@@ -1043,7 +1044,7 @@ mod tests {
         }
 
         fn subscribe(&self) -> EventStream {
-            EventStream::from_broadcast(tokio::sync::broadcast::channel(4).1)
+            EventStream::from_broadcast(self.events.subscribe())
         }
     }
 
@@ -1071,6 +1072,7 @@ mod tests {
             reads: AtomicU64::new(0),
             last_read: Mutex::new(None),
             rate_limited: AtomicBool::new(false),
+            events: tokio::sync::broadcast::channel(4).0,
         }
     }
 
@@ -1298,6 +1300,40 @@ mod tests {
         assert_eq!(
             attr.size, 5,
             "attrs served after lookup must reflect the size learned by the probe"
+        );
+    }
+
+    #[test]
+    fn changed_attrs_record_the_grown_size_of_a_live_file_alone() {
+        let runtime = TokioRuntime::new().expect("tokio runtime");
+        let namespace = Arc::new(stub_tree());
+        let export = Export::new(
+            runtime.handle().clone(),
+            Arc::clone(&namespace) as Arc<dyn Namespace>,
+        );
+        let changed = |node: &str, stability| {
+            namespace
+                .events
+                .send(NsEvent::AttrsChanged {
+                    path: path(node),
+                    attrs: Attrs {
+                        size: 7,
+                        stability,
+                        ..stub_attrs(EntryKind::File)
+                    },
+                })
+                .expect("the export listens");
+            export.apply_pending_events();
+        };
+        changed("/test/message", Stability::Stable);
+        assert!(export.grown_sizes.is_empty());
+        changed("/test/live", Stability::Live);
+        assert_eq!(
+            export
+                .grown_sizes
+                .get(&path("/test/live"))
+                .map(|size| *size),
+            Some(7)
         );
     }
 
