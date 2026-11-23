@@ -69,28 +69,6 @@ pub(crate) async fn poll_until_mut<S, T>(
     }
 }
 
-/// The synchronous twin of [`poll_until`] for the one caller
-/// (`commands/mount/detect.rs`) that runs outside the async runtime. `check`
-/// returning `Some(value)` means ready (a caller folds any hard-abort
-/// condition into this rather than a separate error channel); `None` means
-/// keep polling.
-pub(crate) fn poll_until_sync<T>(
-    timeout: Duration,
-    interval: Duration,
-    mut check: impl FnMut() -> Option<T>,
-) -> Option<T> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Some(value) = check() {
-            return Some(value);
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(interval);
-    }
-}
-
 /// How a detached child's log file should be opened. The host runner's log
 /// accumulates across every launch (the runner itself is long-lived state);
 /// the libkrun helper's diagnostic log is per-launch and holds credential-free

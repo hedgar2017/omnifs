@@ -7,11 +7,8 @@
 use omnifs_auth::{AmbientKind, AmbientSource, AuthManifest};
 use secrecy::SecretString;
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
-
-/// How long an ambient command may run before it is killed and ignored.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub struct DetectedCredential {
@@ -55,7 +52,7 @@ fn read_source(source: &AmbientSource) -> Option<DetectedCredential> {
             })
         },
         AmbientKind::Command { argv } => {
-            let token = run_command(argv)?;
+            let token = run_command(argv, omnifs_core::SILENT_PEER_TIMEOUT)?;
             Some(DetectedCredential {
                 source: source.note.clone(),
                 value: SecretString::from(token),
@@ -65,10 +62,11 @@ fn read_source(source: &AmbientSource) -> Option<DetectedCredential> {
 }
 
 /// Runs `argv` as a plain argv exec (never a shell, no string interpolation)
-/// and returns its trimmed stdout if it exits successfully within
-/// [`COMMAND_TIMEOUT`]. A command that is still running at the deadline is
-/// killed and treated as not found.
-fn run_command(argv: &[String]) -> Option<String> {
+/// and returns its trimmed stdout if it exits successfully. The end of its
+/// output, at its exit, ends the wait; a command that holds its output open
+/// and writes nothing for `silence` is a silent peer, killed and treated as
+/// not found.
+fn run_command(argv: &[String], silence: Duration) -> Option<String> {
     let (binary, rest) = argv.split_first()?;
     let mut child = Command::new(binary)
         .args(rest)
@@ -77,42 +75,39 @@ fn run_command(argv: &[String]) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-
-    // Drain stdout on a separate thread so a chatty command can't deadlock on
-    // pipe backpressure while we poll for exit below. Killing the child on
-    // timeout closes its stdout, so joining afterwards never blocks long.
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-
-    let exited = wait_within(&mut child, COMMAND_TIMEOUT);
-    if !exited {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let output = reader.join().ok()?;
-    if !exited {
-        return None;
-    }
-
-    let token = String::from_utf8_lossy(&output).trim().to_string();
-    (!token.is_empty()).then_some(token)
-}
-
-/// Polls `child` until it exits or `timeout` elapses. Returns whether it
-/// exited successfully within the deadline.
-fn wait_within(child: &mut Child, timeout: Duration) -> bool {
-    crate::process::poll_until_sync(timeout, Duration::from_millis(20), || {
-        match child.try_wait() {
-            Ok(Some(status)) => Some(status.success()),
-            Ok(None) => None,
-            Err(_) => Some(false),
+    let (chunks, output) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) | Err(_) => {
+                    let _ = chunks.send(None);
+                    return;
+                },
+                Ok(read) => {
+                    if chunks.send(Some(buffer[..read].to_vec())).is_err() {
+                        return;
+                    }
+                },
+            }
         }
-    })
-    .unwrap_or(false)
+    });
+    let mut bytes = Vec::new();
+    loop {
+        match output.recv_timeout(silence) {
+            Ok(Some(chunk)) => bytes.extend(chunk),
+            Ok(None) => break,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            },
+        }
+    }
+    let succeeded = child.wait().ok()?.success();
+    let token = String::from_utf8_lossy(&bytes).trim().to_string();
+    (succeeded && !token.is_empty()).then_some(token)
 }
 
 #[cfg(test)]
@@ -120,7 +115,6 @@ mod tests {
     use super::*;
     use omnifs_auth::{AuthScheme, StaticTokenScheme};
     use secrecy::ExposeSecret;
-    use std::time::Instant;
 
     fn manifest_with(sources: Vec<AmbientSource>) -> AuthManifest {
         AuthManifest {
@@ -174,21 +168,16 @@ mod tests {
         assert_eq!(credential.value().expose_secret(), "command-token");
     }
 
+    /// A command that holds its output open and writes nothing is killed
+    /// after the silence of the wait, and gives no credential.
     #[test]
-    fn detect_command_source_times_out() {
-        let manifest = manifest_with(vec![AmbientSource {
-            kind: AmbientKind::Command {
-                argv: vec!["sleep".into(), "10".into()],
-            },
-            note: String::new(),
-        }]);
-        let start = Instant::now();
-        let found = detect(Some(&manifest));
-        assert!(found.is_empty());
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "expected the command to be killed at the timeout, took {:?}",
-            start.elapsed()
+    fn a_silent_detect_command_is_killed_after_its_silence() {
+        let argv = vec!["sleep".to_owned(), "1000".to_owned()];
+        assert_eq!(run_command(&argv, Duration::from_millis(100)), None);
+        let argv = vec!["echo".to_owned(), "token".to_owned()];
+        assert_eq!(
+            run_command(&argv, Duration::from_millis(100)).as_deref(),
+            Some("token")
         );
     }
 }
