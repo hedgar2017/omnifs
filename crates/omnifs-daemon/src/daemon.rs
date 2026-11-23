@@ -19,10 +19,6 @@ use crate::control::mapping::{
     api_credential_health_kind, api_credential_status, api_mount_record,
 };
 
-/// The wait of a shutdown for the filesystems that it asked to detach, which
-/// their detach ends; a filesystem that holds its attachment and makes no
-/// progress is a silent peer.
-pub(crate) const DRAIN_TIMEOUT: std::time::Duration = omnifs_core::SILENT_PEER_TIMEOUT;
 /// Loopback, or Linux's Docker bridge gateway when that interface exists.
 /// Never binds all interfaces. A `getifaddrs` failure is a genuine "we do
 /// not know the answer" and must propagate rather than silently bind
@@ -62,6 +58,10 @@ pub(crate) struct Daemon {
     pub(crate) vfs: Arc<omnifs_vfs::VfsServer>,
     pub(crate) bound_tcp: OnceLock<omnifs_vfs::Endpoint>,
     pub(crate) shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// The wait of a shutdown for its requests and for the filesystems that
+    /// it asked to detach, which their ends end; a request or a filesystem
+    /// that makes no progress is a silent peer.
+    pub(crate) drain_timeout: std::time::Duration,
 }
 
 pub(crate) struct DaemonParts {
@@ -72,6 +72,7 @@ pub(crate) struct DaemonParts {
     pub(crate) manager: Arc<crate::manager::MutationManager>,
     pub(crate) inspector: Option<Arc<Inspector>>,
     pub(crate) shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub(crate) drain_timeout: std::time::Duration,
 }
 
 impl Daemon {
@@ -84,6 +85,7 @@ impl Daemon {
             manager,
             inspector,
             shutdown_tx,
+            drain_timeout,
         } = parts;
         let serving_dyn: Arc<dyn omnifs_vfs::ServingNamespace> = Arc::clone(&serving) as Arc<_>;
         let vfs = omnifs_vfs::VfsServer::new(serving_dyn);
@@ -97,6 +99,7 @@ impl Daemon {
             vfs,
             bound_tcp: OnceLock::new(),
             shutdown_tx,
+            drain_timeout,
         }
     }
 
@@ -138,7 +141,7 @@ impl Daemon {
             .map_err(|error| anyhow::anyhow!("mutation manager shutdown: {error}"));
         let retired = self.serving.retire_active();
         self.vfs.shutdown().await;
-        let generation_result = match retired.drain(DRAIN_TIMEOUT).await {
+        let generation_result = match retired.drain(self.drain_timeout).await {
             omnifs_engine::DrainOutcome::Drained => Ok(()),
             omnifs_engine::DrainOutcome::Stuck { active, .. } => Err(anyhow::anyhow!(
                 "active generation retained {active} request(s) after shutdown grace"

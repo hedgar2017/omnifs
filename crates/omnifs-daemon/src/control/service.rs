@@ -324,12 +324,13 @@ impl wire::control_server::Control for GrpcControlService {
             }));
         };
         let vfs = Arc::clone(&daemon.vfs);
+        let drain_timeout = daemon.drain_timeout;
         let shutdown_tx = daemon.shutdown_tx.clone();
         let result = tokio::spawn(async move {
             let (detached, still_attached) = if stop_filesystems {
                 let before = vfs.attachments().len();
                 vfs.stop_filesystems();
-                let still = vfs.drain_attachments(DRAIN_TIMEOUT).await;
+                let still = vfs.drain_attachments(drain_timeout).await;
                 (
                     before.saturating_sub(still.len()),
                     still

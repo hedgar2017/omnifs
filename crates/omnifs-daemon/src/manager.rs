@@ -30,15 +30,28 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 const MUTATION_QUEUE_CAPACITY: usize = 16;
-/// The wait of a new generation for the operations of the one before it,
-/// which their ends end; an operation that a silent peer holds is bound by
-/// the silence of that peer.
-const GENERATION_DRAIN_GRACE: Duration = omnifs_core::SILENT_PEER_TIMEOUT;
-/// The lease of a mutation, which its apply or its drop ends: a holder that
-/// does neither is a silent peer, and the next `begin` steals its lease.
-/// This only gates the `BeginMutation` → `ApplyMutation` gap; the
-/// single-writer task serializes everything else.
-const MUTATION_LEASE: Duration = omnifs_core::SILENT_PEER_TIMEOUT;
+
+/// The waits of the manager that only a silent peer could hang.
+#[derive(Clone, Copy)]
+pub(crate) struct ManagerBounds {
+    /// The lease of a mutation, which its apply or its drop ends: a holder
+    /// that does neither is a silent peer, and the next `begin` steals its
+    /// lease. This only gates the `BeginMutation` → `ApplyMutation` gap; the
+    /// single-writer task serializes everything else.
+    pub(crate) lease: Duration,
+    /// The wait of a new generation for the operations of the one before it,
+    /// which their ends end; an operation that a silent peer holds is bound
+    /// by the silence of that peer.
+    pub(crate) drain_grace: Duration,
+}
+
+impl ManagerBounds {
+    /// The bounds of the daemon: each is the bound of a silent peer.
+    pub(crate) const SILENT_PEER: Self = Self {
+        lease: omnifs_core::SILENT_PEER_TIMEOUT,
+        drain_grace: omnifs_core::SILENT_PEER_TIMEOUT,
+    };
+}
 
 /// A live view of the held slot, mirrored outside the single-writer task so
 /// synchronous status reporting can read it without a channel round trip.
@@ -61,17 +74,15 @@ impl MutationManager {
         host: Arc<HostOnline>,
         serving: Arc<ServingCell>,
     ) -> Arc<Self> {
-        Self::spawn_with_lease(state, host, serving, MUTATION_LEASE)
+        Self::spawn_with_bounds(state, host, serving, ManagerBounds::SILENT_PEER)
     }
 
-    /// Test-only entry point so lease-expiry tests can inject a short lease
-    /// instead of waiting out the real 30-second one. Also the production
-    /// path (via `spawn`), which always passes the fixed [`MUTATION_LEASE`].
-    pub(crate) fn spawn_with_lease(
+    /// [`Self::spawn`] with `bounds`, which tests shorten.
+    pub(crate) fn spawn_with_bounds(
         state: Arc<StateStore>,
         host: Arc<HostOnline>,
         serving: Arc<ServingCell>,
-        lease: Duration,
+        bounds: ManagerBounds,
     ) -> Arc<Self> {
         let (sender, receiver) = mpsc::channel(MUTATION_QUEUE_CAPACITY);
         let refreshes = state.subscribe_credential_refreshes();
@@ -80,7 +91,7 @@ impl MutationManager {
             state,
             host,
             serving,
-            lease,
+            bounds,
             Arc::clone(&slot_view),
             refreshes,
             receiver,
@@ -236,7 +247,7 @@ struct ManagerState {
     host: Arc<HostOnline>,
     serving: Arc<ServingCell>,
     stuck: Option<omnifs_engine::RetiredGeneration>,
-    lease: Duration,
+    bounds: ManagerBounds,
     slot: Option<MutationSlot>,
     slot_view: Arc<std::sync::Mutex<Option<SlotView>>>,
 }
@@ -245,7 +256,7 @@ async fn run_manager(
     state: Arc<StateStore>,
     host: Arc<HostOnline>,
     serving: Arc<ServingCell>,
-    lease: Duration,
+    bounds: ManagerBounds,
     slot_view: Arc<std::sync::Mutex<Option<SlotView>>>,
     mut refreshes: tokio::sync::watch::Receiver<()>,
     mut receiver: mpsc::Receiver<ManagerCommand>,
@@ -255,7 +266,7 @@ async fn run_manager(
         host,
         serving,
         stuck: None,
-        lease,
+        bounds,
         slot: None,
         slot_view,
     };
@@ -337,10 +348,10 @@ impl ManagerState {
                 deadline_unix_ms: slot.deadline_unix_ms,
             });
         }
-        let deadline_unix_ms = unix_millis_now() + duration_millis(self.lease);
+        let deadline_unix_ms = unix_millis_now() + duration_millis(self.bounds.lease);
         self.set_slot(Some(MutationSlot {
             id,
-            deadline: Instant::now() + self.lease,
+            deadline: Instant::now() + self.bounds.lease,
             deadline_unix_ms,
         }));
         Ok(deadline_unix_ms)
@@ -565,7 +576,7 @@ impl ManagerState {
             pending_refreshes,
         } = build.into_parts();
         let retired = self.serving.publish(ready);
-        match retired.drain(GENERATION_DRAIN_GRACE).await {
+        match retired.drain(self.bounds.drain_grace).await {
             DrainOutcome::Drained => {
                 if let Err(error) = pending_refreshes.activate(&self.state).await {
                     let detail = format!(
@@ -842,56 +853,81 @@ mod tests {
         ));
     }
 
-    /// Each wait of the daemon that only a silent live peer could hang has
-    /// the one bound of a silent peer, and no number of its own.
-    #[test]
-    fn the_waits_on_a_silent_peer_have_its_one_bound() {
-        assert_eq!(super::MUTATION_LEASE, omnifs_core::SILENT_PEER_TIMEOUT);
-        assert_eq!(
-            super::GENERATION_DRAIN_GRACE,
+    /// The lease of a mutation that the daemon spawns ends once its holder
+    /// is silent for the bound of a silent peer, and not before: the next
+    /// `begin` steals it then.
+    #[tokio::test]
+    async fn the_lease_of_a_silent_holder_ends_after_the_bound_of_a_silent_peer() {
+        let (state, host, serving, _temp) = test_parts().await;
+        let manager = MutationManager::spawn(state, host, serving);
+        tokio::time::pause();
+        let first = MutationId::from_bytes([1; 16]);
+        let second = MutationId::from_bytes([2; 16]);
+        manager.begin(first).await.unwrap();
+        tokio::time::advance(
             omnifs_core::SILENT_PEER_TIMEOUT
-        );
-        assert_eq!(
-            crate::daemon::DRAIN_TIMEOUT,
-            omnifs_core::SILENT_PEER_TIMEOUT
-        );
-    }
-
-    async fn test_manager(lease: Duration) -> (Arc<MutationManager>, tempfile::TempDir) {
-        let temp = tempfile::tempdir().unwrap();
-        let endpoint = Bootstrap::<Daemon>::under_root(temp.path());
-        let state = Arc::new(
-            StateStore::open(&endpoint, StateStoreOptions::default())
-                .await
+                .checked_sub(Duration::from_millis(1))
                 .unwrap(),
-        );
-        let paths = state.engine_paths();
-        let host = Arc::new(
-            omnifs_engine::HostOnline::open_runtime(omnifs_engine::HostRuntimeOpen {
-                projection: paths.projection_cache().to_path_buf(),
-                wasmtime: paths.wasmtime_cache().to_path_buf(),
-                clones: paths.clone_cache().to_path_buf(),
-            })
-            .unwrap(),
-        );
-        let draft = GenerationDraft::load(&state).await.unwrap();
-        let parts = draft.prepare(&state, &host).await.unwrap().into_parts();
-        let serving = ServingCell::new([0; 16], parts.ready);
-        parts.pending_refreshes.activate(&state).await.unwrap();
-        state.mark_serving(parts.revision).await.unwrap();
-        let manager = MutationManager::spawn_with_lease(state, host, serving, lease);
-        (manager, temp)
+        )
+        .await;
+        assert!(matches!(
+            manager.begin(second).await,
+            Err(ManagerError::MutationInProgress { holder, .. }) if holder == first
+        ));
+        tokio::time::advance(Duration::from_millis(2)).await;
+        manager.begin(second).await.unwrap();
+        manager.shutdown().await.unwrap();
     }
 
-    /// Same setup as [`test_manager`], but also hands back the `StateStore`
-    /// and `ServingCell` so a test can commit durable state behind the
-    /// manager's back (bypassing `apply`, which always rebuilds) and then
-    /// observe whether a later call actually rebuilt the serving generation.
-    async fn test_manager_with_state(
-        lease: Duration,
-    ) -> (
-        Arc<MutationManager>,
+    /// A new generation waits for a request of the one before it that a
+    /// silent peer holds for its drain grace, and then cancels it.
+    #[tokio::test]
+    async fn a_new_generation_cancels_a_silent_request_after_its_drain_grace() {
+        use omnifs_vfs::ServingNamespace as _;
+        let (state, host, serving, _temp) = test_parts().await;
+        let lease = serving.acquire().unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let request = tokio::spawn(async move {
+            lease
+                .run(async move {
+                    let _ = started_tx.send(());
+                    std::future::pending::<Result<(), omnifs_vfs::NsError>>().await
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        let grace = Duration::from_millis(200);
+        let manager = MutationManager::spawn_with_bounds(
+            state,
+            host,
+            serving,
+            ManagerBounds {
+                lease: omnifs_core::SILENT_PEER_TIMEOUT,
+                drain_grace: grace,
+            },
+        );
+        let id = MutationId::from_bytes([1; 16]);
+        manager.begin(id).await.unwrap();
+        let started = Instant::now();
+        tokio::time::timeout(grace * 25, manager.apply(id, Vec::new()))
+            .await
+            .expect("the silent request held the new generation")
+            .unwrap();
+        assert!(started.elapsed() >= grace);
+        assert_eq!(request.await.unwrap(), Err(omnifs_vfs::NsError::Network));
+        manager.shutdown().await.unwrap();
+    }
+
+    fn test_bounds(lease: Duration) -> ManagerBounds {
+        ManagerBounds {
+            lease,
+            ..ManagerBounds::SILENT_PEER
+        }
+    }
+
+    async fn test_parts() -> (
         Arc<StateStore>,
+        Arc<HostOnline>,
         Arc<omnifs_engine::ServingCell>,
         tempfile::TempDir,
     ) {
@@ -916,11 +952,33 @@ mod tests {
         let serving = ServingCell::new([0; 16], parts.ready);
         parts.pending_refreshes.activate(&state).await.unwrap();
         state.mark_serving(parts.revision).await.unwrap();
-        let manager = MutationManager::spawn_with_lease(
+        (state, host, serving, temp)
+    }
+
+    async fn test_manager(lease: Duration) -> (Arc<MutationManager>, tempfile::TempDir) {
+        let (state, host, serving, temp) = test_parts().await;
+        let manager = MutationManager::spawn_with_bounds(state, host, serving, test_bounds(lease));
+        (manager, temp)
+    }
+
+    /// Same setup as [`test_manager`], but also hands back the `StateStore`
+    /// and `ServingCell` so a test can commit durable state behind the
+    /// manager's back (bypassing `apply`, which always rebuilds) and then
+    /// observe whether a later call actually rebuilt the serving generation.
+    async fn test_manager_with_state(
+        lease: Duration,
+    ) -> (
+        Arc<MutationManager>,
+        Arc<StateStore>,
+        Arc<omnifs_engine::ServingCell>,
+        tempfile::TempDir,
+    ) {
+        let (state, host, serving, temp) = test_parts().await;
+        let manager = MutationManager::spawn_with_bounds(
             Arc::clone(&state),
             host,
             Arc::clone(&serving),
-            lease,
+            test_bounds(lease),
         );
         (manager, state, serving, temp)
     }

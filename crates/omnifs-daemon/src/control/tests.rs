@@ -292,24 +292,27 @@ async fn test_runtime(
     preface_timeout: std::time::Duration,
     lease: Duration,
 ) -> TestRuntime {
-    test_runtime_with_upload_silence(
+    test_runtime_with_bounds(
         dir,
         connection_limit,
         preface_timeout,
         lease,
+        omnifs_core::SILENT_PEER_TIMEOUT,
         omnifs_core::SILENT_PEER_TIMEOUT,
     )
     .await
 }
 
 /// [`test_runtime`] whose provider upload fails after `upload_silence`
-/// without bytes.
-async fn test_runtime_with_upload_silence(
+/// without bytes, and whose shutdown waits `drain_timeout` for its requests
+/// and its filesystems.
+async fn test_runtime_with_bounds(
     dir: &tempfile::TempDir,
     connection_limit: usize,
     preface_timeout: std::time::Duration,
     lease: Duration,
     upload_silence: Duration,
+    drain_timeout: Duration,
 ) -> TestRuntime {
     let _ = dir;
     let context = Arc::new(crate::context::DaemonContext::resolve().unwrap());
@@ -340,11 +343,14 @@ async fn test_runtime_with_upload_silence(
         omnifs_engine::ServingCell::new(context.namespace_epoch().daemon_instance(), parts.ready);
     parts.pending_refreshes.activate(&state).await.unwrap();
     state.mark_serving(parts.revision).await.unwrap();
-    let manager = crate::manager::MutationManager::spawn_with_lease(
+    let manager = crate::manager::MutationManager::spawn_with_bounds(
         Arc::clone(&state),
         host,
         Arc::clone(&serving),
-        lease,
+        crate::manager::ManagerBounds {
+            lease,
+            ..crate::manager::ManagerBounds::SILENT_PEER
+        },
     );
     let (shutdown, _) = tokio::sync::watch::channel(false);
     let embedded = Arc::new(super::EmbeddedProviders::default());
@@ -356,6 +362,7 @@ async fn test_runtime_with_upload_silence(
         manager,
         inspector: None,
         shutdown_tx: shutdown.clone(),
+        drain_timeout,
     }));
     let (control, _repairs) = super::ControlServer::new_with_limits(
         Arc::clone(&context),
@@ -1177,12 +1184,13 @@ async fn a_provider_upload_without_bytes_fails_after_its_silence() {
     unsafe {
         std::env::set_var("OMNIFS_HOME", &home);
     }
-    let runtime = test_runtime_with_upload_silence(
+    let runtime = test_runtime_with_bounds(
         &dir,
         CONTROL_CONNECTION_LIMIT,
         CONTROL_PREFACE_TIMEOUT,
         Duration::from_secs(30),
         Duration::from_millis(100),
+        omnifs_core::SILENT_PEER_TIMEOUT,
     )
     .await;
     runtime.control.set_ready(Arc::clone(&runtime.daemon));
@@ -1205,4 +1213,134 @@ async fn a_provider_upload_without_bytes_fails_after_its_silence() {
         status.message()
     );
     runtime.shutdown().await;
+}
+
+/// A daemon in a shutdown waits for a request that a silent peer holds for
+/// its drain timeout, and then cancels it.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(unsafe_code)]
+async fn a_shutdown_cancels_a_silent_request_after_its_drain_timeout() {
+    use omnifs_vfs::ServingNamespace as _;
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = crate::ENV_LOCK.lock().await;
+    let home = std::fs::canonicalize(dir.path()).unwrap();
+    unsafe {
+        std::env::set_var("OMNIFS_HOME", &home);
+    }
+    let drain = Duration::from_millis(200);
+    let runtime = test_runtime_with_bounds(
+        &dir,
+        CONTROL_CONNECTION_LIMIT,
+        CONTROL_PREFACE_TIMEOUT,
+        omnifs_core::SILENT_PEER_TIMEOUT,
+        omnifs_core::SILENT_PEER_TIMEOUT,
+        drain,
+    )
+    .await;
+    runtime.control.set_ready(Arc::clone(&runtime.daemon));
+    let lease = runtime.daemon.serving.acquire().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let request = tokio::spawn(async move {
+        lease
+            .run(async move {
+                let _ = started_tx.send(());
+                std::future::pending::<Result<(), omnifs_vfs::NsError>>().await
+            })
+            .await
+    });
+    started_rx.await.unwrap();
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(drain * 25, runtime.shutdown())
+        .await
+        .expect("the silent request held the shutdown");
+    assert!(started.elapsed() >= drain);
+    assert_eq!(request.await.unwrap(), Err(omnifs_vfs::NsError::Network));
+}
+
+/// A shutdown that stops the filesystems waits for a busy one for its drain
+/// timeout, and then answers with it still attached.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(unsafe_code)]
+async fn a_shutdown_answers_with_a_busy_filesystem_after_its_drain_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = crate::ENV_LOCK.lock().await;
+    let home = std::fs::canonicalize(dir.path()).unwrap();
+    unsafe {
+        std::env::set_var("OMNIFS_HOME", &home);
+    }
+    let drain = Duration::from_millis(200);
+    let runtime = test_runtime_with_bounds(
+        &dir,
+        CONTROL_CONNECTION_LIMIT,
+        CONTROL_PREFACE_TIMEOUT,
+        omnifs_core::SILENT_PEER_TIMEOUT,
+        omnifs_core::SILENT_PEER_TIMEOUT,
+        drain,
+    )
+    .await;
+    runtime.control.set_ready(Arc::clone(&runtime.daemon));
+    let socket = home.join("attach-test.sock");
+    runtime.daemon.vfs.serve_unix(&socket).unwrap();
+    let identity = omnifs_core::fs::Spec::new(
+        "test".parse().unwrap(),
+        omnifs_core::fs::Protocol::Fuse,
+        omnifs_core::fs::Runtime::Host,
+        std::path::PathBuf::from("/mnt/test"),
+    )
+    .unwrap();
+    let (teardown_tx, mut teardown_rx) = tokio::sync::mpsc::channel(1);
+    let namespace = omnifs_vfs::WireNamespace::attach_with_teardown(
+        omnifs_vfs::AttachTarget::Unix(socket),
+        "0123456789abcdef0123456789abcdef".parse().unwrap(),
+        identity.clone(),
+        tokio::runtime::Handle::current(),
+        teardown_tx,
+    )
+    .await
+    .unwrap();
+    let busy = tokio::spawn(async move {
+        let request = teardown_rx.recv().await.unwrap();
+        request.complete(omnifs_vfs::TeardownOutcome::Busy);
+    });
+    let mut c = client(&home.join("control.sock")).await;
+    let started = tokio::time::Instant::now();
+    let answer = tokio::time::timeout(
+        drain * 25,
+        c.shutdown(wire::ShutdownRequest {
+            stop_filesystems: true,
+        }),
+    )
+    .await
+    .expect("the busy filesystem held the shutdown")
+    .unwrap()
+    .into_inner();
+    assert!(started.elapsed() >= drain);
+    assert_eq!(answer.still_attached, vec![identity.to_string()]);
+    busy.await.unwrap();
+    drop(namespace);
+    runtime.shutdown().await;
+}
+
+/// A control connection whose peer sends no preface ends once it is silent
+/// for the bound of a silent peer, and not before.
+#[tokio::test(start_paused = true)]
+async fn a_control_connection_without_a_preface_ends_after_the_bound_of_a_silent_peer() {
+    let (inner, _peer) = tokio::net::UnixStream::pair().unwrap();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let prepared = tokio::time::timeout(
+        omnifs_core::SILENT_PEER_TIMEOUT * 2,
+        super::prepare_control_connection(inner, permit, CONTROL_PREFACE_TIMEOUT),
+    )
+    .await
+    .expect("the silent peer held its control connection");
+    assert!(prepared.is_err());
+    let waited = started.elapsed();
+    assert!(
+        waited >= omnifs_core::SILENT_PEER_TIMEOUT
+            && waited < omnifs_core::SILENT_PEER_TIMEOUT + Duration::from_secs(1),
+        "{waited:?}"
+    );
 }

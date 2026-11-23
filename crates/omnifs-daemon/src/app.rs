@@ -277,6 +277,7 @@ async fn build_daemon(
         manager,
         inspector,
         shutdown_tx,
+        drain_timeout: omnifs_core::SILENT_PEER_TIMEOUT,
     }));
     match daemon.start().await {
         Ok(events) => Ok((daemon, events)),
