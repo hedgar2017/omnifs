@@ -123,6 +123,7 @@ impl GithubProvider {
             "/{owner}/{repo}/pulls/{filter}/{number}/files/{path}",
             |o| {
                 o.dynamic();
+                o.listed();
                 o.file("file.json").canonical::<Json>()?;
                 o.file("file.md").representation::<Markdown>()?;
                 o.file("filename").computed(ChangedFile::filename)?;
@@ -136,6 +137,7 @@ impl GithubProvider {
             "/{owner}/{repo}/pulls/{filter}/{number}/reviews/{review_id}",
             |o| {
                 o.dynamic();
+                o.listed();
                 o.file("review.json").canonical::<Json>()?;
                 o.file("review.md").representation::<Markdown>()?;
                 o.file("state").computed(Review::state)?;
@@ -150,6 +152,7 @@ impl GithubProvider {
             "/{owner}/{repo}/pulls/{filter}/{number}/reviews/{review_id}/comments/{comment_id}",
             |o| {
                 o.dynamic();
+                o.listed();
                 o.file("comment.json").canonical::<Json>()?;
                 o.file("comment.md").representation::<Markdown>()?;
                 o.file("body.md").lazy().computed(ReviewComment::body_md)?;

@@ -52,6 +52,9 @@ pub(in crate::router) struct ObjectDefinition<O: Object> {
     /// always present, but an object may decline a canonical leaf when it has
     /// only direct/blob/stream faces).
     pub(super) has_canonical: bool,
+    /// Whether the listing of a parent collection writes the canonical of the
+    /// object (`o.listed()`).
+    pub(super) listed: bool,
     pub(super) leaves: Vec<ObjectLeaf<O>>,
     /// Boxed live-face handlers, shared so an alias replays the same closures.
     pub(super) face_handlers:
@@ -149,6 +152,7 @@ impl<O: Object> Clone for ObjectDefinition<O> {
             stability: self.stability,
             render_table: self.render_table.clone(),
             has_canonical: self.has_canonical,
+            listed: self.listed,
             leaves: self.leaves.clone(),
             face_handlers: self.face_handlers.clone(),
             collections: self.collections.clone(),
@@ -248,6 +252,7 @@ pub struct ObjectBlock<O: Object> {
     fed_anchor: bool,
     fed_dirs: Vec<&'static str>,
     feed: Option<FeedDeclaration<O::State>>,
+    listed: bool,
     /// The single allowed file-object face name (file shape only).
     file_face_seen: bool,
 }
@@ -270,8 +275,18 @@ impl<O: Object> ObjectBlock<O> {
             fed_anchor: false,
             fed_dirs: Vec::new(),
             feed: None,
+            listed: false,
             file_face_seen: false,
         })
+    }
+
+    /// Take the object from the listing of its parent collection, which
+    /// writes its canonical whole. With that canonical in the projection,
+    /// neither a listing of the anchor nor a read of a face loads the object,
+    /// and an answer of the page of the parent is what changes it.
+    pub fn listed(&mut self) -> &mut Self {
+        self.listed = true;
+        self
     }
 
     /// Feed the anchor's own lookup: whether the object exists comes from
@@ -460,6 +475,7 @@ impl<O: Object> ObjectBlock<O> {
             stability,
             render_table,
             has_canonical,
+            listed: self.listed,
             leaves: self.leaves,
             face_handlers: std::rc::Rc::new(self.face_handlers),
             collections: std::rc::Rc::new(self.collections),

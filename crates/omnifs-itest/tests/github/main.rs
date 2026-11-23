@@ -1724,17 +1724,49 @@ async fn the_files_of_a_listed_entry_render_from_its_row_without_a_request() {
     )
     .await;
     assert_eq!(listing.unwrap(), ["80"]);
-    for (path, expected) in [
+    for folder in [
+        format!("{pull}/files/src%2Flib.rs"),
+        format!("{pull}/reviews/80"),
+    ] {
+        let (listing, requests) = answering(&harness, names(&harness, &folder), []).await;
+        assert!(!listing.unwrap().is_empty(), "{folder}");
+        assert!(requests.is_empty(), "the listing of {folder}");
+    }
+    let leaves = [
         (format!("{pull}/files/src%2Flib.rs/status"), "modified"),
         (format!("{pull}/files/src%2Flib.rs/file.json"), file),
         (format!("{pull}/reviews/80/state"), "APPROVED"),
         (format!("{pull}/reviews/80/review.json"), review),
-    ] {
+    ];
+    for (path, expected) in &leaves {
         assert_eq!(
-            served(&harness, read(&harness, &path)).await.unwrap(),
-            expected,
+            served(&harness, read(&harness, path)).await.unwrap(),
+            *expected,
             "{path}"
         );
+    }
+
+    // In a later sync, the page of the parent is what is asked again: an
+    // entry that it brought asks nothing of its own.
+    harness.begin_sync();
+    let (listing, _) = answering(
+        &harness,
+        names(&harness, &format!("{pull}/files")),
+        [fetched(pull_seven()), fetched(not_modified())],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), ["src%2Flib.rs"]);
+    let (listing, _) = answering(
+        &harness,
+        names(&harness, &format!("{pull}/reviews")),
+        [fetched(not_modified())],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), ["80"]);
+    for (path, expected) in &leaves {
+        let (body, requests) = answering(&harness, read(&harness, path), []).await;
+        assert_eq!(body.unwrap(), *expected, "{path}");
+        assert!(requests.is_empty(), "the read of {path} in a sync");
     }
 }
 
