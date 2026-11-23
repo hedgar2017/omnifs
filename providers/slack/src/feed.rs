@@ -30,6 +30,7 @@
 //! it, once for each `url_private_download` and `edit_timestamp` of the file.
 
 use std::collections::BTreeSet;
+use std::str::FromStr;
 
 use omnifs_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -147,9 +148,9 @@ fn folder(path: &Path) -> Result<Path> {
 
 /// The names of the listing of `path` in the projection, none without a
 /// listing.
-fn listed<K>(cx: &FeedCx<K>, path: &str) -> Result<BTreeSet<Ts>> {
+fn listed<K, T: FromStr + Ord>(cx: &FeedCx<K>, path: &str) -> Result<BTreeSet<T>> {
     Ok(cx
-        .names::<Ts>(path)?
+        .names::<T>(path)?
         .map(|listed| listed.names.into_iter().collect())
         .unwrap_or_default())
 }
@@ -166,10 +167,10 @@ fn read_whole<K>(cx: &FeedCx<K>, path: &str) -> Result<Option<Vec<u8>>> {
     Ok(cx.read_range(path, 0, length)?.map(|file| file.bytes))
 }
 
-/// The `message.json` of the message or the reply at `at` in the
-/// projection, none without one.
-fn projected<K>(cx: &FeedCx<K>, at: &str) -> Result<Option<MessageObject>> {
-    read_whole(cx, &format!("{at}/message.json"))?
+/// The file `json` of the message or the reply at `at` in the projection,
+/// none without one.
+fn projected<K>(cx: &FeedCx<K>, at: &str, json: &str) -> Result<Option<MessageObject>> {
+    read_whole(cx, &format!("{at}/{json}"))?
         .map(|bytes| decode(&bytes))
         .transpose()
 }
@@ -265,7 +266,7 @@ fn take<K>(
     let bytes = object.get().as_bytes();
     let message: MessageObject = decode(bytes)?;
     let at = format!("{listing}/{}", message.ts);
-    let before = projected(cx, &at)?;
+    let before = projected(cx, &at, "message.json")?;
     cx.dir(&at, ListingWrite::Partial)?;
     cx.file(
         format!("{at}/author"),
@@ -299,29 +300,22 @@ fn take<K>(
         }
         files.insert(file.id.clone());
     }
-    let listed = cx
-        .names::<Id>(&folder)?
-        .map(|listed| listed.names)
-        .unwrap_or_default();
-    for id in listed.iter().filter(|id| !files.contains(id)) {
+    for id in listed::<_, Id>(cx, &folder)?.difference(&files) {
         cx.remove(format!("{folder}/{id}"))?;
     }
     Ok(Taken { message, before })
 }
 
 /// The `replies/` of the message `message` at `at`: complete and empty for a
-/// message without replies, and their removal for replies complete in the
-/// projection when the `reply_count` or the `latest_reply` of the message are
-/// not those of `before`, the message as the projection had it, so that a
-/// thread is asked for again only when Slack tells of another reply.
-fn take_replies<K>(
-    cx: &FeedCx<K>,
-    at: &str,
-    message: &MessageObject,
-    before: Option<&MessageObject>,
-) -> Result<()> {
+/// message without replies, without its `thread.json`; and their removal
+/// for replies complete in the projection when the `reply_count` or the
+/// `latest_reply` of the message are not those of its `thread.json`, the
+/// message as the answer of those replies gave it, so that a thread is asked
+/// for again only when Slack tells of other replies than those held.
+fn take_replies<K>(cx: &FeedCx<K>, at: &str, message: &MessageObject) -> Result<()> {
     let replies = format!("{at}/replies");
     let Some(thread) = message.thread() else {
+        cx.remove(format!("{at}/thread.json"))?;
         return complete_replies(cx, &replies, &BTreeSet::new());
     };
     if !cx
@@ -330,7 +324,8 @@ fn take_replies<K>(
     {
         return Ok(());
     }
-    if before.and_then(MessageObject::thread) != Some(thread) {
+    let held = projected(cx, at, "thread.json")?;
+    if held.as_ref().and_then(MessageObject::thread) != Some(thread) {
         cx.remove(replies)?;
     }
     Ok(())
@@ -474,11 +469,7 @@ async fn full_listing(cx: &FeedCx<WorkspaceKey>, listing: Listing) -> Result<Fee
         }))?
         .more(true)
     } else {
-        let listed = cx
-            .names::<Id>(folder.as_str())?
-            .map(|listed| listed.names)
-            .unwrap_or_default();
-        for id in listed.iter().filter(|id| !ids.contains(id)) {
+        for id in listed::<_, Id>(cx, folder.as_str())?.difference(&ids) {
             cx.remove(format!("{folder}/{id}"))?;
         }
         Feed::part(&ListingToken::None)?
@@ -516,12 +507,7 @@ fn take_message(
     let channel = &cx.key().id;
     let at = cx.path().as_str();
     let Taken { message, before } = take(cx, Of::Channel(channel), at, object, inner)?;
-    take_replies(
-        cx,
-        &format!("{at}/{}", message.ts),
-        &message,
-        before.as_ref(),
-    )?;
+    take_replies(cx, &format!("{at}/{}", message.ts), &message)?;
     let new = before.is_none();
     let ts = message.ts;
     if new && !token.swept {
@@ -638,7 +624,8 @@ impl MessageFeed<'_> {
         format!("{}/replies", self.cx.path())
     }
 
-    /// The replies of the message for a start in `replies`: nothing for
+    /// The replies of the message for a start in `replies` or at
+    /// `thread.json`: nothing for
     /// `replies/` complete in the projection, which has each reply, as for a
     /// lookup of a reply that it lacks, and for a message that the
     /// projection does not have; `replies/` complete and empty without a
@@ -648,7 +635,7 @@ impl MessageFeed<'_> {
         if self.cx.count(&at)?.is_some_and(|listed| listed.complete) {
             return self.part(None);
         }
-        match projected(self.cx, self.cx.path().as_str())? {
+        match projected(self.cx, self.cx.path().as_str(), "message.json")? {
             None => self.part(None),
             Some(message) if message.thread().is_none() => {
                 complete_replies(self.cx, &at, &BTreeSet::new())?;
@@ -663,7 +650,7 @@ impl MessageFeed<'_> {
     /// removal for an answer without it; nothing for a message that the
     /// projection has, which the sweep of its channel takes.
     async fn message(&mut self) -> Result<Feed> {
-        if projected(self.cx, self.cx.path().as_str())?.is_some() {
+        if projected(self.cx, self.cx.path().as_str(), "message.json")?.is_some() {
             return self.part(None);
         }
         let key = self.cx.key();
@@ -686,15 +673,12 @@ impl MessageFeed<'_> {
             }) => return self.channel_removal(),
             Err(refusal) => return Err(refusal.error),
         };
-        let mut found = None;
-        for object in &page.objects {
-            if decode::<MessageObject>(object.get().as_bytes())?.ts == key.ts {
-                found = Some(object);
-            }
-        }
-        let Some(object) = found else {
+        let Some(object) = page.objects.first() else {
             return self.removal();
         };
+        if decode::<MessageObject>(object.get().as_bytes())?.ts != key.ts {
+            return self.removal();
+        }
         self.cx.dir(&self.messages, ListingWrite::Join)?;
         let taken = take(
             self.cx,
@@ -703,19 +687,15 @@ impl MessageFeed<'_> {
             object,
             &mut self.inner,
         )?;
-        take_replies(
-            self.cx,
-            self.cx.path().as_str(),
-            &taken.message,
-            taken.before.as_ref(),
-        )?;
+        take_replies(self.cx, self.cx.path().as_str(), &taken.message)?;
         self.part(None)
     }
 
     /// A page of the replies, written at its answer, by the cursor of the
     /// page before it, with the `ts` of the replies of the pages before it in
     /// the token: each message whose `thread_ts` is the `ts` of the message,
-    /// without the message itself; the last page writes `replies/` complete
+    /// and the message itself as `thread.json`, whose `message.json` the
+    /// feed of the history writes; the last page writes `replies/` complete
     /// without each other reply. `thread_not_found` removes the message, `channel_not_found` and
     /// `not_in_channel` the channel, and `invalid_cursor` restarts the
     /// replies.
@@ -757,7 +737,10 @@ impl MessageFeed<'_> {
         let thread = Of::Thread(&key.id, &key.ts);
         for object in &page.objects {
             let message: MessageObject = decode(object.get().as_bytes())?;
-            if message.ts != key.ts && message.thread_ts.as_ref() == Some(&key.ts) {
+            if message.ts == key.ts {
+                let json = format!("{}/thread.json", self.cx.path());
+                self.cx.file(json, object.get().as_bytes())?;
+            } else if message.thread_ts.as_ref() == Some(&key.ts) {
                 take(self.cx, thread, &at, object, &mut self.inner)?;
                 taken.insert(message.ts);
             }

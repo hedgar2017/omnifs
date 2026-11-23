@@ -5,12 +5,15 @@
 //! its `error`, and a rate limit with the status `429` and its `Retry-After`.
 
 use omnifs_sdk::endpoint::HttpResponse;
-use omnifs_sdk::error::ProviderError;
+use omnifs_sdk::error::{ProviderError, ProviderErrorKind};
+use std::marker::PhantomData;
+
+use omnifs_sdk::prelude::Result;
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::value::RawValue;
 
-use crate::{Id, Result, Ts};
+use crate::{Id, Ts};
 
 /// The Web API of Slack.
 #[derive(omnifs_sdk::Endpoint)]
@@ -23,68 +26,89 @@ pub(crate) struct SlackApi;
 pub(crate) struct SlackFiles;
 
 #[derive(Deserialize)]
-pub(crate) struct Metadata {
+struct Metadata {
     next_cursor: Option<String>,
 }
 
-/// The answer of a method of Slack: `ok`, the `error` of `ok` of `false`,
-/// the cursor of the next page, and the objects of the page, none in an
-/// answer with `ok` of `false`.
-pub(crate) struct Answer {
+/// A method of Slack, whose answer has its objects under `OBJECTS`.
+pub(crate) trait Method {
+    const OBJECTS: &'static str;
+}
+
+/// `users.list`, with the users under `members`.
+pub(crate) struct UsersList;
+
+impl Method for UsersList {
+    const OBJECTS: &'static str = "members";
+}
+
+/// `users.conversations`, with the conversations under `channels`.
+pub(crate) struct UsersConversations;
+
+impl Method for UsersConversations {
+    const OBJECTS: &'static str = "channels";
+}
+
+/// `conversations.history` and `conversations.replies`, with the messages
+/// under `messages`.
+pub(crate) struct ConversationsMessages;
+
+impl Method for ConversationsMessages {
+    const OBJECTS: &'static str = "messages";
+}
+
+/// The answer of the method `M`: `ok`, the `error` of `ok` of `false`, the
+/// cursor of the next page, and the objects under `M::OBJECTS` as they came,
+/// none in an answer with `ok` of `false`.
+struct Answer<M> {
     ok: bool,
     error: Option<String>,
     response_metadata: Option<Metadata>,
     objects: Option<Vec<Box<RawValue>>>,
+    method: PhantomData<M>,
 }
 
-/// A method of Slack, whose answer has its objects under the name that the
-/// method gives them.
-pub(crate) trait Method: DeserializeOwned {
-    fn answer(self) -> Answer;
-}
+impl<'de, M: Method> Deserialize<'de> for Answer<M> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct Fields<M>(PhantomData<M>);
 
-/// The answer of the method `$method` with its objects under `$objects`.
-macro_rules! method {
-    ($(#[$doc:meta])* $method:ident, $objects:ident) => {
-        $(#[$doc])*
-        #[derive(Deserialize)]
-        pub(crate) struct $method {
-            ok: bool,
-            error: Option<String>,
-            response_metadata: Option<Metadata>,
-            $objects: Option<Vec<Box<RawValue>>>,
-        }
+        impl<'de, M: Method> Visitor<'de> for Fields<M> {
+            type Value = Answer<M>;
 
-        impl Method for $method {
-            fn answer(self) -> Answer {
-                Answer {
-                    ok: self.ok,
-                    error: self.error,
-                    response_metadata: self.response_metadata,
-                    objects: self.$objects,
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "an answer of Slack with its {}", M::OBJECTS)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Answer<M>, A::Error> {
+                let (mut ok, mut error, mut response_metadata, mut objects) =
+                    (None, None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "ok" => ok = Some(map.next_value()?),
+                        "error" => error = map.next_value()?,
+                        "response_metadata" => response_metadata = map.next_value()?,
+                        key if key == M::OBJECTS => objects = map.next_value()?,
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        },
+                    }
                 }
+                Ok(Answer {
+                    ok: ok.ok_or_else(|| serde::de::Error::missing_field("ok"))?,
+                    error,
+                    response_metadata,
+                    objects,
+                    method: PhantomData,
+                })
             }
         }
-    };
-}
 
-method!(
-    /// The answer of `users.list`, with the users under `members`.
-    UsersList,
-    members
-);
-method!(
-    /// The answer of `users.conversations`, with the conversations under
-    /// `channels`.
-    UsersConversations,
-    channels
-);
-method!(
-    /// The answer of `conversations.history` and of `conversations.replies`,
-    /// with the messages under `messages`.
-    ConversationsMessages,
-    messages
-);
+        deserializer.deserialize_map(Fields(PhantomData))
+    }
+}
 
 /// A page of a method of Slack: its objects as they came, and the cursor of
 /// the next page.
@@ -141,8 +165,8 @@ pub(crate) fn page<M: Method>(response: &HttpResponse) -> std::result::Result<Pa
     if status == 429 {
         return Err(failed().into());
     }
-    let answer = match serde_json::from_slice::<M>(response.body()) {
-        Ok(answer) => answer.answer(),
+    let answer = match serde_json::from_slice::<Answer<M>>(response.body()) {
+        Ok(answer) => answer,
         Err(_) if !(200..300).contains(&status) => return Err(failed().into()),
         Err(error) => return Err(undecoded(&error).into()),
     };
@@ -150,7 +174,7 @@ pub(crate) fn page<M: Method>(response: &HttpResponse) -> std::result::Result<Pa
         let error = answer.error.ok_or_else(|| {
             ProviderError::invalid_input("an answer of Slack with ok of false has no error")
         })?;
-        return Err(refusal(&error));
+        return Err(refusal(&error, failed()));
     }
     let objects = answer.objects.ok_or_else(|| {
         ProviderError::invalid_input("an answer of Slack with ok of true has no objects")
@@ -164,16 +188,15 @@ pub(crate) fn page<M: Method>(response: &HttpResponse) -> std::result::Result<Pa
     })
 }
 
-/// The refusal of a request that Slack answered with the error `error`, with
-/// the kind of that error: not found for a channel or a thread that the bot
-/// sees no more, a timeout for a cursor that Slack takes no more, which the
-/// first request again answers, a refused credential for a token that Slack
-/// takes no more, a denial for a token without the right of the request, a
-/// failure of the network for a failure of Slack itself, which Slack asks to
-/// retry, a timeout for a request that Slack did not answer in time, an
-/// invalid input for a request that Slack does not take, and an internal
-/// error for each other one.
-fn refusal(error: &str) -> Refusal {
+/// The refusal of a request that Slack answered with the error `error`: not
+/// found for a channel or a thread that the bot sees no more, a timeout for a
+/// cursor that Slack takes no more, which the first request again answers, a
+/// refused credential for a token that Slack takes no more, a denial for a
+/// token without the right of the request, a failure of the network for a
+/// failure of Slack itself, which Slack asks to retry, and a timeout for a
+/// request that Slack did not answer in time; each other one is `failed`,
+/// the failure of the request by its status, with the `error` of Slack.
+fn refusal(error: &str, failed: ProviderError) -> Refusal {
     let message = format!("Slack answered the error {error}");
     let (of, error) = match error {
         "channel_not_found" | "not_in_channel" => {
@@ -191,13 +214,29 @@ fn refusal(error: &str) -> Refusal {
             (Refused::Request, ProviderError::network(message))
         },
         "request_timeout" => (Refused::Request, ProviderError::timeout(message)),
-        "invalid_arguments" | "invalid_arg_name" | "invalid_array_arg" | "invalid_charset"
-        | "invalid_form_data" | "invalid_post_type" | "missing_post_type" => {
-            (Refused::Request, ProviderError::invalid_input(message))
-        },
-        _ => (Refused::Request, ProviderError::internal(message)),
+        _ => (Refused::Request, with_message(&failed, message)),
     };
     Refusal { of, error }
+}
+
+/// `error` of its kind and its `Retry-After`, with `message`.
+fn with_message(error: &ProviderError, message: String) -> ProviderError {
+    let made = match error.kind() {
+        ProviderErrorKind::NotFound => ProviderError::not_found(message),
+        ProviderErrorKind::NotADirectory => ProviderError::not_a_directory(message),
+        ProviderErrorKind::NotAFile => ProviderError::not_a_file(message),
+        ProviderErrorKind::PermissionDenied => ProviderError::permission_denied(message),
+        ProviderErrorKind::Network => ProviderError::network(message),
+        ProviderErrorKind::Timeout => ProviderError::timeout(message),
+        ProviderErrorKind::Denied => ProviderError::denied(message),
+        ProviderErrorKind::InvalidInput => ProviderError::invalid_input(message),
+        ProviderErrorKind::TooLarge => ProviderError::too_large(message),
+        ProviderErrorKind::RateLimited => ProviderError::rate_limited(message),
+        ProviderErrorKind::VersionMismatch => ProviderError::version_mismatch(message),
+        ProviderErrorKind::Unimplemented => ProviderError::unimplemented(message),
+        ProviderErrorKind::Internal => ProviderError::internal(message),
+    };
+    made.with_retry_after(error.retry_after())
 }
 
 fn undecoded(error: &serde_json::Error) -> ProviderError {

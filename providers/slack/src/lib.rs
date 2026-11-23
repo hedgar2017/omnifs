@@ -1,12 +1,12 @@
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-
 //! slack-provider: the users, the channels, and the messages of a workspace
-//! of Slack for omnifs, as its bot sees them.
+//! of Slack for omnifs, as its bot sees them, a component of the target
+//! `wasm32-wasip2` alone.
 //!
 //! The mount has `users/{id}/` for each user with `name` and `user.json`,
 //! and `channels/{id}/` for each public and private channel that the bot is
 //! in, archived too, with `name`, `channel.json`, and `messages/{ts}/` for
 //! each message of its history with `author`, `text`, `message.json`,
+//! `thread.json`, the message as the answer of its replies gave it,
 //! `replies/{ts}/` with `author`, `text`, and `message.json` of each reply of
 //! its thread, and `files/{id}/` with `name` and `content` of each file of a
 //! message or a reply, by the ID of Slack of a user, a channel, or a file,
@@ -18,10 +18,10 @@
 //! projection lacks by its `ts` and its replies, and of a file, which takes
 //! its content.
 
+#![cfg(target_arch = "wasm32")]
+
 use omnifs_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-
-pub(crate) use omnifs_sdk::prelude::Result;
 
 mod api;
 mod feed;
@@ -173,7 +173,7 @@ pub(crate) struct ReplyFile;
     display_name = "Slack",
     description = "users, channels, messages, and files from your workspace",
     mount = "slack",
-    projection = 4,
+    projection = 5,
     capabilities(
         domain(
             "slack.com",
@@ -248,9 +248,11 @@ impl SlackProvider {
             o.file("author").fed()?;
             o.file("text").fed()?;
             o.file("message.json").fed()?;
+            o.file("thread.json").fed()?;
             o.dir("replies").fed()?;
             o.dir("files").fed()?;
             o.feed(Message::feed).own().starts([
+                "thread.json",
                 "replies",
                 "replies/{reply}",
                 "replies/{reply}/author",
