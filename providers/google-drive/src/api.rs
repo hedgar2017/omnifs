@@ -77,13 +77,24 @@ pub(crate) struct FileList {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DriveList {
-    pub(crate) drives: Vec<SharedDrive>,
+    #[serde(deserialize_with = "drive_ids")]
+    pub(crate) drives: Vec<String>,
     pub(crate) next_page_token: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub(crate) struct SharedDrive {
-    pub(crate) id: String,
+/// The IDs of the shared drives of a page, each of the object
+/// `{"id": ...}`.
+fn drive_ids<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    struct Drive {
+        id: String,
+    }
+    Ok(Vec::<Drive>::deserialize(deserializer)?
+        .into_iter()
+        .map(|drive| drive.id)
+        .collect())
 }
 
 /// A page of the changes of Google Drive: the token of its next page while

@@ -1,6 +1,6 @@
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-
-//! google-drive-provider: the items of a Google Drive for omnifs.
+//! google-drive-provider: the items of a Google Drive for omnifs, a
+//! component of the target `wasm32-wasip2` alone.
+#![cfg(target_arch = "wasm32")]
 //!
 //! The mount has `files/{id}/` for each file with `name`, `file.json`, and
 //! `content`, `folders/{id}/` for each folder with `name` and `folder.json`,
@@ -34,7 +34,7 @@ mod feed;
 
 /// The ID of an item of Google Drive: letters, digits, `-`, and `_`.
 #[omnifs_sdk::path_segment(validate = is_id)]
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct Id(String);
 

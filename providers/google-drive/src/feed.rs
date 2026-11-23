@@ -86,13 +86,36 @@ enum Corpus {
     User,
     /// A page of the shared drives.
     Drives,
-    /// The items of the shared drive `id`; `next` are the drives after it
-    /// of its page of drives, and `drives` is the token of the next page.
-    Drive {
-        id: String,
-        next: Vec<String>,
-        drives: Option<String>,
-    },
+    /// The items of a shared drive.
+    Drive(SharedDrive),
+}
+
+/// The shared drive `id` of a full listing; `next` are the drives after it
+/// of its page of drives, and `drives` is the token of the next page.
+#[derive(Serialize, Deserialize)]
+struct SharedDrive {
+    id: String,
+    next: Vec<String>,
+    drives: Option<String>,
+}
+
+/// The corpus after the shared drives `ids` of a page of drives, and the
+/// token of its request: the first of them, else the page `drives` of the
+/// drives after them; none after the last.
+fn next_drive(ids: Vec<String>, drives: Option<String>) -> Option<(Corpus, Option<String>)> {
+    let mut ids = ids.into_iter();
+    match (ids.next(), drives) {
+        (Some(id), drives) => Some((
+            Corpus::Drive(SharedDrive {
+                id,
+                next: ids.collect(),
+                drives,
+            }),
+            None,
+        )),
+        (None, Some(drives)) => Some((Corpus::Drives, Some(drives))),
+        (None, None) => None,
+    }
 }
 
 /// The token of the own feed of an item that the mount has; `None` for one
@@ -206,13 +229,13 @@ async fn by_id<K>(cx: &FeedCx<K>, id: &Id) -> Result<Option<Box<RawValue>>> {
     match response.status() {
         200 => Ok(Some(decode(response.body())?)),
         404 => Ok(None),
-        status => Err(answer_error(&response, status)),
+        _ => Err(answer_error(&response)),
     }
 }
 
-fn answer_error(response: &omnifs_sdk::endpoint::HttpResponse, status: u16) -> ProviderError {
+fn answer_error(response: &omnifs_sdk::endpoint::HttpResponse) -> ProviderError {
     ProviderError::from_http_answer(
-        status,
+        response.status(),
         response
             .headers()
             .iter()
@@ -226,7 +249,7 @@ fn answer_error(response: &omnifs_sdk::endpoint::HttpResponse, status: u16) -> P
 struct DriveFeed<'a> {
     cx: &'a FeedCx<DriveKey>,
     inner: Vec<(Kind, Id, Option<ItemState>)>,
-    written: HashSet<(Kind, String)>,
+    written: HashSet<(Kind, Id)>,
     errors: Vec<String>,
 }
 
@@ -300,10 +323,9 @@ impl DriveFeed<'_> {
     /// items, or the shared drives, then its next request, and after its
     /// last one the listing of each kind complete, without the items of the
     /// projection that a full listing other than the first lacks. A token of
-    /// a page that
-    /// Google Drive refuses with `400` begins the listing again, and a page
-    /// for which it searched not all of its corpus is the error of the
-    /// request.
+    /// a page that Google Drive refuses with `400` begins the listing again,
+    /// and a page for which it searched not all of its corpus is the error of
+    /// the request.
     async fn listing(
         &mut self,
         first: bool,
@@ -319,7 +341,7 @@ impl DriveFeed<'_> {
                 .query("fields", "nextPageToken,drives(id)"),
             Corpus::User | Corpus::Drive { .. } => {
                 let request = match &corpus {
-                    Corpus::Drive { id, .. } => endpoint
+                    Corpus::Drive(SharedDrive { id, .. }) => endpoint
                         .get("/drive/v3/files")
                         .query("corpora", "drive")
                         .query("driveId", id),
@@ -357,55 +379,17 @@ impl DriveFeed<'_> {
                 } else {
                     DriveToken::Relisting
                 };
-                return Feed::restart(&again, answer_error(&response, 400));
+                return Feed::restart(&again, answer_error(&response));
             },
-            status => return Err(answer_error(&response, status)),
+            _ => return Err(answer_error(&response)),
         }
-        let next = if let Corpus::Drives = corpus {
-            let list: DriveList = decode(response.body())?;
-            let mut ids = list.drives.into_iter().map(|drive| drive.id);
-            match (ids.next(), list.next_page_token) {
-                (Some(id), drives) => Some((
-                    Corpus::Drive {
-                        id,
-                        next: ids.collect(),
-                        drives,
-                    },
-                    None,
-                )),
-                (None, Some(drives)) => Some((Corpus::Drives, Some(drives))),
-                (None, None) => None,
-            }
-        } else {
-            let list: FileList = decode(response.body())?;
-            if list.incomplete_search {
-                return Err(ProviderError::invalid_input(
-                    "Google Drive searched not all of a corpus for a full listing",
-                ));
-            }
-            for object in &list.files {
-                self.take(object, ListingWrite::Partial)?;
-            }
-            match (list.next_page_token, corpus) {
-                (Some(page), corpus) => Some((corpus, Some(page))),
-                (None, Corpus::User) => Some((Corpus::Drives, None)),
-                (None, Corpus::Drive { next, drives, .. }) => {
-                    let mut next = next.into_iter();
-                    match (next.next(), drives) {
-                        (Some(id), drives) => Some((
-                            Corpus::Drive {
-                                id,
-                                next: next.collect(),
-                                drives,
-                            },
-                            None,
-                        )),
-                        (None, Some(drives)) => Some((Corpus::Drives, Some(drives))),
-                        (None, None) => None,
-                    }
-                },
-                (None, Corpus::Drives) => unreachable!("a page of drives has no items"),
-            }
+        let next = match corpus {
+            Corpus::Drives => {
+                let list: DriveList = decode(response.body())?;
+                next_drive(list.drives, list.next_page_token)
+            },
+            Corpus::User => self.items(response.body(), None)?,
+            Corpus::Drive(drive) => self.items(response.body(), Some(drive))?,
         };
         if let Some((corpus, page)) = next {
             return self.listing_part(first, changes, corpus, page);
@@ -419,21 +403,44 @@ impl DriveFeed<'_> {
         self.end(changes)
     }
 
+    /// The items of a page of a full listing in the corpus of the user, or
+    /// of the shared drive `drive`, and the corpus and the token of the next
+    /// request.
+    fn items(
+        &mut self,
+        body: &[u8],
+        drive: Option<SharedDrive>,
+    ) -> Result<Option<(Corpus, Option<String>)>> {
+        let list: FileList = decode(body)?;
+        if list.incomplete_search {
+            return Err(ProviderError::invalid_input(
+                "Google Drive searched not all of a corpus for a full listing",
+            ));
+        }
+        for object in &list.files {
+            self.take(object, ListingWrite::Partial)?;
+        }
+        Ok(match (list.next_page_token, drive) {
+            (Some(page), drive) => Some((drive.map_or(Corpus::User, Corpus::Drive), Some(page))),
+            (None, None) => Some((Corpus::Drives, None)),
+            (None, Some(drive)) => next_drive(drive.next, drive.drives),
+        })
+    }
+
     /// The removal of each item of `kind` of the projection that neither
     /// the kept parts of a full listing nor its last part wrote or removed.
     fn sweep(&mut self, kind: Kind) -> Result<()> {
         let Some(listed) = self.cx.names::<Id>(dir(kind))? else {
             return Ok(());
         };
-        let kept = self.cx.kept::<String>(dir(kind))?;
+        let kept = self.cx.kept::<Id>(dir(kind))?;
         let taken = kept
             .written
             .into_iter()
             .chain(kept.removed)
             .collect::<HashSet<_>>();
         for id in listed.names {
-            let name = id.to_string();
-            if !taken.contains(&name) && !self.written.contains(&(kind, name)) {
+            if !taken.contains(&id) && !self.written.contains(&(kind, id.clone())) {
                 self.remove(kind, id)?;
             }
         }
@@ -487,9 +494,9 @@ impl DriveFeed<'_> {
         match response.status() {
             200 => {},
             400 => {
-                return Feed::restart(&DriveToken::Relisting, answer_error(&response, 400));
+                return Feed::restart(&DriveToken::Relisting, answer_error(&response));
             },
-            status => return Err(answer_error(&response, status)),
+            _ => return Err(answer_error(&response)),
         }
         let list: ChangeList = decode(response.body())?;
         for change in &list.changes {
@@ -573,7 +580,7 @@ impl DriveFeed<'_> {
             self.cx.remove(content_path(&item.id))?;
         }
         write_item(self.cx, kind, &item, object, listed)?;
-        self.written.insert((kind, item.id.to_string()));
+        self.written.insert((kind, item.id.clone()));
         self.inner.push((
             kind,
             item.id,
@@ -771,7 +778,7 @@ async fn take_content(cx: &FeedCx<ItemKey>, id: &Id, content: &Content<'_>) -> R
                 },
                 (200..=399 | 416, _) => Err(error),
                 (404, _) => Ok(false),
-                (status, _) => Err(answer_error(&refusal, status)),
+                _ => Err(answer_error(&refusal)),
             };
         },
         Err(error) => return Err(error),
