@@ -30,11 +30,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 const MUTATION_QUEUE_CAPACITY: usize = 16;
-const GENERATION_DRAIN_GRACE: Duration = Duration::from_secs(10);
-/// Fixed lease length: no renewal, and an expired lease is stealable by the
-/// next `begin`. This only gates the `BeginMutation` → `ApplyMutation` gap;
-/// the single-writer task serializes everything else.
-const MUTATION_LEASE: Duration = Duration::from_secs(30);
+/// The wait of a new generation for the operations of the one before it,
+/// which their ends end; an operation that a silent peer holds is bound by
+/// the silence of that peer.
+const GENERATION_DRAIN_GRACE: Duration = omnifs_core::SILENT_PEER_TIMEOUT;
+/// The lease of a mutation, which its apply or its drop ends: a holder that
+/// does neither is a silent peer, and the next `begin` steals its lease.
+/// This only gates the `BeginMutation` → `ApplyMutation` gap; the
+/// single-writer task serializes everything else.
+const MUTATION_LEASE: Duration = omnifs_core::SILENT_PEER_TIMEOUT;
 
 /// A live view of the held slot, mirrored outside the single-writer task so
 /// synchronous status reporting can read it without a channel round trip.
@@ -836,6 +840,21 @@ mod tests {
             revocation_finish(&id, async { Ok(()) }, silence).await,
             CredentialRevocationFinish::Deleted
         ));
+    }
+
+    /// Each wait of the daemon that only a silent live peer could hang has
+    /// the one bound of a silent peer, and no number of its own.
+    #[test]
+    fn the_waits_on_a_silent_peer_have_its_one_bound() {
+        assert_eq!(super::MUTATION_LEASE, omnifs_core::SILENT_PEER_TIMEOUT);
+        assert_eq!(
+            super::GENERATION_DRAIN_GRACE,
+            omnifs_core::SILENT_PEER_TIMEOUT
+        );
+        assert_eq!(
+            crate::daemon::DRAIN_TIMEOUT,
+            omnifs_core::SILENT_PEER_TIMEOUT
+        );
     }
 
     async fn test_manager(lease: Duration) -> (Arc<MutationManager>, tempfile::TempDir) {

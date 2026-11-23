@@ -40,7 +40,9 @@ use mapping::manager_error;
 use service::GrpcControlService;
 
 const CONTROL_CONNECTION_LIMIT: usize = 64;
-const CONTROL_PREFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// A client that holds a control connection without its preface is a silent
+/// peer.
+const CONTROL_PREFACE_TIMEOUT: std::time::Duration = omnifs_core::SILENT_PEER_TIMEOUT;
 const CONTROL_HTTP2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 #[derive(Clone)]
 enum ControlPhase {

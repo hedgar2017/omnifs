@@ -5,8 +5,8 @@ use super::context::{ATTACH_PORT_COUNT, ATTACH_PORT_MIN, DaemonContext};
 use super::provider_bundle::EmbeddedProviders;
 use anyhow::Context as _;
 use omnifs_api::{
-    CONTROL_SHUTDOWN_DRAIN_SECS, CredentialHealth, DaemonHealth, DaemonInventory, DaemonPhase,
-    DaemonRecovery, DaemonStatus, HealthReport, HealthState, MountHealth, MountInfo, MountRecord,
+    CredentialHealth, DaemonHealth, DaemonInventory, DaemonPhase, DaemonRecovery, DaemonStatus,
+    HealthReport, HealthState, MountHealth, MountInfo, MountRecord,
 };
 use omnifs_engine::{Inspector, ServingCell};
 use omnifs_state::StateStore;
@@ -19,8 +19,10 @@ use crate::control::mapping::{
     api_credential_health_kind, api_credential_status, api_mount_record,
 };
 
-pub(crate) const DRAIN_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(CONTROL_SHUTDOWN_DRAIN_SECS);
+/// The wait of a shutdown for the filesystems that it asked to detach, which
+/// their detach ends; a filesystem that holds its attachment and makes no
+/// progress is a silent peer.
+pub(crate) const DRAIN_TIMEOUT: std::time::Duration = omnifs_core::SILENT_PEER_TIMEOUT;
 /// Loopback, or Linux's Docker bridge gateway when that interface exists.
 /// Never binds all interfaces. A `getifaddrs` failure is a genuine "we do
 /// not know the answer" and must propagate rather than silently bind
