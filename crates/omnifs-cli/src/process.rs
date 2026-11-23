@@ -1,20 +1,13 @@
-//! Unix process probes shared by detached runtime owners, and the shared
-//! deadline-poll loop every one of them needs while waiting for a runner,
-//! helper, or daemon to reach some observable state.
+//! Unix process probes shared by detached runtime owners: the exit of a
+//! process, an event of the kernel, and the poll of a Docker mount, which
+//! has no event.
 
 use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-
-/// A boxed, borrowed-state future for [`poll_until_mut`]: unlike a plain
-/// generic `Fut` type parameter, a trait object lets the returned future's
-/// lifetime vary with each call's `&mut S` argument (a higher-ranked bound
-/// a fixed `Fut` type cannot express).
-type PollFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<Option<T>>> + 'a>>;
 
 /// Poll `check` at `interval` until it returns `Ok(Some(value))` (ready), an
 /// `Err` (an immediate hard failure, not subject to the deadline), or return
@@ -35,31 +28,6 @@ where
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(value) = check().await? {
-            return Ok(Some(value));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// The variant of [`poll_until`] for a `check` that needs `&mut` access to
-/// state across iterations (for example, polling a child process through
-/// `try_wait`, or recording the last observed state for a timeout message).
-/// `state` is threaded through as an explicit argument, rather than let
-/// `check` capture it, because an `FnMut` closure cannot itself return a
-/// future that borrows its own captured environment; a fresh reborrow of an
-/// argument does not have that restriction.
-pub(crate) async fn poll_until_mut<S, T>(
-    timeout: Duration,
-    interval: Duration,
-    state: &mut S,
-    mut check: impl for<'a> FnMut(&'a mut S) -> PollFuture<'a, T>,
-) -> anyhow::Result<Option<T>> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Some(value) = check(state).await? {
             return Ok(Some(value));
         }
         if tokio::time::Instant::now() >= deadline {
@@ -163,19 +131,33 @@ pub(crate) fn is_alive(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// The exit of the process `pid`, an event of the kernel that becomes
+/// readable at it; none for a process that has already exited.
+pub(crate) fn exit_event(
+    pid: u32,
+) -> Result<Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>> {
+    Ok(omnifs_mtab::process_exit(pid)
+        .with_context(|| format!("watch the exit of process {pid}"))?
+        .map(|exit| tokio::io::unix::AsyncFd::with_interest(exit, tokio::io::Interest::READABLE))
+        .transpose()?)
+}
+
+/// The exit that `exit` watches; at once without one, for a process that
+/// has already exited.
+pub(crate) async fn exited(exit: Option<&tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>) {
+    if let Some(exit) = exit {
+        drop(exit.readable().await);
+    }
+}
+
 /// Waits for the exit of the process `pid`, an event of the kernel: true at
 /// its exit, or for a process that has already exited; false once it is
 /// silent for `silence` without an exit.
 pub(crate) async fn process_ended(pid: u32, silence: Duration) -> Result<bool> {
-    let Some(exit) = omnifs_mtab::process_exit(pid)
-        .with_context(|| format!("watch the exit of process {pid}"))?
-    else {
-        return Ok(true);
-    };
-    let exit = tokio::io::unix::AsyncFd::with_interest(exit, tokio::io::Interest::READABLE)?;
-    Ok(tokio::time::timeout(silence, exit.readable())
+    let exit = exit_event(pid)?;
+    Ok(tokio::time::timeout(silence, exited(exit.as_ref()))
         .await
-        .is_ok_and(|ready| ready.is_ok()))
+        .is_ok())
 }
 
 #[cfg(test)]

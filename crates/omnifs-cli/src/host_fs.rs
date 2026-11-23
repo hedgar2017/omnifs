@@ -137,7 +137,8 @@ impl HostDriver {
         // The exit is watched before the runner is reconfirmed, so that the
         // process it watches is the runner that answers, and before its
         // restart, which leaves the mount to the next runner.
-        let exit = process_exit(record.pid)?.context("the runner ended before its restart")?;
+        let exit = crate::process::exit_event(record.pid)?
+            .context("the runner ended before its restart")?;
         let client = RunnerControlClient::new(&record);
         client.ping().await.context("reconfirm host filesystem")?;
         client.restart().await?;
@@ -253,13 +254,13 @@ impl PendingHostFilesystem {
     /// exit of its process, events of the runner and of the kernel; a runner
     /// that makes no progress is a silent peer.
     async fn wait_until_mounted(mut self, spec: &fs::Spec) -> Result<()> {
-        let exit = process_exit(self.child.id())?;
+        let exit = crate::process::exit_event(self.child.id())?;
         let mounted = {
             let mounted = self.mounted(spec);
             tokio::pin!(mounted);
             tokio::select! {
                 result = &mut mounted => Some(result),
-                () = exited(exit.as_ref()) => None,
+                () = crate::process::exited(exit.as_ref()) => None,
             }
         };
         match mounted {
@@ -341,14 +342,6 @@ impl PendingHostFilesystem {
     }
 }
 
-/// The exit that `exit` watches; at once without one, for a process that
-/// has already exited.
-async fn exited(exit: Option<&tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>) {
-    if let Some(exit) = exit {
-        drop(exit.readable().await);
-    }
-}
-
 fn phase_label(phase: Option<RunnerPhase>) -> String {
     phase.map_or_else(|| "unconfirmed".to_owned(), |phase| format!("{phase:?}"))
 }
@@ -386,14 +379,6 @@ async fn wait_for_cleanup(
         mount_point.display(),
         omnifs_core::SILENT_PEER_TIMEOUT.as_secs()
     );
-}
-
-/// The exit of the process `pid`, an event of the kernel that becomes
-/// readable at it; none for a process that has already exited.
-fn process_exit(pid: u32) -> Result<Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>> {
-    Ok(omnifs_mtab::process_exit(pid)?
-        .map(|exit| tokio::io::unix::AsyncFd::with_interest(exit, tokio::io::Interest::READABLE))
-        .transpose()?)
 }
 
 pub(crate) async fn owned(filesystem: &ClientFilesystemState) -> Result<Vec<Candidate>> {
@@ -454,7 +439,7 @@ mod tests {
             .arg("1")
             .spawn()
             .unwrap();
-        let exit = process_exit(child.id())
+        let exit = crate::process::exit_event(child.id())
             .unwrap()
             .expect("a running process");
         drop(
@@ -464,7 +449,7 @@ mod tests {
                 .unwrap(),
         );
         child.wait().unwrap();
-        assert!(process_exit(child.id()).unwrap().is_none());
+        assert!(crate::process::exit_event(child.id()).unwrap().is_none());
     }
 
     fn pending_runner(temp: &tempfile::TempDir, seconds: &str) -> PendingHostFilesystem {

@@ -39,7 +39,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use omnifs_core::fs;
@@ -61,24 +61,6 @@ use crate::ui::output::Output;
 const SSH_KEY_NAME: &str = "id_ed25519";
 const ROOT_RAW_PART_PREFIX: &str = "root.raw.part.";
 const SEED_STAGING_NAME: &str = "seed-staging";
-
-/// How long a launch waits for the guest readiness beacon. Generous relative
-/// to the host and Docker drivers' launch timeouts because it covers a full
-/// microVM boot, not just a process or container start.
-const LAUNCH_READY_TIMEOUT: Duration = Duration::from_secs(90);
-/// How long a launch waits for the just-spawned helper to publish its
-/// durable record.
-const HELPER_RECORD_TIMEOUT: Duration = Duration::from_secs(5);
-/// Poll interval shared by every short deadline-poll loop in this module.
-const HELPER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// How long teardown waits for a directly-owned child (still attached to
-/// this process) to exit on its own before escalating to `kill`.
-const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long teardown waits for a directly-owned child to exit after `kill`.
-const CHILD_KILL_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long teardown waits for a detached (not directly owned) helper to
-/// remove its own durable record after a shutdown request.
-const DETACHED_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Guest vsock port the daemon's attach listener is proxied onto.
 const ATTACH_VSOCK_PORT: u32 = 1024;
@@ -689,90 +671,95 @@ impl<'a> LibkrunLaunchLease<'a> {
             .context("adopt the readiness listener into the async runtime")
     }
 
+    /// Waits for the record of the helper, at a change of its folder, or
+    /// for the exit of the helper, events of the kernel; a helper that does
+    /// neither is a silent peer.
     async fn wait_for_helper_record(&mut self) -> Result<HelperRecord> {
-        let ready = crate::process::poll_until_mut(
-            HELPER_RECORD_TIMEOUT,
-            HELPER_POLL_INTERVAL,
-            self,
-            |lease| {
-                Box::pin(async move {
-                    if let Ok(Some(record)) = lease.runner.read_helper_record()
-                        && lease.instance_id.as_deref() == Some(record.instance_id.as_str())
-                    {
-                        return Ok(Some(record));
-                    }
-                    if let Some(status) = lease
-                        .child
-                        .as_mut()
-                        .context(
-                            "libkrun helper identity was lost before helper-record publication",
-                        )?
-                        .try_wait()
-                        .context("poll libkrun helper before helper-record publication")?
-                    {
+        let silence = omnifs_core::SILENT_PEER_TIMEOUT;
+        let child = self
+            .child
+            .as_mut()
+            .context("libkrun helper identity was lost before helper-record publication")?;
+        let exit = crate::process::exit_event(child.id())?;
+        let folder = self.runner.dir();
+        loop {
+            let change = omnifs_bootstrap::FolderChange::watch(folder)
+                .with_context(|| format!("watch {}", folder.display()))?;
+            if let Ok(Some(record)) = self.runner.read_helper_record()
+                && self.instance_id.as_deref() == Some(record.instance_id.as_str())
+            {
+                return Ok(record);
+            }
+            let change =
+                tokio::io::unix::AsyncFd::with_interest(change, tokio::io::Interest::READABLE)?;
+            tokio::select! {
+                changed = tokio::time::timeout(silence, change.readable()) => {
+                    if changed.is_err() {
                         anyhow::bail!(
-                            "omnifs-libkrun exited with {status} before publishing {};\n{}",
-                            lease.runner.pidfile().display(),
-                            lease.runner.diagnostic_tail()
+                            "omnifs-libkrun did not publish {} within {}s;\n{}",
+                            self.runner.pidfile().display(),
+                            silence.as_secs(),
+                            self.runner.diagnostic_tail()
                         );
                     }
-                    Ok(None)
-                })
-            },
-        )
-        .await?;
-        ready.with_context(|| {
-            format!(
-                "omnifs-libkrun did not publish {} within {}s;\n{}",
-                self.runner.pidfile().display(),
-                HELPER_RECORD_TIMEOUT.as_secs(),
-                self.runner.diagnostic_tail()
-            )
-        })
+                }
+                () = crate::process::exited(exit.as_ref()) => {
+                    let status = child
+                        .wait()
+                        .context("inspect libkrun helper before helper-record publication")?;
+                    anyhow::bail!(
+                        "omnifs-libkrun exited with {status} before publishing {};\n{}",
+                        self.runner.pidfile().display(),
+                        self.runner.diagnostic_tail()
+                    );
+                }
+            }
+        }
     }
 
+    /// Waits for the readiness beacon of the guest, or for the exit of the
+    /// helper, an event of the kernel; a guest that sends no beacon is a
+    /// silent peer.
     async fn wait_for_ready(&mut self, row: &mut crate::ui::live::Spinner) -> Result<()> {
         let listener = self
             .ready_listener
             .take()
             .context("libkrun readiness listener was not prepared")?;
-        let wait = async {
+        let child = self
+            .child
+            .as_mut()
+            .context("libkrun helper identity was lost while waiting for readiness")?;
+        let exit = crate::process::exit_event(child.id())?;
+        row.update("booting guest");
+        let beacon = async {
             loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (mut stream, _) = accepted?;
-                        let mut buf = [0_u8; 64];
-                        let n = stream.read(&mut buf).await?;
-                        if buf[..n].starts_with(b"ready") {
-                            return Ok::<(), anyhow::Error>(());
-                        }
-                    }
-                    () = tokio::time::sleep(HELPER_POLL_INTERVAL) => {
-                        row.update("booting guest");
-                        if let Some(status) = self
-                            .child
-                            .as_mut()
-                            .context("libkrun helper identity was lost while waiting for readiness")?
-                            .try_wait()
-                            .context("poll libkrun helper while waiting for readiness")?
-                        {
-                            anyhow::bail!(
-                                "omnifs-libkrun exited with {status} before guest readiness;\n{}",
-                                self.runner.diagnostic_tail()
-                            );
-                        }
-                    }
+                let (mut stream, _) = listener.accept().await?;
+                let mut buf = [0_u8; 64];
+                let n = stream.read(&mut buf).await?;
+                if buf[..n].starts_with(b"ready") {
+                    return Ok::<(), anyhow::Error>(());
                 }
             }
         };
-        if let Ok(result) = tokio::time::timeout(LAUNCH_READY_TIMEOUT, wait).await {
-            result.context("read the libkrun readiness beacon")
-        } else {
-            anyhow::bail!(
-                "{} did not appear inside the filesystem within {}s",
-                fs::GUEST_LOCATION,
-                LAUNCH_READY_TIMEOUT.as_secs()
-            )
+        let silence = omnifs_core::SILENT_PEER_TIMEOUT;
+        tokio::select! {
+            ready = tokio::time::timeout(silence, beacon) => match ready {
+                Ok(result) => result.context("read the libkrun readiness beacon"),
+                Err(_) => anyhow::bail!(
+                    "{} did not appear inside the filesystem within {}s",
+                    fs::GUEST_LOCATION,
+                    silence.as_secs()
+                ),
+            },
+            () = crate::process::exited(exit.as_ref()) => {
+                let status = child
+                    .wait()
+                    .context("inspect libkrun helper while waiting for readiness")?;
+                anyhow::bail!(
+                    "omnifs-libkrun exited with {status} before guest readiness;\n{}",
+                    self.runner.diagnostic_tail()
+                );
+            }
         }
     }
 
@@ -794,7 +781,7 @@ impl<'a> LibkrunLaunchLease<'a> {
         }
 
         if self.child.is_some() {
-            if !self.wait_for_owned_child_exit(CHILD_EXIT_TIMEOUT).await? {
+            if !self.wait_for_owned_child_exit().await? {
                 let child = self
                     .child
                     .as_mut()
@@ -804,14 +791,13 @@ impl<'a> LibkrunLaunchLease<'a> {
                     .kill()
                     .with_context(|| format!("kill directly-owned libkrun child {pid}"))?;
                 anyhow::ensure!(
-                    self.wait_for_owned_child_exit(CHILD_KILL_TIMEOUT).await?,
+                    self.wait_for_owned_child_exit().await?,
                     "directly-owned libkrun child {pid} remained live after termination; \
                      recovery identity was preserved"
                 );
             }
         } else if let Some(expected) = record.as_ref() {
-            self.wait_for_detached_exit(expected, DETACHED_EXIT_TIMEOUT)
-                .await?;
+            self.wait_for_detached_exit(expected).await?;
         }
 
         self.child = None;
@@ -823,47 +809,36 @@ impl<'a> LibkrunLaunchLease<'a> {
         Ok(())
     }
 
-    async fn wait_for_owned_child_exit(&mut self, timeout: Duration) -> Result<bool> {
-        Ok(
-            crate::process::poll_until_mut(timeout, HELPER_POLL_INTERVAL, self, |lease| {
-                Box::pin(async move {
-                    let exited = lease
-                        .child
-                        .as_mut()
-                        .context("libkrun child identity was lost while waiting for exit")?
-                        .try_wait()?
-                        .is_some();
-                    Ok(exited.then_some(()))
-                })
-            })
-            .await?
-            .is_some(),
-        )
+    /// Waits for the exit of the directly-owned child, an event of the
+    /// kernel, and reaps it; false for a child that is silent for the bound
+    /// of a silent peer without an exit.
+    async fn wait_for_owned_child_exit(&mut self) -> Result<bool> {
+        let child = self
+            .child
+            .as_mut()
+            .context("libkrun child identity was lost while waiting for exit")?;
+        if !crate::process::process_ended(child.id(), omnifs_core::SILENT_PEER_TIMEOUT).await? {
+            return Ok(false);
+        }
+        child.wait().context("reap the libkrun child")?;
+        Ok(true)
     }
 
-    async fn wait_for_detached_exit(
-        &self,
-        expected: &HelperRecord,
-        timeout: Duration,
-    ) -> Result<()> {
-        crate::process::poll_until(timeout, HELPER_POLL_INTERVAL, || async {
-            match self.runner.read_helper_record()? {
-                None => Ok(Some(())),
-                Some(current) if current != *expected => {
-                    anyhow::bail!(
-                        "libkrun helper identity changed while waiting for shutdown; recovery artifacts were preserved"
-                    );
-                },
-                Some(_) => Ok(None),
-            }
-        })
-        .await?
-        .with_context(|| {
-            format!(
-                "identity-matched libkrun helper did not finish shutdown within {}s; recovery artifacts were preserved",
-                timeout.as_secs()
-            )
-        })
+    /// Waits for the exit of a detached helper after its shutdown request,
+    /// an event of the kernel; a helper that does not exit is a silent peer.
+    async fn wait_for_detached_exit(&self, expected: &HelperRecord) -> Result<()> {
+        let silence = omnifs_core::SILENT_PEER_TIMEOUT;
+        anyhow::ensure!(
+            crate::process::process_ended(expected.pid, silence).await?,
+            "identity-matched libkrun helper did not finish shutdown within {}s; recovery artifacts were preserved",
+            silence.as_secs()
+        );
+        match self.runner.read_helper_record()? {
+            Some(current) if current != *expected => anyhow::bail!(
+                "libkrun helper identity changed while waiting for shutdown; recovery artifacts were preserved"
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// Remove only launch artifacts. The daemon attach listener, verified
@@ -1086,6 +1061,113 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(image, custom);
+    }
+
+    fn kill_later(pid: u32) {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status()
+                .unwrap();
+        });
+    }
+
+    /// The wait for the exit of a directly-owned child ends at its exit, an
+    /// event of the kernel.
+    #[tokio::test]
+    async fn the_wait_for_an_owned_child_ends_at_its_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = LibkrunRunner::new(temp.path().to_path_buf());
+        let mut lease = LibkrunLaunchLease::new(&runner, temp.path(), PathBuf::new());
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        kill_later(child.id());
+        lease.child = Some(child);
+        let exited = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lease.wait_for_owned_child_exit(),
+        )
+        .await
+        .expect("the wait outlived the exit")
+        .unwrap();
+        assert!(exited);
+    }
+
+    /// The wait for the record of the helper ends at its publication, a
+    /// change of its folder.
+    #[tokio::test]
+    async fn the_wait_for_the_helper_record_ends_at_its_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = LibkrunRunner::new(temp.path().to_path_buf());
+        let mut lease = LibkrunLaunchLease::new(&runner, temp.path(), PathBuf::new());
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let instance = "0123456789abcdef0123456789abcdef";
+        let record = HelperRecord::new(
+            child.id(),
+            fs::Spec::new(
+                fs::Id::new("main").unwrap(),
+                fs::Protocol::Fuse,
+                fs::Runtime::Libkrun,
+                PathBuf::from(fs::GUEST_LOCATION),
+            )
+            .unwrap(),
+            instance,
+        )
+        .unwrap();
+        let pidfile = runner.pidfile();
+        let published = record.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::fs::write(pidfile, serde_json::to_vec(&published).unwrap()).unwrap();
+        });
+        lease.instance_id = Some(instance.to_owned());
+        lease.child = Some(child);
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lease.wait_for_helper_record(),
+        )
+        .await
+        .expect("the wait outlived the publication")
+        .unwrap();
+        assert_eq!(found, record);
+        let mut child = lease.child.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// The wait for the readiness of the guest ends at the exit of the
+    /// helper, an event of the kernel.
+    #[tokio::test]
+    async fn the_wait_for_readiness_ends_at_the_exit_of_the_helper() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = LibkrunRunner::new(temp.path().to_path_buf());
+        let mut lease = LibkrunLaunchLease::new(&runner, temp.path(), PathBuf::new());
+        lease.ready_listener = Some(lease.bind_ready_listener().unwrap());
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        kill_later(child.id());
+        lease.child = Some(child);
+        let mut row = crate::ui::live::Spinner::new(
+            Output::new(crate::ui::output::OutputMode::Human, false),
+            "filesystem",
+            10,
+        );
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lease.wait_for_ready(&mut row),
+        )
+        .await
+        .expect("the wait outlived the helper")
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("exited with"), "{error:#}");
     }
 
     #[tokio::test]
