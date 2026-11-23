@@ -10,14 +10,6 @@ use crate::ui::output::Output;
 use crate::ui::render::{self, LedgerRow};
 use omnifs_bootstrap::{Bootstrap, Client, Instance};
 use std::fmt::Write as _;
-use std::time::Duration;
-
-// The daemon may spend ten seconds draining the final serving generation
-// after it acknowledges Shutdown, then still has to join the mutation manager
-// and close durable state. This deadline covers that bounded teardown without
-// reporting a healthy in-progress shutdown as failed.
-const SHUTDOWN_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
-const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// One observable teardown result. The variants retain enough context for a
 /// command to choose severity and wording without parsing internal prose.
@@ -187,72 +179,37 @@ impl DaemonTeardown {
         Ok(outcomes)
     }
 
-    /// Request shutdown and wait until the control surface and process are gone.
-    /// The daemon acknowledges shutdown before its serving task exits, so a
-    /// successful POST alone is not enough to report `DaemonStopped`.
+    /// Request shutdown and wait for the exit of the daemon process, which
+    /// ends its control surface. The daemon acknowledges shutdown before its
+    /// serving task exits, so the acknowledgement alone is not enough to
+    /// report `DaemonStopped`; a daemon that does not exit is a silent peer.
     async fn shutdown_and_wait(&self, pid: u32, stop_filesystems: bool) -> TeardownOutcome {
         match self.rpc.shutdown(stop_filesystems).await {
             Ok(Some(shutdown)) => {
-                // Bundled so the check closure captures nothing from the
-                // enclosing scope and takes everything by explicit `&mut`
-                // argument instead: an `FnMut` closure cannot itself return a
-                // future that borrows its own captured environment, but a
-                // fresh reborrow of an argument can. `check` never returns
-                // `Err`: every failure is transient (retry until the
-                // deadline) or recorded in `last_error` for the timeout
-                // message below, rather than aborting the poll.
-                struct Wait<'a> {
-                    teardown: &'a DaemonTeardown,
-                    pid: u32,
-                    last_error: Option<String>,
-                }
-                let mut wait = Wait {
-                    teardown: self,
+                let stopped = match crate::process::process_ended(
                     pid,
-                    last_error: None,
-                };
-                let stopped = crate::process::poll_until_mut(
-                    SHUTDOWN_SETTLE_TIMEOUT,
-                    SHUTDOWN_POLL_INTERVAL,
-                    &mut wait,
-                    |wait| {
-                        Box::pin(async move {
-                            let status = wait.teardown.rpc.status_optional().await;
-                            let process_is_alive = wait.teardown.initial_process_is_alive(wait.pid);
-                            match status {
-                                Ok(None) | Err(_) if !process_is_alive => Ok(Some(())),
-                                Ok(Some(_) | None) => Ok(None),
-                                Err(error) => {
-                                    wait.last_error = Some(format!("{error:#}"));
-                                    Ok(None)
-                                },
-                            }
-                        })
-                    },
+                    omnifs_core::SILENT_PEER_TIMEOUT,
                 )
                 .await
-                .unwrap_or(None);
-                if stopped.is_some() {
+                {
+                    Ok(ended) => ended || !self.initial_process_is_alive(pid),
+                    Err(error) => {
+                        return TeardownOutcome::DaemonShutdownFailed {
+                            error: format!("{error:#}"),
+                        };
+                    },
+                };
+                if stopped {
                     return TeardownOutcome::DaemonStopped {
                         pid,
                         detached: shutdown.detached,
                         still_attached: shutdown.still_attached,
                     };
                 }
-                let detail = wait.last_error.take().map_or_else(
-                    || {
-                        if self.initial_process_is_alive(pid) {
-                            "the control surface or daemon process remained alive".to_owned()
-                        } else {
-                            "the control surface remained reachable".to_owned()
-                        }
-                    },
-                    |error| format!("the control surface could not be verified: {error}"),
-                );
                 TeardownOutcome::DaemonShutdownFailed {
                     error: format!(
-                        "shutdown acknowledged but daemon did not become unavailable within {}s; {detail}",
-                        SHUTDOWN_SETTLE_TIMEOUT.as_secs()
+                        "shutdown acknowledged but the daemon process did not exit within {}s",
+                        omnifs_core::SILENT_PEER_TIMEOUT.as_secs()
                     ),
                 }
             },

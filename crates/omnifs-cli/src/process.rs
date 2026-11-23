@@ -163,9 +163,66 @@ pub(crate) fn is_alive(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Waits for the exit of the process `pid`, an event of the kernel: true at
+/// its exit, or for a process that has already exited; false once it is
+/// silent for `silence` without an exit.
+pub(crate) async fn process_ended(pid: u32, silence: Duration) -> Result<bool> {
+    let Some(exit) = omnifs_mtab::process_exit(pid)
+        .with_context(|| format!("watch the exit of process {pid}"))?
+    else {
+        return Ok(true);
+    };
+    let exit = tokio::io::unix::AsyncFd::with_interest(exit, tokio::io::Interest::READABLE)?;
+    Ok(tokio::time::timeout(silence, exit.readable())
+        .await
+        .is_ok_and(|ready| ready.is_ok()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_alive;
+    use super::{is_alive, process_ended};
+    use std::time::Duration;
+
+    /// The wait for the exit of a process ends at its exit, past which it
+    /// would have waited for the bound of a silent peer.
+    #[tokio::test]
+    async fn the_wait_for_an_exit_ends_at_the_exit() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let wait = tokio::spawn(process_ended(pid, omnifs_core::SILENT_PEER_TIMEOUT));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        child.kill().unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the wait outlived the exit")
+            .unwrap()
+            .unwrap();
+        assert!(ended);
+        child.wait().unwrap();
+    }
+
+    /// The wait for the exit of a live process that does not exit ends once
+    /// it is silent for its bound.
+    #[tokio::test]
+    async fn the_wait_for_an_exit_of_a_live_process_ends_after_its_silence() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            process_ended(child.id(), Duration::from_millis(50)),
+        )
+        .await
+        .expect("the wait outlived its silence")
+        .unwrap();
+        assert!(!ended);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 
     #[test]
     fn distinguishes_current_and_exited_processes() {
