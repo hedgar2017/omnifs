@@ -522,7 +522,9 @@ impl RpcClient {
             .await
             .context("daemon not running")
             .with_exit_code(ExitCode::DaemonUnavailable)?;
-        Ok(ControlClient::new(channel.clone()))
+        Ok(ControlClient::new(channel.clone())
+            .max_decoding_message_size(usize::MAX)
+            .max_encoding_message_size(usize::MAX))
     }
 }
 
@@ -932,6 +934,29 @@ mod tests {
             format!("{error:#}").contains("did not answer within"),
             "{error:#}"
         );
+    }
+
+    /// An answer of the daemon of any size reaches the command: no limit of
+    /// a control message bounds it.
+    #[tokio::test]
+    async fn an_answer_of_any_size_reaches_the_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Bootstrap::<Client>::under_root(dir.path());
+        let mut inventory =
+            crate::inventory::DaemonFacts::test(crate::inventory::DaemonHealth::Running)
+                .status
+                .expect("a test inventory");
+        inventory.health.mounts.message = "m".repeat(8 * 1024 * 1024);
+        let _daemon = crate::fake_daemon::FakeDaemon::start(
+            &endpoint,
+            crate::fake_daemon::Answers {
+                info: crate::fake_daemon::info(CONTROL_PROTOCOL),
+                inventory: Ok(inventory),
+            },
+        );
+        let rpc = RpcClient::from_endpoint(endpoint);
+        let answered = rpc.inventory().await.expect("a large inventory");
+        assert_eq!(answered.health.mounts.message.len(), 8 * 1024 * 1024);
     }
 
     /// A control request carries no deadline of the client to the daemon.

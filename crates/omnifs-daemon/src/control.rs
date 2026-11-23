@@ -16,13 +16,12 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use omnifs_api::grpc::{self, wire};
 use omnifs_api::{
-    CONTROL_MESSAGE_MAX_BYTES, ControlError, ControlErrorCode, CredentialHealth, CredentialKey,
-    CredentialKind, CredentialStatus, CredentialStatusKind, DaemonHealth, DaemonInfo,
-    DaemonInventory, DaemonPhase, DaemonRecovery, HealthReport, HealthState,
-    MountDefinition as ApiMountDefinition, MountHealth, MountLimits as ApiMountLimits,
-    MountOpResult, MountRecord, MutationOpResult, PhaseEvent, ProviderImportDisposition,
-    ProviderImportReceipt, ProviderMetadata, ProviderReference, RecoveryId, RepairAction,
-    RepairReceipt,
+    ControlError, ControlErrorCode, CredentialHealth, CredentialKey, CredentialKind,
+    CredentialStatus, CredentialStatusKind, DaemonHealth, DaemonInfo, DaemonInventory, DaemonPhase,
+    DaemonRecovery, HealthReport, HealthState, MountDefinition as ApiMountDefinition, MountHealth,
+    MountLimits as ApiMountLimits, MountOpResult, MountRecord, MutationOpResult, PhaseEvent,
+    ProviderImportDisposition, ProviderImportReceipt, ProviderMetadata, ProviderReference,
+    RecoveryId, RepairAction, RepairReceipt,
 };
 use omnifs_state::StateStore;
 use prost::Message as _;
@@ -243,8 +242,8 @@ impl ControlServer {
                 wire::control_server::ControlServer::new(GrpcControlService::new(Arc::clone(
                     &self,
                 )))
-                .max_decoding_message_size(CONTROL_MESSAGE_MAX_BYTES)
-                .max_encoding_message_size(CONTROL_MESSAGE_MAX_BYTES),
+                .max_decoding_message_size(usize::MAX)
+                .max_encoding_message_size(usize::MAX),
             )
             .serve_with_incoming_shutdown(incoming, async move {
                 loop {
@@ -289,16 +288,10 @@ pub(crate) fn grpc_status(error: ControlError) -> Status {
     Status::with_details(grpc_code(error.code), error.message, Bytes::from(details))
 }
 
-/// The reply of a request with `message`, or the error of a message over
-/// the limit of a control message, which the daemon answers itself: the
-/// transport would refuse it without an error of the control protocol.
+/// The reply of a request with `message`, of any size: no limit of a
+/// control message bounds what the daemon answers.
+#[allow(clippy::unnecessary_wraps, reason = "the result of each handler")]
 pub(crate) fn reply<M: prost::Message>(message: M) -> Result<Response<M>, Status> {
-    let length = message.encoded_len();
-    if length > CONTROL_MESSAGE_MAX_BYTES {
-        return Err(grpc_internal(format!(
-            "the answer of the daemon has {length} bytes, over the {CONTROL_MESSAGE_MAX_BYTES} bytes of a control message"
-        )));
-    }
     Ok(Response::new(message))
 }
 

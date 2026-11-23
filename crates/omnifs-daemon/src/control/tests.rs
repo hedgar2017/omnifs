@@ -210,10 +210,10 @@ async fn a_sync_of_a_mount_that_the_daemon_does_not_serve_is_not_found() {
     runtime.shutdown().await;
 }
 
-/// The daemon answers a message over the limit of a control message with
-/// its own error, which names the size and the limit.
+/// The daemon answers a message of any size: no limit of a control message
+/// bounds an answer, as the mounts of a large config.
 #[test]
-fn a_reply_over_the_limit_of_a_control_message_is_an_error_of_the_daemon() {
+fn a_reply_of_any_size_is_an_answer_of_the_daemon() {
     let mount = |config: usize| wire::ListMountsResponse {
         mounts: vec![wire::MountRecord {
             definition: Some(wire::MountDefinition {
@@ -224,12 +224,7 @@ fn a_reply_over_the_limit_of_a_control_message_is_an_error_of_the_daemon() {
         }],
     };
     assert!(super::reply(mount(1024)).is_ok());
-    let status = super::reply(mount(CONTROL_MESSAGE_MAX_BYTES)).unwrap_err();
-    assert_eq!(error_code(&status), ControlErrorCode::Internal);
-    assert_eq!(
-        status.message(),
-        "the answer of the daemon has 1048588 bytes, over the 1048576 bytes of a control message"
-    );
+    assert!(super::reply(mount(8 * 1024 * 1024)).is_ok());
 }
 
 #[test]

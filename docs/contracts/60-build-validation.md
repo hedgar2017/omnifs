@@ -29,7 +29,7 @@ The provider manifest schema is generated from provider model types. The local c
 
 Run `just schema` after provider manifest schema changes. Keep the generated provider schema checked in when its source model changes.
 
-The control protocol has one current protobuf package, `omnifs.control.v1`; it does not use a postcard frame or a separate version prefix. Unary messages and stream items are bounded to 1 MiB, and log tails to 10,000 lines. `DaemonStatus` retains operational nested types consumed by Inventory, and `FilesystemInfo.mount_point` remains the per-filesystem wire field. Protocol tests exercise the generated service boundary and typed domain conversions directly.
+The control protocol has one current protobuf package, `omnifs.control.v1`; it does not use a postcard frame or a separate version prefix. Unary messages have no size bound, stream items are parts of at most 1 MiB, and log tails are bounded to 10,000 lines. `DaemonStatus` retains operational nested types consumed by Inventory, and `FilesystemInfo.mount_point` remains the per-filesystem wire field. Protocol tests exercise the generated service boundary and typed domain conversions directly.
 
 ### Live runtime validation
 
