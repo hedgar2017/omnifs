@@ -25,9 +25,6 @@ use omnifs_wit::host::types as wit_types;
 use std::io::Write;
 use std::sync::Arc;
 
-/// The longest version of a blob request, in bytes.
-const MAX_VERSION_BYTES: usize = 256;
-
 /// Host-side size limits for blob fetches: the limit that the mount
 /// declares bounds how much data the host stores on disk for one fetch, and
 /// no size bounds the fetch of a mount without one.
@@ -502,17 +499,14 @@ fn valid_md5(md5: &str) -> Result<&str, String> {
     }
 }
 
-/// `version` as the version of the bytes of a blob request: 1 to
-/// [`MAX_VERSION_BYTES`] bytes without a control character.
+/// `version` as the version of the bytes of a blob request: at least one
+/// byte, of any length, without a control character.
 fn valid_version(version: &str) -> Result<&str, String> {
-    if !version.is_empty()
-        && version.len() <= MAX_VERSION_BYTES
-        && !version.chars().any(char::is_control)
-    {
+    if !version.is_empty() && !version.chars().any(char::is_control) {
         Ok(version)
     } else {
         Err(format!(
-            "the version of a blob request is 1 to {MAX_VERSION_BYTES} bytes without a control character, not {version:?}"
+            "the version of a blob request is at least one byte without a control character, not {version:?}"
         ))
     }
 }

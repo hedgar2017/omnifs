@@ -14,9 +14,7 @@ pub use crate::error::{ProviderError, ProviderErrorKind, Result};
 pub use crate::feed::{
     FedRange, FedRecord, Feed, FeedCx, FeedPart, KeptNames, ListedCount, ListedNames,
 };
-pub use crate::file_attrs::{
-    FileAttrs, FileSize, MAX_PROJECTED_BYTES, MAX_VERSION_TOKEN_BYTES, Stability, VersionToken,
-};
+pub use crate::file_attrs::{FileAttrs, FileSize, MAX_PROJECTED_BYTES, Stability, VersionToken};
 pub use crate::handler::{
     Cursor, DirCx, DirIntent, FileChunk, MemoryRangeReader, RangeReader, Tree, TreeRef,
 };

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::object_id::ObjectId;
-use crate::view::{MAX_EAGER_RESPONSE_BYTES, MAX_VERSION_TOKEN_BYTES};
+use crate::view::MAX_EAGER_RESPONSE_BYTES;
 use crate::wit_protocol::{try_file_attrs_from_attrs, try_file_attrs_from_file_out};
 use omnifs_core::path::{Path, Segment};
 use omnifs_wit::host::types as wit_types;
@@ -260,13 +260,6 @@ where
                 }
                 Self::track_unique_path_id(&mut canonical_path_to_id, leaf, &id_bytes)?;
             }
-            if let Some(token) = &store.validator
-                && token.len() > MAX_VERSION_TOKEN_BYTES
-            {
-                return Err(format!(
-                    "canonical-store validator token exceeds {MAX_VERSION_TOKEN_BYTES} bytes"
-                ));
-            }
         }
         for write in &effects.fs {
             let path = Path::parse(&write.path);
@@ -476,11 +469,6 @@ where
     fn version_token(token: &str) -> std::result::Result<(), String> {
         if token.is_empty() {
             return Err("version token must not be empty".to_string());
-        }
-        if token.len() > MAX_VERSION_TOKEN_BYTES {
-            return Err(format!(
-                "version token exceeds {MAX_VERSION_TOKEN_BYTES} bytes"
-            ));
         }
         Ok(())
     }
@@ -797,10 +785,22 @@ mod tests {
         assert!(error.contains("without a validator"));
         validate_list(&unchanged, &effects(), true, |_| true).unwrap();
 
-        for (token, message) in [
-            (String::new(), "must not be empty"),
-            ("v".repeat(MAX_VERSION_TOKEN_BYTES + 1), "exceeds"),
-        ] {
+        // A token of any length is a validator: an empty one alone is not.
+        let long = wit_types::PageValidator {
+            token: "v".repeat(64 * 1024),
+            interval: None,
+        };
+        let listed = Ok(wit_types::ListChildrenResult::Entries(
+            wit_types::DirListing {
+                entries: vec![entry("child")],
+                exhaustive: true,
+                next_cursor: None,
+                validator: Some(long),
+            },
+        ));
+        validate_list(&listed, &effects(), false, |_| true).unwrap();
+        {
+            let (token, message) = (String::new(), "must not be empty");
             let validator = wit_types::PageValidator {
                 token,
                 interval: None,

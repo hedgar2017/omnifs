@@ -1285,14 +1285,12 @@ fn fetched(result: wit_types::CalloutResult) -> wit_types::BlobFetched {
 async fn a_blob_request_of_an_md5_or_a_version_that_is_not_valid_is_refused() {
     let upstream = Upstream::start(|_| reply("200 OK", &[], "body")).await;
     let blobs = blobs(local_stack(&["localhost"]));
-    let long = "v".repeat(257);
     for (md5, version) in [
         (Some("3D93DA86C9045CB1B17E96790CD19789"), None),
         (Some("3d93da86c9045cb1b17e96790cd1978"), None),
         (Some("version:7"), None),
         (None, Some("")),
         (None, Some("one\ntwo")),
-        (None, Some(long.as_str())),
     ] {
         let mut request = blob_request(upstream.url("localhost", "/file"));
         request.md5 = md5.map(str::to_owned);
@@ -1307,7 +1305,8 @@ async fn a_blob_request_of_an_md5_or_a_version_that_is_not_valid_is_refused() {
     }
     assert!(upstream.requests().is_empty());
     let mut request = blob_request(upstream.url("localhost", "/file"));
-    request.version = Some("v".repeat(256));
+    // A version of any length is one.
+    request.version = Some("v".repeat(64 * 1024));
     assert_eq!(
         size(&fetched(blobs.executor.fetch(&request, 0).await)),
         Some(4)

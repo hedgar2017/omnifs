@@ -18,9 +18,6 @@ use omnifs_wit::provider::types as wit_types;
 /// [`FileProj::validate`]. Content larger than this must be a deferred
 /// projection or a blob; it cannot ride inline in a terminal.
 pub const MAX_PROJECTED_BYTES: usize = 64 * 1024;
-/// Maximum [`VersionToken`] length in bytes, enforced by
-/// [`VersionToken::validate`].
-pub const MAX_VERSION_TOKEN_BYTES: usize = 256;
 
 /// Declared metadata for a projected file: size, stability, and optional
 /// version evidence.
@@ -69,7 +66,7 @@ impl FileAttrs {
 /// Opaque version evidence for a file or object: an `ETag`, commit SHA,
 /// updated-at timestamp, or any string that changes when the content does.
 ///
-/// Must be non-empty and at most [`MAX_VERSION_TOKEN_BYTES`] bytes
+/// Must be non-empty, of any length
 /// ([`Self::validate`]); the same type doubles as the object-layer
 /// conditional-request validator ([`crate::object::Validator`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,11 +82,6 @@ impl VersionToken {
             return Err(ProviderError::invalid_input(
                 "version token must not be empty",
             ));
-        }
-        if self.0.len() > MAX_VERSION_TOKEN_BYTES {
-            return Err(ProviderError::invalid_input(format!(
-                "version token exceeds {MAX_VERSION_TOKEN_BYTES} bytes"
-            )));
         }
         Ok(())
     }
@@ -196,8 +188,7 @@ impl FileProj {
     ///   served through the ranged live path, never inline or full-read.
     /// - Inline bytes require `FileSize::Exact` equal to the actual byte
     ///   length, and at most [`MAX_PROJECTED_BYTES`].
-    /// - A version token, when present, must be non-empty and within
-    ///   [`MAX_VERSION_TOKEN_BYTES`].
+    /// - A version token, when present, must be non-empty.
     pub fn validate(&self) -> Result<()> {
         self.attrs.validate()?;
 

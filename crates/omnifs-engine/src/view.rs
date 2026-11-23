@@ -36,7 +36,6 @@ impl BodyId {
 
 pub const MAX_INLINE_PROJECTABLE_BYTES: usize = 64 * 1024;
 pub const MAX_EAGER_RESPONSE_BYTES: usize = 512 * 1024;
-pub const MAX_VERSION_TOKEN_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ByteSource {
@@ -64,11 +63,6 @@ impl VersionToken {
     pub fn validate(&self) -> Result<(), String> {
         if self.0.is_empty() {
             return Err("version token must not be empty".to_string());
-        }
-        if self.0.len() > MAX_VERSION_TOKEN_BYTES {
-            return Err(format!(
-                "version token exceeds {MAX_VERSION_TOKEN_BYTES} bytes"
-            ));
         }
         Ok(())
     }
