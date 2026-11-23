@@ -54,7 +54,7 @@ struct WorkspaceToken {
 }
 
 /// The latest `last_edited_time` of results, and the count of them with it.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct Latest {
     #[serde(with = "time::serde::rfc3339")]
     time: OffsetDateTime,
@@ -309,7 +309,6 @@ fn within_minute(last_edited_time: OffsetDateTime, response: &HttpResponse) -> R
     Ok(minute(date)? <= minute(last_edited_time)?)
 }
 
-/// The minute of `time`.
 fn minute(time: OffsetDateTime) -> Result<OffsetDateTime> {
     time.replace_second(0)
         .and_then(|time| time.replace_nanosecond(0))
@@ -455,8 +454,8 @@ impl WorkspaceFeed<'_> {
 
     /// Take the result `found` of the search, or of a request by its ID,
     /// with its `object`, into the projection, its folder joining its listing
-    /// as `write` says: nothing of one with an earlier `last_edited_time`
-    /// than its object of the projection; the removal of one in the trash;
+    /// as `write` says: its folder alone for one with an earlier
+    /// `last_edited_time` than its object of the projection; the removal of one in the trash;
     /// and the facts of another, with the state of its feed for a data source
     /// and for a page that the projection lacks or has with another
     /// `last_edited_time`, whose content and comments it removes.
@@ -470,6 +469,12 @@ impl WorkspaceFeed<'_> {
             },
         )?;
         if projected.is_some_and(|projected| projected > found.last_edited_time) {
+            let (listing, at) = match found.object {
+                Kind::Page => (PAGES, page_path(&id)),
+                Kind::DataSource => (DATABASES, data_source_path(&id)),
+            };
+            self.cx.dir(listing, write)?;
+            self.cx.dir(at, ListingWrite::Partial)?;
             return Ok(id);
         }
         if found.in_trash {
