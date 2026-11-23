@@ -93,10 +93,11 @@ where
     }
 
     /// The effects of `canonical`, which a feed part writes for the object
-    /// anchored at `anchor`: its store, with each face under that anchor
-    /// alone that serves canonical bytes as a view leaf, and each of those
-    /// leaves as a file of the object without bytes of its own, which the
-    /// host keeps as a fed fact of the part. The feed chooses the facets of
+    /// anchored at `anchor`: its store, with its canonical and representation
+    /// faces under that anchor alone as files with their bytes, which the host
+    /// serves without the provider, and each other face that serves canonical
+    /// bytes as a view leaf without bytes of its own, each a fed fact of the
+    /// part. The feed chooses the facets of
     /// its anchor, as the state of an issue: a leaf under another choice of
     /// a facet would keep the object where the feed no longer writes it.
     fn store(
@@ -115,8 +116,26 @@ where
         let id = key.anchor(O::kind());
         let view_leaves = self.view_leaves_at(anchor);
         let mut effects = Effects::new();
-        for leaf in &view_leaves {
-            effects.fed_view_leaf(leaf, &id)?;
+        if self.shape == AnchorShape::File {
+            for leaf in &view_leaves {
+                effects.fed_view_leaf(leaf, &id)?;
+            }
+        } else {
+            for leaf in self.leaves.iter().filter(|leaf| leaf.is_canonical_view()) {
+                let path = format!("{anchor}/{}", leaf.leaf_name());
+                match leaf {
+                    ObjectLeaf::Canonical { .. } => {
+                        effects.fed_object_file(&path, &id, canonical.bytes.clone())?;
+                    },
+                    ObjectLeaf::Representation { ct, .. } => {
+                        let rendered = self.render_table.serve(*ct, &canonical.bytes)?;
+                        effects.fed_object_file(&path, &id, rendered)?;
+                    },
+                    _ => {
+                        effects.fed_view_leaf(&path, &id)?;
+                    },
+                }
+            }
         }
         effects.canonical_store(&id, canonical.validator, canonical.bytes, view_leaves);
         Ok(effects)

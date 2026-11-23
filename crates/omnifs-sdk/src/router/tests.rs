@@ -1476,7 +1476,8 @@ fn a_feed_writes_the_canonical_bytes_of_an_object_with_its_view_leaves_as_fed_fi
     assert_eq!(stored.bytes, br#"{"title":"fed"}"#);
     assert_eq!(stored.validator.as_deref(), Some("v1"));
     assert_eq!(stored.view_leaves, leaves);
-    // Each view leaf is a file of the object without bytes of its own.
+    // The canonical and the representation are files of the object with
+    // their bytes, and a computed face is one without bytes of its own.
     assert_eq!(
         effects
             .fs
@@ -1490,12 +1491,30 @@ fn a_feed_writes_the_canonical_bytes_of_an_object_with_its_view_leaves_as_fed_fi
         let wit_types::FsKind::File(file) = &write.kind else {
             panic!("a view leaf is a file");
         };
-        assert!(matches!(
-            file.bytes,
-            wit_types::ByteSource::Deferred(wit_types::ReadMode::Full)
-        ));
-        assert!(matches!(file.attrs.size, wit_types::FileSize::Unknown));
+        if write.path.as_str() == "/items/9/title" {
+            assert!(matches!(
+                file.bytes,
+                wit_types::ByteSource::Deferred(wit_types::ReadMode::Full)
+            ));
+            assert!(matches!(file.attrs.size, wit_types::FileSize::Unknown));
+        } else {
+            let wit_types::ByteSource::Inline(bytes) = &file.bytes else {
+                panic!("{} has its bytes", write.path.as_str());
+            };
+            assert!(!bytes.is_empty());
+            assert!(matches!(file.attrs.size, wit_types::FileSize::Exact(_)));
+        }
     }
+    let json = effects
+        .fs
+        .iter()
+        .find(|write| write.path.as_str() == "/items/9/item.json");
+    let Some(wit_types::FsKind::File(file)) = json.map(|write| &write.kind) else {
+        panic!("item.json is a file");
+    };
+    assert!(
+        matches!(&file.bytes, wit_types::ByteSource::Inline(bytes) if bytes == br#"{"title":"fed"}"#)
+    );
 
     // A path that is no anchor of an object of the type, and an object
     // without a canonical face, fail the part.

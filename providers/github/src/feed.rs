@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use omnifs_sdk::cx::join_all;
 use omnifs_sdk::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,16 @@ use crate::{RepoId, StateFilter};
 
 /// The nodes and the rows of a page.
 const PAGE: usize = 100;
+
+/// The pages of the comments of a repository that a part asks for at once.
+const COMMENT_PAGES_AT_ONCE: u64 = 16;
+
+/// The pull requests whose reviews one `POST` asks for.
+const REVIEWED_AT_ONCE: usize = 25;
+
+/// The reviews of pull requests by their numbers, each with its inline
+/// comments.
+type ReviewsOf = BTreeMap<u64, Vec<(Review, Vec<ReviewComment>)>>;
 
 /// The token of the feed of a repository: the cursor of the last issue and
 /// of the last pull request that it took, the list of its comments, the REST
@@ -783,15 +794,14 @@ macro_rules! review_fields {
 const ITEM: &str = item_fields!();
 
 /// The selection of a pull request: the canonical bytes of `PullRequest`,
-/// with its branches and its first reviews. A pull request with more takes them by [`more_reviews`].
+/// with its branches and the count of its reviews, which [`page_reviews`]
+/// takes.
 const PULL: &str = concat!(
     item_fields!(),
     " isDraft merged baseRefName headRefName \
      reviewRequests(first: 100) { nodes { requestedReviewer \
      { ... on User { login } ... on Team { slug } } } } \
-     reviews(first: 10) { nodes { ",
-    review_fields!(),
-    " } pageInfo { hasNextPage endCursor } }"
+     reviews { totalCount }"
 );
 
 impl ItemKind {
@@ -914,6 +924,94 @@ impl ReviewCommentNode {
             path: self.path,
         })
     }
+}
+
+/// A pull request with the count of its reviews.
+#[derive(Deserialize)]
+struct ReviewCount {
+    reviews: crate::objects::Total,
+}
+
+/// The first page of the reviews of each of `numbers`, in one `POST`; none
+/// for a pull request that GitHub GraphQL no longer resolves.
+async fn first_reviews(
+    cx: &Cx,
+    repo: &RepoId,
+    numbers: &[u64],
+) -> Result<Vec<(u64, Connection<ReviewNode>)>> {
+    let selection = numbers
+        .iter()
+        .map(|number| {
+            format!(
+                "p{number}: pullRequest(number: {number}) {{ reviews(first: 10) {{ nodes {{ {} }} \
+                 pageInfo {{ hasNextPage endCursor }} }} }}",
+                review_fields!(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut answer: Aliased = graphql(cx, repo, "", &selection, json!({})).await?;
+    let mut pages = Vec::with_capacity(numbers.len());
+    for number in numbers {
+        if let Some(Reviewed { reviews }) = aliased(&mut answer, &format!("p{number}"))? {
+            pages.push((*number, reviews));
+        }
+    }
+    Ok(pages)
+}
+
+/// Each review of the pull requests among `nodes` with a review, with its
+/// inline comments, from `POST`s at the same time.
+async fn page_reviews<'n>(
+    cx: &Cx,
+    repo: &RepoId,
+    kind: ItemKind,
+    nodes: impl IntoIterator<Item = &'n Node>,
+) -> Result<ReviewsOf> {
+    if kind != ItemKind::Pulls {
+        return Ok(ReviewsOf::new());
+    }
+    let mut numbers = Vec::new();
+    for node in nodes {
+        let ReviewCount { reviews } = decode_json(node.bytes.get())?;
+        if reviews.total_count != 0 {
+            numbers.push(node.data.number);
+        }
+    }
+    let answers = join_all(
+        numbers
+            .chunks(REVIEWED_AT_ONCE)
+            .map(|chunk| first_reviews(cx, repo, chunk)),
+    )
+    .await;
+    let mut pages = Vec::with_capacity(numbers.len());
+    for answer in answers {
+        pages.extend(answer?);
+    }
+    let reviews = join_all(pages.into_iter().map(|(number, page)| async move {
+        Ok::<_, ProviderError>((number, all_reviews(cx, repo, number, page).await?))
+    }))
+    .await;
+    reviews.into_iter().collect()
+}
+
+/// `path` with `page` as its query pair `page`.
+fn with_page(path: &str, page: u64) -> Result<String> {
+    let (base, query) = path
+        .split_once('?')
+        .ok_or_else(|| ProviderError::invalid_input(format!("{path} names no page")))?;
+    let query = query
+        .split('&')
+        .map(|pair| {
+            if pair.starts_with("page=") {
+                format!("page={page}")
+            } else {
+                pair.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    Ok(format!("{base}?{query}"))
 }
 
 /// The page of the reviews of the pull request `number` after `after`.
@@ -1231,18 +1329,23 @@ impl<'a, K> Writer<'a, K> {
         Ok(())
     }
 
-    /// The facts of an item from its node, and for a pull request each of
-    /// its reviews.
-    async fn written(&mut self, kind: ItemKind, node: &Node, folders: ListingWrite) -> Result<()> {
+    /// The facts of an item from its node, and for a pull request its
+    /// reviews among `reviews`.
+    fn written(
+        &mut self,
+        kind: ItemKind,
+        node: &Node,
+        folders: ListingWrite,
+        reviews: &ReviewsOf,
+    ) -> Result<()> {
         self.item(kind, node, folders)?;
         if kind == ItemKind::Pulls {
-            let Reviewed { reviews } = decode_json(node.bytes.get())?;
-            let reviews = all_reviews(self.cx, self.repo, node.data.number, reviews).await?;
             let item = ItemRef {
                 kind,
                 number: node.data.number,
             };
-            self.reviews(item, &reviews)?;
+            let reviews = reviews.get(&item.number).map_or(&[][..], Vec::as_slice);
+            self.reviews(item, reviews)?;
         }
         Ok(())
     }
@@ -1656,9 +1759,10 @@ impl RepoFeed<'_> {
             .into_iter()
             .map(Node::of)
             .collect::<Result<Vec<_>>>()?;
+        let reviews = page_reviews(self.cx, &self.repo, kind, &nodes).await?;
         let mut w = Writer::new(self.cx, &self.repo, None);
         for node in &nodes {
-            w.written(kind, node, ListingWrite::Partial).await?;
+            w.written(kind, node, ListingWrite::Partial, &reviews)?;
         }
         let stage = match (page.page_info.next()?, kind) {
             (Some(_), kind) => Stage::Items { kind },
@@ -1706,7 +1810,11 @@ impl RepoFeed<'_> {
     async fn listing_comments(&mut self, link: Option<String>) -> Result<Feed> {
         let first = link.is_none();
         let RestPage::Rows {
-            rows, next, date, ..
+            mut rows,
+            mut next,
+            last,
+            date,
+            ..
         } = self.comments_page(None, link.as_deref()).await?
         else {
             return Err(ProviderError::internal(
@@ -1715,6 +1823,28 @@ impl RepoFeed<'_> {
         };
         if first {
             self.comments.answered = Some(date_of(date.as_deref())?);
+        }
+        if let (Some(from), Some(last)) = (next.clone(), last) {
+            let (start, end) = (page_of(&from)?, page_of(&last)?);
+            let stop = end.min(start + COMMENT_PAGES_AT_ONCE - 1);
+            let paths = (start..=stop)
+                .map(|page| with_page(&from, page))
+                .collect::<Result<Vec<_>>>()?;
+            let cx = self.cx;
+            for page in join_all(paths.iter().map(|path| rest_page(cx, path, None))).await {
+                match page? {
+                    RestPage::Rows { rows: more, .. } => rows.extend(more),
+                    RestPage::Gone => return Err(moved(&self.repo)),
+                    RestPage::Unchanged { .. } => {
+                        return Err(ProviderError::internal(
+                            "the comments answered 304 to a request without an ETag",
+                        ));
+                    },
+                }
+            }
+            next = (stop < end)
+                .then(|| with_page(&from, stop + 1))
+                .transpose()?;
         }
         let mut w = Writer::new(self.cx, &self.repo, None);
         for bytes in rows {
@@ -1909,14 +2039,19 @@ impl RepoFeed<'_> {
             if page.page_info.next()?.is_some() {
                 more.insert(kind);
             }
-            for bytes in page.nodes {
-                let node = Node::of(bytes)?;
+            let nodes = page
+                .nodes
+                .into_iter()
+                .map(Node::of)
+                .collect::<Result<Vec<_>>>()?;
+            let reviews = page_reviews(self.cx, &self.repo, kind, &nodes).await?;
+            for node in nodes {
                 let item = ItemRef {
                     kind,
                     number: node.data.number,
                 };
                 let new = !w.has_item(item)?;
-                w.written(kind, &node, ListingWrite::Complete).await?;
+                w.written(kind, &node, ListingWrite::Complete, &reviews)?;
                 let comments = node.data.comments.total_count;
                 changed.insert(
                     item.number,
@@ -2175,6 +2310,16 @@ impl RepoFeed<'_> {
             .take(PAGE)
             .collect::<Vec<_>>();
         let found = by_numbers(self.cx, &self.repo, &page).await?;
+        let reviews = page_reviews(
+            self.cx,
+            &self.repo,
+            kind,
+            found.iter().filter_map(|(_, item)| match item {
+                ByNumber::Found(found, node) if *found == kind => Some(node),
+                _ => None,
+            }),
+        )
+        .await?;
         let Check {
             changed, ledger, ..
         } = &mut *check;
@@ -2183,7 +2328,7 @@ impl RepoFeed<'_> {
             if let ByNumber::Found(found, node) = item
                 && found == kind
             {
-                w.written(kind, &node, ListingWrite::Complete).await?;
+                w.written(kind, &node, ListingWrite::Complete, &reviews)?;
                 let comments = node.data.comments.total_count;
                 changed.insert(
                     number,
@@ -2450,8 +2595,9 @@ async fn item_feed<K>(cx: &FeedCx<K>, repo: &RepoId, item: ItemRef) -> Result<Fe
             item.number, item.kind
         )));
     }
+    let reviews = page_reviews(cx, repo, kind, [&node]).await?;
     let mut w = Writer::new(cx, repo, None);
-    w.written(kind, &node, ListingWrite::Partial).await?;
+    w.written(kind, &node, ListingWrite::Partial, &reviews)?;
     let mut next = ItemToken {
         updated_at: node.data.updated_at,
         comments: node.data.comments.total_count,

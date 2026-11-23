@@ -118,10 +118,7 @@ fn node(number: u64, title: &str, state: &str, updated: &str, comments: u64) -> 
 /// A pull request as a node of GitHub GraphQL, without reviews.
 fn pull(number: u64, title: &str, state: &str, updated: &str, comments: u64) -> Value {
     let mut pull = node(number, title, state, updated, comments);
-    pull["reviews"] = json!({
-        "nodes": [],
-        "pageInfo": { "hasNextPage": false, "endCursor": null },
-    });
+    pull["reviews"] = json!({ "totalCount": 0 });
     pull
 }
 

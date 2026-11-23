@@ -969,7 +969,7 @@ fn item_json_is_the_node_of_its_number() {
     };
 
     let issue_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0}}"#;
-    let pull_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0},"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#;
+    let pull_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0},"reviews":{"totalCount":0}}"#;
     let answer = |kind: &str, repository: &str, item_json: &str| {
         format!(
             r#"{{"data":{{"repository":{{"nameWithOwner":"octocat/Hello-World",
@@ -1250,12 +1250,23 @@ async fn the_reviews_of_a_pull_request_come_with_its_node_without_code() {
 
     let harness = github_harness();
     let pull = "/github/octocat/Hello-World/pulls/all/7";
+    let sync = harness.begin_sync_of(&["/octocat/Hello-World"]);
     let reviews = r#"{"nodes":[{"fullDatabaseId":"80","author":{"login":"reviewer"},
         "state":"APPROVED","body":"ok","submittedAt":"2026-11-18T09:00:00Z",
         "comments":{"nodes":[{"fullDatabaseId":"900","author":{"login":"reviewer"},
         "body":"first","path":"src/lib.rs"}],
         "pageInfo":{"hasNextPage":true,"endCursor":"c1"}}}],
         "pageInfo":{"hasNextPage":true,"endCursor":"r1"}}"#;
+    let first = HttpResponse {
+        status: 200,
+        headers: Vec::new(),
+        body: format!(
+            r#"{{"data":{{"repository":{{"nameWithOwner":"octocat/Hello-World",
+            "p7":{{"reviews":{reviews}}}}}}}}}"#
+        )
+        .into_bytes(),
+        redirected: None,
+    };
     let more = HttpResponse {
         status: 200,
         headers: Vec::new(),
@@ -1280,15 +1291,17 @@ async fn the_reviews_of_a_pull_request_come_with_its_node_without_code() {
         &harness,
         names(&harness, &format!("{pull}/reviews")),
         [
-            fetched(pull_seven_with(reviews)),
+            fetched(pull_seven_with(r#"{"totalCount":2}"#)),
+            fetched(first),
             fetched(more),
             fetched(rows),
         ],
     )
     .await;
     assert_eq!(listing.unwrap(), ["80", "81"]);
+    harness.end_sync(sync);
     assert!(
-        http(&requests[2])
+        http(&requests[3])
             .url
             .ends_with("/repos/octocat/Hello-World/pulls/7/reviews/80/comments?per_page=100")
     );
@@ -1305,6 +1318,17 @@ async fn the_reviews_of_a_pull_request_come_with_its_node_without_code() {
         let path = format!("{pull}/reviews/{leaf}");
         let (body, requests) = answering(&harness, read(&harness, &path), []).await;
         assert_eq!(body.unwrap(), expected, "{path}");
+        assert!(requests.is_empty(), "the read of {path}");
+    }
+    for leaf in [
+        "item.json",
+        "item.md",
+        "reviews/80/review.json",
+        "reviews/80/review.md",
+    ] {
+        let path = format!("{pull}/{leaf}");
+        let (body, requests) = answering(&harness, read(&harness, &path), []).await;
+        assert!(!body.unwrap().is_empty(), "{path}");
         assert!(requests.is_empty(), "the read of {path}");
     }
     for leaf in ["comment.json", "comment.md"] {

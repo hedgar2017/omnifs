@@ -157,6 +157,28 @@ impl Effects {
         Ok(self)
     }
 
+    /// A fed file of the object `id` with `bytes`, which a read serves from
+    /// the projection without its provider.
+    pub(crate) fn fed_object_file(
+        &mut self,
+        path: &str,
+        id: &LogicalId,
+        bytes: Vec<u8>,
+    ) -> Result<&mut Self> {
+        let size = u64::try_from(bytes.len())
+            .map_err(|_| ProviderError::too_large("fed file length does not fit u64"))?;
+        self.fs.push(wit_types::FsWrite {
+            id: Some(id.into()),
+            path: wire_path(path)?.into(),
+            kind: wit_types::FsKind::File(wit_types::FileOut {
+                content_type: None,
+                attrs: FileAttrs::new(FileSize::Exact(size), Stability::Stable).into(),
+                bytes: wit_types::ByteSource::Inline(bytes),
+            }),
+        });
+        Ok(self)
+    }
+
     /// A fed file whose bytes are the blob `blob` of `size` bytes in the
     /// host, which no size bounds.
     pub(crate) fn fed_blob(
