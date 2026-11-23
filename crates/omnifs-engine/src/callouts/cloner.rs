@@ -174,6 +174,24 @@ impl GitCloner {
         Ok(repo)
     }
 
+    /// The checkout of the clone of `id` at `commit`, without a request:
+    /// none without a valid clone with `commit` as its `HEAD`.
+    pub(crate) fn checked_out(&self, id: &GitId, commit: &str) -> Option<PathBuf> {
+        let cache_path = self.cache_dir.join(id.filesystem_name());
+        let lock = self
+            .locks
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock();
+        let binding = Self::read_binding(&Self::binding_path(&cache_path)).ok()?;
+        if !Self::is_valid_clone(&cache_path, &binding.remote, binding.reference.as_deref()) {
+            return None;
+        }
+        let repo = cache_path.join(CLONE_REPO_DIR);
+        (Self::head(&repo).ok()?.trim_ascii_end() == commit.as_bytes()).then_some(repo)
+    }
+
     /// Clone the remote into `cache_path`, published whole by rename.
     fn clone_into(
         cache_path: &Path,

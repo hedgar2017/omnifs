@@ -378,6 +378,12 @@ impl ServingCell {
         self.with_table(mount, |table| table.begin_sync(mount))
     }
 
+    /// Begin a sync of `mount` in the serving generation that names `paths`;
+    /// see [`MountTable::begin_sync_of`](crate::MountTable::begin_sync_of).
+    pub fn begin_sync_of(&self, mount: &str, paths: &[String]) -> Result<u64, crate::SyncError> {
+        self.with_table(mount, |table| table.begin_sync_of(mount, paths))
+    }
+
     /// End the sync `sync` of `mount` in the serving generation.
     pub fn end_sync(&self, mount: &str, sync: u64) -> Result<(), crate::SyncError> {
         self.with_table(mount, |table| table.end_sync(mount, sync))

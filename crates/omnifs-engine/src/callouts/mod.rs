@@ -62,6 +62,7 @@ pub(crate) mod http;
 pub(crate) mod wit_convert;
 
 use crate::blob::BlobExecutor;
+use crate::cache::MountResources;
 use crate::git::GitExecutor;
 use crate::http::HttpStack;
 use crate::log_redaction::WitHeaders;
@@ -217,16 +218,23 @@ pub(crate) struct CalloutHost {
     http: Arc<HttpStack>,
     git: GitExecutor,
     blob: BlobExecutor,
+    resources: Arc<MountResources>,
     next_callout_index: Arc<AtomicUsize>,
     test_callouts: Option<TestCallouts>,
 }
 
 impl CalloutHost {
-    pub(crate) fn new(http: Arc<HttpStack>, git: GitExecutor, blob: BlobExecutor) -> Self {
+    pub(crate) fn new(
+        http: Arc<HttpStack>,
+        git: GitExecutor,
+        blob: BlobExecutor,
+        resources: Arc<MountResources>,
+    ) -> Self {
         Self {
             http,
             git,
             blob,
+            resources,
             next_callout_index: Arc::new(AtomicUsize::new(0)),
             test_callouts: None,
         }
@@ -250,6 +258,9 @@ impl CalloutHost {
     }
 
     async fn run(&self, callout: &wit_types::Callout, op_id: u64) -> wit_types::CalloutResult {
+        if self.resources.served_from_projection() {
+            return callout_denied("a mount with synced paths asks its upstream only in a sync");
+        }
         if let Some(test_callouts) = &self.test_callouts {
             return test_callouts.run(op_id, callout.clone()).await;
         }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// its info. It moves with each change of `control.proto` that a peer of the
 /// earlier number would not honour, as a field of a request that it would
 /// drop. A daemon of a build before the number names 0.
-pub const CONTROL_PROTOCOL: u32 = 1;
+pub const CONTROL_PROTOCOL: u32 = 2;
 /// Limit for each item on a control stream.
 pub const CONTROL_STREAM_ITEM_MAX_BYTES: usize = 1024 * 1024;
 /// Payload budget after reserving protobuf envelope overhead.

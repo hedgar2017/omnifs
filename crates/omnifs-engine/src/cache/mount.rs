@@ -19,7 +19,7 @@ use fjall::Readable;
 use omnifs_core::MountName;
 use omnifs_core::path::Path;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path as StdPath;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -32,7 +32,7 @@ use super::collect::Collected;
 use super::collect::Collector;
 use super::identity::ProjectionId;
 use super::identity::{BlobRequestId, GitId};
-use super::projection::{ProjectionStore, ProjectionStoreError};
+use super::projection::{ProjectionStore, ProjectionStoreError, ScopeStore};
 use crate::cache::memory::MemoryTier;
 use crate::object_id::ObjectId;
 use crate::view::{
@@ -579,6 +579,7 @@ pub struct Caches {
     collector: Arc<Collector>,
     projection_root: std::path::PathBuf,
     pub(crate) projection_database: OptimisticTxDatabase,
+    scopes: Arc<ScopeStore>,
     projection_fences: Mutex<HashMap<ProjectionId, Weak<ResourceFence>>>,
 }
 
@@ -597,6 +598,7 @@ impl Caches {
         let projection_database = OptimisticTxDatabase::builder(projection_root.join("database"))
             .cache_size(PROJECTION_BLOCK_CACHE_BYTES)
             .open()?;
+        let scopes = Arc::new(ScopeStore::open(&projection_database)?);
         let body = Arc::new(BodyStore::open(dir.join("bodies"))?);
         let collector = Collector::new(Arc::clone(&body), projection_database.clone());
         // What a stop between the publication of a body and the commit of
@@ -610,6 +612,7 @@ impl Caches {
             collector,
             projection_root,
             projection_database,
+            scopes,
             projection_fences: Mutex::new(HashMap::new()),
         }))
     }
@@ -676,9 +679,26 @@ pub struct MountResources {
     feed_calls: Mutex<BTreeMap<u64, usize>>,
     /// The number of the sync of the mount in progress, none outside one.
     sync: Mutex<Option<u64>>,
+    /// The name of the mount, the key of its paths in [`ScopeStore`].
+    name: MountName,
+    /// The paths of the mount that a sync named, none for a mount that
+    /// serves its whole tree and asks its provider for what it lacks.
+    scope: Mutex<Vec<Path>>,
+    scopes: Arc<ScopeStore>,
     publication: PublicationReservations,
     fence: Arc<ResourceFence>,
     generation: ResourceGeneration,
+}
+
+/// Where a path of a mount stands to the paths that a sync named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopePlace {
+    /// At or below a named path, or in a mount without named paths.
+    Within,
+    /// Above a named path, a directory of the names on the way to it.
+    Above,
+    /// Neither, which does not exist in the mount.
+    Outside,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -799,11 +819,24 @@ impl MountResources {
             mount,
             spec_source,
         )?;
-        Ok(Self::from_projection(caches, projection, fence))
+        let scope = caches
+            .scopes
+            .get(mount)?
+            .map(|bytes| postcard::from_bytes::<Vec<String>>(&bytes))
+            .transpose()?
+            .unwrap_or_default()
+            .iter()
+            .map(|path| Path::parse(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_projection(
+            caches, mount, scope, projection, fence,
+        ))
     }
 
     fn from_projection(
         caches: &Caches,
+        mount: &MountName,
+        scope: Vec<Path>,
         projection: ProjectionStore,
         fence: Arc<ResourceFence>,
     ) -> Arc<Self> {
@@ -823,6 +856,9 @@ impl MountResources {
             next_blob_id: AtomicU64::new(1),
             feed_calls: Mutex::new(BTreeMap::new()),
             sync: Mutex::new(None),
+            name: mount.clone(),
+            scope: Mutex::new(scope),
+            scopes: Arc::clone(&caches.scopes),
             publication: PublicationReservations {
                 active: Mutex::new(HashSet::new()),
                 wake: Notify::new(),
@@ -1735,6 +1771,64 @@ impl MountResources {
         self.sync_count()?
             .checked_add(1)
             .ok_or_else(|| ProjectionError::Inconsistent("the count of the syncs overflows".into()))
+    }
+
+    /// Add `paths` to the paths of the mount that a sync named, durably and
+    /// over each projection of the mount.
+    pub(crate) fn extend_scope(&self, paths: &[Path]) -> Result<(), ProjectionError> {
+        let mut scope = self.scope.lock();
+        let mut next = scope.clone();
+        for path in paths {
+            if !next.contains(path) {
+                next.push(path.clone());
+            }
+        }
+        if next.len() == scope.len() {
+            return Ok(());
+        }
+        next.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let text: Vec<&str> = next.iter().map(Path::as_str).collect();
+        self.scopes.put(
+            &self.name,
+            &postcard::to_allocvec(&text).map_err(ProjectionError::from)?,
+        )?;
+        *scope = next;
+        Ok(())
+    }
+
+    /// Whether the projection alone serves an operation of the mount: a
+    /// mount with named paths asks its provider only in a sync.
+    pub(crate) fn served_from_projection(&self) -> bool {
+        !self.scope.lock().is_empty() && self.sync_now() == 0
+    }
+
+    /// Where `path` stands to the paths that a sync named.
+    pub(crate) fn scope_place(&self, path: &Path) -> ScopePlace {
+        let scope = self.scope.lock();
+        if scope.is_empty() || scope.iter().any(|named| path.has_prefix(named)) {
+            ScopePlace::Within
+        } else if scope.iter().any(|named| named.has_prefix(path)) {
+            ScopePlace::Above
+        } else {
+            ScopePlace::Outside
+        }
+    }
+
+    /// The names of the children of `path`, for a path above a named path:
+    /// the next name on the way to each named path below it.
+    pub(crate) fn scope_children(&self, path: &Path) -> Option<BTreeSet<String>> {
+        if self.scope_place(path) != ScopePlace::Above {
+            return None;
+        }
+        let depth = path.segments().count();
+        Some(
+            self.scope
+                .lock()
+                .iter()
+                .filter(|named| named.has_prefix(path))
+                .filter_map(|named| named.segments().nth(depth).map(str::to_owned))
+                .collect(),
+        )
     }
 
     /// Begin a sync of the mount, which ends the sync in progress: its

@@ -527,10 +527,10 @@ impl wire::control_server::Control for GrpcControlService {
         request: Request<wire::BeginSyncRequest>,
     ) -> Result<Response<wire::BeginSyncResponse>, Status> {
         let daemon = self.daemon()?;
-        let mount = request.into_inner().mount;
+        let request = request.into_inner();
         let sync = daemon
             .serving
-            .begin_sync(&mount)
+            .begin_sync_of(&request.mount, &request.paths)
             .map_err(|error| sync_status(&error))?;
         reply(wire::BeginSyncResponse { sync })
     }
@@ -870,7 +870,9 @@ fn sync_status(error: &omnifs_engine::SyncError) -> Status {
     let code = match error {
         omnifs_engine::SyncError::UnknownMount(_) => ControlErrorCode::NotFound,
         omnifs_engine::SyncError::Unavailable(_) => ControlErrorCode::NotReady,
-        omnifs_engine::SyncError::Engine { .. } => ControlErrorCode::InvalidRequest,
+        omnifs_engine::SyncError::InvalidPath(_) | omnifs_engine::SyncError::Engine { .. } => {
+            ControlErrorCode::InvalidRequest
+        },
     };
     grpc_status(ControlError::new(code, error.to_string()))
 }

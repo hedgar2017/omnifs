@@ -98,7 +98,7 @@ message ServingOutcome { bool serving = 1; optional string recovery_detail = 2; 
 
 message ListMountsResponse { repeated MountRecord mounts = 1; }
 message GetMountRequest { string name = 1; }
-message BeginSyncRequest { string mount = 1; }
+message BeginSyncRequest { string mount = 1; repeated string paths = 2; }
 message BeginSyncResponse { uint64 sync = 1; }
 message EndSyncRequest { string mount = 1; uint64 sync = 2; }
 message GetMountResponse { MountRecord mount = 1; }

@@ -102,7 +102,11 @@ impl EngineNamespace {
     /// way this returns `Ok(None)` so the renderer falls through to the full read
     /// path.
     pub(crate) async fn open(&self, node: &Node) -> Result<Option<RangedHandle>> {
-        let captured_epoch = self.runtime_for(node.mount())?.resources.current_epoch();
+        // Without a runtime that serves it, the projection serves the read.
+        let Some(runtime) = self.entry_for(node.mount())?.runtime() else {
+            return Ok(None);
+        };
+        let captured_epoch = runtime.resources.current_epoch();
         let projected = node.attrs().ok_or_else(|| {
             TreeError::invalid_input(format!(
                 "open requires a deferred file projection: {}",
@@ -119,7 +123,6 @@ impl EngineNamespace {
             return Ok(None);
         }
 
-        let runtime = self.runtime_for(node.mount())?;
         let opened = match runtime.open_file(node.path(), captured_epoch).await {
             Ok(opened) => opened,
             Err(error) if error.is_provider_not_found_or_invalid_input() => return Ok(None),
@@ -147,7 +150,9 @@ impl EngineNamespace {
         mount: &str,
         path: &Path,
     ) -> Result<Option<FileAttrsCache>> {
-        let runtime = self.runtime_for(mount)?;
+        let Some(runtime) = self.entry_for(mount)?.runtime() else {
+            return Ok(None);
+        };
         let captured_epoch = runtime.resources.current_epoch();
         let opened = match runtime.open_file(path, captured_epoch).await {
             Ok(opened) => opened,

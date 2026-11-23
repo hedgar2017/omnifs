@@ -1,6 +1,6 @@
 //! Internal provider path resolution and child traversal.
 
-use crate::cache::MountResources;
+use crate::cache::{MountResources, ScopePlace};
 use crate::effect_apply::LookupOutcome;
 use crate::ops::namespace::PageRequest;
 use crate::tree_refs::TreeRef;
@@ -147,6 +147,21 @@ impl EngineNamespace {
             return Ok(Node::synthetic(mount, rel, meta, syn));
         }
 
+        // Only the paths that a sync named exist in a mount with such paths,
+        // and the directories on the way to them need no provider.
+        match resources.scope_place(&rel) {
+            ScopePlace::Within => {},
+            ScopePlace::Above => {
+                return Ok(Node::new(
+                    mount,
+                    rel,
+                    EntryMeta::directory(),
+                    NodeBody::Provider,
+                ));
+            },
+            ScopePlace::Outside => return Err(TreeError::not_found(rel.as_str())),
+        }
+
         // A pagination control (`@next`/`@all`) resolves ONLY from the parent's
         // cached dirents, and does so for the directory's whole paginated
         // lifetime: the record persists past exhaustion so a name a consumer
@@ -199,7 +214,8 @@ impl EngineNamespace {
         above_fed: bool,
     ) -> Result<Node> {
         let resources = entry.resources()?;
-        let offline = entry.runtime().is_none();
+        let serving = entry.runtime();
+        let offline = serving.is_none();
         // A fed fact is served once its feeds have answered, so its lookup
         // asks the provider for their claims; without the provider, the
         // projection serves it as the fed fact that it is.
@@ -234,7 +250,9 @@ impl EngineNamespace {
         }
 
         crate::inspector::cache_event(CacheKind::BrowseMiss);
-        let runtime = entry.runtime().expect("online entry has a runtime");
+        let Some(runtime) = serving else {
+            return Err(entry.miss(format!("no fact of the projection for {rel}")));
+        };
         match runtime.lookup_child(parent, name).await? {
             LookupOutcome::Entry(entry) if fed => Ok(Node::fed(
                 mount,
@@ -333,10 +351,21 @@ impl EngineNamespace {
         else {
             return Ok(None);
         };
-        let Some(tree_ref) = entry.trees().by_identity(&git.id, &git.relative_path) else {
-            return Ok(None);
+        let runtime = entry.runtime();
+        let tree_ref = match entry.trees().by_identity(&git.id, &git.relative_path) {
+            Some(tree_ref) => tree_ref,
+            // Without a runtime that serves it, the clone of the last sync
+            // serves the tree after a restart, without a request.
+            None if runtime.is_none() => match entry
+                .kept_tree(&git)
+                .map_err(|error| TreeError::internal(error.to_string()))?
+            {
+                Some(tree_ref) => tree_ref,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
         };
-        let Some(runtime) = entry.runtime() else {
+        let Some(runtime) = runtime else {
             return Ok(Some(tree_ref));
         };
         if runtime.rate_limited_until().is_some()
@@ -415,9 +444,7 @@ fn cached_child_node(
         {
             return Err(TreeError::not_found(rel.as_str()));
         }
-        return Err(TreeError::offline_miss(format!(
-            "offline lookup has no complete fact for {rel}"
-        )));
+        return Err(entry.miss(format!("offline lookup has no complete fact for {rel}")));
     }
     Ok(None)
 }

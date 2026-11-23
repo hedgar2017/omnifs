@@ -195,6 +195,7 @@ async fn a_sync_of_a_mount_that_the_daemon_does_not_serve_is_not_found() {
     let status = c
         .begin_sync(wire::BeginSyncRequest {
             mount: "missing".to_owned(),
+            paths: Vec::new(),
         })
         .await
         .unwrap_err();

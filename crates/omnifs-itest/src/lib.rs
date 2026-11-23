@@ -195,6 +195,15 @@ impl RuntimeHarness {
             .expect("a sync of the mount begins")
     }
 
+    /// Begin a sync of the selected mount that names `paths`, after which
+    /// only they exist in it and nothing outside a sync asks its upstream.
+    pub fn begin_sync_of(&self, paths: &[&str]) -> u64 {
+        let paths: Vec<Path> = paths.iter().map(|path| parse_path(path)).collect();
+        self.runtime
+            .begin_sync_of(&paths)
+            .expect("a sync of the mount begins")
+    }
+
     /// End the sync `number` of the selected mount: an operation after it is
     /// served from the projection.
     pub fn end_sync(&self, number: u64) {

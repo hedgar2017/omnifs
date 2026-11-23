@@ -95,11 +95,27 @@ impl EngineNamespace {
         let path = node.path();
         let captured_epoch = resources.current_epoch();
 
+        // A directory above a path that a sync named lists the names on the
+        // way to the named paths, without the provider.
+        if let Some(names) = resources.scope_children(path) {
+            let mut entries: Vec<Entry> = names
+                .into_iter()
+                .map(|name| Entry::provider(name, EntryMeta::directory()))
+                .collect();
+            if path.is_root() {
+                entries.extend(Synthetic::root_ignore_entries());
+            }
+            return Ok(ListOutcome::Listing(Listing {
+                entries,
+                next_cursor: None,
+            }));
+        }
+
         // An explicit-cursor continuation is a raw page drain: no cache consult,
         // no synthetic entries, the direct provider paginated read.
         if let Some(cursor) = cursor {
             let runtime = entry.runtime().ok_or_else(|| {
-                TreeError::offline_miss(format!(
+                entry.miss(format!(
                     "offline listing continuation requires a provider for {path}"
                 ))
             })?;
@@ -148,7 +164,7 @@ impl EngineNamespace {
         }
 
         let runtime = entry.runtime().ok_or_else(|| {
-            TreeError::offline_miss(format!("offline listing has no complete fact for {path}"))
+            entry.miss(format!("offline listing has no complete fact for {path}"))
         })?;
         self.list_via_provider(&runtime, node, captured_epoch).await
     }

@@ -194,6 +194,42 @@ impl ProjectionStore {
     }
 }
 
+/// The paths of each mount that a sync named, apart from the facts of a
+/// projection, so that they stay over a change of its number.
+pub(crate) struct ScopeStore {
+    db: OptimisticTxDatabase,
+    scopes: OptimisticTxKeyspace,
+}
+
+impl ScopeStore {
+    pub(crate) fn open(database: &OptimisticTxDatabase) -> Result<Self, ProjectionStoreError> {
+        let scopes = database.keyspace("scopes", KeyspaceCreateOptions::default)?;
+        Ok(Self {
+            db: database.clone(),
+            scopes,
+        })
+    }
+
+    pub(crate) fn get(&self, mount: &MountName) -> Result<Option<Vec<u8>>, ProjectionStoreError> {
+        Ok(self
+            .scopes
+            .get(mount.to_string().as_bytes())?
+            .map(|value| value.to_vec()))
+    }
+
+    pub(crate) fn put(&self, mount: &MountName, value: &[u8]) -> Result<(), ProjectionStoreError> {
+        let key = mount.to_string();
+        for _ in 0..8 {
+            let mut tx = self.db.write_tx()?.durability(Some(PersistMode::SyncAll));
+            tx.insert(&self.scopes, key.as_bytes(), value);
+            if let Ok(()) = tx.commit()? {
+                return Ok(());
+            }
+        }
+        Err(ProjectionStoreError::Conflict)
+    }
+}
+
 fn read_manifest(path: &Path) -> Result<Vec<u8>, ProjectionStoreError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);

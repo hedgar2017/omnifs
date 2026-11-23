@@ -438,10 +438,12 @@ impl RpcClient {
             .map_err(Into::into)
     }
 
-    /// Begin a sync of `mount`, and the number of the sync.
-    pub(crate) async fn begin_sync(&self, mount: &str) -> anyhow::Result<u64> {
+    /// Begin a sync of `mount` that names `paths`, and the number of the
+    /// sync.
+    pub(crate) async fn begin_sync(&self, mount: &str, paths: &[String]) -> anyhow::Result<u64> {
         let request = wire::BeginSyncRequest {
             mount: mount.to_owned(),
+            paths: paths.to_vec(),
         };
         Ok(bounded_unary!(self, begin_sync, request).into_inner().sync)
     }

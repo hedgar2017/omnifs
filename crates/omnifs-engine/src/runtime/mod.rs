@@ -261,7 +261,12 @@ impl Runtime {
             Arc::clone(&resources),
             config.max_fetch_blob_bytes,
         );
-        let mut callout_host = CalloutHost::new(Arc::clone(&http), git.clone(), blob.clone());
+        let mut callout_host = CalloutHost::new(
+            Arc::clone(&http),
+            git.clone(),
+            blob.clone(),
+            Arc::clone(&resources),
+        );
         if let Some(test_callouts) = test_callouts {
             callout_host = callout_host.with_test_callouts(test_callouts);
         }
@@ -432,6 +437,15 @@ impl Runtime {
             .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
         self.failures.lock().unwrap().clear();
         Ok(sync)
+    }
+
+    /// Begin a sync of the mount that names `paths`, which stay the paths
+    /// of the mount with those of each earlier sync.
+    pub fn begin_sync_of(&self, paths: &[omnifs_core::path::Path]) -> Result<u64> {
+        self.resources
+            .extend_scope(paths)
+            .map_err(|error| EngineError::ProviderProtocol(error.to_string()))?;
+        self.begin_sync()
     }
 
     /// End the sync `number` of the mount.

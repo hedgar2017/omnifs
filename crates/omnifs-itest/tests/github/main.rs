@@ -1323,6 +1323,59 @@ fn entry_names(page: &omnifs_engine::DirPage) -> Vec<&str> {
         .collect()
 }
 
+/// A sync that names a repository leaves it alone under its owner, and
+/// outside the sync nothing asks GitHub, for a path that the projection
+/// lacks either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_that_names_a_repository_leaves_it_alone_and_nothing_asks_after_it() {
+    let harness = github_harness();
+    let namespace = harness.namespace.as_ref();
+    let sync = harness.begin_sync_of(&["/octocat/Hello-World"]);
+
+    let owner = resolve_namespace(namespace, "/github/octocat").await;
+    let listing = namespace
+        .readdir(owner.path.clone(), omnifs_engine::DirCursor::start(), 0)
+        .await
+        .unwrap();
+    assert_eq!(entry_names(&listing), ["Hello-World"]);
+    let other = namespace.lookup(owner.path.clone(), "other").await.unwrap();
+    assert!(other.is_missing(), "a repository that no sync named");
+
+    let repo = namespace
+        .lookup(owner.path.clone(), "Hello-World")
+        .await
+        .unwrap();
+    assert!(!repo.is_missing());
+    let (listing, requests) = answering(
+        &harness,
+        namespace.readdir(repo.path.clone(), omnifs_engine::DirCursor::start(), 0),
+        [fetched(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: br#"{"name":"Hello-World"}"#.to_vec(),
+            redirected: None,
+        })],
+    )
+    .await;
+    assert!(entry_names(&listing.unwrap()).contains(&"pulls"));
+    assert!(
+        http(&requests[0])
+            .url
+            .ends_with("/repos/octocat/Hello-World")
+    );
+    harness.end_sync(sync);
+
+    let (pulls, requests) =
+        answering(&harness, namespace.lookup(repo.path.clone(), "pulls"), []).await;
+    let pulls = pulls.unwrap();
+    assert!(!pulls.is_missing(), "what the sync took stays");
+    assert!(requests.is_empty());
+    let (lacking, requests) =
+        answering(&harness, namespace.lookup(pulls.path.clone(), "all"), []).await;
+    assert!(lacking.unwrap().is_missing(), "what the sync did not take");
+    assert!(requests.is_empty());
+}
+
 /// A page answer without an `ETag` has no validator to be asked for again
 /// with, and `notifications/` takes the seconds of `X-Poll-Interval` only as
 /// a number: each is an error of the listing.

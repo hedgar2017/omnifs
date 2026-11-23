@@ -3,12 +3,14 @@
 //! Startup is atomic: every selected mount is built and validated in a
 //! temporary collection before the fixed table is published.
 
-use crate::cache::{MountResources, ProjectionId};
+use crate::cache::{GitFact, MountResources, ProjectionId};
+use crate::cloner::GitCloner;
 use crate::runtime::RuntimeBuildInput;
 use crate::runtime::host::HostOnline;
-use crate::tree_refs::TreeRefs;
+use crate::tree_refs::{TreeRef, TreeRefs};
 use crate::{BuildError, Runtime, RuntimeMountConfig};
 use omnifs_auth::AuthBinding;
+use omnifs_core::path::Path;
 use omnifs_core::{CredentialGeneration, MountName, ProviderId};
 use omnifs_provider::ProviderManifest;
 use std::collections::BTreeMap;
@@ -25,6 +27,7 @@ pub struct MountEntry {
     availability: MountAvailability,
     resources: Option<Arc<MountResources>>,
     trees: Arc<TreeRefs>,
+    cloner: Arc<GitCloner>,
     runtime: Option<Arc<Runtime>>,
 }
 
@@ -90,8 +93,40 @@ impl MountEntry {
         &self.trees
     }
 
+    /// The runtime that serves an operation of the mount: none for a mount
+    /// without its provider, and none outside a sync of a mount with synced
+    /// paths, which its projection alone serves.
     pub(crate) fn runtime(&self) -> Option<Arc<Runtime>> {
+        self.runtime
+            .clone()
+            .filter(|runtime| !runtime.resources.served_from_projection())
+    }
+
+    /// The runtime of the provider of the mount, whether it serves an
+    /// operation or not.
+    fn provider_runtime(&self) -> Option<Arc<Runtime>> {
         self.runtime.clone()
+    }
+
+    /// The error of what the projection lacks without a runtime that serves
+    /// the operation: a mount with its provider, outside a sync, has no such
+    /// path; a mount without its provider cannot tell.
+    pub(crate) fn miss(&self, message: String) -> crate::tree::TreeError {
+        if self.runtime.is_some() {
+            crate::tree::TreeError::not_found(message)
+        } else {
+            crate::tree::TreeError::offline_miss(message)
+        }
+    }
+
+    /// The tree of `git` from its clone at its commit, without a request.
+    pub(crate) fn kept_tree(&self, git: &GitFact) -> std::io::Result<Option<TreeRef>> {
+        let Some(repo) = self.cloner.checked_out(&git.id, &git.commit) else {
+            return Ok(None);
+        };
+        self.trees
+            .open(git.id, &git.relative_path, &repo.join(&git.relative_path))
+            .map(Some)
     }
 
     pub(crate) fn availability(&self) -> &MountAvailability {
@@ -229,13 +264,16 @@ impl MountTable {
             availability,
             resources,
             trees,
+            cloner: Arc::clone(host.cloner()),
             runtime,
         })
     }
 
     /// The immutable runtime for one loaded mount.
     pub fn get(&self, mount: &str) -> Option<Arc<Runtime>> {
-        self.entries.get(mount).and_then(MountEntry::runtime)
+        self.entries
+            .get(mount)
+            .and_then(MountEntry::provider_runtime)
     }
 
     pub(crate) fn entry(&self, mount: &str) -> Option<&MountEntry> {
@@ -248,6 +286,22 @@ impl MountTable {
     pub fn begin_sync(&self, mount: &str) -> Result<u64, SyncError> {
         self.sync_runtime(mount)?
             .begin_sync()
+            .map_err(|error| SyncError::Engine {
+                mount: mount.to_owned(),
+                message: error.to_string(),
+            })
+    }
+
+    /// Begin a sync of `mount` that names `paths`. Once a mount has named
+    /// paths, only they and the directories on the way to them exist in it,
+    /// and its provider is asked only in a sync. `/` names the whole mount.
+    pub fn begin_sync_of(&self, mount: &str, paths: &[String]) -> Result<u64, SyncError> {
+        let paths = paths
+            .iter()
+            .map(|path| Path::parse(path).map_err(|_| SyncError::InvalidPath(path.clone())))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.sync_runtime(mount)?
+            .begin_sync_of(&paths)
             .map_err(|error| SyncError::Engine {
                 mount: mount.to_owned(),
                 message: error.to_string(),
@@ -270,7 +324,7 @@ impl MountTable {
             .get(mount)
             .ok_or_else(|| SyncError::UnknownMount(mount.to_owned()))?;
         entry
-            .runtime()
+            .provider_runtime()
             .ok_or_else(|| SyncError::Unavailable(mount.to_owned()))
     }
 
@@ -281,7 +335,11 @@ impl MountTable {
     pub fn runtime_entries(&self) -> Vec<(String, Arc<Runtime>)> {
         self.entries
             .iter()
-            .filter_map(|(mount, entry)| entry.runtime().map(|runtime| (mount.clone(), runtime)))
+            .filter_map(|(mount, entry)| {
+                entry
+                    .provider_runtime()
+                    .map(|runtime| (mount.clone(), runtime))
+            })
             .collect()
     }
 
@@ -301,7 +359,7 @@ impl MountTable {
                 &entry.name,
                 &entry.config,
                 entry.availability().clone(),
-                entry.runtime(),
+                entry.provider_runtime(),
             )
         })
     }
@@ -315,7 +373,7 @@ impl MountTable {
 
     fn shutdown_runtimes(&self) {
         for (mount, entry) in &self.entries {
-            if let Some(runtime) = entry.runtime()
+            if let Some(runtime) = entry.provider_runtime()
                 && let Err(e) = runtime.shutdown()
             {
                 warn!(mount, error = %e, "shutdown failed");
@@ -465,6 +523,8 @@ pub enum SyncError {
     UnknownMount(String),
     #[error("mount {0} has no provider to sync")]
     Unavailable(String),
+    #[error("{0} is not a path of a mount")]
+    InvalidPath(String),
     #[error("sync of mount {mount}: {message}")]
     Engine { mount: String, message: String },
 }

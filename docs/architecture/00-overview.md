@@ -49,7 +49,7 @@ The host owns storage as opaque facts and bytes.
 
 On a warm object read, the host pushes cached canonical bytes into the provider's read operation. The provider decodes and renders from those bytes. There is no provider-to-host canonical-read callout and no host-side render operation.
 
-Online access asks a provider again only in a sync of its mount, once for each feed, page, and fact, and for a fact that the projection lacks; nothing asks because time passed. Cache-only access ignores syncs and serves complete durable facts. A missing body, partial listing, deferred/live/ranged value, or other provider-dependent fact returns `OfflineMiss`; a corrupt relation fails table construction.
+Online access asks a provider again only in a sync of its mount, once for each feed, page, and fact, and for a fact that the projection lacks; nothing asks because time passed. A mount whose syncs named paths holds only those paths and asks its provider in a sync alone. Cache-only access ignores syncs and serves complete durable facts. A missing body, partial listing, deferred/live/ranged value, or other provider-dependent fact returns `OfflineMiss`; a corrupt relation fails table construction.
 
 ## Dispatch and listing
 

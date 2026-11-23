@@ -309,9 +309,10 @@ impl EngineNamespace {
     }
 
     pub(crate) fn runtime_for(&self, mount: &str) -> Result<Arc<Engine>, TreeError> {
-        self.entry_for(mount)?
+        let entry = self.entry_for(mount)?;
+        entry
             .runtime()
-            .ok_or_else(|| TreeError::offline_miss(format!("mount {mount} is cache-only")))
+            .ok_or_else(|| entry.miss(format!("mount {mount} is served from its projection")))
     }
 
     /// The entry of `mount`: an active mount, or a mount without its provider,
@@ -1193,14 +1194,18 @@ impl EngineNamespace {
         let span = Self::begin_span(op, &display_mount, &display_path);
         let result = async {
             let mut node = self.resolve_node(&full_path).await?;
-            if node.is_dir() && node.is_fed() {
-                let runtime = self.runtime_for(node.mount()).map_err(NsError::from)?;
-                if runtime.resources.sync_now() != 0 {
-                    crate::tree::feed::answer_in_sync(&runtime, node.path())
-                        .await
-                        .map_err(NsError::from)?;
-                    node = self.resolve_node(&full_path).await?;
-                }
+            if node.is_dir()
+                && node.is_fed()
+                && let Some(runtime) = self
+                    .entry_for(node.mount())
+                    .map_err(NsError::from)?
+                    .runtime()
+                && runtime.resources.sync_now() != 0
+            {
+                crate::tree::feed::answer_in_sync(&runtime, node.path())
+                    .await
+                    .map_err(NsError::from)?;
+                node = self.resolve_node(&full_path).await?;
             }
             // The attrs carry each change that the resolve recorded.
             self.process_invalidations(&mount);

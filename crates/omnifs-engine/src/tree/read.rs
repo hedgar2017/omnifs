@@ -211,9 +211,8 @@ impl EngineNamespace {
             .map_err(|error| TreeError::internal(error.to_string()))?
         {
             let Some(runtime) = entry.runtime() else {
-                return fed_range(resources, node.fact(), offset, len, false)?.ok_or_else(|| {
-                    TreeError::offline_miss(format!("offline read has no body for {path}"))
-                });
+                return fed_range(resources, node.fact(), offset, len, false)?
+                    .ok_or_else(|| entry.miss(format!("offline read has no body for {path}")));
             };
             let content_type = path.content_type_mime(None).to_string();
             return match runtime
@@ -238,13 +237,9 @@ impl EngineNamespace {
             return Ok(read);
         }
 
-        if offline {
-            return Err(TreeError::offline_miss(format!(
-                "offline read has no complete body for {path}"
-            )));
-        }
-
-        let runtime = entry.runtime().expect("online entry has a runtime");
+        let Some(runtime) = entry.runtime() else {
+            return Err(entry.miss(format!("offline read has no complete body for {path}")));
+        };
 
         // Cold miss. Derive the content type the host echoes into `read-file`:
         // the path's representation suffix wins, else octet-stream (the

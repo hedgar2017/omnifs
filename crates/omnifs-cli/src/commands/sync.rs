@@ -27,6 +27,11 @@ pub enum SyncCommand {
 pub struct BeginArgs {
     /// Name of the mount.
     pub mount: String,
+    /// A path of the mount for this sync, `/` for the whole mount. Once a
+    /// mount has such a path, only those paths exist in it, and no operation
+    /// outside a sync asks its upstream.
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -49,7 +54,7 @@ impl SyncArgs {
         let rpc = crate::rpc::RpcClient::resolve()?;
         let result = match self.command {
             SyncCommand::Begin(args) => {
-                let sync = rpc.begin_sync(&args.mount).await?;
+                let sync = rpc.begin_sync(&args.mount, &args.paths).await?;
                 SyncResult {
                     mount: args.mount,
                     sync,
