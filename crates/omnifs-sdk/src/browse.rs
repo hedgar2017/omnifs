@@ -97,6 +97,11 @@ pub struct Effects {
 }
 
 impl Effects {
+    /// The canonical stores of these effects.
+    pub(crate) fn canonical_stores(&self) -> &[wit_types::CanonicalStore] {
+        &self.canonical
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

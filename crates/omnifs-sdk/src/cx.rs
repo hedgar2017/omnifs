@@ -47,13 +47,21 @@ struct CxShared {
     /// glue via [`Cx::with_version`]; read by handlers through
     /// [`Cx::version`].
     version: Option<crate::file_attrs::VersionToken>,
+    /// The canonical bytes that this operation stored so far, which the
+    /// projection has only once the operation ends: a collection of an
+    /// anchor reads the object that the listing of the anchor just loaded.
+    stored: RefCell<Vec<omnifs_wit::provider::types::CanonicalStore>>,
 }
 
 impl<S> Cx<S> {
     /// Create a new context for the given operation id and state handle.
     pub fn new(id: u64, state: Rc<RefCell<S>>) -> Self {
         Self {
-            shared: Rc::new(CxShared { id, version: None }),
+            shared: Rc::new(CxShared {
+                id,
+                version: None,
+                stored: RefCell::new(Vec::new()),
+            }),
             state,
         }
     }
@@ -69,6 +77,7 @@ impl<S> Cx<S> {
             shared: Rc::new(CxShared {
                 id: self.shared.id,
                 version,
+                stored: RefCell::new(self.shared.stored.borrow().clone()),
             }),
             state: Rc::clone(&self.state),
         }
@@ -108,9 +117,37 @@ impl<S> Cx<S> {
     ) -> crate::error::Result<Option<O>> {
         let id: omnifs_wit::provider::types::LogicalId =
             crate::object::Key::anchor(key, O::kind()).into();
-        crate::omnifs::provider::projection::object(self.id(), &id)?
-            .map(|bytes| O::decode(&bytes))
-            .transpose()
+        let same = |other: &omnifs_wit::provider::types::LogicalId| {
+            other.kind == id.kind
+                && other.captures.len() == id.captures.len()
+                && other
+                    .captures
+                    .iter()
+                    .zip(&id.captures)
+                    .all(|(a, b)| a.name == b.name && a.value == b.value)
+        };
+        let held = self
+            .shared
+            .stored
+            .borrow()
+            .iter()
+            .rev()
+            .find(|store| same(&store.id))
+            .map(|store| store.bytes.clone());
+        let bytes = match held {
+            Some(bytes) => Some(bytes),
+            None => crate::omnifs::provider::projection::object(self.id(), &id)?,
+        };
+        bytes.map(|bytes| O::decode(&bytes)).transpose()
+    }
+
+    /// Hold the canonical stores of `effects`, which this operation made,
+    /// for [`Self::object`] before the projection has them.
+    pub(crate) fn hold_stored(&self, effects: &crate::browse::Effects) {
+        self.shared
+            .stored
+            .borrow_mut()
+            .extend(effects.canonical_stores().iter().cloned());
     }
 
     pub fn id(&self) -> u64 {

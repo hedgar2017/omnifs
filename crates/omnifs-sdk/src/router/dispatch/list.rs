@@ -128,6 +128,9 @@ impl<S> CompiledRouter<S> {
                 .await
                 .map_err(|error| error.with_context("list-children", &abs))?
             };
+            // The collection of the anchor reads the object that this
+            // listing just loaded, before the projection has it.
+            cx.hold_stored(&out.effects);
             let listing = shape
                 .object_dir_listing(route.entry, &abs, out.source.as_ref())
                 .with_effects(out.effects);
