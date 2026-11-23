@@ -21,9 +21,6 @@ const REPO: &str = "/github/octocat/hello";
 const COMMENTS: &str =
     "/repos/octocat/hello/issues/comments?sort=updated&direction=asc&per_page=100";
 
-/// The REST count of the comments of the repository.
-const REMOTE: &str = "/repos/octocat/hello/issues/comments?sort=created&direction=desc&per_page=1";
-
 fn api(path: &str) -> String {
     format!("https://api.github.com{path}")
 }
@@ -201,21 +198,56 @@ fn by_number(number: u64, kind: &str, repository: &str, answered: u64, item: &Va
     })
 }
 
-/// The REST count of the comments of the repository, `total`, with its newest
-/// comment `newest`, as one row a page.
-fn remote(total: u64, newest: Option<u64>) -> Answer {
-    let rows = newest.map_or(json!([]), |id| json!([{ "id": id }]));
+/// The `Date` of each answer of the comments of the repository: hours after
+/// each of their times, so that each pass took each second up to the next
+/// row.
+const DATE: &str = "Wed, 18 Nov 2026 12:00:00 GMT";
+
+/// A page of the comments of the repository, with `headers` beside its
+/// `Date`.
+fn listed(headers: &[(&str, &str)], rows: &Value) -> Answer {
+    let mut headers = headers.to_vec();
+    headers.push(("Date", DATE));
+    json_answer(200, &headers, rows)
+}
+
+/// The `304` of the comments of the repository.
+fn listed_unchanged() -> Answer {
+    empty(304, &[("Date", DATE)])
+}
+
+/// The page of one comment of the comments of the repository at `page`.
+fn count_url(page: u64) -> String {
+    api(&format!(
+        "/repos/octocat/hello/issues/comments?sort=created&direction=desc&per_page=1&page={page}"
+    ))
+}
+
+/// The answers of the REST count of the comments of the repository, `total`:
+/// its first page, with the count as its link `last`, and the page at the
+/// last position of the count with the `ETag` `"count-{total}"`, one page
+/// for a count of one or none.
+fn count(total: u64) -> Vec<Answer> {
+    let etag = format!("\"count-{total}\"");
     if total < 2 {
-        return ok(&rows);
+        let rows = if total == 0 {
+            json!([])
+        } else {
+            json!([{ "id": 1 }])
+        };
+        return vec![json_answer(200, &[("ETag", &etag)], &rows)];
     }
     let links = format!(
         "<https://api.github.com/repositories/1/issues/comments?sort=created&direction=desc&per_page=1&page=2>; rel=\"next\", \
          <https://api.github.com/repositories/1/issues/comments?sort=created&direction=desc&per_page=1&page={total}>; rel=\"last\""
     );
-    json_answer(200, &[("Link", &links)], &rows)
+    vec![
+        json_answer(200, &[("Link", &links)], &json!([{ "id": total }])),
+        json_answer(200, &[("ETag", &etag)], &json!([{ "id": 1 }])),
+    ]
 }
 
-/// The comments of the repository since a second before `time`.
+/// The comments of the repository since `time`.
 fn comments_since(time: &str) -> String {
     api(&format!("{COMMENTS}&since={time}"))
 }
@@ -241,20 +273,15 @@ async fn first_full_listing(
             })
             .collect::<Vec<_>>()
     };
-    let newest = comments.iter().filter_map(|row| row["id"].as_u64()).max();
-    let (listing, _) = answering(
-        harness,
-        names(harness, &at("issues/all")),
-        [
-            graphql(&json!({ "issues": rows(issues, issues.len() as u64, Some("i-1"), false) })),
-            graphql(&json!({ "pulls": rows(pulls, pulls.len() as u64, Some("p-1"), false) })),
-            ok(&Value::Array(comments.to_vec())),
-            graphql(&counted(&counts(issues), None)),
-            graphql(&counted(&counts(pulls), None)),
-            remote(comments.len() as u64, newest),
-        ],
-    )
-    .await;
+    let mut answers = vec![
+        graphql(&json!({ "issues": rows(issues, issues.len() as u64, Some("i-1"), false) })),
+        graphql(&json!({ "pulls": rows(pulls, pulls.len() as u64, Some("p-1"), false) })),
+        listed(&[], &Value::Array(comments.to_vec())),
+        graphql(&counted(&counts(issues), None)),
+        graphql(&counted(&counts(pulls), None)),
+    ];
+    answers.extend(count(comments.len() as u64));
+    let (listing, _) = answering(harness, names(harness, &at("issues/all")), answers).await;
     listing.unwrap();
 }
 
@@ -290,28 +317,29 @@ async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_count
     let eleven = comment(11, 1, false, "second", "2026-11-18T08:15:00Z");
     let twelve = comment(12, 1, false, "third", "2026-11-18T08:30:00Z");
     let next = r#"<https://api.github.com/repositories/1/issues/comments?page=2>; rel="next""#;
-    let (listing, requests) = answering(
-        &harness,
-        names(&harness, &at("issues/all")),
-        [
-            graphql(&json!({ "issues": rows(&[three.clone(), one.clone()], 3, Some("i-1"), true) })),
-            graphql(&json!({ "issues": rows(&[four], 3, Some("i-2"), false) })),
-            graphql(&json!({ "pulls": rows(std::slice::from_ref(&two), 1, Some("p-1"), false) })),
-            json_answer(
-                200,
-                &[("Link", next)],
-                &json!([ten, comment(50, 2, true, "on the pull", "2026-11-18T08:20:00Z")]),
-            ),
-            ok(&json!([twelve.clone()])),
-            graphql(&counted(&[(3, 0), (1, 3), (4, 0)], None)),
-            graphql(&json!({ "item": ids(1, &[(10, "2026-11-18T08:10:00Z"), (11, "2026-11-18T08:15:00Z")], Some("c-2")) })),
-            ok(&eleven),
-            graphql(&json!({ "item": ids(1, &[(12, "2026-11-18T08:30:00Z")], None) })),
-            graphql(&counted(&[(2, 1)], None)),
-            remote(4, Some(50)),
-        ],
-    )
-    .await;
+    let mut answers = vec![
+        graphql(&json!({ "issues": rows(&[three.clone(), one.clone()], 3, Some("i-1"), true) })),
+        graphql(&json!({ "issues": rows(&[four], 3, Some("i-2"), false) })),
+        graphql(&json!({ "pulls": rows(std::slice::from_ref(&two), 1, Some("p-1"), false) })),
+        listed(
+            &[("Link", next)],
+            &json!([
+                ten,
+                comment(50, 2, true, "on the pull", "2026-11-18T08:20:00Z")
+            ]),
+        ),
+        listed(&[], &json!([twelve.clone()])),
+        graphql(&counted(&[(3, 0), (1, 3), (4, 0)], None)),
+        graphql(
+            &json!({ "item": ids(1, &[(10, "2026-11-18T08:10:00Z"), (11, "2026-11-18T08:15:00Z")], Some("c-2")) }),
+        ),
+        ok(&eleven),
+        graphql(&json!({ "item": ids(1, &[(12, "2026-11-18T08:30:00Z")], None) })),
+        graphql(&counted(&[(2, 1)], None)),
+    ];
+    answers.extend(count(4));
+    let (listing, requests) =
+        answering(&harness, names(&harness, &at("issues/all")), answers).await;
     assert_eq!(listing.unwrap(), ["1", "3", "4"]);
     let (query, variables) = graphql_of(&requests[0]);
     assert!(
@@ -352,7 +380,8 @@ async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_count
         api("/repos/octocat/hello/issues/comments/11")
     );
     assert!(graphql_of(&requests[9]).0.contains("page: pullRequests("));
-    assert_eq!(http(&requests[10]).url, api(REMOTE));
+    assert_eq!(http(&requests[10]).url, count_url(1));
+    assert_eq!(http(&requests[11]).url, count_url(4));
 
     for (folder, expected) in [
         ("issues/open", vec!["1", "4"]),
@@ -441,13 +470,15 @@ async fn the_attributes_of_the_files_of_an_issue_and_of_a_pull_request_take_no_r
     }
 }
 
-/// A check asks for the nodes of each kind after its cursor and for the REST
-/// count of the comments, and for the comments since a second before the last
-/// one, so that it takes them whether GitHub's `since` includes that second
-/// or not: the rows of that second come once, and the next check asks with
-/// the `ETag` of their answer, which `304` keeps.
+/// A check asks for the nodes of each kind after its cursor, for the comments
+/// since the second after the last one, which the answer of the last pass
+/// came after, so that it takes no comment that it holds whether GitHub's
+/// `since` includes that second or not, and for the REST count of the
+/// comments by the `ETag` of the page at its last position: the next check
+/// asks both with their `ETag`s, which `304` keeps, so that nothing is
+/// downloaded again.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_check_asks_after_the_cursors_and_for_the_comments_since_a_second_before_the_last_one() {
+async fn a_check_asks_after_the_cursors_and_downloads_no_comment_and_no_count_again() {
     let harness = github_harness();
     let last = comment(10, 1, false, "first", "2026-11-18T09:00:00Z");
     first_full_listing(
@@ -464,8 +495,8 @@ async fn a_check_asks_after_the_cursors_and_for_the_comments_since_a_second_befo
         names(&harness, &at("issues/all")),
         [
             no_rows(1, 0),
-            remote(1, Some(10)),
-            json_answer(200, &[("ETag", r#""comments-1""#)], &json!([last])),
+            listed(&[("ETag", r#""comments-1""#)], &json!([])),
+            not_modified(),
         ],
     )
     .await;
@@ -475,29 +506,70 @@ async fn a_check_asks_after_the_cursors_and_for_the_comments_since_a_second_befo
     assert!(query.contains("pulls: pullRequests("), "{query}");
     assert_eq!(variables["issues"], "i-1");
     assert_eq!(variables["pulls"], "p-1");
-    assert_eq!(http(&requests[1]).url, api(REMOTE));
     assert_eq!(
-        http(&requests[2]).url,
-        comments_since("2026-11-18T08:59:59Z")
+        http(&requests[1]).url,
+        comments_since("2026-11-18T09:00:01Z")
     );
-    assert_eq!(header(&requests[2], "if-none-match"), None);
+    assert_eq!(header(&requests[1], "if-none-match"), None);
+    assert_eq!(http(&requests[2]).url, count_url(1));
+    assert_eq!(header(&requests[2], "if-none-match"), Some(r#""count-1""#));
 
     harness.begin_sync();
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
-        [no_rows(1, 0), remote(1, Some(10)), not_modified()],
+        [no_rows(1, 0), listed_unchanged(), not_modified()],
     )
     .await;
     assert_eq!(listing.unwrap(), ["1"]);
     assert_eq!(
-        http(&requests[2]).url,
-        comments_since("2026-11-18T08:59:59Z")
+        http(&requests[1]).url,
+        comments_since("2026-11-18T09:00:01Z")
     );
     assert_eq!(
-        header(&requests[2], "if-none-match"),
+        header(&requests[1], "if-none-match"),
         Some(r#""comments-1""#)
     );
+    assert_eq!(header(&requests[2], "if-none-match"), Some(r#""count-1""#));
+}
+
+/// A pass whose answer came in the second after its last comment asks the
+/// next from the second of that comment, which ended before the answer, and
+/// one in the second of its last comment from the second before, so that the
+/// rows of a second that may have more come whether `since` includes their
+/// second or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_asks_the_comments_of_a_second_that_may_have_more_again() {
+    for (date, since) in [
+        ("Wed, 18 Nov 2026 09:00:01 GMT", "2026-11-18T09:00:00Z"),
+        ("Wed, 18 Nov 2026 09:00:00 GMT", "2026-11-18T08:59:59Z"),
+    ] {
+        let harness = github_harness();
+        let last = comment(10, 1, false, "first", "2026-11-18T09:00:00Z");
+        let mut answers = vec![
+            graphql(
+                &json!({ "issues": rows(&[node(1, "One", "OPEN", "2026-11-18T08:00:00Z", 1)], 1, Some("i-1"), false) }),
+            ),
+            graphql(&json!({ "pulls": rows(&[], 0, Some("p-1"), false) })),
+            json_answer(200, &[("Date", date)], &json!([last])),
+            graphql(&counted(&[(1, 1)], None)),
+            graphql(&counted(&[], None)),
+        ];
+        answers.extend(count(1));
+        answering(&harness, names(&harness, &at("issues/all")), answers)
+            .await
+            .0
+            .unwrap();
+
+        harness.begin_sync();
+        let (_, requests) = answering(
+            &harness,
+            names(&harness, &at("issues/all")),
+            [no_rows(1, 0), listed(&[], &json!([last])), not_modified()],
+        )
+        .await;
+        assert_eq!(http(&requests[1]).url, comments_since(since), "{date}");
+    }
 }
 
 /// A check takes the changed items, the comments since its time, an edit of
@@ -526,55 +598,62 @@ async fn a_check_takes_the_changed_items_the_comments_since_and_the_ids_of_an_it
     .await;
 
     harness.begin_sync();
-    let (listing, requests) = answering(
-        &harness,
-        names(&harness, &at("issues/all")),
-        [
-            graphql(&json!({
-                "issues": rows(
-                    &[
-                        node(1, "One again", "CLOSED", "2026-11-18T11:00:00Z", 3),
-                        node(5, "Five", "OPEN", "2026-11-18T11:30:00Z", 0),
-                    ],
-                    2,
-                    Some("i-2"),
-                    false,
-                ),
-                "pulls": rows(&[], 0, None, false),
-            })),
-            remote(3, Some(13)),
-            ok(&json!([
+    let mut answers = vec![
+        graphql(&json!({
+            "issues": rows(
+                &[
+                    node(1, "One again", "CLOSED", "2026-11-18T11:00:00Z", 3),
+                    node(5, "Five", "OPEN", "2026-11-18T11:30:00Z", 0),
+                ],
+                2,
+                Some("i-2"),
+                false,
+            ),
+            "pulls": rows(&[], 0, None, false),
+        })),
+        listed(
+            &[],
+            &json!([
                 comment(12, 1, false, "second, edited", "2026-11-18T10:30:00Z"),
                 comment(11, 1, false, "third", "2026-11-18T11:00:00Z"),
                 comment(13, 1, false, "fourth", "2026-11-18T11:05:00Z"),
-            ])),
-            graphql(&json!({
-                "i1": ids(
-                    1,
-                    &[
-                        (11, "2026-11-18T11:00:00Z"),
-                        (12, "2026-11-18T10:30:00Z"),
-                        (13, "2026-11-18T11:05:00Z"),
-                    ],
-                    None,
-                ),
-            })),
-            graphql(&numbered(&[1, 5], None)),
-        ],
-    )
-    .await;
+            ]),
+        ),
+        ok(&json!([{ "id": 2 }])),
+    ];
+    answers.extend(count(3));
+    answers.extend([
+        graphql(&json!({
+            "i1": ids(
+                1,
+                &[
+                    (11, "2026-11-18T11:00:00Z"),
+                    (12, "2026-11-18T10:30:00Z"),
+                    (13, "2026-11-18T11:05:00Z"),
+                ],
+                None,
+            ),
+        })),
+        graphql(&numbered(&[1, 5], None)),
+    ]);
+    let (listing, requests) =
+        answering(&harness, names(&harness, &at("issues/all")), answers).await;
     assert_eq!(listing.unwrap(), ["1", "5"]);
     assert_eq!(
-        http(&requests[2]).url,
-        comments_since("2026-11-18T08:29:59Z")
+        http(&requests[1]).url,
+        comments_since("2026-11-18T08:30:01Z")
     );
-    let (query, _) = graphql_of(&requests[3]);
+    assert_eq!(http(&requests[2]).url, count_url(2));
+    assert_eq!(header(&requests[2], "if-none-match"), Some(r#""count-2""#));
+    assert_eq!(http(&requests[3]).url, count_url(1));
+    assert_eq!(http(&requests[4]).url, count_url(3));
+    let (query, _) = graphql_of(&requests[5]);
     assert!(
         query.contains("i1: issueOrPullRequest(number: 1)"),
         "{query}"
     );
     assert!(!query.contains("(number: 5)"), "{query}");
-    let (query, _) = graphql_of(&requests[4]);
+    let (query, _) = graphql_of(&requests[6]);
     assert!(
         query.contains("page: issues(first: 100, after: $after) { totalCount nodes { number }"),
         "{query}"
@@ -629,7 +708,6 @@ async fn a_check_takes_the_changed_items_the_comments_since_and_the_ids_of_an_it
 #[tokio::test(flavor = "multi_thread")]
 async fn a_comment_deleted_from_an_unchanged_item_leaves_at_the_next_check() {
     let harness = github_harness();
-    let last = comment(20, 2, true, "on the pull", "2026-11-18T09:00:00Z");
     first_full_listing(
         &harness,
         &[
@@ -640,33 +718,30 @@ async fn a_comment_deleted_from_an_unchanged_item_leaves_at_the_next_check() {
         &[
             comment(10, 1, false, "first", "2026-11-18T08:00:00Z"),
             comment(12, 1, false, "second", "2026-11-18T08:30:00Z"),
-            last.clone(),
+            comment(20, 2, true, "on the pull", "2026-11-18T09:00:00Z"),
         ],
     )
     .await;
 
     harness.begin_sync();
-    let (listing, requests) = answering(
-        &harness,
-        names(&harness, &at("issues/all")),
-        [
-            no_rows(2, 1),
-            remote(2, Some(20)),
-            ok(&json!([last])),
-            graphql(&counted(&[(1, 1), (3, 0)], None)),
-            graphql(&json!({ "i1": ids(1, &[(12, "2026-11-18T08:30:00Z")], None) })),
-        ],
-    )
-    .await;
+    let mut answers = vec![no_rows(2, 1), listed(&[], &json!([])), ok(&json!([]))];
+    answers.extend(count(2));
+    answers.extend([
+        graphql(&counted(&[(1, 1), (3, 0)], None)),
+        graphql(&json!({ "i1": ids(1, &[(12, "2026-11-18T08:30:00Z")], None) })),
+    ]);
+    let (listing, requests) =
+        answering(&harness, names(&harness, &at("issues/all")), answers).await;
     assert_eq!(listing.unwrap(), ["1", "3"]);
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 7);
+    assert_eq!(http(&requests[2]).url, count_url(3));
     assert!(
-        graphql_of(&requests[3])
+        graphql_of(&requests[5])
             .0
             .contains("page: issues(first: 100, after: $after) { totalCount nodes { number comments { totalCount } }")
     );
     assert!(
-        graphql_of(&requests[4])
+        graphql_of(&requests[6])
             .0
             .contains("i1: issueOrPullRequest(number: 1)")
     );
@@ -681,10 +756,11 @@ async fn a_comment_deleted_from_an_unchanged_item_leaves_at_the_next_check() {
     let (_, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
-        [no_rows(2, 1), remote(2, Some(20)), ok(&json!([]))],
+        [no_rows(2, 1), listed(&[], &json!([])), not_modified()],
     )
     .await;
     assert_eq!(requests.len(), 3);
+    assert_eq!(http(&requests[2]).url, count_url(2));
 }
 
 /// A comment that comes again in one pass of the comments of a check moved
@@ -713,37 +789,40 @@ async fn a_comment_that_moved_while_the_comments_paged_asks_for_them_again() {
         names(&harness, &at("issues/all")),
         [
             no_rows(1, 0),
-            remote(3, Some(12)),
-            json_answer(
-                200,
+            listed(
                 &[("Link", next)],
+                &json!([comment(10, 1, false, "edited", "2026-11-18T10:00:00Z")]),
+            ),
+            listed(
+                &[],
+                &json!([comment(
+                    10,
+                    1,
+                    false,
+                    "edited again",
+                    "2026-11-18T10:05:00Z"
+                )]),
+            ),
+            listed(
+                &[],
                 &json!([
-                    last,
-                    comment(10, 1, false, "edited", "2026-11-18T10:00:00Z")
+                    comment(11, 1, false, "between, edited", "2026-11-18T10:01:00Z"),
+                    comment(10, 1, false, "edited again", "2026-11-18T10:05:00Z"),
                 ]),
             ),
-            ok(&json!([comment(
-                10,
-                1,
-                false,
-                "edited again",
-                "2026-11-18T10:05:00Z"
-            )])),
-            ok(&json!([
-                comment(11, 1, false, "between, edited", "2026-11-18T10:01:00Z"),
-                comment(10, 1, false, "edited again", "2026-11-18T10:05:00Z"),
-            ])),
+            not_modified(),
         ],
     )
     .await;
     assert_eq!(listing.unwrap(), ["1"]);
-    let since = comments_since("2026-11-18T08:59:59Z");
-    assert_eq!(http(&requests[2]).url, since);
+    let since = comments_since("2026-11-18T09:00:01Z");
+    assert_eq!(http(&requests[1]).url, since);
     assert_eq!(
-        http(&requests[3]).url,
+        http(&requests[2]).url,
         api("/repositories/1/issues/comments?page=2")
     );
-    assert_eq!(http(&requests[4]).url, since);
+    assert_eq!(http(&requests[3]).url, since);
+    assert_eq!(http(&requests[4]).url, count_url(3));
     for (file, expected) in [("10", "edited again"), ("11", "between, edited")] {
         assert_eq!(
             served(
@@ -794,8 +873,8 @@ async fn a_check_takes_the_numbers_of_a_kind_with_another_count_once() {
         names(&harness, &at("issues/all")),
         [
             no_rows(3, 0),
-            remote(0, None),
-            json_answer(200, &[("ETag", r#""comments-0""#)], &json!([])),
+            listed(&[("ETag", r#""comments-0""#)], &json!([])),
+            not_modified(),
             graphql(&numbered(&[1, 9], Some("n-1"))),
             graphql(&numbered(&[10], None)),
             graphql(&found),
@@ -803,7 +882,7 @@ async fn a_check_takes_the_numbers_of_a_kind_with_another_count_once() {
     )
     .await;
     assert_eq!(listing.unwrap(), ["1", "10", "9"]);
-    assert_eq!(http(&requests[2]).url, api(COMMENTS));
+    assert_eq!(http(&requests[1]).url, api(COMMENTS));
     assert_eq!(graphql_of(&requests[4]).1["after"], "n-1");
     let (query, _) = graphql_of(&requests[5]);
     assert!(
@@ -825,7 +904,7 @@ async fn a_check_takes_the_numbers_of_a_kind_with_another_count_once() {
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
-        [no_rows(3, 0), remote(0, None), not_modified()],
+        [no_rows(3, 0), listed_unchanged(), not_modified()],
     )
     .await;
     assert_eq!(listing.unwrap(), ["1", "10", "9"]);
@@ -922,8 +1001,8 @@ async fn an_item_that_github_answers_from_elsewhere_left_this_repository() {
                 "issues": rows(&[node(1, "One", "OPEN", "2026-11-18T10:00:00Z", 1)], 1, Some("i-2"), false),
                 "pulls": rows(&[], 0, None, false),
             })),
-            remote(0, None),
-            ok(&json!([])),
+            listed(&[], &json!([])),
+            not_modified(),
             graphql(&json!({ "i1": elsewhere })),
             graphql(&numbered(&[], None)),
         ],
@@ -994,10 +1073,10 @@ async fn a_first_full_listing_stopped_at_a_rate_limit_continues_from_its_next_pa
                 "issues": rows(&[node(3, "Three", "CLOSED", "2026-11-18T10:00:00Z", 0)], 2, Some("i-2"), false),
             })),
             graphql(&json!({ "pulls": rows(&[], 0, None, false) })),
-            ok(&json!([])),
+            listed(&[], &json!([])),
             graphql(&counted(&[(1, 0), (3, 0)], None)),
             graphql(&counted(&[], None)),
-            remote(0, None),
+            count(0).remove(0),
         ],
     )
     .await;
@@ -1051,11 +1130,12 @@ async fn a_check_stopped_by_the_network_serves_a_read_what_the_projection_has() 
     let (title, requests) = answering(
         &harness,
         read(&harness, &at("issues/all/1/title")),
-        [remote(0, None), ok(&json!([]))],
+        [listed(&[], &json!([])), not_modified()],
     )
     .await;
     assert_eq!(title.unwrap(), "One again");
-    assert_eq!(http(&requests[0]).url, api(REMOTE));
+    assert_eq!(http(&requests[0]).url, api(COMMENTS));
+    assert_eq!(http(&requests[1]).url, count_url(1));
 }
 
 /// A `RATE_LIMITED` answer of GitHub GraphQL stops a check with the window
@@ -1099,7 +1179,7 @@ async fn a_check_stopped_by_the_rate_limit_of_github_graphql_continues_with_its_
     let (listing, requests) = answering(
         &harness,
         names(&harness, &at("issues/all")),
-        [no_rows(1, 0), remote(0, None), ok(&json!([]))],
+        [no_rows(1, 0), listed(&[], &json!([])), not_modified()],
     )
     .await;
     assert_eq!(listing.unwrap(), ["1"]);
@@ -1388,17 +1468,14 @@ async fn the_first_full_listing_removes_an_item_that_github_graphql_cannot_resol
                 false,
             ) })),
             graphql(&json!({ "pulls": rows(&[], 0, None, false) })),
-            ok(&json!([comment(
-                10,
-                1,
-                false,
-                "first",
-                "2026-11-18T08:00:00Z"
-            )])),
+            listed(
+                &[],
+                &json!([comment(10, 1, false, "first", "2026-11-18T08:00:00Z")]),
+            ),
             graphql(&counted(&[(1, 2), (2, 0)], None)),
             graphql_not_found(&json!({ "item": null })),
             graphql(&counted(&[], None)),
-            remote(0, None),
+            count(0).remove(0),
         ],
     )
     .await;
@@ -1458,10 +1535,11 @@ async fn a_check_asks_github_graphql_for_a_hundred_changed_items_a_post() {
             "pulls": rows(&[], 0, None, false),
         })),
         graphql(&json!({ "issues": rows(&changed[100..], 102, Some("i-3"), false) })),
-        remote(0, None),
-        ok(&json!([])),
-        graphql(&page(1..=100)),
+        listed(&[], &json!([])),
+        ok(&json!([{ "id": 1_101 }])),
     ];
+    answers.extend(count(101));
+    answers.push(graphql(&page(1..=100)));
     answers.extend((1..=100).map(fetched));
     answers.push(graphql(&page(101..=101)));
     answers.push(fetched(101));
@@ -1469,13 +1547,13 @@ async fn a_check_asks_github_graphql_for_a_hundred_changed_items_a_post() {
     let (listing, requests) =
         answering(&harness, names(&harness, &at("issues/all")), answers).await;
     assert_eq!(listing.unwrap().len(), 102);
-    let (query, _) = graphql_of(&requests[4]);
+    let (query, _) = graphql_of(&requests[6]);
     assert!(
         query.contains("i100: issueOrPullRequest(number: 100)"),
         "{query}"
     );
     assert!(!query.contains("(number: 101)"), "{query}");
-    let (query, _) = graphql_of(&requests[105]);
+    let (query, _) = graphql_of(&requests[107]);
     assert!(
         query.contains("i101: issueOrPullRequest(number: 101)"),
         "{query}"
@@ -1576,10 +1654,10 @@ async fn an_owner_in_another_spelling_names_another_repository() {
                     &format!("{owner}/hello"),
                     &json!({ "pulls": rows(&[], 0, None, false) }),
                 ),
-                ok(&json!([])),
+                listed(&[], &json!([])),
                 graphql_named(&format!("{owner}/hello"), &counted(&[(number, 0)], None)),
                 graphql_named(&format!("{owner}/hello"), &counted(&[], None)),
-                remote(0, None),
+                count(0).remove(0),
             ],
         )
         .await;
