@@ -1,4 +1,4 @@
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#![cfg(target_arch = "wasm32")]
 
 //! notion-provider: the pages, data sources, and comments of a Notion
 //! workspace for omnifs.
