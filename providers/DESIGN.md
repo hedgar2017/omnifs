@@ -799,12 +799,16 @@ comments of each item, where an item with another count takes the ids of its
 comments and each comment of those that the projection lacks by its id, and
 the REST count of the comments. After it, each answer, which the host asks
 for once in each sync, is a check: one `POST` of the nodes of each kind after its cursor with the count of
-each kind; the REST count of the comments with its newest comment; each page
-of the comments since a second before the last one, the first with the `ETag`
-of that time: GitHub gives each time to the second, and the second before is
-the one unit of its precision that takes each comment whether `since`
-includes its second or not, and again from that time when a comment comes twice in one
-pass, which a move past a page while the pass paged shifted; the ids of each
+each kind; each page of the comments since the second after the last one,
+the first with the `ETag` of that time: GitHub gives each time to the second,
+and the last pass took each comment updated before the second of its first
+answer, so that the check takes each comment that it lacks and none that it
+holds, whether `since` includes its second or not, from the second that may
+hold more when the last comment came within a second of that answer, and
+again from that time when a comment comes twice in one pass, which a move
+past a page while the pass paged shifted; the REST count of the comments, by
+the page of one comment at the last position of the count held with its
+`ETag`, which `304` keeps at that count; the ids of each
 changed item whose comments are other than its count; for a count of a kind
 other than the projection's with the changes of the check, the numbers of that
 kind once, as bits, which remove each item that they lack and bring each item
