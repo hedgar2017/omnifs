@@ -1554,7 +1554,9 @@ async fn a_channel_that_the_feed_of_a_message_removed_takes_each_page_again() {
 /// sync with nothing changed in Slack: the second asks for the pages of the
 /// listings of the users, of the channels, and of the history alone, with no
 /// request of the replies of a thread and no request of the bytes of a file,
-/// of a message or of a reply, with an `edit_timestamp` or without one.
+/// of a message or of a reply, with an `edit_timestamp` or without one; also
+/// for a thread whose `reply_count` is not the count of the replies that
+/// `conversations.replies` gives.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_second_walk_with_nothing_changed_asks_for_no_replies_and_no_file() {
@@ -1570,7 +1572,7 @@ async fn a_second_walk_with_nothing_changed_asks_for_no_replies_and_no_file() {
                     unedited("F02", "plain.txt"),
                 ],
             ),
-            1,
+            2,
             11,
         )
     };

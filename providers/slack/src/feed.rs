@@ -37,7 +37,7 @@ use serde_json::value::RawValue;
 
 use crate::api::{
     ConversationObject, ConversationsMessages, FileObject, MessageObject, Refusal, Refused,
-    SlackApi, SlackFiles, Thread, UserObject, UsersConversations, UsersList, decode, page,
+    SlackApi, SlackFiles, UserObject, UsersConversations, UsersList, decode, page,
 };
 use crate::{
     ChannelKey, Channels, File, FileKey, History, Id, Message, MessageKey, ReplyFile, ReplyFileKey,
@@ -242,7 +242,8 @@ impl Of<'_> {
 /// none at its `ts` before.
 struct Taken {
     message: MessageObject,
-    new: bool,
+    /// The message as the projection had it before, none for a new one.
+    before: Option<MessageObject>,
 }
 
 /// Take the message or the reply `object` of `of` into the projection at its
@@ -305,29 +306,31 @@ fn take<K>(
     for id in listed.iter().filter(|id| !files.contains(id)) {
         cx.remove(format!("{folder}/{id}"))?;
     }
-    Ok(Taken {
-        message,
-        new: before.is_none(),
-    })
+    Ok(Taken { message, before })
 }
 
 /// The `replies/` of the message `message` at `at`: complete and empty for a
 /// message without replies, and their removal for replies complete in the
-/// projection whose count or latest `ts` are not the `reply_count` or the
-/// `latest_reply` of the message.
-fn take_replies<K>(cx: &FeedCx<K>, at: &str, message: &MessageObject) -> Result<()> {
+/// projection when the `reply_count` or the `latest_reply` of the message are
+/// not those of `before`, the message as the projection had it, so that a
+/// thread is asked for again only when Slack tells of another reply.
+fn take_replies<K>(
+    cx: &FeedCx<K>,
+    at: &str,
+    message: &MessageObject,
+    before: Option<&MessageObject>,
+) -> Result<()> {
     let replies = format!("{at}/replies");
     let Some(thread) = message.thread() else {
         return complete_replies(cx, &replies, &BTreeSet::new());
     };
-    let Some(listed) = cx.names::<Ts>(&replies)?.filter(|listed| listed.complete) else {
+    if !cx
+        .names::<Ts>(&replies)?
+        .is_some_and(|listed| listed.complete)
+    {
         return Ok(());
-    };
-    let has = Thread {
-        count: listed.names.len() as u64,
-        latest: listed.names.iter().max(),
-    };
-    if has != thread {
+    }
+    if before.and_then(MessageObject::thread) != Some(thread) {
         cx.remove(replies)?;
     }
     Ok(())
@@ -512,8 +515,14 @@ fn take_message(
 ) -> Result<Ts> {
     let channel = &cx.key().id;
     let at = cx.path().as_str();
-    let Taken { message, new } = take(cx, Of::Channel(channel), at, object, inner)?;
-    take_replies(cx, &format!("{at}/{}", message.ts), &message)?;
+    let Taken { message, before } = take(cx, Of::Channel(channel), at, object, inner)?;
+    take_replies(
+        cx,
+        &format!("{at}/{}", message.ts),
+        &message,
+        before.as_ref(),
+    )?;
+    let new = before.is_none();
     let ts = message.ts;
     if new && !token.swept {
         inner.push(Inner::Message(MessageKey {
@@ -694,7 +703,12 @@ impl MessageFeed<'_> {
             object,
             &mut self.inner,
         )?;
-        take_replies(self.cx, self.cx.path().as_str(), &taken.message)?;
+        take_replies(
+            self.cx,
+            self.cx.path().as_str(),
+            &taken.message,
+            taken.before.as_ref(),
+        )?;
         self.part(None)
     }
 
