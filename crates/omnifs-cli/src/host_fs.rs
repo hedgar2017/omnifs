@@ -11,11 +11,6 @@ use omnifs_thin::host_control::{
 };
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::time::Duration;
-
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
-const STOP_TIMEOUT: Duration = Duration::from_secs(6);
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) fn probe(protocol: fs::Protocol) -> Result<()> {
     if protocol == fs::Protocol::Fuse && !Path::new("/dev/fuse").exists() {
@@ -112,7 +107,7 @@ impl HostDriver {
         let client = RunnerControlClient::new(&record);
         client.ping().await.context("reconfirm host filesystem")?;
         let outcome = client.stop().await?;
-        wait_for_cleanup(&self.state_dir, record.spec.location(), outcome).await
+        wait_for_cleanup(&self.state_dir, &record, outcome).await
     }
 
     /// Ends a proven runner before a new one starts: a runner of an active NFS
@@ -237,6 +232,8 @@ impl PendingHostFilesystem {
             &log_path,
             crate::process::LogMode::Append,
         )?;
+        std::fs::create_dir_all(&state_dir)
+            .with_context(|| format!("create {}", state_dir.display()))?;
         let child = command.spawn().with_context(|| {
             format!(
                 "start host {} filesystem with {}",
@@ -252,94 +249,103 @@ impl PendingHostFilesystem {
         })
     }
 
-    async fn wait_until_mounted(self, spec: &fs::Spec) -> Result<()> {
-        // Bundled (including `spec`) so the check closure captures nothing
-        // from the enclosing scope and takes everything by explicit `&mut`
-        // argument instead: an `FnMut` closure cannot itself return a future
-        // that borrows its own captured environment, but a fresh reborrow of
-        // an argument can.
-        struct Wait<'a> {
-            pending: PendingHostFilesystem,
-            spec: &'a fs::Spec,
-            last_phase: Option<RunnerPhase>,
-        }
-        let mut wait = Wait {
-            pending: self,
-            spec,
-            last_phase: None,
+    /// Waits for the mount of the runner, which its phases give, or for the
+    /// exit of its process, events of the runner and of the kernel; a runner
+    /// that makes no progress is a silent peer.
+    async fn wait_until_mounted(mut self, spec: &fs::Spec) -> Result<()> {
+        let exit = process_exit(self.child.id())?;
+        let mounted = {
+            let mounted = self.mounted(spec);
+            tokio::pin!(mounted);
+            tokio::select! {
+                result = &mut mounted => Some(result),
+                () = exited(exit.as_ref()) => None,
+            }
         };
-        let ready =
-            crate::process::poll_until_mut(STARTUP_TIMEOUT, POLL_INTERVAL, &mut wait, |wait| {
-                Box::pin(async move {
-                    if let Some(status) = wait
-                        .pending
-                        .child
-                        .try_wait()
-                        .context("inspect host filesystem process")?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "host filesystem `{}` exited with {status}",
-                            wait.spec.id()
-                        ))
-                        .with_hint(format!("See {}", wait.pending.log_path.display()));
-                    }
-                    match RunnerRecord::read(&wait.pending.state_dir) {
-                        Ok(Some(record)) if record.instance_id == wait.pending.instance_id => {
-                            crate::filesystem_driver::ensure_record_matches(
-                                &record.spec,
-                                wait.spec,
-                            )?;
-                            if let Ok(state) = RunnerControlClient::new(&record).ping().await {
-                                wait.last_phase = Some(state.phase.clone());
-                                match state.phase {
-                                    RunnerPhase::Mounted => return Ok(Some(())),
-                                    RunnerPhase::Failed { message } => {
-                                        return Err(anyhow::anyhow!(
-                                            "host filesystem `{}` failed: {message}",
-                                            wait.spec.id()
-                                        ))
-                                        .with_hint(format!(
-                                            "See {}",
-                                            wait.pending.log_path.display()
-                                        ));
-                                    },
-                                    RunnerPhase::Preflight
-                                    | RunnerPhase::Attaching
-                                    | RunnerPhase::Mounting
-                                    | RunnerPhase::Stopping
-                                    | RunnerPhase::Busy => {},
-                                }
-                            }
-                        },
-                        Ok(Some(record)) => {
-                            return Err(anyhow::anyhow!(
-                                "host filesystem state at {} belongs to runner {}",
-                                wait.pending.state_dir.display(),
-                                record.instance_id
-                            ))
-                            .with_hint("Run `omnifs doctor` to diagnose");
-                        },
-                        Ok(None) => {},
-                        Err(error) => return Err(error.into()),
-                    }
-                    Ok(None)
-                })
-            })
-            .await?;
-        ready.map_or_else(
-            || {
-                let phase = phase_label(wait.last_phase.clone());
+        match mounted {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => Err(error).with_hint(format!("See {}", self.log_path.display())),
+            None => {
+                let status = self
+                    .child
+                    .wait()
+                    .context("inspect host filesystem process")?;
                 Err(anyhow::anyhow!(
-                    "host filesystem `{}` did not confirm mount startup within {}s; \
-                     last proved phase was {phase}; runner {} was left alive for safe cleanup",
-                    spec.id(),
-                    STARTUP_TIMEOUT.as_secs(),
-                    wait.pending.instance_id
+                    "host filesystem `{}` exited with {status}",
+                    spec.id()
                 ))
-                .with_hint(format!("See {}", wait.pending.log_path.display()))
+                .with_hint(format!("See {}", self.log_path.display()))
             },
-            Ok,
-        )
+        }
+    }
+
+    /// The mount of the runner: its record, at a change of its state folder,
+    /// then each of its phases until `Mounted`.
+    async fn mounted(&self, spec: &fs::Spec) -> Result<()> {
+        let silence = omnifs_core::SILENT_PEER_TIMEOUT;
+        let silent = |what: &str, phase: Option<RunnerPhase>| {
+            anyhow::anyhow!(
+                "host filesystem `{}` did not {what} within {}s; last proved phase was {}; \
+                 runner {} was left alive for safe cleanup",
+                spec.id(),
+                silence.as_secs(),
+                phase_label(phase),
+                self.instance_id
+            )
+        };
+        let record = loop {
+            let change = omnifs_bootstrap::FolderChange::watch(&self.state_dir)
+                .with_context(|| format!("watch {}", self.state_dir.display()))?;
+            match RunnerRecord::read(&self.state_dir)? {
+                Some(record) if record.instance_id == self.instance_id => break record,
+                Some(record) => {
+                    return Err(anyhow::anyhow!(
+                        "host filesystem state at {} belongs to runner {}",
+                        self.state_dir.display(),
+                        record.instance_id
+                    ))
+                    .with_hint("Run `omnifs doctor` to diagnose");
+                },
+                None => {},
+            }
+            let change =
+                tokio::io::unix::AsyncFd::with_interest(change, tokio::io::Interest::READABLE)?;
+            drop(
+                tokio::time::timeout(silence, change.readable())
+                    .await
+                    .map_err(|_| silent("publish its record", None))??,
+            );
+        };
+        crate::filesystem_driver::ensure_record_matches(&record.spec, spec)?;
+        let client = RunnerControlClient::new(&record);
+        let mut phase = client.ping().await?.phase;
+        loop {
+            match &phase {
+                RunnerPhase::Mounted => return Ok(()),
+                RunnerPhase::Failed { message } => {
+                    anyhow::bail!("host filesystem `{}` failed: {message}", spec.id());
+                },
+                RunnerPhase::Preflight
+                | RunnerPhase::Attaching
+                | RunnerPhase::Mounting
+                | RunnerPhase::Stopping
+                | RunnerPhase::Busy => {},
+            }
+            phase = match client.next_phase(&phase).await {
+                Ok(next) => next,
+                Err(error) => {
+                    return Err(silent("confirm mount startup", Some(phase)).context(error));
+                },
+            };
+        }
+    }
+}
+
+/// The exit that `exit` watches; at once without one, for a process that
+/// has already exited.
+async fn exited(exit: Option<&tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>) {
+    if let Some(exit) = exit {
+        drop(exit.readable().await);
     }
 }
 
@@ -347,9 +353,12 @@ fn phase_label(phase: Option<RunnerPhase>) -> String {
     phase.map_or_else(|| "unconfirmed".to_owned(), |phase| format!("{phase:?}"))
 }
 
+/// Waits for the end of the runner of `record` after its stop, an exit of
+/// its process, which removes its record and follows its unmount; a runner
+/// that does not exit is a silent peer.
 async fn wait_for_cleanup(
     state_dir: &Path,
-    mount_point: &Path,
+    record: &RunnerRecord,
     outcome: StopOutcome,
 ) -> Result<()> {
     let busy_message = match outcome {
@@ -357,28 +366,26 @@ async fn wait_for_cleanup(
         StopOutcome::Busy { message } => Some(message),
         StopOutcome::Failed { message } => anyhow::bail!("{message}"),
     };
-    crate::process::poll_until(STOP_TIMEOUT, POLL_INTERVAL, || async {
-        let record_gone = RunnerRecord::read(state_dir)?.is_none();
-        let mount_gone = !omnifs_nfs::mount_is_active(mount_point);
-        Ok((record_gone && mount_gone).then_some(()))
-    })
-    .await?
-    .map_or_else(
-        || {
-            if let Some(message) = &busy_message {
-                anyhow::bail!(
-                    "{message}; cleanup did not finish within {}s",
-                    STOP_TIMEOUT.as_secs()
-                );
-            }
-            anyhow::bail!(
-                "host filesystem reported stopped but cleanup at {} did not finish within {}s",
-                mount_point.display(),
-                STOP_TIMEOUT.as_secs()
-            );
-        },
-        Ok,
-    )
+    let exited =
+        crate::process::process_ended(record.pid, omnifs_core::SILENT_PEER_TIMEOUT).await?;
+    let mount_point = record.spec.location();
+    if exited
+        && RunnerRecord::read(state_dir)?.is_none()
+        && !omnifs_nfs::mount_is_active(mount_point)
+    {
+        return Ok(());
+    }
+    if let Some(message) = &busy_message {
+        anyhow::bail!(
+            "{message}; cleanup did not finish within {}s",
+            omnifs_core::SILENT_PEER_TIMEOUT.as_secs()
+        );
+    }
+    anyhow::bail!(
+        "host filesystem reported stopped but cleanup at {} did not finish within {}s",
+        mount_point.display(),
+        omnifs_core::SILENT_PEER_TIMEOUT.as_secs()
+    );
 }
 
 /// The exit of the process `pid`, an event of the kernel that becomes
@@ -437,6 +444,7 @@ pub(crate) async fn owned(filesystem: &ClientFilesystemState) -> Result<Vec<Cand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// The exit of a process is an event that a wait takes at the exit, and
     /// a process that has exited has none.
@@ -459,17 +467,129 @@ mod tests {
         assert!(process_exit(child.id()).unwrap().is_none());
     }
 
+    fn pending_runner(temp: &tempfile::TempDir, seconds: &str) -> PendingHostFilesystem {
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        PendingHostFilesystem {
+            child: std::process::Command::new("sleep")
+                .arg(seconds)
+                .spawn()
+                .unwrap(),
+            state_dir,
+            instance_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            log_path: temp.path().join("runner.log"),
+        }
+    }
+
+    /// A start waits for the record of its runner, at a change of its state
+    /// folder, and then for each phase of the runner until its mount.
+    #[tokio::test]
+    async fn a_start_waits_for_the_record_and_the_mount_of_its_runner() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let temp = tempfile::tempdir().unwrap();
+        let pending = pending_runner(&temp, "30");
+        let pid = pending.child.id();
+        let spec = fs::Spec::new(
+            fs::Id::new("main").unwrap(),
+            fs::Protocol::Nfs,
+            fs::Runtime::Host,
+            temp.path().join("mount"),
+        )
+        .unwrap();
+        let record = RunnerRecord {
+            version: RunnerRecord::VERSION,
+            instance_id: pending.instance_id.clone(),
+            pid,
+            process_group: pid,
+            spec: spec.clone(),
+            control_socket: temp.path().join("control.sock"),
+            program: None,
+        };
+        let state_dir = pending.state_dir.clone();
+        let runner = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let listener = tokio::net::UnixListener::bind(&record.control_socket).unwrap();
+            std::fs::write(
+                state_dir.join("runner.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            for (kind, phase, reply) in [
+                ("ping", "mounting", serde_json::json!({"kind": "pong"})),
+                (
+                    "next_phase",
+                    "mounted",
+                    serde_json::json!({"kind": "phase"}),
+                ),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                tokio::io::BufReader::new(reader)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["request"]["kind"], kind);
+                let envelope = serde_json::json!({
+                    "version": 1,
+                    "instance_id": record.instance_id,
+                    "phase": phase,
+                    "reply": reply,
+                });
+                writer
+                    .write_all(format!("{envelope}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), pending.wait_until_mounted(&spec))
+            .await
+            .expect("the start outlived the mount of its runner")
+            .unwrap();
+        runner.await.unwrap();
+        std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .unwrap();
+    }
+
+    /// A start ends at the exit of its runner.
+    #[tokio::test]
+    async fn a_start_ends_at_the_exit_of_its_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let pending = pending_runner(&temp, "0.3");
+        let spec = fs::Spec::new(
+            fs::Id::new("main").unwrap(),
+            fs::Protocol::Nfs,
+            fs::Runtime::Host,
+            temp.path().join("mount"),
+        )
+        .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), pending.wait_until_mounted(&spec))
+            .await
+            .expect("the start outlived its runner")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("exited with"), "{error:#}");
+    }
+
+    /// A busy stop waits for the exit of its runner, which removes its
+    /// record.
     #[tokio::test]
     async fn busy_stop_waits_for_runner_cleanup() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let mount_point = temp.path().join("mount");
+        let mut runner = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let record = RunnerRecord {
             version: RunnerRecord::VERSION,
             instance_id: "0123456789abcdef0123456789abcdef".to_owned(),
-            pid: 42,
-            process_group: 42,
+            pid: runner.id(),
+            process_group: runner.id(),
             spec: fs::Spec::new(
                 fs::Id::new("main").unwrap(),
                 fs::Protocol::Fuse,
@@ -486,20 +606,30 @@ mod tests {
         )
         .unwrap();
         let record_path = state_dir.join("runner.json");
-        tokio::spawn(async move {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            std::fs::remove_file(record_path).unwrap();
+        let wait = tokio::spawn({
+            let state_dir = state_dir.clone();
+            let record = record.clone();
+            async move {
+                wait_for_cleanup(
+                    &state_dir,
+                    &record,
+                    StopOutcome::Busy {
+                        message: "cleanup is still running".to_owned(),
+                    },
+                )
+                .await
+            }
         });
-
-        wait_for_cleanup(
-            &state_dir,
-            &mount_point,
-            StopOutcome::Busy {
-                message: "cleanup is still running".to_owned(),
-            },
-        )
-        .await
-        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::remove_file(record_path).unwrap();
+        runner.kill().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the stop outlived its runner")
+            .unwrap()
+            .unwrap();
+        runner.wait().unwrap();
+        let _ = mount_point;
     }
 
     /// A runner of a build before `Restart`, which answers `Ping` without it,
@@ -519,11 +649,19 @@ mod tests {
             temp.path().join("mount"),
         )
         .unwrap();
+        #[allow(
+            clippy::zombie_processes,
+            reason = "the runner of the test kills and waits for it at its stop"
+        )]
+        let mut process = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let record = RunnerRecord {
             version: RunnerRecord::VERSION,
             instance_id: instance.to_owned(),
-            pid: 42,
-            process_group: 42,
+            pid: process.id(),
+            process_group: process.id(),
             spec: spec.clone(),
             control_socket: state_dir.join("control.sock"),
             program: None,
@@ -547,6 +685,8 @@ mod tests {
                     "ping" => serde_json::json!({"kind": "pong"}),
                     "stop" => {
                         std::fs::remove_file(&record_path).unwrap();
+                        process.kill().unwrap();
+                        process.wait().unwrap();
                         serde_json::json!({"kind": "stop", "value": "stopped"})
                     },
                     kind => panic!("a runner before `Restart` got `{kind}`"),

@@ -36,6 +36,11 @@ enum RunnerRequest {
     Restart {
         instance_id: String,
     },
+    /// Answer at the first phase of the runner other than `after`.
+    NextPhase {
+        instance_id: String,
+        after: RunnerPhase,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,6 +63,8 @@ enum RunnerReply {
     Stop(StopOutcome),
     /// The runner released its mount and ends.
     Restart,
+    /// The phase of the envelope follows the one that `NextPhase` named.
+    Phase,
     Error {
         message: String,
     },
@@ -224,7 +231,8 @@ async fn handle_connection(
     let requested_id = match &request.request {
         RunnerRequest::Ping { instance_id }
         | RunnerRequest::Stop { instance_id }
-        | RunnerRequest::Restart { instance_id } => instance_id,
+        | RunnerRequest::Restart { instance_id }
+        | RunnerRequest::NextPhase { instance_id, .. } => instance_id,
     };
     if requested_id != &instance_id {
         let current_phase = phase.borrow().clone();
@@ -254,6 +262,15 @@ async fn handle_connection(
         },
         RunnerRequest::Restart { .. } => {
             answer_restart(&mut writer, &instance_id, &phase, requests.restart).await
+        },
+        RunnerRequest::NextPhase { after, .. } => {
+            let mut phase = phase;
+            let next = phase
+                .wait_for(|current| *current != after)
+                .await
+                .map_err(|_| anyhow::anyhow!("the runner ended"))?
+                .clone();
+            write_reply(&mut writer, &instance_id, next, RunnerReply::Phase).await
         },
         RunnerRequest::Stop { .. } => {
             let (outcome, outcome_rx) = oneshot::channel();
@@ -395,7 +412,7 @@ impl RunnerControlClient {
                 restart: answer.is_some_and(|answer| answer.restart),
             }),
             RunnerReply::Error { message } => Err(anyhow::anyhow!(message)),
-            RunnerReply::Stop(_) | RunnerReply::Restart => {
+            RunnerReply::Stop(_) | RunnerReply::Restart | RunnerReply::Phase => {
                 anyhow::bail!("unexpected lifecycle reply to ping")
             },
         }
@@ -413,7 +430,7 @@ impl RunnerControlClient {
         match reply.reply {
             RunnerReply::Restart => Ok(()),
             RunnerReply::Error { message } => Err(anyhow::anyhow!(message)),
-            RunnerReply::Pong(_) | RunnerReply::Stop(_) => {
+            RunnerReply::Pong(_) | RunnerReply::Stop(_) | RunnerReply::Phase => {
                 anyhow::bail!("unexpected reply to restart")
             },
         }
@@ -428,8 +445,26 @@ impl RunnerControlClient {
         match reply.reply {
             RunnerReply::Stop(outcome) => Ok(outcome),
             RunnerReply::Error { message } => Err(anyhow::anyhow!(message)),
-            RunnerReply::Pong(_) | RunnerReply::Restart => {
+            RunnerReply::Pong(_) | RunnerReply::Restart | RunnerReply::Phase => {
                 anyhow::bail!("unexpected reply to stop")
+            },
+        }
+    }
+
+    /// The first phase of the runner other than `after`; a runner that keeps
+    /// `after` for the bound of a silent peer fails it.
+    pub async fn next_phase(&self, after: &RunnerPhase) -> anyhow::Result<RunnerPhase> {
+        let reply = self
+            .request(RunnerRequest::NextPhase {
+                instance_id: self.instance_id.clone(),
+                after: after.clone(),
+            })
+            .await?;
+        match reply.reply {
+            RunnerReply::Phase => Ok(reply.phase),
+            RunnerReply::Error { message } => Err(anyhow::anyhow!(message)),
+            RunnerReply::Pong(_) | RunnerReply::Stop(_) | RunnerReply::Restart => {
+                anyhow::bail!("unexpected reply to next phase")
             },
         }
     }
@@ -644,6 +679,37 @@ mod tests {
             .await
             .unwrap();
         completion.await.unwrap();
+    }
+
+    /// `NextPhase` answers at the change of the phase of the runner.
+    #[tokio::test]
+    async fn the_next_phase_answers_at_its_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let instance = "0123456789abcdef0123456789abcdef";
+        let mut control =
+            HostControl::bind(temp.path(), &record(socket.clone(), instance)).unwrap();
+        let (phase_tx, phase_rx) = watch::channel(RunnerPhase::Mounting);
+        let (stop_tx, _stop_rx) = mpsc::channel(1);
+        control.spawn(
+            instance.to_owned(),
+            phase_rx,
+            ControlRequests {
+                stop: stop_tx,
+                restart: None,
+            },
+        );
+        let client = RunnerControlClient::new(&record(socket, instance));
+        let next = tokio::spawn(async move { client.next_phase(&RunnerPhase::Mounting).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!next.is_finished());
+        phase_tx.send_replace(RunnerPhase::Mounted);
+        let phase = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .expect("the next phase outlived its change")
+            .unwrap()
+            .unwrap();
+        assert_eq!(phase, RunnerPhase::Mounted);
     }
 
     /// The runner ends the connection of a client that sends no request
