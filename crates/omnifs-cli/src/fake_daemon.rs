@@ -20,6 +20,7 @@ pub(crate) struct Answers {
 }
 
 pub(crate) struct FakeDaemon {
+    attachments: tokio::sync::watch::Sender<Vec<omnifs_core::fs::Spec>>,
     begun: Arc<AtomicUsize>,
     deadlines: Arc<AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
@@ -32,8 +33,10 @@ impl FakeDaemon {
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind the control socket");
         let begun = Arc::new(AtomicUsize::new(0));
         let deadlines = Arc::new(AtomicUsize::new(0));
+        let (attachments, _) = tokio::sync::watch::channel(Vec::new());
         let service = wire::control_server::ControlServer::new(Service {
             answers,
+            attachments: attachments.clone(),
             begun: Arc::clone(&begun),
             deadlines: Arc::clone(&deadlines),
         });
@@ -45,10 +48,17 @@ impl FakeDaemon {
                 .expect("serve the control socket");
         });
         Self {
+            attachments,
             begun,
             deadlines,
             server,
         }
+    }
+
+    /// Attaches `spec`, which the `WatchAttachments` stream gives.
+    pub(crate) fn attach(&self, spec: omnifs_core::fs::Spec) {
+        self.attachments
+            .send_modify(|attachments| attachments.push(spec));
     }
 
     /// The number of mutations that began.
@@ -84,6 +94,7 @@ pub(crate) fn info(protocol: u32) -> DaemonInfo {
 
 struct Service {
     answers: Answers,
+    attachments: tokio::sync::watch::Sender<Vec<omnifs_core::fs::Spec>>,
     begun: Arc<AtomicUsize>,
     deadlines: Arc<AtomicUsize>,
 }
@@ -126,6 +137,24 @@ impl wire::control_server::Control for Service {
     type SubscribeInspectorStream = ReceiverStream<Result<wire::InspectorStreamItem, Status>>;
     type StreamLogsStream = ReceiverStream<Result<wire::LogStreamItem, Status>>;
     type WatchPhaseStream = ReceiverStream<Result<wire::PhaseEvent, Status>>;
+    type WatchAttachmentsStream = ReceiverStream<Result<wire::AttachmentsEvent, Status>>;
+
+    async fn watch_attachments(
+        &self,
+        _request: Request<wire::Empty>,
+    ) -> Result<Response<Self::WatchAttachmentsStream>, Status> {
+        let mut attachments = self.attachments.subscribe();
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            loop {
+                let event = grpc::to_attachments_event(&attachments.borrow_and_update());
+                if sender.send(Ok(event)).await.is_err() || attachments.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
 
     async fn get_daemon_info(
         &self,

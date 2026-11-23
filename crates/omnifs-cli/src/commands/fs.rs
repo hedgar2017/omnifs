@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, ensure};
 use clap::{Args, Subcommand};
@@ -14,9 +13,6 @@ use crate::error::{ExitCode, WithHint};
 use crate::filesystem_driver::{Confirmed, FilesystemDriver};
 use crate::rpc::RpcClient;
 use crate::ui::output::{Output, ResultVerdict};
-
-const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
-const POLL: Duration = Duration::from_millis(200);
 
 #[derive(Args, Debug)]
 pub struct FsArgs {
@@ -523,27 +519,15 @@ pub(crate) fn client_owner_id() -> Result<ClientOwnerId> {
     crate::client_state::ClientState::resolve()?.owner_id()
 }
 
+/// Waits for the attachment of `spec` to the daemon, an event of the daemon;
+/// a filesystem that does not attach is a silent peer.
 pub(crate) async fn wait_for_attachment(spec: &fs::Spec) -> bool {
-    // A resolve failure is not transient (it never depends on daemon state),
-    // so it short-circuits the wait instead of polling for something that
-    // cannot change.
     let Ok(rpc) = RpcClient::resolve() else {
         return false;
     };
-    // The client is built once and its connection reused across ticks
-    // instead of reconnecting every 200ms. An inventory-fetch failure is
-    // transient and treated the same as "not attached yet": keep polling
-    // rather than aborting, so `check` never actually returns `Err`.
-    crate::process::poll_until(ATTACH_TIMEOUT, POLL, || async {
-        let attached = match rpc.inventory().await {
-            Ok(inventory) => inventory.attachments.contains(spec),
-            Err(_) => false,
-        };
-        Ok(attached.then_some(()))
-    })
-    .await
-    .unwrap_or(None)
-    .is_some()
+    rpc.attached(spec, omnifs_core::SILENT_PEER_TIMEOUT)
+        .await
+        .unwrap_or(false)
 }
 
 async fn shell(args: ShellArgs, output: Output) -> Result<ExitCode> {

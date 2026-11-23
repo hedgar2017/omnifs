@@ -1344,3 +1344,53 @@ async fn a_control_connection_without_a_preface_ends_after_the_bound_of_a_silent
         "{waited:?}"
     );
 }
+
+/// The attachments stream of a daemon gives an attachment at the attach.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(unsafe_code)]
+async fn the_attachments_stream_gives_an_attachment_at_the_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let _guard = crate::ENV_LOCK.lock().await;
+    let home = std::fs::canonicalize(dir.path()).unwrap();
+    unsafe {
+        std::env::set_var("OMNIFS_HOME", &home);
+    }
+    let runtime = test_daemon(&dir).await;
+    let socket = home.join("attach-test.sock");
+    runtime.daemon.vfs.serve_unix(&socket).unwrap();
+    let mut c = client(&home.join("control.sock")).await;
+    let mut attachments = c
+        .watch_attachments(wire::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    let first = attachments.next().await.unwrap().unwrap();
+    assert!(first.attachments.is_empty());
+    let identity = omnifs_core::fs::Spec::new(
+        "test".parse().unwrap(),
+        omnifs_core::fs::Protocol::Fuse,
+        omnifs_core::fs::Runtime::Host,
+        std::path::PathBuf::from("/mnt/test"),
+    )
+    .unwrap();
+    let namespace = omnifs_vfs::WireNamespace::attach(
+        omnifs_vfs::AttachTarget::Unix(socket),
+        "0123456789abcdef0123456789abcdef".parse().unwrap(),
+        identity.clone(),
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
+    let attached = tokio::time::timeout(Duration::from_secs(5), attachments.next())
+        .await
+        .expect("the stream outlived the attach")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        omnifs_api::grpc::attachments_event(&attached).unwrap(),
+        vec![identity]
+    );
+    drop(attachments);
+    drop(namespace);
+    runtime.shutdown().await;
+}

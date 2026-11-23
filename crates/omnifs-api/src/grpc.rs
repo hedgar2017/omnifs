@@ -1096,6 +1096,21 @@ pub fn credential_status(v: &wire::CredentialStatus) -> Result<CredentialStatus,
     })
 }
 
+/// The event of the attachments `v` of a daemon.
+#[must_use]
+pub fn to_attachments_event(v: &[omnifs_core::fs::Spec]) -> wire::AttachmentsEvent {
+    wire::AttachmentsEvent {
+        attachments: v.iter().map(to_filesystem_spec).collect(),
+    }
+}
+
+/// The attachments of the event `v` of a daemon.
+pub fn attachments_event(
+    v: &wire::AttachmentsEvent,
+) -> Result<Vec<omnifs_core::fs::Spec>, FromGrpcError> {
+    v.attachments.iter().map(filesystem_spec).collect()
+}
+
 fn to_filesystem_spec(v: &omnifs_core::fs::Spec) -> wire::FilesystemSpec {
     wire::FilesystemSpec {
         id: v.id().to_string(),

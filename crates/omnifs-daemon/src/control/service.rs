@@ -812,6 +812,57 @@ impl wire::control_server::Control for GrpcControlService {
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
     }
+
+    type WatchAttachmentsStream = ReceiverStream<Result<wire::AttachmentsEvent, Status>>;
+
+    /// The attachments of the daemon at the subscription, then at each change
+    /// of them, up to the end of the daemon.
+    async fn watch_attachments(
+        &self,
+        _request: Request<wire::Empty>,
+    ) -> Result<Response<Self::WatchAttachmentsStream>, Status> {
+        let ControlPhase::Ready(daemon) = self.phase() else {
+            return Err(grpc_status(ControlError::new(
+                ControlErrorCode::NotReady,
+                "the daemon has no attachments before it is ready",
+            )));
+        };
+        let permit = Arc::clone(&self.control.stream_permits)
+            .try_acquire_owned()
+            .map_err(|_| {
+                grpc_status(ControlError::new(
+                    ControlErrorCode::Busy,
+                    "stream capacity exhausted",
+                ))
+            })?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let mut shutdown = self.control.shutdown_tx.subscribe();
+        let mut attached = daemon.vfs.attachment_changes();
+        tokio::spawn(async move {
+            let _permit = permit;
+            loop {
+                attached.mark_unchanged();
+                let event = grpc::to_attachments_event(&daemon.vfs.attachments());
+                if sender.send(Ok(event)).await.is_err() {
+                    return;
+                }
+                tokio::select! {
+                    () = sender.closed() => return,
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                    },
+                    changed = attached.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    },
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
 }
 
 /// The status of the error of a begin or an end of a sync.

@@ -255,6 +255,34 @@ impl RpcClient {
         .await
     }
 
+    /// Waits for the attachment of `spec`, as the `WatchAttachments` stream
+    /// of the daemon gives it: false at the end of the stream, or once it is
+    /// silent for `silence` without the attachment.
+    pub(crate) async fn attached(
+        &self,
+        spec: &omnifs_core::fs::Spec,
+        silence: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        let mut client = self.client().await?;
+        let mut attachments = client
+            .watch_attachments(Request::new(wire::Empty {}))
+            .await
+            .map_err(|status| status_error(&status))?
+            .into_inner();
+        loop {
+            let Ok(event) = tokio::time::timeout(silence, attachments.next()).await else {
+                return Ok(false);
+            };
+            let Some(event) = event else {
+                return Ok(false);
+            };
+            let event = event.map_err(|status| status_error(&status))?;
+            if grpc::attachments_event(&event)?.contains(spec) {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Waits for the daemon to be ready, as its `WatchPhase` stream gives
     /// it: the error of a daemon that requires recovery, or of one that ends
     /// before it is ready.
@@ -957,6 +985,76 @@ mod tests {
         let rpc = RpcClient::from_endpoint(endpoint);
         let answered = rpc.inventory().await.expect("a large inventory");
         assert_eq!(answered.health.mounts.message.len(), 8 * 1024 * 1024);
+    }
+
+    fn test_spec() -> omnifs_core::fs::Spec {
+        omnifs_core::fs::Spec::new(
+            omnifs_core::fs::Id::new("main").unwrap(),
+            omnifs_core::fs::Protocol::Nfs,
+            omnifs_core::fs::Runtime::Host,
+            std::path::PathBuf::from("/mnt/main"),
+        )
+        .unwrap()
+    }
+
+    /// The wait for an attachment ends at the attachment, an event of the
+    /// daemon.
+    #[tokio::test]
+    async fn the_wait_for_an_attachment_ends_at_the_attachment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Bootstrap::<Client>::under_root(dir.path());
+        let daemon = crate::fake_daemon::FakeDaemon::start(
+            &endpoint,
+            crate::fake_daemon::Answers {
+                info: crate::fake_daemon::info(CONTROL_PROTOCOL),
+                inventory: Err(omnifs_api::ControlError::new(
+                    omnifs_api::ControlErrorCode::Internal,
+                    "unused",
+                )),
+            },
+        );
+        let rpc = RpcClient::from_endpoint(endpoint);
+        let spec = test_spec();
+        let wait = tokio::spawn({
+            let spec = spec.clone();
+            async move { rpc.attached(&spec, omnifs_core::SILENT_PEER_TIMEOUT).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!wait.is_finished());
+        daemon.attach(spec);
+        let attached = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .expect("the wait outlived the attachment")
+            .unwrap()
+            .unwrap();
+        assert!(attached);
+    }
+
+    /// The wait for an attachment that does not come ends once the daemon
+    /// is silent for its bound.
+    #[tokio::test]
+    async fn the_wait_for_an_attachment_ends_after_its_silence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Bootstrap::<Client>::under_root(dir.path());
+        let _daemon = crate::fake_daemon::FakeDaemon::start(
+            &endpoint,
+            crate::fake_daemon::Answers {
+                info: crate::fake_daemon::info(CONTROL_PROTOCOL),
+                inventory: Err(omnifs_api::ControlError::new(
+                    omnifs_api::ControlErrorCode::Internal,
+                    "unused",
+                )),
+            },
+        );
+        let rpc = RpcClient::from_endpoint(endpoint);
+        let attached = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rpc.attached(&test_spec(), std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect("the wait outlived its silence")
+        .unwrap();
+        assert!(!attached);
     }
 
     /// A control request carries no deadline of the client to the daemon.

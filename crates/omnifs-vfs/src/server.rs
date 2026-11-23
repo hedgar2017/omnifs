@@ -389,6 +389,12 @@ impl VfsServer {
         self.attachments.snapshot()
     }
 
+    /// A receiver that changes at each change of the attachments.
+    #[must_use]
+    pub fn attachment_changes(&self) -> watch::Receiver<usize> {
+        self.attachments.changed.subscribe()
+    }
+
     /// Stop admitting attachments and push a stop command to every live
     /// connection.
     pub fn stop_filesystems(&self) {
