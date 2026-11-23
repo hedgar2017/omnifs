@@ -799,6 +799,31 @@ async fn an_object_by_its_id(folder: &str, object: fn(u32, &str, &str) -> Value)
             .unwrap(),
         names_of(&[1, 2, 5])
     );
+
+    // A later full listing asks nothing by its ID of an object that its
+    // search brought, older than the projection too.
+    harness.begin_sync();
+    let (listing, requests) = answering(
+        &harness,
+        names(&harness, &format!("/notion/{folder}")),
+        vec![ok(&list(
+            &[
+                object(1, "First", EDITED),
+                object(2, "Second", EDITED),
+                object(5, "Fifth", EDITED),
+            ],
+            None,
+        ))],
+    )
+    .await;
+    assert_eq!(listing.unwrap(), names_of(&[1, 2, 5]));
+    expect_search(&requests[0], 100, None);
+    assert_eq!(
+        served(&harness, read(&harness, &format!("{}/title", at(1))))
+            .await
+            .unwrap(),
+        "First renamed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
