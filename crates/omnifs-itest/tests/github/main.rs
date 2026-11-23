@@ -1544,6 +1544,32 @@ async fn diff_patch_is_the_diff_of_the_commits_that_its_pull_request_names() {
     }
 }
 
+/// A diff that GitHub refuses with `406`, as one of more than 20,000 lines,
+/// is the permission error of its read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_diff_that_github_refuses_is_the_permission_error_of_its_read() {
+    use omnifs_itest::support::{Answer, read};
+
+    let harness = github_harness();
+    let (read, requests) = answering(
+        &harness,
+        read(
+            &harness,
+            "/github/octocat/Hello-World/pulls/all/7/diff.patch",
+        ),
+        [
+            fetched(pull_seven_at("head-1")),
+            Answer::Blob(406, b"too large".to_vec()),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(read, Err(omnifs_engine::NsError::Permission)),
+        "{read:?}"
+    );
+    assert_eq!(requests.len(), 2);
+}
+
 /// The page of the folder `folder` of pull request 7, `body` from `url` with
 /// the `ETag` `"page-1"`, has `names`. It serves from cache outside a sync,
 /// and is asked for again with `If-None-Match` in a sync, once the feed of

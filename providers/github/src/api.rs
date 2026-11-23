@@ -31,6 +31,14 @@ impl EndpointHooks for GitHubApi {
     /// that does not parse; `None` for everything else, leaving the SDK's
     /// default 4xx/5xx mapping in charge.
     fn classify(&self, resp: &Response<Vec<u8>>) -> Option<ProviderError> {
+        // GitHub answers `406` to the one request with another media type,
+        // that of the diff of a pull request, for a diff of more than
+        // 20,000 lines: the refusal of that content.
+        if resp.status() == StatusCode::NOT_ACCEPTABLE {
+            return Some(ProviderError::denied(
+                "GitHub gives no diff of more than 20,000 lines",
+            ));
+        }
         if !is_rate_limited(resp) {
             return None;
         }
