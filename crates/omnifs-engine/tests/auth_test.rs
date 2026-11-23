@@ -7,7 +7,7 @@ use omnifs_auth::{
 use omnifs_auth::{CredentialEntry, DurableCredentialSnapshot};
 use omnifs_core::CredentialVersion;
 use omnifs_engine::test_support::authority::RuntimeAuthority;
-use omnifs_engine::test_support::blob::{BlobExecutor, BlobLimits};
+use omnifs_engine::test_support::blob::BlobExecutor;
 use omnifs_engine::test_support::cache::{Caches, mount};
 use omnifs_engine::test_support::http::HttpStack;
 use omnifs_wit::host::types as wit_types;
@@ -379,7 +379,7 @@ async fn fetch_blob_uses_same_oauth_retry_path() {
     let caches = Caches::open(temp.path()).unwrap();
     let name = omnifs_core::MountName::new("test").unwrap();
     let resources = mount(&caches, &name, b"auth-test").unwrap();
-    let executor = BlobExecutor::new(stack, resources, BlobLimits::default());
+    let executor = BlobExecutor::new(stack, resources, None);
 
     let result = executor
         .fetch(
@@ -425,7 +425,7 @@ async fn fetch_blob_answers_the_bytes_of_the_md5_that_the_provider_asks_for() {
     let caches = Caches::open(temp.path()).unwrap();
     let name = omnifs_core::MountName::new("test").unwrap();
     let resources = mount(&caches, &name, b"auth-test").unwrap();
-    let executor = BlobExecutor::new(stack, resources, BlobLimits::default());
+    let executor = BlobExecutor::new(stack, resources, None);
     let fetch = |md5: &str| {
         let request = wit_types::BlobFetchRequest {
             method: "GET".to_string(),
@@ -1252,7 +1252,7 @@ fn blobs(stack: HttpStack) -> Blobs {
     let caches = Caches::open(temp.path()).unwrap();
     let name = omnifs_core::MountName::new("test").unwrap();
     let resources = mount(&caches, &name, b"blob-test").unwrap();
-    let executor = BlobExecutor::new(Arc::new(stack), resources, BlobLimits::default());
+    let executor = BlobExecutor::new(Arc::new(stack), resources, None);
     Blobs {
         _temp: temp,
         caches,

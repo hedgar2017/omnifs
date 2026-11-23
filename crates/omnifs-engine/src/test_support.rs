@@ -56,7 +56,7 @@ pub fn load_mount_table_for_callout_tests(
 }
 
 pub mod blob {
-    pub use crate::blob::{BlobExecutor, BlobLimits};
+    pub use crate::blob::BlobExecutor;
 }
 
 pub mod authority {

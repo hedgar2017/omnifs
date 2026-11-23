@@ -15,7 +15,7 @@ mod revocation;
 pub(crate) use revocation::{PreparedCredentialRevocation, prepare_credential_revocation};
 
 use anyhow::Context as _;
-use auth_fingerprint::{auth_fingerprint, earlier_auth_fingerprint};
+use auth_fingerprint::auth_fingerprint;
 use credential_codec::{CredentialPayload, decode_payload, encode_payload};
 use omnifs_api::{
     CredentialClientOverrides, CredentialMaterial, CredentialSubmission, SecretBytes,
@@ -432,9 +432,7 @@ fn issued_scheme(
     };
     Ok(
         auth_fingerprint(credential.provider, scheme, &credential.overrides)?
-            == credential.fingerprint
-            || earlier_auth_fingerprint(credential.provider, scheme, &credential.overrides)?
-                == credential.fingerprint,
+            == credential.fingerprint,
     )
 }
 
@@ -758,18 +756,6 @@ mod tests {
         ));
     }
 
-    /// A credential that an earlier omnifs stored, with the fingerprint of
-    /// that omnifs for the auth scheme of the provider of its mount, stays
-    /// bound to its mount: a new omnifs leaves no mount without its
-    /// credential.
-    #[test]
-    fn a_credential_of_the_fingerprint_of_an_earlier_omnifs_stays_bound() {
-        assert!(matches!(
-            state_with_fingerprint(earlier_auth_fingerprint),
-            MountBuildState::Active { auth: Some(_), .. }
-        ));
-    }
-
     /// The manifest of an artifact of an earlier omnifs, whose flow
     /// `jwtBearer` had the scopes in a claim and whose scheme had to declare
     /// an authorization endpoint.
@@ -847,7 +833,7 @@ mod tests {
                 redirect_uri: None,
                 scopes: None,
             },
-            earlier_auth_fingerprint,
+            auth_fingerprint,
         );
         let MountBuildState::ProviderUnavailable { reason } = state else {
             panic!("the mount is not unavailable");

@@ -13,10 +13,6 @@ use serde::Serialize;
 /// stores.
 const AUTH_FINGERPRINT_DOMAIN: &str = "omnifs auth runtime fingerprint v2";
 
-/// The domain of the fingerprint of a credential that an earlier omnifs
-/// stored.
-const EARLIER_AUTH_FINGERPRINT_DOMAIN: &str = "omnifs auth runtime fingerprint v1";
-
 #[derive(Serialize)]
 struct FingerprintInput<'a, C> {
     provider: &'a [u8; 32],
@@ -29,16 +25,6 @@ struct FingerprintInput<'a, C> {
 #[derive(Serialize)]
 struct FingerprintClient<'a> {
     client_id: &'a Option<String>,
-    redirect_uri: &'a Option<String>,
-    scopes: &'a Option<Vec<String>>,
-}
-
-/// The client of a credential in the fingerprint of an earlier omnifs: a
-/// none in the place of the client secret.
-#[derive(Serialize)]
-struct EarlierFingerprintClient<'a> {
-    client_id: &'a Option<String>,
-    no_client_secret: Option<()>,
     redirect_uri: &'a Option<String>,
     scopes: &'a Option<Vec<String>>,
 }
@@ -57,30 +43,6 @@ pub(super) fn auth_fingerprint(
             scheme,
             client: FingerprintClient {
                 client_id: &overrides.client_id,
-                redirect_uri: &overrides.redirect_uri,
-                scopes: &overrides.scopes,
-            },
-        },
-    )
-}
-
-/// The fingerprint that an earlier omnifs gave the credential of `provider`
-/// with `overrides`, issued against `scheme`. A stored credential with it is
-/// issued against `scheme` as one with [`auth_fingerprint`], and keeps it
-/// until its next submission.
-pub(super) fn earlier_auth_fingerprint(
-    provider: ProviderId,
-    scheme: &AuthScheme,
-    overrides: &CredentialClientOverrides,
-) -> anyhow::Result<AuthRuntimeFingerprint> {
-    digest(
-        EARLIER_AUTH_FINGERPRINT_DOMAIN,
-        &FingerprintInput {
-            provider: provider.as_bytes(),
-            scheme,
-            client: EarlierFingerprintClient {
-                client_id: &overrides.client_id,
-                no_client_secret: None,
                 redirect_uri: &overrides.redirect_uri,
                 scopes: &overrides.scopes,
             },
@@ -136,33 +98,6 @@ mod tests {
         assert_eq!(
             without,
             AuthRuntimeFingerprint::from_digest(*hasher.finalize().as_bytes())
-        );
-    }
-
-    /// The fingerprint of an earlier omnifs is the one that it stored, by
-    /// the digests of two credentials of it, and is not the one of this
-    /// omnifs.
-    #[test]
-    fn the_earlier_fingerprint_is_the_one_that_an_earlier_omnifs_stored() {
-        let provider = ProviderId::from_digest([7; 32]);
-        let earlier = |overrides: &CredentialClientOverrides| {
-            hex::encode(
-                earlier_auth_fingerprint(provider, &AuthScheme::None, overrides)
-                    .unwrap()
-                    .as_bytes(),
-            )
-        };
-        assert_eq!(
-            earlier(&overrides(None)),
-            "8a27c87c3ebc8475e94b91ee5be769bb88357439edb44401eb30723dbf8137a0"
-        );
-        assert_eq!(
-            earlier(&overrides(Some(b"key"))),
-            "8a27c87c3ebc8475e94b91ee5be769bb88357439edb44401eb30723dbf8137a0"
-        );
-        assert_ne!(
-            earlier_auth_fingerprint(provider, &AuthScheme::None, &overrides(None)).unwrap(),
-            auth_fingerprint(provider, &AuthScheme::None, &overrides(None)).unwrap()
         );
     }
 }

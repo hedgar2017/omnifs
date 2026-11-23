@@ -5,7 +5,7 @@
 //! Typed operation execution is in `ops::lifecycle`; WASI store plumbing is in `wasi`.
 
 use crate::authority::RuntimeAuthority;
-use crate::blob::{BlobExecutor, BlobLimits};
+use crate::blob::BlobExecutor;
 use crate::cache::MountResources;
 use crate::callouts::{CalloutHost, TestCallouts, TestSignal};
 use crate::cloner::GitCloner;
@@ -255,9 +255,12 @@ impl Runtime {
             .map_err(BuildError::from)?;
         let git = git::GitExecutor::new(cloner, Arc::clone(&authority), trees.clone(), mount_name);
 
-        let blob_limits = BlobLimits::from_max_fetch_bytes(config.max_fetch_blob_bytes);
         let http = Arc::new(HttpStack::new(auth.clone(), authority)?);
-        let blob = BlobExecutor::new(Arc::clone(&http), Arc::clone(&resources), blob_limits);
+        let blob = BlobExecutor::new(
+            Arc::clone(&http),
+            Arc::clone(&resources),
+            config.max_fetch_blob_bytes,
+        );
         let mut callout_host = CalloutHost::new(Arc::clone(&http), git.clone(), blob.clone());
         if let Some(test_callouts) = test_callouts {
             callout_host = callout_host.with_test_callouts(test_callouts);

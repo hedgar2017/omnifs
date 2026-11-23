@@ -96,7 +96,7 @@ The OAuth JWT bearer grant is the one of RFC 7523. The host signs an assertion w
 
 The validation of a static token is a declaration of the manifest that binds its probe: one request of the declared method to the declared URL, with the token in the header of its scheme and each declared header beside it, which follows no redirect, so that the token reaches the declared URL alone and a redirect is a failed validation. The token is valid with the declared status, which is no redirect, and with a value at the declared JSON pointer that is not `null`, `false`, or an empty string.
 
-The fingerprint of a credential is of its provider, its auth scheme, and the client ID, the redirect URI and the scopes of its client, without its client secret. A credential with the fingerprint that an earlier omnifs gave it stays bound to its mount, and its next submission stores the fingerprint and the encoding of this one.
+The fingerprint of a credential is of its provider, its auth scheme, and the client ID, the redirect URI and the scopes of its client, without its client secret. A credential of another fingerprint, as one that an earlier omnifs stored, requires re-authentication.
 
 A credential that its upstream rejects, by a 401 or by a 403 that names an invalid bearer token, requires re-authentication in the health of its mount from that answer on, up to an answer in which the upstream takes it: a static token, which has no refresh, and an OAuth token whose refresh fails. `omnifs status` gives that mount with the auth state `error` and its `omnifs mount reauth` command, and ends as degraded.
 

@@ -25,23 +25,6 @@ use omnifs_wit::host::types as wit_types;
 use std::io::Write;
 use std::sync::Arc;
 
-/// Host-side size limits for blob fetches: the limit that the mount
-/// declares bounds how much data the host stores on disk for one fetch, and
-/// no size bounds the fetch of a mount without one.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct BlobLimits {
-    /// Maximum response-body bytes accepted by `fetch-blob`.
-    pub max_fetch_blob_bytes: Option<u64>,
-}
-
-impl BlobLimits {
-    pub fn from_max_fetch_bytes(max_fetch_blob_bytes: Option<u64>) -> Self {
-        Self {
-            max_fetch_blob_bytes,
-        }
-    }
-}
-
 /// Errors raised while fetching or storing host-resident blobs.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BlobError {
@@ -97,7 +80,9 @@ impl From<BlobError> for wit_types::CalloutResult {
 pub struct BlobExecutor {
     http: Arc<HttpStack>,
     resources: Arc<MountResources>,
-    limits: BlobLimits,
+    /// The limit of the bytes of one fetch that the mount declares; none
+    /// bounds the fetch of a mount without one.
+    max_fetch_blob_bytes: Option<u64>,
 }
 
 /// The answer of an upstream to a blob request as a fetch takes it: its
@@ -145,11 +130,15 @@ impl BlobRequest {
 
 impl BlobExecutor {
     /// Construct an executor with explicit host blob limits.
-    pub fn new(http: Arc<HttpStack>, resources: Arc<MountResources>, limits: BlobLimits) -> Self {
+    pub fn new(
+        http: Arc<HttpStack>,
+        resources: Arc<MountResources>,
+        max_fetch_blob_bytes: Option<u64>,
+    ) -> Self {
         Self {
             http,
             resources,
-            limits,
+            max_fetch_blob_bytes,
         }
     }
 
@@ -298,7 +287,7 @@ impl BlobExecutor {
             body,
             length,
             Arc::clone(&self.resources.body),
-            self.limits.max_fetch_blob_bytes,
+            self.max_fetch_blob_bytes,
             request.md5.is_some(),
         )
         .await?;
@@ -552,7 +541,6 @@ mod tests {
         ));
         assert_eq!(files(tmp.path()), 0);
 
-        assert_eq!(BlobLimits::default().max_fetch_blob_bytes, None);
         let whole = stream(None, None)
             .await
             .expect("a body without a limit")
