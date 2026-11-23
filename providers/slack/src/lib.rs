@@ -6,7 +6,8 @@
 //! and `channels/{id}/` for each public and private channel that the bot is
 //! in, archived too, with `name`, `channel.json`, and `messages/{ts}/` for
 //! each message of its history with `author`, `text`, `message.json`,
-//! `thread.json`, the message as the answer of its replies gave it,
+//! `thread.json`, the message as the answer of its replies gave it, empty
+//! for a message without replies,
 //! `replies/{ts}/` with `author`, `text`, and `message.json` of each reply of
 //! its thread, and `files/{id}/` with `name` and `content` of each file of a
 //! message or a reply, by the ID of Slack of a user, a channel, or a file,

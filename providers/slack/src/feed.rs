@@ -307,7 +307,7 @@ fn take<K>(
 }
 
 /// The `replies/` of the message `message` at `at`: complete and empty for a
-/// message without replies, without its `thread.json`; and their removal
+/// message without replies, with its `thread.json` empty; and their removal
 /// for replies complete in the projection when the `reply_count` or the
 /// `latest_reply` of the message are not those of its `thread.json`, the
 /// message as the answer of those replies gave it, so that a thread is asked
@@ -315,7 +315,7 @@ fn take<K>(
 fn take_replies<K>(cx: &FeedCx<K>, at: &str, message: &MessageObject) -> Result<()> {
     let replies = format!("{at}/replies");
     let Some(thread) = message.thread() else {
-        cx.remove(format!("{at}/thread.json"))?;
+        cx.file(format!("{at}/thread.json"), b"")?;
         return complete_replies(cx, &replies, &BTreeSet::new());
     };
     if !cx
@@ -324,7 +324,10 @@ fn take_replies<K>(cx: &FeedCx<K>, at: &str, message: &MessageObject) -> Result<
     {
         return Ok(());
     }
-    let held = projected(cx, at, "thread.json")?;
+    let held = read_whole(cx, &format!("{at}/thread.json"))?
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| decode::<MessageObject>(&bytes))
+        .transpose()?;
     if held.as_ref().and_then(MessageObject::thread) != Some(thread) {
         cx.remove(replies)?;
     }

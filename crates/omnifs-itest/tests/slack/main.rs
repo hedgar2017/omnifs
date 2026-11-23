@@ -470,6 +470,12 @@ async fn the_first_full_listing_of_a_channel_takes_each_page_at_its_answer() {
             "thread.json"
         ]
     );
+    assert_eq!(
+        served(&harness, read(&harness, &format!("{}/thread.json", at(1))))
+            .await
+            .unwrap(),
+        ""
+    );
     for (n, author) in [(1, ""), (2, "U02")] {
         assert_eq!(
             served(&harness, read(&harness, &format!("{}/author", at(n))))
