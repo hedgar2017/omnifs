@@ -41,7 +41,6 @@ const VCPUS: u8 = 2;
 const MEMORY_MIB: u32 = 2048;
 const HELPER_RECORD_VERSION: u8 = 3;
 const CONTROL_MAX_LINE_BYTES: u64 = 128;
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -422,6 +421,9 @@ impl Config {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlSocket {
     path: PathBuf,
+    /// How long the helper may take no step of a request before it fails:
+    /// [`omnifs_core::SILENT_PEER_TIMEOUT`].
+    silence: Duration,
 }
 
 impl ControlSocket {
@@ -437,7 +439,10 @@ impl ControlSocket {
     }
 
     fn new_unchecked(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            silence: omnifs_core::SILENT_PEER_TIMEOUT,
+        }
     }
 
     pub fn ping(
@@ -516,10 +521,10 @@ impl ControlSocket {
         let mut stream = UnixStream::connect(&self.path)
             .map_err(|error| Error::io("connect to control socket", &self.path, error))?;
         stream
-            .set_read_timeout(Some(CONTROL_TIMEOUT))
+            .set_read_timeout(Some(self.silence))
             .map_err(|error| Error::io("set control socket read timeout for", &self.path, error))?;
         stream
-            .set_write_timeout(Some(CONTROL_TIMEOUT))
+            .set_write_timeout(Some(self.silence))
             .map_err(|error| {
                 Error::io("set control socket write timeout for", &self.path, error)
             })?;
@@ -547,6 +552,27 @@ impl ControlSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request to a helper that answers nothing fails once the helper is
+    /// silent for the bound of its silence.
+    #[test]
+    fn a_request_to_a_silent_helper_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut socket = ControlSocket::new_unchecked(path);
+        socket.silence = Duration::from_millis(50);
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answer_tx.send(socket.request("ping\n").is_err());
+        });
+        let (_held, _) = listener.accept().unwrap();
+        assert!(
+            answer_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the silent helper held the request")
+        );
+    }
 
     fn spec() -> fs::Spec {
         fs::Spec::new(
