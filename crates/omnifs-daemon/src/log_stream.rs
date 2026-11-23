@@ -13,7 +13,9 @@ use tonic::Status;
 /// The most log a single request will scan backwards for its tail.
 const SCAN_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 64 * 1024;
-const FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 type Sender = tokio::sync::mpsc::Sender<Result<wire::LogStreamItem, Status>>;
 
@@ -122,21 +124,32 @@ pub(crate) async fn stream(
     }
     let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
     loop {
-        let Ok(read) = file.read(&mut buffer).await else {
+        // The watch precedes the read to the end, so that a write after that
+        // read is an event of it.
+        let Ok(change) = omnifs_bootstrap::FileChange::watch(&path)
+            .and_then(|change| AsyncFd::with_interest(change, Interest::READABLE))
+        else {
             return;
         };
-        if read > 0 {
+        loop {
+            let Ok(read) = file.read(&mut buffer).await else {
+                return;
+            };
+            if read == 0 {
+                break;
+            }
             if !send_chunks(&sender, &buffer[..read]).await {
                 return;
             }
-            continue;
         }
         tokio::select! {
             () = sender.closed() => return,
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { return; }
             },
-            () = tokio::time::sleep(FOLLOW_POLL) => {},
+            written = change.readable() => {
+                if written.is_err() { return; }
+            },
         }
     }
 }
@@ -204,5 +217,41 @@ mod tests {
             tail,
             format!("line{}\n", READ_CHUNK_BYTES / 8 - 1).as_bytes()
         );
+    }
+
+    /// A followed log streams each write to it at the write, an event of the
+    /// kernel.
+    #[tokio::test]
+    async fn a_followed_log_streams_a_write_at_the_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("daemon.log");
+        std::fs::write(&log, b"first\n").unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let streaming = tokio::spawn(stream(log.clone(), 10, true, sender, shutdown));
+        let data = |item: Option<Result<wire::LogStreamItem, Status>>| match item
+            .unwrap()
+            .unwrap()
+            .value
+        {
+            Some(wire::log_stream_item::Value::Data(data)) => data.to_vec(),
+            other => panic!("not data: {other:?}"),
+        };
+        assert_eq!(data(receiver.recv().await), b"first\n");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .await
+            .unwrap()
+            .write_all(b"second\n")
+            .await
+            .unwrap();
+        let written = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("the follow outlived the write");
+        assert_eq!(data(written), b"second\n");
+        drop(receiver);
+        streaming.await.unwrap();
     }
 }

@@ -347,6 +347,71 @@ impl std::os::fd::AsFd for FolderChange {
     }
 }
 
+/// A descriptor that becomes readable at a write to a file, an event of the
+/// kernel: a kqueue with `NOTE_WRITE` and `NOTE_EXTEND` of the file on macOS,
+/// an inotify watch of it on Linux.
+#[derive(Debug)]
+pub struct FileChange {
+    events: std::os::fd::OwnedFd,
+    #[cfg(target_os = "macos")]
+    _file: File,
+}
+
+impl FileChange {
+    /// Watch the writes to `file`, which a missing file fails with
+    /// `NotFound`.
+    #[cfg(target_os = "macos")]
+    pub fn watch(file: &Path) -> io::Result<Self> {
+        use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+        use std::os::fd::AsRawFd as _;
+        let opened = File::open(file)?;
+        let ident = usize::try_from(opened.as_raw_fd())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let kqueue = Kqueue::new()?;
+        let change = KEvent::new(
+            ident,
+            EventFilter::EVFILT_VNODE,
+            EvFlags::EV_ADD | EvFlags::EV_CLEAR,
+            FilterFlag::NOTE_WRITE | FilterFlag::NOTE_EXTEND,
+            0,
+            0,
+        );
+        let now = nix::libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        kqueue.kevent(&[change], &mut [], Some(now))?;
+        Ok(Self {
+            events: kqueue.into(),
+            _file: opened,
+        })
+    }
+
+    /// Watch the writes to `file`, which a missing file fails with
+    /// `NotFound`.
+    #[cfg(target_os = "linux")]
+    pub fn watch(file: &Path) -> io::Result<Self> {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let inotify = Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK)?;
+        inotify.add_watch(file, AddWatchFlags::IN_MODIFY)?;
+        Ok(Self {
+            events: inotify.into(),
+        })
+    }
+}
+
+impl std::os::fd::AsRawFd for FileChange {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.events.as_raw_fd()
+    }
+}
+
+impl std::os::fd::AsFd for FileChange {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.events.as_fd()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("cannot resolve omnifs home: set HOME or OMNIFS_HOME")]
 pub struct ResolveError;
@@ -480,6 +545,36 @@ mod tests {
         assert!(readable(&change, 5_000));
         assert_eq!(
             FolderChange::watch(&temp.path().join("missing"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    /// The watch of a file becomes readable at a write to it, and a missing
+    /// file has none.
+    #[test]
+    fn a_write_to_a_file_is_an_event() {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::os::fd::AsFd as _;
+        let readable = |change: &FileChange, timeout: u16| {
+            let mut fds = [PollFd::new(change.as_fd(), PollFlags::POLLIN)];
+            poll(&mut fds, PollTimeout::from(timeout)).unwrap() == 1
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("daemon.log");
+        std::fs::write(&log, b"").unwrap();
+        let change = FileChange::watch(&log).unwrap();
+        assert!(!readable(&change, 0));
+        OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"line\n")
+            .unwrap();
+        assert!(readable(&change, 5_000));
+        assert_eq!(
+            FileChange::watch(&temp.path().join("missing"))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::NotFound
