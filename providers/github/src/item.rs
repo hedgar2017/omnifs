@@ -2,18 +2,16 @@
 //! provider.
 
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 
 use omnifs_core::ContentType;
 use omnifs_sdk::prelude::*;
 
 use crate::api::GitHubApi;
 use crate::objects::{
-    ChangedFile, Comment, Issue, Notification, Owner, PullRequest, Repo, Review, ReviewComment,
+    Comment, Issue, Notification, Owner, PullRequest, Repo, Review, ReviewComment,
 };
 use crate::{
-    FILE_PAGE_SIZE, FilePath, NOTIFICATION_PAGE_SIZE, OwnerKind, OwnerName, REVIEW_PAGE_SIZE,
-    RepoId, RepoName, StateFilter, ThreadId,
+    NOTIFICATION_PAGE_SIZE, OwnerKind, OwnerName, RepoId, RepoName, StateFilter, ThreadId,
 };
 
 /// Identity discriminator for the comment anchor's `{item_kind}` segment. A
@@ -56,27 +54,22 @@ pub(crate) struct IssueKey {
 pub(crate) struct PullKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
-    pub(crate) filter: Facet<StateFilter>,
-    pub(crate) number: u64,
-}
-
-#[omnifs_sdk::path_captures]
-pub(crate) struct ChangedFileKey {
-    pub(crate) owner: OwnerName,
-    pub(crate) repo: RepoName,
     #[expect(
         dead_code,
         reason = "a key of the route binds its `{filter}` capture, which its identity excludes"
     )]
     pub(crate) filter: Facet<StateFilter>,
     pub(crate) number: u64,
-    pub(crate) path: FilePath,
 }
 
 #[omnifs_sdk::path_captures]
 pub(crate) struct ReviewKey {
     pub(crate) owner: OwnerName,
     pub(crate) repo: RepoName,
+    #[expect(
+        dead_code,
+        reason = "a key of the route binds its `{filter}` capture, which its identity excludes"
+    )]
     pub(crate) filter: Facet<StateFilter>,
     pub(crate) number: u64,
     pub(crate) review_id: u64,
@@ -170,23 +163,6 @@ impl PullRequest {
     }
 }
 
-impl ChangedFile {
-    pub(crate) async fn load(
-        cx: &Cx,
-        key: &ChangedFileKey,
-        _since: Option<Validator>,
-    ) -> Result<Load<Self>> {
-        let filename = key.path.decoded()?;
-        let Some((file, raw)) = find_pull_file(cx, key, &filename).await? else {
-            return Ok(Load::NotFound);
-        };
-        Ok(Load::fresh(
-            file,
-            Canonical::new(raw.get().as_bytes(), None),
-        ))
-    }
-}
-
 impl Review {
     pub(crate) async fn load(
         cx: &Cx,
@@ -212,11 +188,22 @@ impl ReviewComment {
         since: Option<Validator>,
     ) -> Result<Load<Self>> {
         let repo = RepoId::new(&key.owner, &key.repo);
-        cx.endpoint(GitHubApi)
+        let load = cx
+            .endpoint(GitHubApi)
             .get(format!("/repos/{repo}/pulls/comments/{}", key.comment_id))
             .maybe_if_none_match(since.as_ref())
             .load_with(decode_json::<Self>)
-            .await
+            .await?;
+        // Its canonical bytes are its fields alone: the row of GitHub has the
+        // code beside the comment.
+        Ok(match load {
+            Load::Fresh { value, .. } => {
+                let bytes = serde_json::to_vec(&value)
+                    .map_err(|error| ProviderError::internal(error.to_string()))?;
+                Load::fresh(value, Canonical::new(bytes, None))
+            },
+            other => other,
+        })
     }
 }
 
@@ -363,124 +350,6 @@ impl Owner {
     }
 }
 
-impl PullRequest {
-    pub(crate) async fn files(
-        key: PullKey,
-        cx: ListCx<PageCursor>,
-    ) -> Result<Collection<ChangedFile, PageCursor>> {
-        let page = cx.cursor().map_or(1, |c| c.0);
-        let answer = cx
-            .endpoint(GitHubApi)
-            .get(pull_files_path(&key.owner, &key.repo, key.number, page))
-            .maybe_if_none_match(cx.validator())
-            .page::<Vec<Box<RawValue>>>()
-            .await?;
-        let more = next_page(&answer);
-        let PageAnswer::Fresh {
-            value: files,
-            validator,
-            ..
-        } = answer
-        else {
-            return unchanged(&cx);
-        };
-        let entries = fresh(files, |file: &ChangedFile| {
-            Ok(ChangedFileKey {
-                owner: key.owner.clone(),
-                repo: key.repo.clone(),
-                filter: key.filter,
-                number: key.number,
-                path: parsed(&FilePath::encode(&file.filename))?,
-            })
-        })?;
-        Ok(with_page_validator(
-            page_or_complete(entries, more, PageCursor(page + 1)),
-            page_etag(validator)?,
-        ))
-    }
-
-    pub(crate) async fn reviews(
-        key: PullKey,
-        cx: ListCx<PageCursor>,
-    ) -> Result<Collection<Review, PageCursor>> {
-        let page = cx.cursor().map_or(1, |c| c.0);
-        let repo = RepoId::new(&key.owner, &key.repo);
-        let answer = cx
-            .endpoint(GitHubApi)
-            .get(format!(
-                "/repos/{repo}/pulls/{}/reviews?per_page={REVIEW_PAGE_SIZE}&page={page}",
-                key.number
-            ))
-            .maybe_if_none_match(cx.validator())
-            .page::<Vec<Box<RawValue>>>()
-            .await?;
-        let more = next_page(&answer);
-        let PageAnswer::Fresh {
-            value: reviews,
-            validator,
-            ..
-        } = answer
-        else {
-            return unchanged(&cx);
-        };
-        let entries = fresh(reviews, |review: &Review| {
-            Ok(ReviewKey {
-                owner: key.owner.clone(),
-                repo: key.repo.clone(),
-                filter: key.filter,
-                number: key.number,
-                review_id: review.id,
-            })
-        })?;
-        Ok(with_page_validator(
-            page_or_complete(entries, more, PageCursor(page + 1)),
-            page_etag(validator)?,
-        ))
-    }
-}
-
-impl Review {
-    pub(crate) async fn comments(
-        key: ReviewKey,
-        cx: ListCx<PageCursor>,
-    ) -> Result<Collection<ReviewComment, PageCursor>> {
-        let page = cx.cursor().map_or(1, |c| c.0);
-        let repo = RepoId::new(&key.owner, &key.repo);
-        let answer = cx
-            .endpoint(GitHubApi)
-            .get(format!(
-                "/repos/{repo}/pulls/{}/reviews/{}/comments?per_page={REVIEW_PAGE_SIZE}&page={page}",
-                key.number, key.review_id
-            ))
-            .maybe_if_none_match(cx.validator())
-            .page::<Vec<Box<RawValue>>>()
-            .await?;
-        let more = next_page(&answer);
-        let PageAnswer::Fresh {
-            value: comments,
-            validator,
-            ..
-        } = answer
-        else {
-            return unchanged(&cx);
-        };
-        let entries = fresh(comments, |comment: &ReviewComment| {
-            Ok(ReviewCommentKey {
-                owner: key.owner.clone(),
-                repo: key.repo.clone(),
-                filter: key.filter,
-                number: key.number,
-                review_id: key.review_id,
-                comment_id: comment.id,
-            })
-        })?;
-        Ok(with_page_validator(
-            page_or_complete(entries, more, PageCursor(page + 1)),
-            page_etag(validator)?,
-        ))
-    }
-}
-
 impl Notification {
     pub(crate) async fn list(cx: DirCx) -> Result<DirListing> {
         match cx.intent() {
@@ -557,98 +426,6 @@ impl Notification {
             },
         }
     }
-}
-
-impl PullRequest {
-    /// The diff of the pull request between its base and its head, which its
-    /// node in the projection names: the host holds the diff of each pair of
-    /// commits and asks GitHub for it once. The read of `diff.patch` follows
-    /// the lookup of its pull request, whose answer wrote that node, so a pull
-    /// request that the projection lacks is not found.
-    pub(crate) async fn diff(cx: Cx, key: PullKey) -> Result<BlobFile<Diff>> {
-        let Some(pull) = cx.object::<Self>(&key)? else {
-            return Err(ProviderError::not_found(format!(
-                "the projection has no pull request {}",
-                key.number
-            )));
-        };
-        let path = format!(
-            "/repos/{}/pulls/{}",
-            RepoId::new(&key.owner, &key.repo),
-            key.number
-        );
-        let version = format!("{}..{}", pull.base_ref_oid, pull.head_ref_oid);
-        let blob = cx
-            .endpoint(GitHubApi)
-            .get(path)
-            .header("Accept", "application/vnd.github.diff")
-            .into_blob()
-            .version(version.as_str())
-            .fetch()
-            .await?;
-        Ok(BlobFile::new(blob.id)
-            .size(FileSize::Exact(blob.size))
-            .stability(Stability::Dynamic)
-            .version(version))
-    }
-}
-
-/// The format of a diff.
-pub(crate) struct Diff;
-
-impl Format for Diff {
-    const CT: ContentType = ContentType::Custom("text/x-diff");
-}
-
-impl Repo {
-    /// The tree of the last commit of the default branch. `commits/HEAD` with
-    /// the `sha` media type answers that commit and takes the commit of the
-    /// tree in quotes as its `ETag`: `304` keeps the tree, and `200` names the
-    /// commit the clone checks out.
-    pub(crate) async fn tree(cx: Cx, key: RepoKey) -> Result<Tree> {
-        let repo_id = RepoId::new(&key.owner, &key.repo);
-        let etag = cx
-            .version()
-            .map(|commit| VersionToken::from(format!("\"{}\"", commit.as_str())));
-        let head = cx
-            .endpoint(GitHubApi)
-            .get(format!("/repos/{repo_id}/commits/HEAD"))
-            .header("Accept", "application/vnd.github.sha")
-            .maybe_if_none_match(etag.as_ref())
-            .send_checked()
-            .await?;
-        if head.status() == 304 {
-            return Ok(Tree::unchanged());
-        }
-        let commit = std::str::from_utf8(head.body())
-            .map_err(|_| ProviderError::invalid_input("the commit of HEAD is not UTF-8"))?;
-        let opened = cx
-            .git()
-            .open_repo(format!("git@github.com:{repo_id}.git"))
-            .commit(commit)
-            .await?;
-        Ok(Tree::at(TreeRef::new(opened.tree), commit))
-    }
-}
-
-/// The entries of the rows of a page, each with its bytes as the canonical
-/// bytes of its object: a row of a list is the object that its own request
-/// answers. `key` names the entry of a row.
-fn fresh<T: omnifs_sdk::object::Object + serde::de::DeserializeOwned>(
-    rows: Vec<Box<RawValue>>,
-    key: impl Fn(&T) -> Result<T::Key>,
-) -> Result<Vec<CollectionEntry<T>>> {
-    rows.into_iter()
-        .map(|row| {
-            let value: T = serde_json::from_str(row.get())
-                .map_err(|error| ProviderError::invalid_input(format!("json decode: {error}")))?;
-            Ok(CollectionEntry::fresh(
-                key(&value)?,
-                value,
-                Canonical::new(row.get().as_bytes(), None),
-            ))
-        })
-        .collect()
 }
 
 /// A segment of a path from a name that GitHub gives, which is the error of
@@ -745,42 +522,4 @@ fn encode_validator<T: Serialize>(validator: &T) -> VersionToken {
 fn decode_validator<T: serde::de::DeserializeOwned>(token: &VersionToken) -> Result<T> {
     serde_json::from_str(token.as_str())
         .map_err(|_| ProviderError::invalid_input("invalid page validator"))
-}
-
-fn pull_files_path(owner: &OwnerName, repo: &RepoName, number: u64, page: u64) -> String {
-    let repo = RepoId::new(owner, repo);
-    format!("/repos/{repo}/pulls/{number}/files?per_page={FILE_PAGE_SIZE}&page={page}")
-}
-
-/// The changed file of a pull request named `filename`, from the pages of
-/// its files by their link `next`.
-async fn find_pull_file(
-    cx: &Cx,
-    key: &ChangedFileKey,
-    filename: &str,
-) -> Result<Option<(ChangedFile, Box<RawValue>)>> {
-    for page in 1.. {
-        let answer = cx
-            .endpoint(GitHubApi)
-            .get(pull_files_path(&key.owner, &key.repo, key.number, page))
-            .page::<Vec<Box<RawValue>>>()
-            .await?;
-        let more = next_page(&answer);
-        let PageAnswer::Fresh { value: rows, .. } = answer else {
-            return Err(ProviderError::internal(
-                "the files answered 304 to a request without an ETag",
-            ));
-        };
-        for raw in rows {
-            let file = serde_json::from_str::<ChangedFile>(raw.get())
-                .map_err(|err| ProviderError::invalid_input(format!("json decode: {err}")))?;
-            if file.filename == filename {
-                return Ok(Some((file, raw)));
-            }
-        }
-        if !more {
-            break;
-        }
-    }
-    Ok(None)
 }

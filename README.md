@@ -159,7 +159,7 @@ The projected namespace is read-only. Mount commands change daemon-owned state t
 
 | Provider | Mount | What it projects |
 | --- | --- | --- |
-| GitHub | `/github` | Users, orgs, repos, issues, pull requests, Actions runs, diffs, and repo trees cloned on demand |
+| GitHub | `/github` | Users, orgs, repos, issues, pull requests, and Actions runs |
 | DNS | `/dns` | DNS-over-HTTPS records, resolver-scoped queries, raw answers, and reverse lookups |
 | arXiv | `/arxiv` | Paper version families, PDFs, source archives, metadata, and category paper listings |
 | Docker | `/docker` | Docker daemon system state, container listings, per-container inspect output, state, and summaries |
@@ -175,11 +175,9 @@ The projected namespace is read-only. Mount commands change daemon-owned state t
 | --- | --- |
 | `/github/{owner}` | Repositories for a user or organization |
 | `/github/{owner}/{repo}` | Repository surface |
-| `/github/{owner}/{repo}/repo/` | Source tree, cloned on demand via SSH |
 | `/github/{owner}/{repo}/issues/{open,all}/` | Issue listings |
 | `/github/{owner}/{repo}/issues/{filter}/{n}/title` | Issue title |
 | `/github/{owner}/{repo}/issues/{filter}/{n}/body` | Issue body |
-| `/github/{owner}/{repo}/pulls/{filter}/{n}/diff.patch` | Pull request diff |
 | `/github/{owner}/{repo}/actions/runs/{id}/status` | Actions run status |
 | `/github/{owner}/{repo}/actions/runs/{id}/log` | Actions run log |
 

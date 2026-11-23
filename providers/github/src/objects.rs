@@ -1,9 +1,8 @@
 //! GitHub object bodies and field projections.
 
-use omnifs_core::ContentType;
 use omnifs_sdk::prelude::*;
 use omnifs_sdk::repr::{Markdown, Representable};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::User;
@@ -61,16 +60,13 @@ impl Representable<Markdown> for Issue {
     }
 }
 
-/// A pull request as a node of GitHub GraphQL: its item, with the commits of
-/// its base and of its head.
+/// A pull request as a node of GitHub GraphQL: its item.
 #[omnifs_sdk::object(kind = "github.pull", key = crate::item::PullKey)]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PullRequest {
     #[serde(flatten)]
     pub(crate) data: ItemData,
-    pub(crate) base_ref_oid: String,
-    pub(crate) head_ref_oid: String,
 }
 
 impl Representable<Markdown> for PullRequest {
@@ -79,57 +75,8 @@ impl Representable<Markdown> for PullRequest {
     }
 }
 
-#[omnifs_sdk::object(kind = "github.pull_file", key = crate::item::ChangedFileKey)]
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct ChangedFile {
-    pub(crate) filename: String,
-    pub(crate) status: String,
-    pub(crate) additions: u64,
-    pub(crate) deletions: u64,
-    pub(crate) changes: u64,
-    pub(crate) patch: Option<String>,
-    pub(crate) previous_filename: Option<String>,
-}
-
-impl ChangedFile {
-    pub(crate) fn filename(&self, _key: &crate::item::ChangedFileKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.filename.clone(), TextFormat::Raw).build())
-    }
-
-    pub(crate) fn status(&self, _key: &crate::item::ChangedFileKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.status.clone(), TextFormat::Raw).build())
-    }
-
-    /// The patch of the file, not found for a file whose patch GitHub does
-    /// not give, as a binary file.
-    pub(crate) fn patch(&self, _key: &crate::item::ChangedFileKey) -> Result<FileProjection> {
-        let patch = self.patch.as_ref().ok_or_else(|| {
-            ProviderError::not_found(format!("GitHub gives no patch of {}", self.filename))
-        })?;
-        Ok(FileProjection::body(patch.clone())
-            .content_type(ContentType::Custom("text/x-diff"))
-            .build())
-    }
-}
-
-impl Representable<Markdown> for ChangedFile {
-    fn represent(&self) -> Vec<u8> {
-        let previous = self
-            .previous_filename
-            .as_ref()
-            .map_or(String::new(), |name| {
-                format!("- Previous filename: {name}\n")
-            });
-        format!(
-            "# {}\n\n- Status: {}\n- Additions: {}\n- Deletions: {}\n- Changes: {}\n{}",
-            self.filename, self.status, self.additions, self.deletions, self.changes, previous
-        )
-        .into_bytes()
-    }
-}
-
 #[omnifs_sdk::object(kind = "github.review", key = crate::item::ReviewKey)]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Review {
     pub(crate) id: u64,
     pub(crate) user: Option<User>,
@@ -139,25 +86,15 @@ pub(crate) struct Review {
 }
 
 impl Review {
-    pub(crate) fn state(&self, _key: &crate::item::ReviewKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.state.clone(), TextFormat::Raw).build())
-    }
-
-    pub(crate) fn user(&self, _key: &crate::item::ReviewKey) -> Result<FileProjection> {
-        let login = self.user.as_ref().map_or("", |u| u.login.as_str());
-        Ok(FileProjection::text(login.to_owned(), TextFormat::Raw).build())
-    }
-
-    pub(crate) fn body_md(&self, _key: &crate::item::ReviewKey) -> Result<FileProjection> {
-        Ok(FileProjection::body(self.body.clone())
-            .content_type(ContentType::Markdown)
-            .build())
+    /// The login of the author, empty for a review without one.
+    pub(crate) fn login(&self) -> &str {
+        self.user.as_ref().map_or("", |u| u.login.as_str())
     }
 }
 
 impl Representable<Markdown> for Review {
     fn represent(&self) -> Vec<u8> {
-        let user = self.user.as_ref().map_or("", |u| u.login.as_str());
+        let user = self.login();
         let Self {
             id, state, body, ..
         } = self;
@@ -171,43 +108,29 @@ impl Representable<Markdown> for Review {
     }
 }
 
+/// An inline comment of a review, without the code that GitHub shows
+/// beside it.
 #[omnifs_sdk::object(kind = "github.review_comment", key = crate::item::ReviewCommentKey)]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ReviewComment {
     pub(crate) id: u64,
     pub(crate) user: Option<User>,
     pub(crate) body: String,
     pub(crate) path: String,
-    pub(crate) diff_hunk: String,
 }
 
 impl ReviewComment {
-    pub(crate) fn body_md(&self, _key: &crate::item::ReviewCommentKey) -> Result<FileProjection> {
-        Ok(FileProjection::body(self.body.clone())
-            .content_type(ContentType::Markdown)
-            .build())
-    }
-
-    pub(crate) fn author(&self, _key: &crate::item::ReviewCommentKey) -> Result<FileProjection> {
-        let login = self.user.as_ref().map_or("", |u| u.login.as_str());
-        Ok(FileProjection::text(login.to_owned(), TextFormat::Raw).build())
-    }
-
-    pub(crate) fn path(&self, _key: &crate::item::ReviewCommentKey) -> Result<FileProjection> {
-        Ok(FileProjection::text(self.path.clone(), TextFormat::Raw).build())
+    /// The login of the author, empty for a comment without one.
+    pub(crate) fn login(&self) -> &str {
+        self.user.as_ref().map_or("", |u| u.login.as_str())
     }
 }
 
 impl Representable<Markdown> for ReviewComment {
     fn represent(&self) -> Vec<u8> {
-        let user = self.user.as_ref().map_or("", |u| u.login.as_str());
-        let Self {
-            path,
-            body,
-            diff_hunk,
-            ..
-        } = self;
-        format!("{user} on `{path}`:\n\n{body}\n\n```diff\n{diff_hunk}\n```\n").into_bytes()
+        let user = self.login();
+        let Self { path, body, .. } = self;
+        format!("{user} on `{path}`:\n\n{body}\n").into_bytes()
     }
 }
 

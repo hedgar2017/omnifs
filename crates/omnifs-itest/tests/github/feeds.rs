@@ -115,12 +115,13 @@ fn node(number: u64, title: &str, state: &str, updated: &str, comments: u64) -> 
     })
 }
 
-/// A pull request as a node of GitHub GraphQL, with `base-1` as its base and
-/// `head-1` as its head.
+/// A pull request as a node of GitHub GraphQL, without reviews.
 fn pull(number: u64, title: &str, state: &str, updated: &str, comments: u64) -> Value {
     let mut pull = node(number, title, state, updated, comments);
-    pull["baseRefOid"] = json!("base-1");
-    pull["headRefOid"] = json!("head-1");
+    pull["reviews"] = json!({
+        "nodes": [],
+        "pageInfo": { "hasNextPage": false, "endCursor": null },
+    });
     pull
 }
 
@@ -352,10 +353,7 @@ async fn the_first_full_listing_takes_the_items_then_the_comments_then_the_count
     assert_eq!(graphql_of(&requests[1]).1["issues"], "i-1");
     let (query, _) = graphql_of(&requests[2]);
     assert!(query.contains("pulls: pullRequests("), "{query}");
-    assert!(
-        query.contains("comments { totalCount } baseRefOid headRefOid }"),
-        "{query}"
-    );
+    assert!(query.contains("comments { totalCount } isDraft"), "{query}");
     assert_eq!(http(&requests[3]).url, api(COMMENTS));
     assert_eq!(
         http(&requests[4]).url,

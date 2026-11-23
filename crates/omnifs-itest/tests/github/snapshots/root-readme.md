@@ -8,9 +8,6 @@ The keying schema is the path grammar below. Literal segments are written as-is.
 
 ## Route templates
 
-- `/{owner}/{repo}/repo` - directory
-  - `{owner}`: `OwnerName`
-  - `{repo}`: `RepoName`
 - `/{owner}/{repo}/issues` - directory
   - `{owner}`: `String`
   - `{repo}`: `String`
@@ -35,6 +32,17 @@ The keying schema is the path grammar below. Literal segments are written as-is.
   - `{repo}`: `RepoName`
   - `{filter}`: `StateFilter` choices `all`, `open`
   - `{number}`: `u64`
+- `/{owner}/{repo}/pulls/{filter}/{number}/reviews` - directory
+  - `{owner}`: `OwnerName`
+  - `{repo}`: `RepoName`
+  - `{filter}`: `StateFilter` choices `all`, `open`
+  - `{number}`: `u64`
+- `/{owner}/{repo}/pulls/{filter}/{number}/reviews/{review_id}/comments` - directory
+  - `{owner}`: `OwnerName`
+  - `{repo}`: `RepoName`
+  - `{filter}`: `StateFilter` choices `all`, `open`
+  - `{number}`: `u64`
+  - `{review_id}`: `u64`
 - `/notifications` - directory
 - `/{owner}` - object `github.owner`
   - `{owner}`: `OwnerName`
@@ -51,12 +59,6 @@ The keying schema is the path grammar below. Literal segments are written as-is.
   - `{repo}`: `RepoName`
   - `{filter}`: `StateFilter` choices `all`, `open`
   - `{number}`: `u64`
-- `/{owner}/{repo}/pulls/{filter}/{number}/files/{path}` - object `github.pull_file`
-  - `{owner}`: `OwnerName`
-  - `{repo}`: `RepoName`
-  - `{filter}`: `StateFilter` choices `all`, `open`
-  - `{number}`: `u64`
-  - `{path}`: `FilePath`
 - `/{owner}/{repo}/pulls/{filter}/{number}/reviews/{review_id}` - object `github.review`
   - `{owner}`: `OwnerName`
   - `{repo}`: `RepoName`
@@ -82,27 +84,11 @@ The keying schema is the path grammar below. Literal segments are written as-is.
 - `/{owner}/{repo}` - collection of `github.repo`
   - `{owner}`: `OwnerName`
   - `{repo}`: `String`
-- `/{owner}/{repo}/pulls/{filter}/{number}/files` - collection of `github.pull_file`
-  - `{owner}`: `OwnerName`
-  - `{repo}`: `RepoName`
-  - `{filter}`: `StateFilter` choices `all`, `open`
-  - `{number}`: `u64`
-- `/{owner}/{repo}/pulls/{filter}/{number}/reviews` - collection of `github.review`
-  - `{owner}`: `OwnerName`
-  - `{repo}`: `RepoName`
-  - `{filter}`: `StateFilter` choices `all`, `open`
-  - `{number}`: `u64`
-- `/{owner}/{repo}/pulls/{filter}/{number}/reviews/{review_id}/comments` - collection of `github.review_comment`
-  - `{owner}`: `OwnerName`
-  - `{repo}`: `RepoName`
-  - `{filter}`: `StateFilter` choices `all`, `open`
-  - `{number}`: `u64`
-  - `{review_id}`: `u64`
 
 ## Example commands
 
 - `ls .`
-- `ls './{owner}/{repo}/repo'`
+- `ls './{owner}/{repo}/issues'`
 - `cat './{owner}/owner.json'`
 
 ## Bulk traversal

@@ -33,15 +33,12 @@
         body
         state
         user
-        diff.patch
         comments/{id}/
           comment.json
           comment.md
           author
           body.md
-        files/{percent-encoded-path}/
         reviews/{id}/
-  repo/  ← bind-mounted clone, lazily cloned via SSH
 /github/notifications/thread-{id}/
 ```
 
@@ -64,11 +61,11 @@ Before the first full listing ends, an item answers from GitHub GraphQL by its n
 
 The owner and the repository are named as the path spells them. The sync program asks GitHub for their canonical spelling and reads that path alone; a path in another spelling is a repository of its own, which takes its own first full listing and shows its own whole tree from it, never one mixed with the facts of another spelling, and is never part of a sync.
 
-The entries of `files/`, `reviews/`, and `reviews/{id}/comments/` render from the row that their listing brought, and a page is the last when its answer has no link `next`. `diff.patch` is the diff between the base and the head of the pull request, which its node in the projection names, without a request for them; the host downloads the diff of a pair of commits once. A read of the diff of a pull request that the projection lacks is not found. A secondary rate limit without `Retry-After` states no window, and the feed is asked again in the next sync.
+The entries of `reviews/` and `reviews/{id}/comments/` come with the node of their pull request, without the code beside an inline comment, and a page is the last when its answer has no link `next`. `diff.patch` is the diff between the base and the head of the pull request, which its node in the projection names, without a request for them; the host downloads the diff of a pair of commits once. A read of the diff of a pull request that the projection lacks is not found. A secondary rate limit without `Retry-After` states no window, and the feed is asked again in the next sync.
 
 ## Capabilities
 
-`api.github.com` over HTTPS plus `git@github.com:*` over SSH for the bind-mounted clones. The default user workflow is `omnifs mount add github`, which runs GitHub's device flow with product client id `Ov23licogxMDzS47s9sF` and no default scopes. That default is public-read only; use `omnifs mount add github --scope repo` only when you need private repository access and accept GitHub OAuth's broad private-repository grant. Use `omnifs mount reauth github` to repair a missing or expired credential after the mount exists, or `omnifs mount add github --token-env GITHUB_TOKEN` to authenticate with a personal access token from an environment variable. Read-only today; mutation path WIP per the design docs.
+`api.github.com` over HTTPS. The default user workflow is `omnifs mount add github`, which runs GitHub's device flow with product client id `Ov23licogxMDzS47s9sF` and no default scopes. That default is public-read only; use `omnifs mount add github --scope repo` only when you need private repository access and accept GitHub OAuth's broad private-repository grant. Use `omnifs mount reauth github` to repair a missing or expired credential after the mount exists, or `omnifs mount add github --token-env GITHUB_TOKEN` to authenticate with a personal access token from an environment variable. Read-only today; mutation path WIP per the design docs.
 
 ## Install
 

@@ -44,9 +44,10 @@ use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
+use crate::User;
 use crate::api::GitHubApi;
 use crate::item::{IssueKey, ItemKind, PullKey, RepoKey};
-use crate::objects::{Comment, Issue, ItemData, PullRequest, Repo};
+use crate::objects::{Comment, Issue, ItemData, PullRequest, Repo, Review, ReviewComment};
 use crate::{RepoId, StateFilter};
 
 /// The nodes and the rows of a page.
@@ -758,12 +759,40 @@ async fn graphql<T: DeserializeOwned>(
     decode_json(repository.get())
 }
 
+/// What an issue and a pull request show on GitHub.
+macro_rules! item_fields {
+    () => {
+        "number title body state author { login } createdAt updatedAt closedAt \
+         labels(first: 100) { nodes { name } } assignees(first: 100) { nodes { login } } \
+         milestone { title } comments { totalCount }"
+    };
+}
+
+/// What a review shows on GitHub, with the first inline comments, each
+/// without the code beside it. A review with more takes them by
+/// [`review_comments`].
+macro_rules! review_fields {
+    () => {
+        "fullDatabaseId author { login } state body submittedAt comments(first: 10) \
+         { nodes { fullDatabaseId author { login } body path } \
+         pageInfo { hasNextPage endCursor } }"
+    };
+}
+
 /// The selection of an issue: the canonical bytes of `Issue`.
-const ITEM: &str = "number title body state author { login } updatedAt comments { totalCount }";
+const ITEM: &str = item_fields!();
 
 /// The selection of a pull request: the canonical bytes of `PullRequest`,
-/// with the commits of its base and of its head, which version its diff.
-const PULL: &str = "number title body state author { login } updatedAt comments { totalCount } baseRefOid headRefOid";
+/// with its branches and its first reviews. A pull request with more takes them by [`more_reviews`].
+const PULL: &str = concat!(
+    item_fields!(),
+    " isDraft merged baseRefName headRefName \
+     reviewRequests(first: 100) { nodes { requestedReviewer \
+     { ... on User { login } ... on Team { slug } } } } \
+     reviews(first: 10) { nodes { ",
+    review_fields!(),
+    " } pageInfo { hasNextPage endCursor } }"
+);
 
 impl ItemKind {
     /// The selection of a node of the kind.
@@ -839,6 +868,158 @@ impl Node {
             bytes,
         })
     }
+}
+
+/// A review as GitHub GraphQL gives it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewNode {
+    full_database_id: String,
+    author: Option<User>,
+    state: String,
+    body: String,
+    submitted_at: Option<String>,
+    comments: Connection<ReviewCommentNode>,
+}
+
+/// An inline comment of a review as GitHub GraphQL gives it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewCommentNode {
+    full_database_id: String,
+    author: Option<User>,
+    body: String,
+    path: String,
+}
+
+/// A pull request with a page of its reviews.
+#[derive(Deserialize)]
+struct Reviewed {
+    reviews: Connection<ReviewNode>,
+}
+
+/// The database ID of a node, which GitHub GraphQL gives as text.
+fn database_id(id: &str) -> Result<u64> {
+    id.parse().map_err(|error| {
+        ProviderError::invalid_input(format!("GitHub GraphQL gives the ID {id:?}: {error}"))
+    })
+}
+
+impl ReviewCommentNode {
+    fn comment(self) -> Result<ReviewComment> {
+        Ok(ReviewComment {
+            id: database_id(&self.full_database_id)?,
+            user: self.author,
+            body: self.body,
+            path: self.path,
+        })
+    }
+}
+
+/// The page of the reviews of the pull request `number` after `after`.
+async fn more_reviews(
+    cx: &Cx,
+    repo: &RepoId,
+    number: u64,
+    after: String,
+) -> Result<Connection<ReviewNode>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Answer {
+        pull_request: Option<Reviewed>,
+    }
+    let selection = concat!(
+        "pullRequest(number: $number) { reviews(first: 100, after: $after) { nodes { ",
+        review_fields!(),
+        " } pageInfo { hasNextPage endCursor } } }"
+    );
+    let answer: Answer = graphql(
+        cx,
+        repo,
+        ", $number: Int!, $after: String",
+        selection,
+        json!({ "number": number, "after": after }),
+    )
+    .await?;
+    answer
+        .pull_request
+        .map(|pull| pull.reviews)
+        .ok_or_else(|| moved(repo))
+}
+
+/// Each inline comment of the review `review` of the pull request `number`,
+/// from its pages, each row without the code beside it.
+async fn review_comments(
+    cx: &Cx,
+    repo: &RepoId,
+    number: u64,
+    review: u64,
+) -> Result<Vec<ReviewComment>> {
+    let mut path =
+        format!("/repos/{repo}/pulls/{number}/reviews/{review}/comments?per_page={PAGE}");
+    let mut comments = Vec::new();
+    loop {
+        match rest_page(cx, &path, None).await? {
+            RestPage::Rows { rows, next, .. } => {
+                for row in rows {
+                    comments.push(decode_json(row.get())?);
+                }
+                match next {
+                    Some(link) => path = link,
+                    None => return Ok(comments),
+                }
+            },
+            RestPage::Gone => return Err(moved(repo)),
+            RestPage::Unchanged { .. } => {
+                return Err(ProviderError::internal(
+                    "the review comments answered 304 to a request without an ETag",
+                ));
+            },
+        }
+    }
+}
+
+/// Each review of the pull request `number`, each with its inline comments,
+/// from `page`, the first page of its reviews.
+async fn all_reviews(
+    cx: &Cx,
+    repo: &RepoId,
+    number: u64,
+    mut page: Connection<ReviewNode>,
+) -> Result<Vec<(Review, Vec<ReviewComment>)>> {
+    let mut nodes = Vec::new();
+    loop {
+        let next = page.page_info.next()?;
+        nodes.append(&mut page.nodes);
+        let Some(after) = next else {
+            break;
+        };
+        page = more_reviews(cx, repo, number, after).await?;
+    }
+    let mut reviews = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let id = database_id(&node.full_database_id)?;
+        let comments = if node.comments.page_info.has_next_page {
+            review_comments(cx, repo, number, id).await?
+        } else {
+            node.comments
+                .nodes
+                .into_iter()
+                .map(ReviewCommentNode::comment)
+                .collect::<Result<Vec<_>>>()?
+        };
+        reviews.push((
+            Review {
+                id,
+                user: node.author,
+                body: node.body,
+                state: node.state,
+                submitted_at: node.submitted_at,
+            },
+            comments,
+        ));
+    }
+    Ok(reviews)
 }
 
 /// What GitHub GraphQL answers for the number of an item.
@@ -1050,6 +1231,74 @@ impl<'a, K> Writer<'a, K> {
         Ok(())
     }
 
+    /// The facts of an item from its node, and for a pull request each of
+    /// its reviews.
+    async fn written(&mut self, kind: ItemKind, node: &Node, folders: ListingWrite) -> Result<()> {
+        self.item(kind, node, folders)?;
+        if kind == ItemKind::Pulls {
+            let Reviewed { reviews } = decode_json(node.bytes.get())?;
+            let reviews = all_reviews(self.cx, self.repo, node.data.number, reviews).await?;
+            let item = ItemRef {
+                kind,
+                number: node.data.number,
+            };
+            self.reviews(item, &reviews)?;
+        }
+        Ok(())
+    }
+
+    /// The folder `reviews/` of a pull request with `reviews` alone: `state`,
+    /// `user`, `body.md`, and the canonical bytes of each, with its inline
+    /// comments in its folder `comments/`, each with `author`, `body.md`,
+    /// `path`, and its canonical bytes.
+    fn reviews(&self, item: ItemRef, reviews: &[(Review, Vec<ReviewComment>)]) -> Result<()> {
+        let cx = self.cx;
+        let folder = format!("{}/reviews", item_path(self.repo, item, StateFilter::All));
+        cx.dir(&folder, ListingWrite::Partial)?;
+        let ids = reviews
+            .iter()
+            .map(|(review, _)| review.id)
+            .collect::<BTreeSet<_>>();
+        self.remove_others(&folder, &ids)?;
+        for (review, comments) in reviews {
+            let at = format!("{folder}/{}", review.id);
+            cx.dir(&at, ListingWrite::Partial)?;
+            cx.file(format!("{at}/state"), review.state.as_bytes())?;
+            cx.file(format!("{at}/user"), review.login().as_bytes())?;
+            cx.file(format!("{at}/body.md"), review.body.as_bytes())?;
+            cx.canonical::<Review>(&at, Canonical::new(encoded(review)?, None));
+            let inline = format!("{at}/comments");
+            cx.dir(&inline, ListingWrite::Partial)?;
+            let ids = comments
+                .iter()
+                .map(|comment| comment.id)
+                .collect::<BTreeSet<_>>();
+            self.remove_others(&inline, &ids)?;
+            for comment in comments {
+                let at = format!("{inline}/{}", comment.id);
+                cx.dir(&at, ListingWrite::Partial)?;
+                cx.file(format!("{at}/author"), comment.login().as_bytes())?;
+                cx.file(format!("{at}/body.md"), comment.body.as_bytes())?;
+                cx.file(format!("{at}/path"), comment.path.as_bytes())?;
+                cx.canonical::<ReviewComment>(&at, Canonical::new(encoded(comment)?, None));
+            }
+            cx.dir(&inline, ListingWrite::Complete)?;
+        }
+        cx.dir(&folder, ListingWrite::Complete)
+    }
+
+    /// The removal of each entry of `folder` other than `ids`.
+    fn remove_others(&self, folder: &str, ids: &BTreeSet<u64>) -> Result<()> {
+        if let Some(listed) = self.cx.names::<u64>(folder)? {
+            for id in listed.names {
+                if !ids.contains(&id) {
+                    self.cx.remove(format!("{folder}/{id}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The facts of a comment: `author`, `body.md`, and its canonical bytes,
     /// the row of its list, under `comments/{id}/` of its item, its
     /// `comments/` joined as `write` says.
@@ -1157,6 +1406,11 @@ impl<'a, K> Writer<'a, K> {
             status => Err(error_of(&response, status)),
         }
     }
+}
+
+/// The canonical bytes of `value`.
+fn encoded<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|error| ProviderError::internal(error.to_string()))
 }
 
 impl Ids {
@@ -1404,7 +1658,7 @@ impl RepoFeed<'_> {
             .collect::<Result<Vec<_>>>()?;
         let mut w = Writer::new(self.cx, &self.repo, None);
         for node in &nodes {
-            w.item(kind, node, ListingWrite::Partial)?;
+            w.written(kind, node, ListingWrite::Partial).await?;
         }
         let stage = match (page.page_info.next()?, kind) {
             (Some(_), kind) => Stage::Items { kind },
@@ -1662,7 +1916,7 @@ impl RepoFeed<'_> {
                     number: node.data.number,
                 };
                 let new = !w.has_item(item)?;
-                w.item(kind, &node, ListingWrite::Complete)?;
+                w.written(kind, &node, ListingWrite::Complete).await?;
                 let comments = node.data.comments.total_count;
                 changed.insert(
                     item.number,
@@ -1929,7 +2183,7 @@ impl RepoFeed<'_> {
             if let ByNumber::Found(found, node) = item
                 && found == kind
             {
-                w.item(kind, &node, ListingWrite::Complete)?;
+                w.written(kind, &node, ListingWrite::Complete).await?;
                 let comments = node.data.comments.total_count;
                 changed.insert(
                     number,
@@ -2197,7 +2451,7 @@ async fn item_feed<K>(cx: &FeedCx<K>, repo: &RepoId, item: ItemRef) -> Result<Fe
         )));
     }
     let mut w = Writer::new(cx, repo, None);
-    w.item(kind, &node, ListingWrite::Partial)?;
+    w.written(kind, &node, ListingWrite::Partial).await?;
     let mut next = ItemToken {
         updated_at: node.data.updated_at,
         comments: node.data.comments.total_count,

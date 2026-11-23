@@ -24,7 +24,6 @@ pub(super) struct ObjectRoute<O: Object> {
     stability: fn(&O::Key) -> Stability,
     render_table: RenderTable,
     has_canonical: bool,
-    listed: bool,
     facet_expansion: FacetExpansion,
     when: Option<fn(&O::Key) -> bool>,
 }
@@ -38,7 +37,6 @@ impl<O: Object> Clone for ObjectRoute<O> {
             stability: self.stability,
             render_table: self.render_table.clone(),
             has_canonical: self.has_canonical,
-            listed: self.listed,
             facet_expansion: self.facet_expansion.clone(),
             when: self.when,
         }
@@ -57,7 +55,6 @@ where
             stability: definition.stability,
             render_table: definition.render_table.clone(),
             has_canonical: definition.has_canonical,
-            listed: definition.listed,
             facet_expansion: FacetExpansion::for_pattern::<O::Key>(pattern)?,
             when: definition.when,
         })
@@ -146,12 +143,6 @@ where
                 source: None,
             });
         }
-        if self.listed && cx.object::<O>(&key)?.is_some() {
-            return Ok(ObjectListing {
-                effects: Effects::new(),
-                source: None,
-            });
-        }
         let stability = (self.stability)(&key);
 
         let since = cx.version().cloned();
@@ -218,7 +209,7 @@ where
         let matched_cached = cached.as_ref().filter(|push| push.matches_anchor(&anchor));
 
         if let Some(push) = matched_cached
-            && (!push.revalidate || self.listed)
+            && !push.revalidate
         {
             return serve.serve_warm(&key, target, &push.bytes, push.validator.clone());
         }

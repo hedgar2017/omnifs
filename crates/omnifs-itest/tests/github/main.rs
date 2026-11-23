@@ -1,7 +1,6 @@
 #![cfg(not(target_os = "wasi"))]
 
 mod feeds;
-mod repo;
 mod support;
 
 use omnifs_engine::Namespace;
@@ -60,7 +59,7 @@ fn github_provider_routes_namespace_and_numeric_paths() {
                 .map(|entry| entry.name.as_str())
                 .collect();
             names.sort_unstable();
-            assert_eq!(names, vec!["issues", "pulls", "repo", "repo.json"]);
+            assert_eq!(names, vec!["issues", "pulls", "repo.json"]);
         },
         other => panic!("expected repo namespace listing, got {other:?}"),
     }
@@ -461,7 +460,7 @@ fn github_provider_missing_item_resources_validate_on_lookup() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn github_pr_lookup_is_fed_and_exposes_diff() {
+fn github_pr_lookup_is_fed() {
     let harness = github_harness();
 
     let lookup = harness
@@ -493,8 +492,6 @@ fn github_pr_lookup_is_fed_and_exposes_diff() {
                 vec![
                     "body",
                     "comments",
-                    "diff.patch",
-                    "files",
                     "item.json",
                     "item.md",
                     "reviews",
@@ -505,262 +502,6 @@ fn github_pr_lookup_is_fed_and_exposes_diff() {
             );
         },
         other => panic!("expected PR dir listing, got {other:?}"),
-    }
-
-    // The diff is versioned by the commits that the node of the pull request
-    // in the projection names: without that node, the pull request is not
-    // in the projection, and its diff is not found, without a request.
-    let diff = harness
-        .read("/octocat/Hello-World/pulls/open/7/diff.patch")
-        .unwrap();
-    assert!(diff.callouts().is_empty(), "{:?}", diff.callouts());
-    assert!(
-        matches!(diff.into_ok(), Err(_) | Ok(ReadFileOutcome::NotFound(_))),
-        "a pull request that the projection lacks has no diff"
-    );
-}
-
-#[test]
-fn github_pr_files_list_and_read_changed_file_objects() {
-    use omnifs_wit::host::types::{CalloutResult, HttpResponse};
-
-    const CHANGED_FILE_ROW: &[u8] = br#"{"changes":7,"unknown_marker":"preserved","filename":"src/lib.rs","deletions":2,"status":"modified","patch":"@@ -1 +1 @@\n-old\n+new","additions":5}"#;
-    let files_response = [b"[".as_slice(), CHANGED_FILE_ROW, b"]".as_slice()].concat();
-    let harness = github_harness();
-    let mut listed = harness
-        .list("/octocat/Hello-World/pulls/open/7/files")
-        .unwrap();
-    let fetch = listed.expect_single_fetch();
-    assert!(
-        fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/pulls/7/files?per_page=100&page=1"),
-        "unexpected PR files URL: {}",
-        fetch.url
-    );
-
-    listed
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""page-1""#)],
-            body: files_response.clone(),
-            redirected: None,
-        })])
-        .unwrap();
-    match listed.result().unwrap() {
-        Ok(ListChildrenResult::Entries(listing)) => {
-            let names: Vec<&str> = listing
-                .entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect();
-            assert_eq!(names, vec!["src%2Flib.rs"]);
-            let effects = listed.effects().unwrap();
-            assert_eq!(
-                canonical_bytes(effects),
-                [CHANGED_FILE_ROW],
-                "the row of a changed file is its canonical bytes"
-            );
-        },
-        other => panic!("expected PR files listing, got {other:?}"),
-    }
-
-    let mut read = harness
-        .read("/octocat/Hello-World/pulls/open/7/files/src%2Flib.rs/file.md")
-        .unwrap();
-    let read_fetch = read.expect_single_fetch();
-    assert!(
-        read_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/pulls/7/files?per_page=100&page=1"),
-        "unexpected changed-file read URL: {}",
-        read_fetch.url
-    );
-    read.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-        status: 200,
-        headers: Vec::new(),
-        body: files_response,
-        redirected: None,
-    })])
-    .unwrap();
-    match read.result().unwrap() {
-        Ok(ReadFileOutcome::Found(file)) => {
-            let body = std::str::from_utf8(omnifs_itest::expect_inline(file)).unwrap();
-            assert!(body.contains("# src/lib.rs"), "unexpected file.md: {body}");
-            assert_eq!(
-                read.effects().unwrap().canonical[0].bytes.as_slice(),
-                CHANGED_FILE_ROW,
-                "changed-file canonical must preserve the matched list row verbatim"
-            );
-        },
-        other => panic!("expected changed-file markdown read, got {other:?}"),
-    }
-}
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn github_pr_reviews_and_review_comments_list_and_read_objects() {
-    use omnifs_wit::host::types::{CalloutResult, HttpResponse};
-
-    let harness = github_harness();
-    let mut reviews = harness
-        .list("/octocat/Hello-World/pulls/open/7/reviews")
-        .unwrap();
-    let fetch = reviews.expect_single_fetch();
-    assert!(
-        fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/pulls/7/reviews?per_page=100&page=1"),
-        "unexpected reviews URL: {}",
-        fetch.url
-    );
-    reviews
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""page-1""#)],
-            body: br#"[
-                {
-                    "id":80,
-                    "state":"APPROVED",
-                    "body":"Looks good",
-                    "user":{"login":"reviewer"}
-                }
-            ]"#
-            .to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match reviews.result().unwrap() {
-        Ok(ListChildrenResult::Entries(listing)) => {
-            let names: Vec<&str> = listing
-                .entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect();
-            assert_eq!(names, vec!["80"]);
-            let effects = reviews.effects().unwrap();
-            assert_eq!(
-                canonical_bytes(effects).len(),
-                1,
-                "the row of a review is its canonical bytes"
-            );
-        },
-        other => panic!("expected reviews listing, got {other:?}"),
-    }
-
-    let mut review_md = harness
-        .read("/octocat/Hello-World/pulls/open/7/reviews/80/review.md")
-        .unwrap();
-    let review_fetch = review_md.expect_single_fetch();
-    assert!(
-        review_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/pulls/7/reviews/80"),
-        "unexpected review read URL: {}",
-        review_fetch.url
-    );
-    review_md
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: br#"{
-                "id":80,
-                "state":"APPROVED",
-                "body":"Looks good",
-                "user":{"login":"reviewer"}
-            }"#
-            .to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match review_md.result().unwrap() {
-        Ok(ReadFileOutcome::Found(file)) => {
-            let body = std::str::from_utf8(omnifs_itest::expect_inline(file)).unwrap();
-            assert!(body.contains("APPROVED"), "unexpected review.md: {body}");
-        },
-        other => panic!("expected review markdown read, got {other:?}"),
-    }
-
-    let mut comments = harness
-        .list("/octocat/Hello-World/pulls/open/7/reviews/80/comments")
-        .unwrap();
-    let comments_fetch = comments.expect_single_fetch();
-    assert!(
-        comments_fetch.url.ends_with(
-            "/repos/octocat/Hello-World/pulls/7/reviews/80/comments?per_page=100&page=1"
-        ),
-        "unexpected review comments URL: {}",
-        comments_fetch.url
-    );
-    comments
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""page-1""#)],
-            body: br#"[
-                {
-                    "id":99,
-                    "body":"nit",
-                    "path":"src/lib.rs",
-                    "diff_hunk":"@@ -1 +1 @@",
-                    "user":{"login":"reviewer"}
-                }
-            ]"#
-            .to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match comments.result().unwrap() {
-        Ok(ListChildrenResult::Entries(listing)) => {
-            let names: Vec<&str> = listing
-                .entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect();
-            assert_eq!(names, vec!["99"]);
-            assert_eq!(
-                canonical_bytes(comments.effects().unwrap()).len(),
-                1,
-                "the row of a review comment is its canonical bytes"
-            );
-        },
-        other => panic!("expected review comments listing, got {other:?}"),
-    }
-
-    let mut comment_md = harness
-        .read("/octocat/Hello-World/pulls/open/7/reviews/80/comments/99/comment.md")
-        .unwrap();
-    let comment_md_fetch = comment_md.expect_single_fetch();
-    assert!(
-        comment_md_fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/pulls/comments/99"),
-        "unexpected review comment read URL: {}",
-        comment_md_fetch.url
-    );
-    comment_md
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: br#"{
-                "id":99,
-                "body":"nit",
-                "path":"src/lib.rs",
-                "diff_hunk":"@@ -1 +1 @@",
-                "user":{"login":"reviewer"}
-            }"#
-            .to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    match comment_md.result().unwrap() {
-        Ok(ReadFileOutcome::Found(file)) => {
-            let body = std::str::from_utf8(omnifs_itest::expect_inline(file)).unwrap();
-            assert!(
-                body.contains("reviewer on `src/lib.rs`"),
-                "unexpected comment.md: {body}"
-            );
-        },
-        other => panic!("expected review comment markdown read, got {other:?}"),
     }
 }
 
@@ -1194,14 +935,10 @@ fn github_provider_list_routes_preserve_typed_http_errors() {
     use omnifs_wit::host::types::{CalloutResult, ErrorKind, Header, HttpResponse};
 
     let harness = github_harness();
-    let mut op = harness
-        .list("/octocat/Hello-World/pulls/open/7/files")
-        .unwrap();
+    let mut op = harness.list("/notifications").unwrap();
     let fetch = op.expect_single_fetch();
     assert!(
-        fetch
-            .url
-            .ends_with("/repos/octocat/Hello-World/pulls/7/files?per_page=100&page=1"),
+        fetch.url.ends_with("/notifications?per_page=50&page=1"),
         "unexpected URL {}",
         fetch.url
     );
@@ -1232,7 +969,7 @@ fn item_json_is_the_node_of_its_number() {
     };
 
     let issue_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0}}"#;
-    let pull_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0},"baseRefOid":"base-1","headRefOid":"head-1"}"#;
+    let pull_json = r#"{"number":42,"title":"Item forty-two","body":"Body text","state":"OPEN","author":{"login":"octocat"},"updatedAt":"2026-11-18T09:00:00Z","comments":{"totalCount":0},"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#;
     let answer = |kind: &str, repository: &str, item_json: &str| {
         format!(
             r#"{{"data":{{"repository":{{"nameWithOwner":"octocat/Hello-World",
@@ -1258,7 +995,9 @@ fn item_json_is_the_node_of_its_number() {
             "{query}"
         );
         assert!(
-            query.contains("... on PullRequest { number title body state author { login } updatedAt comments { totalCount } baseRefOid headRefOid }"),
+            query.contains(
+                "... on PullRequest { number title body state author { login } createdAt updatedAt"
+            ),
             "{query}"
         );
         step.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
@@ -1298,15 +1037,6 @@ fn item_json_is_the_node_of_its_number() {
         matches!(moved.result().unwrap(), Ok(ReadFileOutcome::NotFound(_))),
         "an item of another repository is not this one's"
     );
-}
-
-/// The canonical bytes that `effects` store, each of its object.
-fn canonical_bytes(effects: &omnifs_wit::host::types::Effects) -> Vec<&[u8]> {
-    effects
-        .canonical
-        .iter()
-        .map(|canonical| canonical.bytes.as_slice())
-        .collect()
 }
 
 fn header(name: &str, value: &str) -> Header {
@@ -1382,10 +1112,8 @@ async fn a_sync_that_names_a_repository_leaves_it_alone_and_nothing_asks_after_i
 #[test]
 fn github_page_answers_without_an_etag_or_with_another_poll_interval_fail() {
     let harness = github_harness();
-    let mut files = harness
-        .list("/octocat/Hello-World/pulls/open/7/files")
-        .unwrap();
-    files
+    let mut unversioned = harness.list("/notifications").unwrap();
+    unversioned
         .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
             status: 200,
             headers: Vec::new(),
@@ -1394,7 +1122,7 @@ fn github_page_answers_without_an_etag_or_with_another_poll_interval_fail() {
         })])
         .unwrap();
     assert!(matches!(
-        files.result().unwrap(),
+        unversioned.result().unwrap(),
         Err(error) if error.message.contains("without an ETag")
     ));
 
@@ -1493,16 +1221,9 @@ async fn github_notifications_are_asked_again_only_after_their_poll_interval() {
     assert!(requests.is_empty(), "the page is asked once in a sync");
 }
 
-/// Pull request 7 by its number, which its own feed asks GitHub GraphQL for
-/// before the first full listing of the repository, and again once the feed
-/// is due in a sync.
-fn pull_seven() -> HttpResponse {
-    pull_seven_at("head-1")
-}
-
 /// Pull request 7 by its number, with `base-1` as its base and `head` as its
 /// head.
-fn pull_seven_at(head: &str) -> HttpResponse {
+fn pull_seven_with(reviews: &str) -> HttpResponse {
     HttpResponse {
         status: 200,
         headers: Vec::new(),
@@ -1512,7 +1233,7 @@ fn pull_seven_at(head: &str) -> HttpResponse {
             "t7":{{"__typename":"PullRequest","number":7,"repository":{{"nameWithOwner":"octocat/Hello-World"}}}},
             "n7":{{"number":7,"title":"Seven","body":"Seven body","state":"OPEN","author":{{"login":"octocat"}},
                   "updatedAt":"2026-11-18T09:00:00Z","comments":{{"totalCount":0}},
-                  "baseRefOid":"base-1","headRefOid":"{head}"}}
+                  "reviews":{reviews}}}
         }}}}}}"#
         )
         .into_bytes(),
@@ -1520,253 +1241,79 @@ fn pull_seven_at(head: &str) -> HttpResponse {
     }
 }
 
-/// `diff.patch` is the diff between the base and the head that the node of
-/// its pull request in the projection names, with no request of its own for
-/// them: a read asks the host for the diff of that pair of commits, and a
-/// push to the pull request, which its node in the next sync shows, asks for
-/// the diff of the new pair.
+/// The reviews of a pull request and their inline comments come with its
+/// node and the pages after it, without a request for each file and without
+/// the code that GitHub shows beside an inline comment.
 #[tokio::test(flavor = "multi_thread")]
-async fn diff_patch_is_the_diff_of_the_commits_that_its_pull_request_names() {
-    use omnifs_itest::support::{Answer, Request, read};
+async fn the_reviews_of_a_pull_request_come_with_its_node_without_code() {
+    use omnifs_itest::support::{names, read};
 
     let harness = github_harness();
-    let path = "/github/octocat/Hello-World/pulls/all/7/diff.patch";
-    for (head, diff) in [("head-1", "diff one"), ("head-2", "diff two")] {
-        if head == "head-2" {
-            harness.begin_sync();
-        }
-        let (read, requests) = answering(
-            &harness,
-            read(&harness, path),
-            [
-                fetched(pull_seven_at(head)),
-                Answer::Blob(200, diff.as_bytes().to_vec()),
-            ],
-        )
-        .await;
-        assert_eq!(read.unwrap(), diff);
-        assert_eq!(requests.len(), 2);
-        assert_eq!(http(&requests[0]).url, "https://api.github.com/graphql");
-        let Request::Blob(blob) = &requests[1] else {
-            panic!("expected the blob of the diff, got {:?}", requests[1]);
-        };
-        assert!(
-            blob.url.ends_with("/repos/octocat/Hello-World/pulls/7"),
-            "{}",
-            blob.url
-        );
-        assert!(blob.headers.iter().any(|header| {
-            header.name.eq_ignore_ascii_case("accept")
-                && header.value == "application/vnd.github.diff"
-        }));
-        let version = format!("base-1..{head}");
-        assert_eq!(blob.version.as_deref(), Some(version.as_str()));
-    }
-}
-
-/// A diff that GitHub refuses with `406`, as one of more than 20,000 lines,
-/// is the permission error of its read.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_diff_that_github_refuses_is_the_permission_error_of_its_read() {
-    use omnifs_itest::support::{Answer, read};
-
-    let harness = github_harness();
-    let (read, requests) = answering(
+    let pull = "/github/octocat/Hello-World/pulls/all/7";
+    let reviews = r#"{"nodes":[{"fullDatabaseId":"80","author":{"login":"reviewer"},
+        "state":"APPROVED","body":"ok","submittedAt":"2026-11-18T09:00:00Z",
+        "comments":{"nodes":[{"fullDatabaseId":"900","author":{"login":"reviewer"},
+        "body":"first","path":"src/lib.rs"}],
+        "pageInfo":{"hasNextPage":true,"endCursor":"c1"}}}],
+        "pageInfo":{"hasNextPage":true,"endCursor":"r1"}}"#;
+    let more = HttpResponse {
+        status: 200,
+        headers: Vec::new(),
+        body: br#"{"data":{"repository":{"nameWithOwner":"octocat/Hello-World",
+            "pullRequest":{"reviews":{"nodes":[{"fullDatabaseId":"81","author":null,
+            "state":"COMMENTED","body":"second","submittedAt":null,
+            "comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],
+            "pageInfo":{"hasNextPage":false,"endCursor":"r2"}}}}}}"#
+            .to_vec(),
+        redirected: None,
+    };
+    let rows = HttpResponse {
+        status: 200,
+        headers: Vec::new(),
+        body: br#"[{"id":900,"user":{"login":"reviewer"},"body":"first","path":"src/lib.rs",
+            "diff_hunk":"@@ code @@"},{"id":901,"user":{"login":"other"},"body":"next",
+            "path":"src/main.rs","diff_hunk":"@@ code @@"}]"#
+            .to_vec(),
+        redirected: None,
+    };
+    let (listing, requests) = answering(
         &harness,
-        read(
-            &harness,
-            "/github/octocat/Hello-World/pulls/all/7/diff.patch",
-        ),
+        names(&harness, &format!("{pull}/reviews")),
         [
-            fetched(pull_seven_at("head-1")),
-            Answer::Blob(406, b"too large".to_vec()),
+            fetched(pull_seven_with(reviews)),
+            fetched(more),
+            fetched(rows),
         ],
     )
     .await;
+    assert_eq!(listing.unwrap(), ["80", "81"]);
     assert!(
-        matches!(read, Err(omnifs_engine::NsError::Permission)),
-        "{read:?}"
+        http(&requests[2])
+            .url
+            .ends_with("/repos/octocat/Hello-World/pulls/7/reviews/80/comments?per_page=100")
     );
-    assert_eq!(requests.len(), 2);
-}
 
-/// The page of the folder `folder` of pull request 7, `body` from `url` with
-/// the `ETag` `"page-1"`, has `names`. It serves from cache outside a sync,
-/// and is asked for again with `If-None-Match` in a sync, once the feed of
-/// the pull request has asked for its row again; `304` keeps it.
-async fn pull_page_is_asked_again_with_its_etag_in_a_sync(
-    folder: &str,
-    url: &str,
-    body: &[u8],
-    names: &[&str],
-) {
-    let harness = github_harness();
-    let (dir, _) = answering(
-        &harness,
-        resolve_namespace(
-            harness.namespace.as_ref(),
-            &format!("/github/octocat/Hello-World/pulls/open/7/{folder}"),
-        ),
-        [fetched(pull_seven())],
-    )
-    .await;
-    let readdir = || {
-        harness
-            .namespace
-            .readdir(dir.path.clone(), omnifs_engine::DirCursor::start(), 0)
-    };
-
-    let (first, requests) = answering(
-        &harness,
-        readdir(),
-        [fetched(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""page-1""#)],
-            body: body.to_vec(),
-            redirected: None,
-        })],
-    )
-    .await;
-    assert_eq!(entry_names(&first.unwrap()), names);
-    assert_eq!(
-        http(&requests[0]).url,
-        format!("https://api.github.com/repos/octocat/Hello-World/pulls/7/{url}")
-    );
-    assert_eq!(request_header(http(&requests[0]), "if-none-match"), None);
-
-    let (cached, requests) = answering(&harness, readdir(), []).await;
-    assert_eq!(entry_names(&cached.unwrap()), names);
-    assert!(requests.is_empty(), "the page serves outside a sync");
-
-    harness.begin_sync();
-    let (kept, requests) = answering(
-        &harness,
-        readdir(),
-        [fetched(pull_seven()), fetched(not_modified())],
-    )
-    .await;
-    assert_eq!(entry_names(&kept.unwrap()), names);
-    assert_eq!(http(&requests[0]).url, "https://api.github.com/graphql");
-    assert_eq!(
-        http(&requests[1]).url,
-        format!("https://api.github.com/repos/octocat/Hello-World/pulls/7/{url}")
-    );
-    assert_eq!(
-        request_header(http(&requests[1]), "if-none-match"),
-        Some(r#""page-1""#)
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn github_pr_files_page_is_asked_again_with_its_etag_in_a_sync() {
-    pull_page_is_asked_again_with_its_etag_in_a_sync(
-        "files",
-        "files?per_page=100&page=1",
-        br#"[{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"changes":2}]"#,
-        &["src%2Flib.rs"],
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn github_pr_reviews_page_is_asked_again_with_its_etag_in_a_sync() {
-    pull_page_is_asked_again_with_its_etag_in_a_sync(
-        "reviews",
-        "reviews?per_page=100&page=1",
-        br#"[{"id":80,"state":"APPROVED","body":"ok","user":{"login":"reviewer"}}]"#,
-        &["80"],
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn github_pr_review_comments_page_is_asked_again_with_its_etag_in_a_sync() {
-    pull_page_is_asked_again_with_its_etag_in_a_sync(
-        "reviews/80/comments",
-        "reviews/80/comments?per_page=100&page=1",
-        br#"[{"id":99,"body":"nit","path":"src/lib.rs","diff_hunk":"@@ -1 +1 @@","user":{"login":"reviewer"}}]"#,
-        &["99"],
-    )
-    .await;
-}
-
-/// The files of an entry of a listing render from the row that the listing
-/// brought, without a request of their own: the files and the reviews of a
-/// pull request.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_files_of_a_listed_entry_render_from_its_row_without_a_request() {
-    use omnifs_itest::support::{names, read, served};
-
-    let harness = github_harness();
-    let page = |body: &str| {
-        fetched(HttpResponse {
-            status: 200,
-            headers: vec![header("ETag", r#""page-1""#)],
-            body: body.as_bytes().to_vec(),
-            redirected: None,
-        })
-    };
-    let pull = "/github/octocat/Hello-World/pulls/open/7";
-    let file =
-        r#"{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"changes":2}"#;
-    let review = r#"{"id":80,"state":"APPROVED","body":"ok","user":{"login":"reviewer"}}"#;
-    let (listing, _) = answering(
-        &harness,
-        names(&harness, &format!("{pull}/files")),
-        [fetched(pull_seven()), page(&format!("[{file}]"))],
-    )
-    .await;
-    assert_eq!(listing.unwrap(), ["src%2Flib.rs"]);
-    let (listing, _) = answering(
-        &harness,
-        names(&harness, &format!("{pull}/reviews")),
-        [page(&format!("[{review}]"))],
-    )
-    .await;
-    assert_eq!(listing.unwrap(), ["80"]);
-    for folder in [
-        format!("{pull}/files/src%2Flib.rs"),
-        format!("{pull}/reviews/80"),
+    for (leaf, expected) in [
+        ("80/state", "APPROVED"),
+        ("80/user", "reviewer"),
+        ("80/body.md", "ok"),
+        ("81/body.md", "second"),
+        ("80/comments/901/author", "other"),
+        ("80/comments/901/body.md", "next"),
+        ("80/comments/901/path", "src/main.rs"),
     ] {
-        let (listing, requests) = answering(&harness, names(&harness, &folder), []).await;
-        assert!(!listing.unwrap().is_empty(), "{folder}");
-        assert!(requests.is_empty(), "the listing of {folder}");
+        let path = format!("{pull}/reviews/{leaf}");
+        let (body, requests) = answering(&harness, read(&harness, &path), []).await;
+        assert_eq!(body.unwrap(), expected, "{path}");
+        assert!(requests.is_empty(), "the read of {path}");
     }
-    let leaves = [
-        (format!("{pull}/files/src%2Flib.rs/status"), "modified"),
-        (format!("{pull}/files/src%2Flib.rs/file.json"), file),
-        (format!("{pull}/reviews/80/state"), "APPROVED"),
-        (format!("{pull}/reviews/80/review.json"), review),
-    ];
-    for (path, expected) in &leaves {
-        assert_eq!(
-            served(&harness, read(&harness, path)).await.unwrap(),
-            *expected,
-            "{path}"
-        );
-    }
-
-    // In a later sync, the page of the parent is what is asked again: an
-    // entry that it brought asks nothing of its own.
-    harness.begin_sync();
-    let (listing, _) = answering(
-        &harness,
-        names(&harness, &format!("{pull}/files")),
-        [fetched(pull_seven()), fetched(not_modified())],
-    )
-    .await;
-    assert_eq!(listing.unwrap(), ["src%2Flib.rs"]);
-    let (listing, _) = answering(
-        &harness,
-        names(&harness, &format!("{pull}/reviews")),
-        [fetched(not_modified())],
-    )
-    .await;
-    assert_eq!(listing.unwrap(), ["80"]);
-    for (path, expected) in &leaves {
-        let (body, requests) = answering(&harness, read(&harness, path), []).await;
-        assert_eq!(body.unwrap(), *expected, "{path}");
-        assert!(requests.is_empty(), "the read of {path} in a sync");
+    for leaf in ["comment.json", "comment.md"] {
+        let path = format!("{pull}/reviews/80/comments/901/{leaf}");
+        let (body, requests) = answering(&harness, read(&harness, &path), []).await;
+        let body = body.unwrap();
+        assert!(body.contains("next"), "{path}: {body}");
+        assert!(!body.contains("code"), "{path}: {body}");
+        assert!(requests.is_empty(), "the read of {path}");
     }
 }
 
@@ -1803,50 +1350,6 @@ fn an_object_that_moved_is_not_at_its_path() {
             "{path}"
         );
     }
-}
-
-/// The load of a changed file of a pull request takes the pages of its
-/// files by their link `next` until the file, however many pages that is.
-#[test]
-fn a_changed_file_loads_from_the_pages_of_the_files_by_their_link_next() {
-    use omnifs_wit::host::types::{CalloutResult, HttpResponse, ReadFileOutcome};
-
-    let harness = github_harness();
-    let mut read = harness
-        .read("/octocat/Hello-World/pulls/all/7/files/src%2Flib.rs/file.json")
-        .unwrap();
-    for (page, body, link) in [
-        (
-            1,
-            r#"[{"filename":"README.md","status":"added","additions":1,"deletions":0,"changes":1}]"#,
-            Some(r#"<https://api.github.com/repositories/1/pulls/7/files?page=2>; rel="next""#),
-        ),
-        (
-            2,
-            r#"[{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":1,"changes":2}]"#,
-            None,
-        ),
-    ] {
-        let fetch = read.expect_single_fetch();
-        assert!(
-            fetch.url.ends_with(&format!(
-                "/repos/octocat/Hello-World/pulls/7/files?per_page=100&page={page}"
-            )),
-            "{}",
-            fetch.url
-        );
-        read.answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 200,
-            headers: link.map(|link| header("Link", link)).into_iter().collect(),
-            body: body.as_bytes().to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    }
-    assert!(matches!(
-        read.result().unwrap(),
-        Ok(ReadFileOutcome::Found(_))
-    ));
 }
 
 /// A name that GitHub gives that is no segment of a path, and a comment
