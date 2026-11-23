@@ -97,9 +97,8 @@ fn github_owner_listing_tracks_browsed_repos() {
     );
 
     // Listing the owner anchor fetches (1) the owner profile to load its own
-    // canonical (owner.json/profile.md faces), (2) the repos of an
-    // organization, which answer 404 for a user, then (3) the repos of the
-    // user.
+    // canonical (owner.json/profile.md faces), and then (2) the repos of the
+    // type that the profile gives, a user, in one request.
     let mut owner_listing = harness.list("/octocat").unwrap();
     let owner_load = owner_listing.expect_single_fetch();
     assert!(
@@ -112,22 +111,6 @@ fn github_owner_listing_tracks_browsed_repos() {
             status: 200,
             headers: Vec::<Header>::new(),
             body: br#"{"login":"octocat","type":"User"}"#.to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    let org_repos_fetch = owner_listing.expect_single_fetch();
-    assert!(
-        org_repos_fetch
-            .url
-            .ends_with("/orgs/octocat/repos?sort=full_name&direction=asc&per_page=100&page=1"),
-        "expected the repos of an organization first, got {}",
-        org_repos_fetch.url
-    );
-    owner_listing
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 404,
-            headers: Vec::<Header>::new(),
-            body: br#"{"message":"Not Found"}"#.to_vec(),
             redirected: None,
         })])
         .unwrap();
@@ -358,22 +341,6 @@ fn github_root_and_owner_listings_ignore_unclassified_repo_paths() {
             status: 200,
             headers: Vec::<Header>::new(),
             body: br#"{"login":"open","type":"User"}"#.to_vec(),
-            redirected: None,
-        })])
-        .unwrap();
-    let org_repos_fetch = owner_listing.expect_single_fetch();
-    assert!(
-        org_repos_fetch
-            .url
-            .ends_with("/orgs/open/repos?sort=full_name&direction=asc&per_page=100&page=1"),
-        "expected the repos of an organization first, got {}",
-        org_repos_fetch.url
-    );
-    owner_listing
-        .answer_callouts(vec![CalloutResult::HttpResponse(HttpResponse {
-            status: 404,
-            headers: Vec::<Header>::new(),
-            body: br#"{"message":"Not Found"}"#.to_vec(),
             redirected: None,
         })])
         .unwrap();

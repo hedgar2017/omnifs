@@ -301,19 +301,31 @@ impl Owner {
     /// only the name, not the single-repo canonical, so entries are `key`.
     ///
     /// A page with a cursor or a validator asks the repos of their owner
-    /// kind. The first page without them asks the repos of an organization,
-    /// which answer `404` for a user, and then the repos of that user: the
-    /// listing of the owner loads its profile in the same operation, whose
-    /// type the projection holds only once the operation ends.
+    /// kind. The first page without them asks the repos of the type of the
+    /// owner, by the profile that the listing of the owner loaded in the same
+    /// operation: one request.
     pub(crate) async fn repos(
         key: OwnerKey,
         cx: ListCx<RepoCursor>,
     ) -> Result<Collection<Repo, RepoCursor>> {
         let since: Option<RepoValidator> = cx.validator().map(decode_validator).transpose()?;
         let (kind, page) = match (cx.cursor(), &since) {
-            (Some(cursor), _) => (Some(cursor.kind), cursor.page),
-            (None, Some(since)) => (Some(since.kind), 1),
-            (None, None) => (None, 1),
+            (Some(cursor), _) => (cursor.kind, cursor.page),
+            (None, Some(since)) => (since.kind, 1),
+            (None, None) => {
+                let owner = cx.object::<crate::objects::Owner>(&key)?.ok_or_else(|| {
+                    ProviderError::internal(format!(
+                        "the listing of {} has no profile of its owner",
+                        key.owner
+                    ))
+                })?;
+                let kind = if owner.kind == "Organization" {
+                    OwnerKind::Org
+                } else {
+                    OwnerKind::User
+                };
+                (kind, 1)
+            },
         };
         let etag = since.map(|since| VersionToken(since.etag));
         let repos = |kind: OwnerKind| {
@@ -326,15 +338,7 @@ impl Owner {
                 .maybe_if_none_match(etag.as_ref())
                 .page::<Vec<RepoListing>>()
         };
-        let (kind, answer) = match kind {
-            Some(kind) => (kind, repos(kind).await?),
-            None => match repos(OwnerKind::Org).await {
-                Err(error) if error.kind() == ProviderErrorKind::NotFound => {
-                    (OwnerKind::User, repos(OwnerKind::User).await?)
-                },
-                answer => (OwnerKind::Org, answer?),
-            },
-        };
+        let answer = repos(kind).await?;
         let more = next_page(&answer);
         let PageAnswer::Fresh {
             value: repos,
