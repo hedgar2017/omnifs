@@ -9,7 +9,6 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 pub const RUNNER_CONTROL_VERSION: u8 = 1;
 pub const RUNNER_CONTROL_MAX_LINE_BYTES: usize = 64 * 1024;
-pub const RUNNER_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,6 +135,9 @@ pub(crate) struct ControlRequests {
 pub(crate) struct HostControl {
     listener: Option<UnixListener>,
     socket: PathBuf,
+    /// How long a client may send no request before its connection ends:
+    /// [`omnifs_core::SILENT_PEER_TIMEOUT`].
+    silence: Duration,
     _record: RunnerRecordFile,
 }
 
@@ -158,6 +160,7 @@ impl HostControl {
         Ok(Self {
             listener: Some(listener),
             socket: control_socket,
+            silence: omnifs_core::SILENT_PEER_TIMEOUT,
             _record: record,
         })
     }
@@ -169,6 +172,7 @@ impl HostControl {
         requests: ControlRequests,
     ) -> tokio::task::JoinHandle<()> {
         let listener = self.listener.take().expect("host control starts once");
+        let silence = self.silence;
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -178,7 +182,7 @@ impl HostControl {
                 let phase = phase.clone();
                 let requests = requests.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, instance_id, phase, requests).await;
+                    let _ = handle_connection(stream, instance_id, phase, requests, silence).await;
                 });
             }
         })
@@ -196,12 +200,13 @@ async fn handle_connection(
     instance_id: String,
     phase: watch::Receiver<RunnerPhase>,
     requests: ControlRequests,
+    silence: Duration,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     // A request is answered once the owner of its mount answers it, as a
     // `Restart` once the server has stopped.
     let request: RunnerRequestEnvelope =
-        tokio::time::timeout(RUNNER_CONTROL_TIMEOUT, read_line(reader))
+        tokio::time::timeout(silence, read_line(reader))
             .await
             .map_err(|_| anyhow::anyhow!("runner control request timed out"))??;
     if request.version != RUNNER_CONTROL_VERSION {
@@ -362,6 +367,9 @@ async fn write_reply(
 pub struct RunnerControlClient {
     instance_id: String,
     socket: PathBuf,
+    /// How long the runner may answer nothing before a request but a
+    /// `Restart` fails: [`omnifs_core::SILENT_PEER_TIMEOUT`].
+    silence: Duration,
 }
 
 impl RunnerControlClient {
@@ -370,6 +378,7 @@ impl RunnerControlClient {
         Self {
             instance_id: record.instance_id.clone(),
             socket: record.control_socket.clone(),
+            silence: omnifs_core::SILENT_PEER_TIMEOUT,
         }
     }
 
@@ -426,7 +435,7 @@ impl RunnerControlClient {
     }
 
     async fn request(&self, request: RunnerRequest) -> anyhow::Result<RunnerReplyEnvelope> {
-        tokio::time::timeout(RUNNER_CONTROL_TIMEOUT, self.exchange(request))
+        tokio::time::timeout(self.silence, self.exchange(request))
             .await
             .map_err(|_| anyhow::anyhow!("runner control request timed out"))?
     }
@@ -504,6 +513,7 @@ mod tests {
                             stop: stop_tx.clone(),
                             restart: None,
                         },
+                        omnifs_core::SILENT_PEER_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -584,6 +594,7 @@ mod tests {
                             stop: stop_tx.clone(),
                             restart: Some(restart_tx.clone()),
                         },
+                        omnifs_core::SILENT_PEER_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -625,7 +636,7 @@ mod tests {
         tokio::time::pause();
         let completion = tokio::spawn(async move {
             let request = restart_rx.recv().await.unwrap();
-            tokio::time::sleep(RUNNER_CONTROL_TIMEOUT * 2).await;
+            tokio::time::sleep(omnifs_core::SILENT_PEER_TIMEOUT * 2).await;
             request.complete(Ok(())).await;
         });
         RunnerControlClient::new(&record(socket, instance))
@@ -633,6 +644,56 @@ mod tests {
             .await
             .unwrap();
         completion.await.unwrap();
+    }
+
+    /// The runner ends the connection of a client that sends no request
+    /// once it is silent for the bound of its silence.
+    #[tokio::test]
+    async fn the_runner_ends_the_connection_of_a_silent_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let instance = "0123456789abcdef0123456789abcdef";
+        let mut control =
+            HostControl::bind(temp.path(), &record(socket.clone(), instance)).unwrap();
+        control.silence = Duration::from_millis(50);
+        let (_phase_tx, phase_rx) = watch::channel(RunnerPhase::Mounted);
+        let (stop_tx, _stop_rx) = mpsc::channel(1);
+        control.spawn(
+            instance.to_owned(),
+            phase_rx,
+            ControlRequests {
+                stop: stop_tx,
+                restart: None,
+            },
+        );
+        let mut silent = UnixStream::connect(&socket).await.unwrap();
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut byte))
+            .await
+            .expect("the runner held the connection of a silent client");
+        assert_eq!(read.unwrap(), 0);
+    }
+
+    /// A request to a runner that answers nothing fails once the runner is
+    /// silent for the bound of its silence.
+    #[tokio::test]
+    async fn a_request_to_a_silent_runner_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let held = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let mut client =
+            RunnerControlClient::new(&record(socket, "0123456789abcdef0123456789abcdef"));
+        client.silence = Duration::from_millis(50);
+        let answer = tokio::time::timeout(Duration::from_secs(5), client.ping())
+            .await
+            .expect("the silent runner held the request");
+        assert!(answer.is_err());
+        held.abort();
     }
 
     /// The `Pong` of a runner of a build before `Restart` reads without it.
