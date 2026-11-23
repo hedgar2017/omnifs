@@ -100,9 +100,13 @@ impl ChangedFile {
         Ok(FileProjection::text(self.status.clone(), TextFormat::Raw).build())
     }
 
+    /// The patch of the file, not found for a file whose patch GitHub does
+    /// not give, as a binary file.
     pub(crate) fn patch(&self, _key: &crate::item::ChangedFileKey) -> Result<FileProjection> {
-        let patch = self.patch.as_deref().unwrap_or("");
-        Ok(FileProjection::body(patch.to_owned())
+        let patch = self.patch.as_ref().ok_or_else(|| {
+            ProviderError::not_found(format!("GitHub gives no patch of {}", self.filename))
+        })?;
+        Ok(FileProjection::body(patch.clone())
             .content_type(ContentType::Custom("text/x-diff"))
             .build())
     }
@@ -157,11 +161,13 @@ impl Representable<Markdown> for Review {
         let Self {
             id, state, body, ..
         } = self;
-        let submitted = self.submitted_at.as_deref().unwrap_or("");
-        format!(
-            "# Review {id}\n\n- State: {state}\n- User: {user}\n- Submitted: {submitted}\n\n{body}\n"
-        )
-        .into_bytes()
+        let submitted = self
+            .submitted_at
+            .as_ref()
+            .map(|submitted| format!("- Submitted: {submitted}\n"))
+            .unwrap_or_default();
+        format!("# Review {id}\n\n- State: {state}\n- User: {user}\n{submitted}\n{body}\n")
+            .into_bytes()
     }
 }
 
@@ -220,9 +226,17 @@ pub(crate) struct Owner {
 impl Representable<Markdown> for Owner {
     fn represent(&self) -> Vec<u8> {
         let Self { login, kind, .. } = self;
-        let name = self.name.as_deref().unwrap_or("");
-        let bio = self.bio.as_deref().unwrap_or("");
-        format!("# {login}\n\n- Type: {kind}\n- Name: {name}\n\n{bio}\n").into_bytes()
+        let name = self
+            .name
+            .as_ref()
+            .map(|name| format!("- Name: {name}\n"))
+            .unwrap_or_default();
+        let bio = self
+            .bio
+            .as_ref()
+            .map(|bio| format!("\n{bio}\n"))
+            .unwrap_or_default();
+        format!("# {login}\n\n- Type: {kind}\n{name}{bio}").into_bytes()
     }
 }
 

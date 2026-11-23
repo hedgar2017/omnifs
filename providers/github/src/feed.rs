@@ -15,11 +15,12 @@
 //!
 //! - one `POST` with the nodes of each kind after its cursor and the counts of
 //!   the issues and of the pull requests;
-//! - the REST count of the comments of the repository with its newest
-//!   comment;
-//! - the comments updated since a second before the last one, so that the
-//!   check takes each change whether GitHub's `since` includes its second or
-//!   not;
+//! - the comments updated since the second after the last one, which the
+//!   answer of the last pass came after, so that the check takes each
+//!   change and no comment that it holds, whether GitHub's `since` includes
+//!   its second or not;
+//! - the REST count of the comments of the repository, with the `ETag` of
+//!   the count that the projection holds;
 //! - the IDs of each changed item whose comments are other than its count;
 //! - the numbers of a kind whose count is other than the projection's with
 //!   the changes of the check, which remove each item that left and bring
@@ -40,7 +41,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::value::RawValue;
 use time::format_description::well_known::Rfc3339;
-use time::{Duration, OffsetDateTime};
+use time::macros::format_description;
+use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
 use crate::api::GitHubApi;
 use crate::item::{IssueKey, ItemKind, PullKey, RepoKey};
@@ -49,10 +51,6 @@ use crate::{RepoId, StateFilter};
 
 /// The nodes and the rows of a page.
 const PAGE: usize = 100;
-
-// ===========================================================================
-// Tokens
-// ===========================================================================
 
 /// The token of the feed of a repository: the cursor of the last issue and
 /// of the last pull request that it took, the list of its comments, the REST
@@ -63,17 +61,53 @@ struct RepoToken {
     issues: Option<String>,
     pulls: Option<String>,
     comments: Since,
-    total: Option<u64>,
+    total: Option<Count>,
     stage: Option<Stage>,
 }
 
 /// The list of the comments of the repository: the `updated_at` of its last
-/// row, and the `ETag` of the answer since that time that had no page after
-/// it.
+/// row, the `Date` of the first answer of the pass that took it, and the
+/// `ETag` of the answer since `asked` that had no page after it.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Since {
     #[serde(with = "time::serde::rfc3339::option")]
     time: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    answered: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    asked: Option<OffsetDateTime>,
+    etag: Option<String>,
+}
+
+impl Since {
+    /// The `since` of the next pass: none before a first pass. GitHub gives
+    /// each time to the second, and the pass took each row updated before
+    /// the second of its first answer, so each second after the last row and
+    /// before that second has no row. The second after the last row is then
+    /// the time from which the next pass takes each row that it lacks and
+    /// none that it holds, whether `since` includes its second or not. A last
+    /// row in the second of the answer or the one before it leaves no such
+    /// second: the pass asks from the second that makes it take the rows of
+    /// a second that may have more, the second of the last row when that
+    /// second ended before the answer, else the one before it.
+    fn next(&self) -> Option<OffsetDateTime> {
+        let (last, answered) = (self.time?, self.answered?);
+        Some(if last + Duration::SECOND < answered {
+            last + Duration::SECOND
+        } else if last < answered {
+            last
+        } else {
+            last - Duration::SECOND
+        })
+    }
+}
+
+/// The REST count of the comments of the repository, with the `ETag` of its
+/// page of one comment at its last position, which a `304` keeps at that
+/// count.
+#[derive(Clone, Serialize, Deserialize)]
+struct Count {
+    total: u64,
     etag: Option<String>,
 }
 
@@ -142,7 +176,7 @@ struct Check {
     removed: BTreeSet<ItemRef>,
     numbered: BTreeSet<ItemKind>,
     ledger: Ledger,
-    remote: Option<Remote>,
+    remote: Option<Count>,
     scan: Scan,
 }
 
@@ -165,14 +199,6 @@ struct Ledger {
     removed: BTreeMap<u64, u64>,
 }
 
-/// The REST count of the comments of the repository, with the ID of its
-/// newest comment: a comment with a greater ID came after the count.
-#[derive(Clone, Copy, Serialize, Deserialize)]
-struct Remote {
-    total: u64,
-    newest: Option<u64>,
-}
-
 /// The scan of the counts of the comments of the items of a check: not
 /// begun, at its next page, or at its end.
 #[derive(Serialize, Deserialize)]
@@ -192,12 +218,15 @@ enum CheckRequest {
     /// The REST count of the comments.
     Remote,
     /// A page of the comments updated since `since`, at a link `next`, with
-    /// the IDs of the rows before it and the `updated_at` of the last row.
+    /// the IDs of the rows before it, the `updated_at` of the last row, and
+    /// the `Date` of the first answer of the pass.
     Comments {
         #[serde(with = "time::serde::rfc3339::option")]
         since: Option<OffsetDateTime>,
         link: Option<String>,
         seen: BTreeSet<u64>,
+        #[serde(with = "time::serde::rfc3339::option")]
+        answered: Option<OffsetDateTime>,
         #[serde(with = "time::serde::rfc3339::option")]
         latest: Option<OffsetDateTime>,
     },
@@ -289,10 +318,6 @@ struct ItemRef {
     number: u64,
 }
 
-// ===========================================================================
-// REST
-// ===========================================================================
-
 /// A row of a REST list of comments of the repository.
 struct CommentRow {
     comment: Comment,
@@ -347,14 +372,16 @@ fn decode_json<T: DeserializeOwned>(text: &str) -> Result<T> {
 
 /// The answer of a REST page.
 enum RestPage {
-    /// `304`: the page of the `ETag` stands.
-    Unchanged,
-    /// `200`: its rows, its `ETag`, and its link `next` as a path of the API.
+    /// `304`: the page of the `ETag` stands, with the `Date` of the answer.
+    Unchanged { date: Option<String> },
+    /// `200`: its rows, its `ETag`, its link `next` and its link `last` as
+    /// paths of the API, and the `Date` of the answer.
     Rows {
         rows: Vec<Box<RawValue>>,
         etag: Option<String>,
         next: Option<String>,
         last: Option<String>,
+        date: Option<String>,
     },
     /// `301`, `404`, or `410`: its resource is not in the repository.
     Gone,
@@ -380,8 +407,11 @@ async fn rest_page(cx: &Cx, path: &str, etag: Option<&str>) -> Result<RestPage> 
             etag: response.header("etag").map(ToOwned::to_owned),
             next: link(response.header("link"), "next")?,
             last: link(response.header("link"), "last")?,
+            date: response.header("date").map(ToOwned::to_owned),
         }),
-        304 => Ok(RestPage::Unchanged),
+        304 => Ok(RestPage::Unchanged {
+            date: response.header("date").map(ToOwned::to_owned),
+        }),
         301 | 404 | 410 => Ok(RestPage::Gone),
         status => Err(error_of(&response, status)),
     }
@@ -421,23 +451,59 @@ fn moved(repo: &RepoId) -> ProviderError {
     ProviderError::not_found(format!("{repo} is not at this path"))
 }
 
-/// The REST count of the comments of the repository with its newest
-/// comment: one row a page, the newest first, whose last page is the count.
-async fn remote(cx: &Cx, repo: &RepoId) -> Result<Remote> {
-    #[derive(Deserialize)]
-    struct Id {
-        id: u64,
+/// The `Date` of an answer, which GitHub gives each answer, to the second.
+fn date_of(date: Option<&str>) -> Result<OffsetDateTime> {
+    let date = date.ok_or_else(|| ProviderError::invalid_input("an answer without a Date"))?;
+    PrimitiveDateTime::parse(
+        date,
+        format_description!(
+            "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+        ),
+    )
+    .map(PrimitiveDateTime::assume_utc)
+    .map_err(|error| ProviderError::invalid_input(format!("the Date {date:?}: {error}")))
+}
+
+/// The page of one comment of the comments of the repository, the newest
+/// first, at `page`.
+fn count_path(repo: &RepoId, page: u64) -> String {
+    format!("/repos/{repo}/issues/comments?sort=created&direction=desc&per_page=1&page={page}")
+}
+
+/// The page of the last comment of a count, its oldest: the page of each
+/// count other than it has another comment or none. The first page for a
+/// count of none, which a comment fills.
+fn count_page(total: u64) -> u64 {
+    total.max(1)
+}
+
+/// The REST count of the comments of the repository. The page of one comment
+/// at the last position of the count that the projection holds answers `304`
+/// with the `ETag` of that count while the count is the same: each other
+/// count has another comment at that position, or none. For another answer,
+/// the first page names the count by its link `last`, and the page at the
+/// last position of that count gives the `ETag` of the next request.
+async fn remote(cx: &Cx, repo: &RepoId, known: Option<&Count>) -> Result<Count> {
+    if let Some(Count {
+        total,
+        etag: Some(etag),
+    }) = known
+    {
+        match rest_page(cx, &count_path(repo, count_page(*total)), Some(etag)).await? {
+            RestPage::Unchanged { .. } => return Ok(known.expect("a known count").clone()),
+            RestPage::Rows { .. } => {},
+            RestPage::Gone => return Err(moved(repo)),
+        }
     }
-    let path = format!("/repos/{repo}/issues/comments?sort=created&direction=desc&per_page=1");
     let RestPage::Rows {
-        rows, next, last, ..
-    } = rest_page(cx, &path, None).await?
+        rows,
+        next,
+        last,
+        etag,
+        ..
+    } = rest_page(cx, &count_path(repo, 1), None).await?
     else {
         return Err(moved(repo));
-    };
-    let newest = match rows.first() {
-        Some(row) => Some(decode_json::<Id>(row.get())?.id),
-        None => None,
     };
     let total = match (next, last) {
         (None, None) => rows.len() as u64,
@@ -448,7 +514,15 @@ async fn remote(cx: &Cx, repo: &RepoId) -> Result<Remote> {
             )));
         },
     };
-    Ok(Remote { total, newest })
+    if count_page(total) == 1 {
+        return Ok(Count { total, etag });
+    }
+    let RestPage::Rows { etag, .. } =
+        rest_page(cx, &count_path(repo, count_page(total)), None).await?
+    else {
+        return Err(moved(repo));
+    };
+    Ok(Count { total, etag })
 }
 
 /// The value of the query parameter `page` of a path.
@@ -468,20 +542,15 @@ fn page_of(path: &str) -> Result<u64> {
 /// not.
 fn since_pair(time: Option<OffsetDateTime>) -> Result<String> {
     match time {
-        Some(time) => {
-            let since = time - Duration::SECOND;
-            let text = since
-                .format(&Rfc3339)
-                .map_err(|error| ProviderError::internal(format!("time {since}: {error}")))?;
-            Ok(format!("&since={text}"))
-        },
+        Some(time) => Ok(format!("&since={}", rfc3339(time - Duration::SECOND)?)),
         None => Ok(String::new()),
     }
 }
 
-// ===========================================================================
-// GitHub GraphQL
-// ===========================================================================
+fn rfc3339(time: OffsetDateTime) -> Result<String> {
+    time.format(&Rfc3339)
+        .map_err(|error| ProviderError::internal(format!("time {time}: {error}")))
+}
 
 #[derive(Deserialize)]
 struct GraphQl {
@@ -885,10 +954,6 @@ fn alias(item: ItemRef) -> String {
     format!("i{}", item.number)
 }
 
-// ===========================================================================
-// Facts
-// ===========================================================================
-
 fn folder(repo: &RepoId, kind: ItemKind, filter: StateFilter) -> String {
     format!("/{repo}/{kind}/{filter}")
 }
@@ -1191,10 +1256,6 @@ impl Ids {
     }
 }
 
-// ===========================================================================
-// The feed of a repository
-// ===========================================================================
-
 /// One call of the feed of a repository: its context, the repository, and
 /// its token, which its requests move.
 struct RepoFeed<'a> {
@@ -1203,7 +1264,7 @@ struct RepoFeed<'a> {
     issues: Option<String>,
     pulls: Option<String>,
     comments: Since,
-    total: Option<u64>,
+    total: Option<Count>,
 }
 
 impl Repo {
@@ -1300,8 +1361,8 @@ impl RepoFeed<'_> {
     }
 
     /// A page of the comments of the repository in the order of `updated_at`:
-    /// the page at `link`, else the comments since a second before `since`,
-    /// with the `ETag` of their list for `since` the time of the list.
+    /// the page at `link`, else the comments since `since`, with the `ETag`
+    /// of the answer since that time.
     async fn comments_page(
         &self,
         since: Option<OffsetDateTime>,
@@ -1310,16 +1371,19 @@ impl RepoFeed<'_> {
         let page = if let Some(link) = link {
             rest_page(self.cx, link, None).await?
         } else {
+            let since_query = match since {
+                Some(since) => format!("&since={}", rfc3339(since)?),
+                None => String::new(),
+            };
             let path = format!(
-                "/repos/{}/issues/comments?sort=updated&direction=asc&per_page={PAGE}{}",
+                "/repos/{}/issues/comments?sort=updated&direction=asc&per_page={PAGE}{since_query}",
                 self.repo,
-                since_pair(since)?
             );
             let etag = self
                 .comments
                 .etag
                 .as_deref()
-                .filter(|_| since == self.comments.time);
+                .filter(|_| since == self.comments.asked);
             rest_page(self.cx, &path, etag).await?
         };
         match page {
@@ -1386,12 +1450,18 @@ impl RepoFeed<'_> {
     /// item of the projection joins its `comments/` as complete as it was; a
     /// comment of an item made after the items waits for its item.
     async fn listing_comments(&mut self, link: Option<String>) -> Result<Feed> {
-        let RestPage::Rows { rows, next, .. } = self.comments_page(None, link.as_deref()).await?
+        let first = link.is_none();
+        let RestPage::Rows {
+            rows, next, date, ..
+        } = self.comments_page(None, link.as_deref()).await?
         else {
             return Err(ProviderError::internal(
                 "the comments answered 304 to a request without an ETag",
             ));
         };
+        if first {
+            self.comments.answered = Some(date_of(date.as_deref())?);
+        }
         let mut w = Writer::new(self.cx, &self.repo, None);
         for bytes in rows {
             let row = CommentRow::of(bytes)?;
@@ -1480,7 +1550,7 @@ impl RepoFeed<'_> {
     /// The last part of the first full listing: the REST count of the
     /// comments, with the four folders complete.
     async fn listing_total(&mut self) -> Result<Feed> {
-        self.total = Some(remote(self.cx, &self.repo).await?.total);
+        self.total = Some(remote(self.cx, &self.repo, None).await?);
         for kind in [ItemKind::Issues, ItemKind::Pulls] {
             for filter in [StateFilter::All, StateFilter::Open] {
                 self.cx
@@ -1496,21 +1566,17 @@ impl RepoFeed<'_> {
         let next = match request {
             CheckRequest::Rows { kinds } => Some(self.check_rows(&mut check, kinds).await?),
             CheckRequest::Remote => {
-                check.remote = Some(remote(self.cx, &self.repo).await?);
-                Some(CheckRequest::Comments {
-                    since: self.comments.time,
-                    link: None,
-                    seen: BTreeSet::new(),
-                    latest: self.comments.time,
-                })
+                check.remote = Some(remote(self.cx, &self.repo, self.total.as_ref()).await?);
+                None
             },
             CheckRequest::Comments {
                 since,
                 link,
                 seen,
+                answered,
                 latest,
             } => {
-                self.check_comments(&mut check, since, link, seen, latest)
+                self.check_comments(&mut check, since, link, seen, answered, latest)
                     .await?
             },
             CheckRequest::Counts => {
@@ -1540,7 +1606,7 @@ impl RepoFeed<'_> {
             let remote = check.remote.ok_or_else(|| {
                 ProviderError::internal("a check ends without the count of its comments")
             })?;
-            self.total = Some(remote.total + late(&check.ledger, remote));
+            self.total = Some(remote);
             return Ok(self.part(None)?.into());
         };
         check.next = next;
@@ -1615,30 +1681,53 @@ impl RepoFeed<'_> {
             }
         }
         Ok(if more.is_empty() {
-            CheckRequest::Remote
+            CheckRequest::Comments {
+                since: self.comments.next(),
+                link: None,
+                seen: BTreeSet::new(),
+                answered: None,
+                latest: self.comments.time,
+            }
         } else {
             CheckRequest::Rows { kinds: more }
         })
     }
 
-    /// A page of the comments of a check updated since a second before
-    /// `since`. A row that came before in this pass, which an edit moved past
-    /// a page while the pass paged, shifted the rows after it: the pass asks
-    /// for the comments since `since` again, so that no row is lost to it.
+    /// A page of the comments of a check updated since `since`, then the
+    /// REST count after the last page. A row that came before in this pass,
+    /// which an edit moved past a page while the pass paged, shifted the rows
+    /// after it: the pass asks for the comments since `since` again, so that
+    /// no row is lost to it. A `304` keeps the rows of the list, as of its
+    /// `Date`.
     async fn check_comments(
         &mut self,
         check: &mut Check,
         since: Option<OffsetDateTime>,
         link: Option<String>,
         mut seen: BTreeSet<u64>,
+        answered: Option<OffsetDateTime>,
         mut latest: Option<OffsetDateTime>,
     ) -> Result<Option<CheckRequest>> {
         let first = link.is_none();
-        let RestPage::Rows {
-            rows, etag, next, ..
-        } = self.comments_page(since, link.as_deref()).await?
-        else {
-            return Ok(None);
+        let (rows, etag, next, answered) = match self.comments_page(since, link.as_deref()).await? {
+            RestPage::Unchanged { date } => {
+                self.comments.answered = Some(date_of(date.as_deref())?);
+                return Ok(Some(CheckRequest::Remote));
+            },
+            RestPage::Rows {
+                rows,
+                etag,
+                next,
+                date,
+                ..
+            } => {
+                let answered = match answered {
+                    Some(answered) => answered,
+                    None => date_of(date.as_deref())?,
+                };
+                (rows, etag, next, answered)
+            },
+            RestPage::Gone => return Err(moved(&self.repo)),
         };
         let mut moved = false;
         let Check {
@@ -1669,6 +1758,7 @@ impl RepoFeed<'_> {
                 since,
                 link: None,
                 seen: BTreeSet::new(),
+                answered: None,
                 latest,
             }));
         }
@@ -1677,12 +1767,15 @@ impl RepoFeed<'_> {
                 since,
                 link: Some(link),
                 seen,
+                answered: Some(answered),
                 latest,
             }));
         }
-        self.comments.etag = etag.filter(|_| first && latest == since);
+        self.comments.etag = etag.filter(|_| first);
+        self.comments.asked = since;
         self.comments.time = latest;
-        Ok(None)
+        self.comments.answered = Some(answered);
+        Ok(Some(CheckRequest::Remote))
     }
 
     /// The `POST` of the first pages of the IDs of the next changed items
@@ -1933,12 +2026,16 @@ impl RepoFeed<'_> {
         }
         let remote = check
             .remote
-            .ok_or_else(|| ProviderError::internal("a check lacks the count of its comments"))?;
+            .as_ref()
+            .ok_or_else(|| ProviderError::internal("a check lacks the count of its comments"))?
+            .total;
         let total = self
             .total
-            .ok_or_else(|| ProviderError::internal("a check lacks the count it holds"))?;
-        let expected = total + counted(&check.ledger, remote) - check.ledger.removed.len() as u64;
-        if expected == remote.total {
+            .as_ref()
+            .ok_or_else(|| ProviderError::internal("a check lacks the count it holds"))?
+            .total;
+        let expected = total + check.ledger.added.len() as u64 - check.ledger.removed.len() as u64;
+        if expected == remote {
             return Ok(None);
         }
         Ok(match std::mem::replace(&mut check.scan, Scan::Done) {
@@ -2003,7 +2100,7 @@ impl RepoFeed<'_> {
             issues: self.issues.clone(),
             pulls: self.pulls.clone(),
             comments: self.comments.clone(),
-            total: self.total,
+            total: self.total.clone(),
             stage,
         })?
         .more(more))
@@ -2043,25 +2140,6 @@ fn gone(check: &mut Check, item: ItemRef) {
         },
     }
 }
-
-/// The comments that a check added and that the REST count counts: those
-/// up to its newest comment.
-fn counted(ledger: &Ledger, remote: Remote) -> u64 {
-    ledger
-        .added
-        .keys()
-        .filter(|id| remote.newest.is_some_and(|newest| **id <= newest))
-        .count() as u64
-}
-
-/// The comments that a check added after the REST count.
-fn late(ledger: &Ledger, remote: Remote) -> u64 {
-    ledger.added.len() as u64 - counted(ledger, remote)
-}
-
-// ===========================================================================
-// The feed of an item
-// ===========================================================================
 
 impl Issue {
     /// The feed of an issue before the first full listing of its repository
@@ -2219,7 +2297,7 @@ async fn item_comments<K>(
             Ok(Some((rows, next)))
         },
         RestPage::Gone => Ok(None),
-        RestPage::Unchanged => Err(ProviderError::internal(
+        RestPage::Unchanged { .. } => Err(ProviderError::internal(
             "the comments answered 304 to a request without an ETag",
         )),
     }

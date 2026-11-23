@@ -22,7 +22,7 @@ omnifs-sdk = { workspace = true }
 http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
-time = { workspace = true, features = ["formatting", "macros", "serde"] }
+time = { workspace = true, features = ["formatting", "macros", "parsing", "serde"] }
 
 [lints.rust]
 unsafe_code = "allow"

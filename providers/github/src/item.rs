@@ -29,10 +29,6 @@ pub(crate) enum ItemKind {
     Pulls,
 }
 
-// ===========================================================================
-// Keys
-// ===========================================================================
-
 #[omnifs_sdk::path_captures]
 pub(crate) struct OwnerKey {
     pub(crate) owner: OwnerName,
@@ -118,10 +114,6 @@ pub(crate) struct CommentKey {
 pub(crate) struct NotificationKey {
     pub(crate) thread_id: ThreadId,
 }
-
-// ===========================================================================
-// Object loads (forwarded to by the #[object] macro)
-// ===========================================================================
 
 impl Owner {
     pub(crate) async fn load(
@@ -258,10 +250,6 @@ impl Notification {
             .await
     }
 }
-
-// ===========================================================================
-// Collections
-// ===========================================================================
 
 #[derive(Debug, Deserialize)]
 struct RepoListing {
@@ -571,10 +559,6 @@ impl Notification {
     }
 }
 
-// ===========================================================================
-// Live faces (blob, tree, direct)
-// ===========================================================================
-
 impl PullRequest {
     /// The diff of the pull request between its base and its head, which its
     /// node in the projection names: the host holds the diff of each pair of
@@ -646,10 +630,6 @@ impl Repo {
         Ok(Tree::at(TreeRef::new(opened.tree), commit))
     }
 }
-
-// ===========================================================================
-// Helpers
-// ===========================================================================
 
 /// The entries of the rows of a page, each with its bytes as the canonical
 /// bytes of its object: a row of a list is the object that its own request

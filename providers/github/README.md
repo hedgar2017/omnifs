@@ -52,13 +52,13 @@ The first read of `issues/all/`, `issues/open/`, `pulls/all/`, or `pulls/open/` 
 After it, the first read of those folders in each sync is a check, a part of the answer for each request, which the host publishes together with the last part; outside a sync they are served from the projection:
 
 - one GitHub GraphQL `POST` with the issues and the pull requests after their cursors and the count of each kind;
-- the REST count of the comments of the repository;
-- the comments updated since a second before the last one, the first page with `If-None-Match`: GitHub gives each time to the second, so the second before is the one unit of its precision that takes each edit whether its `since` includes that second or not; a comment that comes twice in one pass moved past a page while the pass paged, and the pass asks again;
+- the comments updated since the second after the last one, the first page with `If-None-Match`: GitHub gives each time to the second, and the last pass took each comment updated before the second of its first answer, so that second after holds no comment and takes each edit and no comment held, whether `since` includes its second or not; when the last comment came in the second of that answer or the one before, the pass asks from the second that may hold more; a comment that comes twice in one pass moved past a page while the pass paged, and the pass asks again;
+- the REST count of the comments of the repository, by the page of one comment at the last position of the count held, with its `ETag`: `304` keeps the count, since each other count has another comment at that position or none;
 - the IDs of each changed item whose comments are other than its count, which remove a deleted comment and bring by its ID a comment that the list lacks;
 - for a count of a kind other than the projection's with the changes of the check, the numbers of that kind, once, which remove the items that left and bring those that the projection lacks;
 - for a REST count of the comments other than the count the projection holds with the changes of the check, the counts of the comments of the items until each item whose comments changed unseen, as by a deletion, took its IDs.
 
-A quiet check is one `POST`, the REST count, and a `304`.
+A quiet check is one `POST` and two `304`s.
 
 Before the first full listing ends, an item answers from GitHub GraphQL by its number, and its comments download at the first read of its `comments/` or of a comment in it, for a count other than `0`. An item that GitHub answers for its number from another repository or with another number, as an issue that moved, and an item whose comments answer `301`, left the repository. A repository that GitHub GraphQL names otherwise, or whose REST requests answer `301`, is not at its path. The facts of an issue or a pull request live under `all/`, which `open/` shares while it is open. GitHub GraphQL answers only an authenticated mount.
 

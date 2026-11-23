@@ -48,7 +48,7 @@ pub enum StateFilter {
     display_name = "GitHub",
     description = "repos, issues, and pull requests",
     mount = "github",
-    projection = 5,
+    projection = 6,
     capabilities(
         domain(
             "api.github.com",
