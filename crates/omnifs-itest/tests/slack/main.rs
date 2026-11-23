@@ -461,7 +461,14 @@ async fn the_first_full_listing_of_a_channel_takes_each_page_at_its_answer() {
     );
     assert_eq!(
         served(&harness, names(&harness, &at(1))).await.unwrap(),
-        ["author", "files", "message.json", "replies", "text"]
+        [
+            "author",
+            "files",
+            "message.json",
+            "replies",
+            "text",
+            "thread.json"
+        ]
     );
     for (n, author) in [(1, ""), (2, "U02")] {
         assert_eq!(
@@ -485,10 +492,11 @@ async fn the_first_full_listing_of_a_channel_takes_each_page_at_its_answer() {
 /// sweep of each page, which takes a new message, an edit of a message, and
 /// the removal of a message that its pages lack, and writes `messages/`
 /// complete after a last page without a new message; it leaves the replies
-/// of a thread whose `reply_count` and `latest_reply` are those of the
-/// replies of the projection, which their next read takes from the
-/// projection, and removes the replies of a thread with another
-/// `reply_count` and `latest_reply`, which their next read takes once more.
+/// of a thread whose `reply_count` and `latest_reply` are those that the
+/// answer of its replies gave, a reply newer than the sweep before it too,
+/// which their next read takes from the projection, and removes the replies
+/// of a thread with another `reply_count` and `latest_reply`, which their
+/// next read takes once more.
 /// Each other operation of the sync, and each one after it, is served from
 /// the projection.
 #[tokio::test(flavor = "multi_thread")]
@@ -526,12 +534,16 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
         names(&harness, &replies),
         vec![ok(&page(
             "messages",
-            &[question(1, 21), reply(21, 2, "U02", "A reply")],
+            &[
+                question(2, 22),
+                reply(21, 2, "U02", "A reply"),
+                reply(22, 2, "U03", "Another reply"),
+            ],
             None,
         ))],
     )
     .await;
-    assert_eq!(listing.unwrap(), stamps(&[21]));
+    assert_eq!(listing.unwrap(), stamps(&[21, 22]));
     expect_replies(&requests[0], "C01", &ts(2), None);
 
     // A new message, at a read of a file in the channel in a sync.
@@ -545,7 +557,7 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
                 &[
                     message(4, Some("U02"), "Fourth"),
                     message(3, Some("U01"), "Third"),
-                    question(1, 21),
+                    question(2, 22),
                 ],
                 Some("cursor-2"),
             )),
@@ -578,7 +590,7 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
                     message(5, Some("U01"), "Fifth"),
                     message(4, Some("U02"), "Fourth"),
                     edited(),
-                    question(1, 21),
+                    question(2, 22),
                 ],
                 Some("cursor-2"),
             )),
@@ -610,7 +622,7 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
     );
     assert_eq!(
         served(&harness, names(&harness, &replies)).await.unwrap(),
-        stamps(&[21])
+        stamps(&[21, 22])
     );
     assert_eq!(
         served(
@@ -638,7 +650,7 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
                 message(5, Some("U01"), "Fifth"),
                 message(4, Some("U02"), "Fourth"),
                 edited(),
-                question(2, 22),
+                question(3, 23),
             ],
             None,
         ))],
@@ -652,15 +664,16 @@ async fn a_sweep_takes_each_change_of_the_messages_of_its_pages() {
         vec![ok(&page(
             "messages",
             &[
-                question(2, 22),
+                question(3, 23),
                 reply(21, 2, "U02", "A reply"),
                 reply(22, 2, "U03", "Another reply"),
+                reply(23, 2, "U01", "A third reply"),
             ],
             None,
         ))],
     )
     .await;
-    assert_eq!(listing.unwrap(), stamps(&[21, 22]));
+    assert_eq!(listing.unwrap(), stamps(&[21, 22, 23]));
     expect_replies(&requests[0], "C01", &ts(2), None);
 }
 
@@ -1332,7 +1345,7 @@ async fn the_errors_of_slack_remove_fail_and_wait() {
         ("invalid_auth", "mount credential is unavailable"),
         ("internal_error", "network error"),
         ("request_timeout", "timeout"),
-        ("invalid_arguments", "invalid argument"),
+        ("invalid_arguments", "internal error"),
         ("an_error_without_a_kind", "internal error"),
     ] {
         let (listing, requests) = answering(
